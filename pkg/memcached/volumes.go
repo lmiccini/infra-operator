@@ -72,18 +72,18 @@ func getVolumes(m *memcachedv1.Memcached) []corev1.Volume {
 				},
 			},
 			{
-				Name: "sasl-config",
+				Name: "sasl-conf",
 				VolumeSource: corev1.VolumeSource{
 					 ConfigMap: &corev1.ConfigMapVolumeSource{
 						 LocalObjectReference: corev1.LocalObjectReference{
-							 Name: fmt.Sprintf("%s-sasl-config", m.Name),
+							 Name: fmt.Sprintf("%s-config-data", m.Name),
 						 },
-						 Items: []corev1.KeyToPath{
-							 {
-								  Key:  "memcached.conf",
-								  Path: "etc/memcached/memcached.conf",
-							 },
-						 },
+						 //Items: []corev1.KeyToPath{
+						 //        {
+						 //       	  Key:  "memcached.conf",
+						 //       	  Path: "etc/memcached/memcached.conf",
+						 //        },
+						 //},
 					 },
 				},
 			},
@@ -110,10 +110,12 @@ func getVolumeMounts(m *memcachedv1.Memcached) []corev1.VolumeMount {
 		vm2 := []corev1.VolumeMount{{
 			MountPath: "/etc/memcached/memcached-sasl-db",
 			ReadOnly:  true,
+			SubPath:   "sasl-db",
 			Name:      "sasl-db",
 		}, {
 			MountPath: "/etc/memcached/memcached.conf",
 			ReadOnly:  true,
+			SubPath:   "memcached.conf",
 			Name:      "sasl-conf",
 		}}
 		vm = append(vm, vm2...)
