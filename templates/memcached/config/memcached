@@ -4,4 +4,6 @@ MAXCONN="8192"
 CACHESIZE="9932"
 # explicit IP to bind to (wrap IPv6 in brackets)
 LISTEN=$(echo 127.0.0.1 ::1 $POD_IPS | tr ',' ' ' | tr ' ' '\n' | sed 's/\(.*\):\(.*\)/[\1:\2]/' {{ .memcachedTLSListen }})
-OPTIONS="-l $(echo $LISTEN | tr ' ' ',') {{ .memcachedTLSOptions }} -vv"
+OPTIONS="-l $(echo $LISTEN | tr ' ' ',') {{ .memcachedTLSOptions }} {{ .memcachedAuthOptions }} -vv"
+MEMCACHED_SASL_PWDB="/etc/memcached/memcached-sasl-db"
+SASL_CONF_PATH="/etc/memcached/memcached.conf"

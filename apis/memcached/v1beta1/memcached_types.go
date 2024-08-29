@@ -60,6 +60,13 @@ type MemcachedSpecCore struct {
 	// +operator-sdk:csv:customresourcedefinitions:type=spec
 	// TLS settings for memcached service
 	TLS tls.SimpleService `json:"tls,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// Auth to enable sasl auth to memcached
+	Auth bool `json:"auth,false"`
+
+	// +kubebuilder:validation:Optional
+	AuthSecret string `json:"authSecret"`
 }
 
 // MemcachedStatus defines the observed state of Memcached
