@@ -106,7 +106,7 @@ func getVolumeMounts(m *memcachedv1.Memcached) []corev1.VolumeMount {
 		Name:      "kolla-config",
 	}}
 
-	if  m.Spec.Auth {
+	if m.Spec.Auth {
 		vm2 := []corev1.VolumeMount{{
 			MountPath: "/etc/memcached/memcached-sasl-db",
 			ReadOnly:  true,
