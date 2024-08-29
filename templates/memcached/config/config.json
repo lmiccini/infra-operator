@@ -1,5 +1,5 @@
 {
-  "command": "bash -c $* -- eval source /etc/sysconfig/memcached; if [ {{ .memcachedAuthOptions }} != '' ]; then export MEMCACHED_SASL_PWDB=/etc/memcached/memcached-sasl-db; export SASL_CONF_PATH=/etc/memcached/memcached.conf; fi; exec /usr/bin/memcached -p ${PORT} -u ${USER} -m ${CACHESIZE} -c ${MAXCONN} $OPTIONS",
+  "command": "bash -c $* -- eval source /etc/sysconfig/memcached; if [ {{ .memcachedAuthOptions }} != '' ]; then chown memcached:memcached /etc/memcached; export MEMCACHED_SASL_PWDB=/etc/memcached/memcached-sasl-db; export SASL_CONF_PATH=/etc/memcached/memcached.conf; fi; exec /usr/bin/memcached -p ${PORT} -u ${USER} -m ${CACHESIZE} -c ${MAXCONN} $OPTIONS",
   "config_files": [
     {
       "dest": "/",
