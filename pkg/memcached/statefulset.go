@@ -76,7 +76,7 @@ func StatefulSet(m *memcachedv1.Memcached) *appsv1.StatefulSet {
 								},
 							},
 						}, {
-							Name: "USER",
+							Name: "USERNAME",
                                                         ValueFrom: &corev1.EnvVarSource{
                                                                 SecretKeyRef: &corev1.SecretKeySelector{
                                                                         LocalObjectReference: corev1.LocalObjectReference{
@@ -86,7 +86,7 @@ func StatefulSet(m *memcachedv1.Memcached) *appsv1.StatefulSet {
                                                                 },
                                                         },
 						}, {
-							Name: "PASS",
+							Name: "PASSWORD",
                                                         ValueFrom: &corev1.EnvVarSource{
                                                                 SecretKeyRef: &corev1.SecretKeySelector{
                                                                         LocalObjectReference: corev1.LocalObjectReference{
