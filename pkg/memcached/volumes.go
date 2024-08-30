@@ -64,26 +64,12 @@ func getVolumes(m *memcachedv1.Memcached) []corev1.Volume {
 	if m.Spec.Auth {
 		v := []corev1.Volume{
 			{
-				Name: "sasl-db",
-				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{
-						SecretName: m.Spec.AuthSecret,
-					},
-				},
-			},
-			{
 				Name: "sasl-conf",
 				VolumeSource: corev1.VolumeSource{
 					 ConfigMap: &corev1.ConfigMapVolumeSource{
 						 LocalObjectReference: corev1.LocalObjectReference{
 							 Name: fmt.Sprintf("%s-config-data", m.Name),
 						 },
-						 //Items: []corev1.KeyToPath{
-						 //        {
-						 //       	  Key:  "memcached.conf",
-						 //       	  Path: "etc/memcached/memcached.conf",
-						 //        },
-						 //},
 					 },
 				},
 			},
@@ -108,11 +94,6 @@ func getVolumeMounts(m *memcachedv1.Memcached) []corev1.VolumeMount {
 
 	if m.Spec.Auth {
 		vm2 := []corev1.VolumeMount{{
-			MountPath: "/etc/memcached/memcached-sasl-db",
-			ReadOnly:  true,
-			SubPath:   "sasl-db",
-			Name:      "sasl-db",
-		}, {
 			MountPath: "/etc/memcached/memcached.conf",
 			ReadOnly:  true,
 			SubPath:   "memcached.conf",

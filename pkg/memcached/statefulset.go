@@ -75,6 +75,26 @@ func StatefulSet(m *memcachedv1.Memcached) *appsv1.StatefulSet {
 									FieldPath: "status.podIPs",
 								},
 							},
+						}, {
+							Name: "USER",
+                                                        ValueFrom: &corev1.EnvVarSource{
+                                                                SecretKeyRef: &corev1.SecretKeySelector{
+                                                                        LocalObjectReference: corev1.LocalObjectReference{
+                                                                                Name: m.Spec.AuthSecret,
+                                                                        },
+                                                                        Key: "username",
+                                                                },
+                                                        },
+						}, {
+							Name: "PASS",
+                                                        ValueFrom: &corev1.EnvVarSource{
+                                                                SecretKeyRef: &corev1.SecretKeySelector{
+                                                                        LocalObjectReference: corev1.LocalObjectReference{
+                                                                                Name: m.Spec.AuthSecret,
+                                                                        },
+                                                                        Key: "password",
+                                                                },
+                                                        },
 						},
 						},
 						VolumeMounts: getVolumeMounts(m),
