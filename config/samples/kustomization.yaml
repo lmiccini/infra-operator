@@ -9,4 +9,7 @@ resources:
 - network_v1beta1_netconfig.yaml
 - network_v1beta1_ipset.yaml
 - network_v1beta1_reservation.yaml
+- mariadb_v1beta1_mariadbdatabase.yaml
+- mariadb_v1beta1_galera.yaml
+- mariadb_v1beta1_mariadbaccount.yaml
 #+kubebuilder:scaffold:manifestskustomizesamples

@@ -42,11 +42,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	instancehav1 "github.com/openstack-k8s-operators/infra-operator/apis/instanceha/v1beta1"
+	mariadbv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/mariadb/v1beta1"
 	memcachedv1 "github.com/openstack-k8s-operators/infra-operator/apis/memcached/v1beta1"
 	networkv1 "github.com/openstack-k8s-operators/infra-operator/apis/network/v1beta1"
 	rabbitmqv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	redisv1 "github.com/openstack-k8s-operators/infra-operator/apis/redis/v1beta1"
 	instancehacontrollers "github.com/openstack-k8s-operators/infra-operator/controllers/instanceha"
+	controllers "github.com/openstack-k8s-operators/infra-operator/controllers/mariadb"
 	memcachedcontrollers "github.com/openstack-k8s-operators/infra-operator/controllers/memcached"
 	networkcontrollers "github.com/openstack-k8s-operators/infra-operator/controllers/network"
 	rabbitmqcontrollers "github.com/openstack-k8s-operators/infra-operator/controllers/rabbitmq"
@@ -70,6 +72,7 @@ func init() {
 	utilruntime.Must(keystonev1.AddToScheme(scheme))
 	utilruntime.Must(redisv1.AddToScheme(scheme))
 	utilruntime.Must(networkv1.AddToScheme(scheme))
+	utilruntime.Must(mariadbv1beta1.AddToScheme(scheme))
 	//+kubebuilder:scaffold:scheme
 }
 
@@ -206,6 +209,22 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "IPSet")
 		os.Exit(1)
 	}
+	if err = (&controllers.GaleraReconciler{
+		Client:  mgr.GetClient(),
+		Kclient: kclient,
+		Scheme:  mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Galera")
+		os.Exit(1)
+	}
+	if err = (&controllers.MariaDBDatabaseReconciler{
+		Client:  mgr.GetClient(),
+		Kclient: kclient,
+		Scheme:  mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "MariaDBDatabase")
+		os.Exit(1)
+	}
 
 	// Acquire environmental defaults and initialize operator defaults with them
 	memcachedv1.SetupDefaults()
@@ -244,7 +263,20 @@ func main() {
 			setupLog.Error(err, "unable to create webhook", "webhook", "IPSet")
 			os.Exit(1)
 		}
+		if err = (&mariadbv1beta1.Galera{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "Galera")
+			os.Exit(1)
+		}
 		checker = mgr.GetWebhookServer().StartedChecker()
+	}
+
+	if err = (&controllers.MariaDBAccountReconciler{
+		Client:  mgr.GetClient(),
+		Kclient: kclient,
+		Scheme:  mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "MariaDBAccount")
+		os.Exit(1)
 	}
 
 	//+kubebuilder:scaffold:builder
