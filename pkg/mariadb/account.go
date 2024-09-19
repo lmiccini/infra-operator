@@ -38,7 +38,7 @@ func CreateDbAccountJob(account *databasev1beta1.MariaDBAccount, databaseName st
 		return nil, err
 	}
 	labels := map[string]string{
-		"owner": "mariadb-operator", "cr": account.Spec.UserName, "app": "mariadbschema",
+		"owner": "infra-operator", "cr": account.Spec.UserName, "app": "mariadbschema",
 	}
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -102,7 +102,7 @@ func DeleteDbAccountJob(account *databasev1beta1.MariaDBAccount, databaseName st
 		return nil, err
 	}
 	labels := map[string]string{
-		"owner": "mariadb-operator", "cr": account.Spec.UserName, "app": "mariadbschema",
+		"owner": "infra-operator", "cr": account.Spec.UserName, "app": "mariadbschema",
 	}
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{

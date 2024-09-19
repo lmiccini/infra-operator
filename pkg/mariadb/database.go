@@ -41,7 +41,7 @@ func DbDatabaseJob(database *databasev1beta1.MariaDBDatabase, databaseHostName s
 		return nil, err
 	}
 	labels := map[string]string{
-		"owner": "mariadb-operator", "cr": database.Spec.Name, "app": "mariadbschema",
+		"owner": "infra-operator", "cr": database.Spec.Name, "app": "mariadbschema",
 	}
 
 	var scriptEnv []corev1.EnvVar
@@ -134,7 +134,7 @@ func DeleteDbDatabaseJob(database *databasev1beta1.MariaDBDatabase, databaseHost
 		return nil, err
 	}
 	labels := map[string]string{
-		"owner": "mariadb-operator", "cr": database.Spec.Name, "app": "mariadbschema",
+		"owner": "infra-operator", "cr": database.Spec.Name, "app": "mariadbschema",
 	}
 
 	var scriptEnv []corev1.EnvVar

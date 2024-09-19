@@ -8,13 +8,13 @@ import (
 
 // GetLabels -
 func GetLabels(name string) map[string]string {
-	return map[string]string{"owner": "mariadb-operator", "cr": "mariadb-" + name, "app": "mariadb"}
+	return map[string]string{"owner": "infra-operator", "cr": "mariadb-" + name, "app": "mariadb"}
 }
 
 // ServiceLabels - labels for service, match statefulset labels
 func ServiceLabels(database metav1.Object) map[string]string {
 	return labels.GetLabels(database, "mariadb", map[string]string{
-		"owner": "mariadb-operator",
+		"owner": "infra-operator",
 		"cr":    "mariadb-" + database.GetName(),
 		"app":   "mariadb",
 	})
@@ -32,7 +32,7 @@ func LabelSelectors(database metav1.Object, dbType string) map[string]string {
 func StatefulSetLabels(database metav1.Object) map[string]string {
 	name := database.GetName()
 	return labels.GetLabels(database, "galera", map[string]string{
-		"owner":            "mariadb-operator",
+		"owner":            "infra-operator",
 		"app":              "galera",
 		"cr":               "galera-" + name,
 		common.AppSelector: StatefulSetName(name),

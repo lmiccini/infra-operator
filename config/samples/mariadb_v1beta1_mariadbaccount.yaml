@@ -4,9 +4,9 @@ metadata:
   labels:
     app.kubernetes.io/name: mariadbaccount
     app.kubernetes.io/instance: mariadbaccount-sample
-    app.kubernetes.io/part-of: mariadb-operator
+    app.kubernetes.io/part-of: infra-operator
     app.kubernetes.io/managed-by: kustomize
-    app.kubernetes.io/created-by: mariadb-operator
+    app.kubernetes.io/created-by: infra-operator
     mariaDBDatabaseName: neutron
   name: neutron1
 spec:
