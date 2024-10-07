@@ -68,6 +68,26 @@ func Deployment(
 					Volumes:                       volumes,
 					TerminationGracePeriodSeconds: ptr.To[int64](0),
 					NodeSelector:                  instance.Spec.NodeSelector,
+					InitContainers: []corev1.Container{
+						{
+							Name:    instance.Name + "-init",
+							Image:   containerImage,
+							Command: []string{"watcher-db-manage", "--config-file", "/etc/watcher/watcher.conf", "upgrade"},
+							SecurityContext: &corev1.SecurityContext{
+								RunAsUser:                ptr.To[int64](42401),
+								RunAsGroup:               ptr.To[int64](42401),
+								RunAsNonRoot:             ptr.To(true),
+								AllowPrivilegeEscalation: ptr.To(false),
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{
+										"ALL",
+									},
+								},
+							},
+							Env:          env.MergeEnvs([]corev1.EnvVar{}, envVars),
+							VolumeMounts: volumeMounts,
+						},
+					},
 					Containers: []corev1.Container{
 						{
 							Name:    instance.Name + "-api",
