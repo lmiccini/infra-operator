@@ -22,11 +22,10 @@ import (
 	"k8s.io/utils/ptr"
 )
 
-func ApiDeployment(
+func Deployment(
 	instance *watcherv1.Watcher,
 	labels map[string]string,
 	annotations map[string]string,
-	openstackcloud string,
 	configHash string,
 	containerImage string,
 ) *appsv1.Deployment {
@@ -34,7 +33,6 @@ func ApiDeployment(
 	replicas := int32(1)
 
 	envVars := map[string]env.Setter{}
-	envVars["OS_CLOUD"] = env.SetValue(openstackcloud)
 	envVars["CONFIG_HASH"] = env.SetValue(configHash)
 
 	// create Volume and VolumeMounts
@@ -70,29 +68,67 @@ func ApiDeployment(
 					Volumes:                       volumes,
 					TerminationGracePeriodSeconds: ptr.To[int64](0),
 					NodeSelector:                  instance.Spec.NodeSelector,
-					Containers: []corev1.Container{{
-						Name:    "watcher",
-						Image:   containerImage,
-						Command: []string{"/usr/bin/watcher-api", "--config-file", "/etc/watcher/watcher.conf"},
-						SecurityContext: &corev1.SecurityContext{
-							RunAsUser:                ptr.To[int64](42401),
-							RunAsGroup:               ptr.To[int64](42401),
-							RunAsNonRoot:             ptr.To(true),
-							AllowPrivilegeEscalation: ptr.To(false),
-							Capabilities: &corev1.Capabilities{
-								Drop: []corev1.Capability{
-									"ALL",
+					Containers: []corev1.Container{
+						{
+							Name:    instance.Name + "-api",
+							Image:   containerImage,
+							Command: []string{"/usr/bin/watcher-api", "--config-file", "/etc/watcher/watcher.conf"},
+							SecurityContext: &corev1.SecurityContext{
+								RunAsUser:                ptr.To[int64](42401),
+								RunAsGroup:               ptr.To[int64](42401),
+								RunAsNonRoot:             ptr.To(true),
+								AllowPrivilegeEscalation: ptr.To(false),
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{
+										"ALL",
+									},
 								},
 							},
+							Env: env.MergeEnvs([]corev1.EnvVar{}, envVars),
+							Ports: []corev1.ContainerPort{{
+								ContainerPort: 9322,
+								Protocol:      "UDP",
+								Name:          "watcher-api-svc",
+							}},
+							VolumeMounts: volumeMounts,
 						},
-						Env: env.MergeEnvs([]corev1.EnvVar{}, envVars),
-						Ports: []corev1.ContainerPort{{
-							ContainerPort: 9322,
-							Protocol:      "UDP",
-							Name:          "watcher-api-svc",
-						}},
-						VolumeMounts: volumeMounts,
-					}},
+						{
+							Name:    instance.Name + "-decision-engine",
+							Image:   containerImage,
+							Command: []string{"/usr/bin/watcher-decision-engine", "--config-file", "/etc/watcher/watcher.conf"},
+							SecurityContext: &corev1.SecurityContext{
+								RunAsUser:                ptr.To[int64](42401),
+								RunAsGroup:               ptr.To[int64](42401),
+								RunAsNonRoot:             ptr.To(true),
+								AllowPrivilegeEscalation: ptr.To(false),
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{
+										"ALL",
+									},
+								},
+							},
+							Env:          env.MergeEnvs([]corev1.EnvVar{}, envVars),
+							VolumeMounts: volumeMounts,
+						},
+						{
+							Name:    instance.Name + "-applier",
+							Image:   containerImage,
+							Command: []string{"/usr/bin/watcher-applier", "--config-file", "/etc/watcher/watcher.conf"},
+							SecurityContext: &corev1.SecurityContext{
+								RunAsUser:                ptr.To[int64](42401),
+								RunAsGroup:               ptr.To[int64](42401),
+								RunAsNonRoot:             ptr.To(true),
+								AllowPrivilegeEscalation: ptr.To(false),
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{
+										"ALL",
+									},
+								},
+							},
+							Env:          env.MergeEnvs([]corev1.EnvVar{}, envVars),
+							VolumeMounts: volumeMounts,
+						},
+					},
 				},
 			},
 		},
@@ -101,163 +137,236 @@ func ApiDeployment(
 	return dep
 }
 
-func ApplierDeployment(
-	instance *watcherv1.Watcher,
-	labels map[string]string,
-	annotations map[string]string,
-	openstackcloud string,
-	configHash string,
-	containerImage string,
-) *appsv1.Deployment {
-
-	replicas := int32(1)
-
-	envVars := map[string]env.Setter{}
-	envVars["OS_CLOUD"] = env.SetValue(openstackcloud)
-	envVars["CONFIG_HASH"] = env.SetValue(configHash)
-
-	// create Volume and VolumeMounts
-	volumes := watcherPodVolumes(instance)
-	volumeMounts := watcherPodVolumeMounts()
-
-	// add CA cert if defined
-	if instance.Spec.CaBundleSecretName != "" {
-		volumes = append(volumes, instance.Spec.CreateVolume())
-		volumeMounts = append(volumeMounts, instance.Spec.CreateVolumeMounts(nil)...)
-	}
-
-	dep := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      instance.Name,
-			Namespace: instance.Namespace,
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
-			Strategy: appsv1.DeploymentStrategy{
-				Type: "Recreate",
-			},
-			Selector: &metav1.LabelSelector{
-				MatchLabels: labels,
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels:      labels,
-					Annotations: annotations,
-				},
-				Spec: corev1.PodSpec{
-					ServiceAccountName:            instance.RbacResourceName(),
-					Volumes:                       volumes,
-					TerminationGracePeriodSeconds: ptr.To[int64](0),
-					NodeSelector:                  instance.Spec.NodeSelector,
-					Containers: []corev1.Container{{
-						Name:    "watcher",
-						Image:   containerImage,
-						Command: []string{"/usr/bin/watcher-api", "--config-file", "/etc/watcher/watcher.conf"},
-						SecurityContext: &corev1.SecurityContext{
-							RunAsUser:                ptr.To[int64](42401),
-							RunAsGroup:               ptr.To[int64](42401),
-							RunAsNonRoot:             ptr.To(true),
-							AllowPrivilegeEscalation: ptr.To(false),
-							Capabilities: &corev1.Capabilities{
-								Drop: []corev1.Capability{
-									"ALL",
-								},
-							},
-						},
-						Env: env.MergeEnvs([]corev1.EnvVar{}, envVars),
-						Ports: []corev1.ContainerPort{{
-							ContainerPort: 9322,
-							Protocol:      "UDP",
-							Name:          "watcher-api-svc",
-						}},
-						VolumeMounts: volumeMounts,
-					}},
-				},
-			},
-		},
-	}
-
-	return dep
-}
-
-func DecisionEngineDeployment(
-	instance *watcherv1.Watcher,
-	labels map[string]string,
-	annotations map[string]string,
-	openstackcloud string,
-	configHash string,
-	containerImage string,
-) *appsv1.Deployment {
-
-	replicas := int32(1)
-
-	envVars := map[string]env.Setter{}
-	envVars["OS_CLOUD"] = env.SetValue(openstackcloud)
-	envVars["CONFIG_HASH"] = env.SetValue(configHash)
-
-	// create Volume and VolumeMounts
-	volumes := watcherPodVolumes(instance)
-	volumeMounts := watcherPodVolumeMounts()
-
-	// add CA cert if defined
-	if instance.Spec.CaBundleSecretName != "" {
-		volumes = append(volumes, instance.Spec.CreateVolume())
-		volumeMounts = append(volumeMounts, instance.Spec.CreateVolumeMounts(nil)...)
-	}
-
-	dep := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      instance.Name,
-			Namespace: instance.Namespace,
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
-			Strategy: appsv1.DeploymentStrategy{
-				Type: "Recreate",
-			},
-			Selector: &metav1.LabelSelector{
-				MatchLabels: labels,
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels:      labels,
-					Annotations: annotations,
-				},
-				Spec: corev1.PodSpec{
-					ServiceAccountName:            instance.RbacResourceName(),
-					Volumes:                       volumes,
-					TerminationGracePeriodSeconds: ptr.To[int64](0),
-					NodeSelector:                  instance.Spec.NodeSelector,
-					Containers: []corev1.Container{{
-						Name:    "watcher",
-						Image:   containerImage,
-						Command: []string{"/usr/bin/watcher-api", "--config-file", "/etc/watcher/watcher.conf"},
-						SecurityContext: &corev1.SecurityContext{
-							RunAsUser:                ptr.To[int64](42401),
-							RunAsGroup:               ptr.To[int64](42401),
-							RunAsNonRoot:             ptr.To(true),
-							AllowPrivilegeEscalation: ptr.To(false),
-							Capabilities: &corev1.Capabilities{
-								Drop: []corev1.Capability{
-									"ALL",
-								},
-							},
-						},
-						Env: env.MergeEnvs([]corev1.EnvVar{}, envVars),
-						Ports: []corev1.ContainerPort{{
-							ContainerPort: 9322,
-							Protocol:      "UDP",
-							Name:          "watcher-api-svc",
-						}},
-						VolumeMounts: volumeMounts,
-					}},
-				},
-			},
-		},
-	}
-
-	return dep
-}
+//func ApiDeployment(
+//	instance *watcherv1.Watcher,
+//	labels map[string]string,
+//	annotations map[string]string,
+//	configHash string,
+//	containerImage string,
+//) *appsv1.Deployment {
+//
+//	replicas := int32(1)
+//
+//	envVars := map[string]env.Setter{}
+//	envVars["CONFIG_HASH"] = env.SetValue(configHash)
+//
+//	// create Volume and VolumeMounts
+//	volumes := watcherPodVolumes(instance)
+//	volumeMounts := watcherPodVolumeMounts()
+//
+//	// add CA cert if defined
+//	if instance.Spec.CaBundleSecretName != "" {
+//		volumes = append(volumes, instance.Spec.CreateVolume())
+//		volumeMounts = append(volumeMounts, instance.Spec.CreateVolumeMounts(nil)...)
+//	}
+//
+//	dep := &appsv1.Deployment{
+//		ObjectMeta: metav1.ObjectMeta{
+//			Name:      instance.Name,
+//			Namespace: instance.Namespace,
+//		},
+//		Spec: appsv1.DeploymentSpec{
+//			Replicas: &replicas,
+//			Strategy: appsv1.DeploymentStrategy{
+//				Type: "Recreate",
+//			},
+//			Selector: &metav1.LabelSelector{
+//				MatchLabels: labels,
+//			},
+//			Template: corev1.PodTemplateSpec{
+//				ObjectMeta: metav1.ObjectMeta{
+//					Labels:      labels,
+//					Annotations: annotations,
+//				},
+//				Spec: corev1.PodSpec{
+//					ServiceAccountName:            instance.RbacResourceName(),
+//					Volumes:                       volumes,
+//					TerminationGracePeriodSeconds: ptr.To[int64](0),
+//					NodeSelector:                  instance.Spec.NodeSelector,
+//					Containers: []corev1.Container{{
+//						Name:    "watcher",
+//						Image:   containerImage,
+//						Command: []string{"/usr/bin/watcher-api", "--config-file", "/etc/watcher/watcher.conf"},
+//						SecurityContext: &corev1.SecurityContext{
+//							RunAsUser:                ptr.To[int64](42401),
+//							RunAsGroup:               ptr.To[int64](42401),
+//							RunAsNonRoot:             ptr.To(true),
+//							AllowPrivilegeEscalation: ptr.To(false),
+//							Capabilities: &corev1.Capabilities{
+//								Drop: []corev1.Capability{
+//									"ALL",
+//								},
+//							},
+//						},
+//						Env: env.MergeEnvs([]corev1.EnvVar{}, envVars),
+//						Ports: []corev1.ContainerPort{{
+//							ContainerPort: 9322,
+//							Protocol:      "UDP",
+//							Name:          "watcher-api-svc",
+//						}},
+//						VolumeMounts: volumeMounts,
+//					}},
+//				},
+//			},
+//		},
+//	}
+//
+//	return dep
+//}
+//
+//func ApplierDeployment(
+//	instance *watcherv1.Watcher,
+//	labels map[string]string,
+//	annotations map[string]string,
+//	configHash string,
+//	containerImage string,
+//) *appsv1.Deployment {
+//
+//	replicas := int32(1)
+//
+//	envVars := map[string]env.Setter{}
+//	envVars["CONFIG_HASH"] = env.SetValue(configHash)
+//
+//	// create Volume and VolumeMounts
+//	volumes := watcherPodVolumes(instance)
+//	volumeMounts := watcherPodVolumeMounts()
+//
+//	// add CA cert if defined
+//	if instance.Spec.CaBundleSecretName != "" {
+//		volumes = append(volumes, instance.Spec.CreateVolume())
+//		volumeMounts = append(volumeMounts, instance.Spec.CreateVolumeMounts(nil)...)
+//	}
+//
+//	dep := &appsv1.Deployment{
+//		ObjectMeta: metav1.ObjectMeta{
+//			Name:      instance.Name,
+//			Namespace: instance.Namespace,
+//		},
+//		Spec: appsv1.DeploymentSpec{
+//			Replicas: &replicas,
+//			Strategy: appsv1.DeploymentStrategy{
+//				Type: "Recreate",
+//			},
+//			Selector: &metav1.LabelSelector{
+//				MatchLabels: labels,
+//			},
+//			Template: corev1.PodTemplateSpec{
+//				ObjectMeta: metav1.ObjectMeta{
+//					Labels:      labels,
+//					Annotations: annotations,
+//				},
+//				Spec: corev1.PodSpec{
+//					ServiceAccountName:            instance.RbacResourceName(),
+//					Volumes:                       volumes,
+//					TerminationGracePeriodSeconds: ptr.To[int64](0),
+//					NodeSelector:                  instance.Spec.NodeSelector,
+//					Containers: []corev1.Container{{
+//						Name:    "watcher",
+//						Image:   containerImage,
+//						Command: []string{"/usr/bin/watcher-api", "--config-file", "/etc/watcher/watcher.conf"},
+//						SecurityContext: &corev1.SecurityContext{
+//							RunAsUser:                ptr.To[int64](42401),
+//							RunAsGroup:               ptr.To[int64](42401),
+//							RunAsNonRoot:             ptr.To(true),
+//							AllowPrivilegeEscalation: ptr.To(false),
+//							Capabilities: &corev1.Capabilities{
+//								Drop: []corev1.Capability{
+//									"ALL",
+//								},
+//							},
+//						},
+//						Env: env.MergeEnvs([]corev1.EnvVar{}, envVars),
+//						Ports: []corev1.ContainerPort{{
+//							ContainerPort: 9322,
+//							Protocol:      "UDP",
+//							Name:          "watcher-api-svc",
+//						}},
+//						VolumeMounts: volumeMounts,
+//					}},
+//				},
+//			},
+//		},
+//	}
+//
+//	return dep
+//}
+//
+//func DecisionEngineDeployment(
+//	instance *watcherv1.Watcher,
+//	labels map[string]string,
+//	annotations map[string]string,
+//	configHash string,
+//	containerImage string,
+//) *appsv1.Deployment {
+//
+//	replicas := int32(1)
+//
+//	envVars := map[string]env.Setter{}
+//	envVars["CONFIG_HASH"] = env.SetValue(configHash)
+//
+//	// create Volume and VolumeMounts
+//	volumes := watcherPodVolumes(instance)
+//	volumeMounts := watcherPodVolumeMounts()
+//
+//	// add CA cert if defined
+//	if instance.Spec.CaBundleSecretName != "" {
+//		volumes = append(volumes, instance.Spec.CreateVolume())
+//		volumeMounts = append(volumeMounts, instance.Spec.CreateVolumeMounts(nil)...)
+//	}
+//
+//	dep := &appsv1.Deployment{
+//		ObjectMeta: metav1.ObjectMeta{
+//			Name:      instance.Name,
+//			Namespace: instance.Namespace,
+//		},
+//		Spec: appsv1.DeploymentSpec{
+//			Replicas: &replicas,
+//			Strategy: appsv1.DeploymentStrategy{
+//				Type: "Recreate",
+//			},
+//			Selector: &metav1.LabelSelector{
+//				MatchLabels: labels,
+//			},
+//			Template: corev1.PodTemplateSpec{
+//				ObjectMeta: metav1.ObjectMeta{
+//					Labels:      labels,
+//					Annotations: annotations,
+//				},
+//				Spec: corev1.PodSpec{
+//					ServiceAccountName:            instance.RbacResourceName(),
+//					Volumes:                       volumes,
+//					TerminationGracePeriodSeconds: ptr.To[int64](0),
+//					NodeSelector:                  instance.Spec.NodeSelector,
+//					Containers: []corev1.Container{{
+//						Name:    "watcher",
+//						Image:   containerImage,
+//						Command: []string{"/usr/bin/watcher-api", "--config-file", "/etc/watcher/watcher.conf"},
+//						SecurityContext: &corev1.SecurityContext{
+//							RunAsUser:                ptr.To[int64](42401),
+//							RunAsGroup:               ptr.To[int64](42401),
+//							RunAsNonRoot:             ptr.To(true),
+//							AllowPrivilegeEscalation: ptr.To(false),
+//							Capabilities: &corev1.Capabilities{
+//								Drop: []corev1.Capability{
+//									"ALL",
+//								},
+//							},
+//						},
+//						Env: env.MergeEnvs([]corev1.EnvVar{}, envVars),
+//						Ports: []corev1.ContainerPort{{
+//							ContainerPort: 9322,
+//							Protocol:      "UDP",
+//							Name:          "watcher-api-svc",
+//						}},
+//						VolumeMounts: volumeMounts,
+//					}},
+//				},
+//			},
+//		},
+//	}
+//
+//	return dep
+//}
 
 func watcherPodVolumeMounts() []corev1.VolumeMount {
 	return []corev1.VolumeMount{
@@ -295,7 +404,7 @@ func watcherPodVolumes(
 	instance *watcherv1.Watcher,
 ) []corev1.Volume {
 
-	var config0644AccessMode int32 = 0644
+	//var config0644AccessMode int32 = 0644
 	return []corev1.Volume{
 		//{
 		//	Name: "openstack-config",

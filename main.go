@@ -46,11 +46,13 @@ import (
 	networkv1 "github.com/openstack-k8s-operators/infra-operator/apis/network/v1beta1"
 	rabbitmqv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	redisv1 "github.com/openstack-k8s-operators/infra-operator/apis/redis/v1beta1"
+	watcherv1 "github.com/openstack-k8s-operators/infra-operator/apis/watcher/v1beta1"
 	instancehacontrollers "github.com/openstack-k8s-operators/infra-operator/controllers/instanceha"
 	memcachedcontrollers "github.com/openstack-k8s-operators/infra-operator/controllers/memcached"
 	networkcontrollers "github.com/openstack-k8s-operators/infra-operator/controllers/network"
 	rabbitmqcontrollers "github.com/openstack-k8s-operators/infra-operator/controllers/rabbitmq"
 	rediscontrollers "github.com/openstack-k8s-operators/infra-operator/controllers/redis"
+	watchercontrollers "github.com/openstack-k8s-operators/infra-operator/controllers/watcher"
 	keystonev1 "github.com/openstack-k8s-operators/keystone-operator/api/v1beta1"
 	//+kubebuilder:scaffold:imports
 )
@@ -67,6 +69,7 @@ func init() {
 	utilruntime.Must(rabbitmqclusterv2.AddToScheme(scheme))
 	utilruntime.Must(memcachedv1.AddToScheme(scheme))
 	utilruntime.Must(instancehav1.AddToScheme(scheme))
+	utilruntime.Must(watcherv1.AddToScheme(scheme))
 	utilruntime.Must(keystonev1.AddToScheme(scheme))
 	utilruntime.Must(redisv1.AddToScheme(scheme))
 	utilruntime.Must(networkv1.AddToScheme(scheme))
@@ -164,6 +167,14 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "InstanceHa")
 		os.Exit(1)
 	}
+	if err = (&watchercontrollers.Reconciler{
+		Client:  mgr.GetClient(),
+		Kclient: kclient,
+		Scheme:  mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Watcher")
+		os.Exit(1)
+	}
 	if err = (&rediscontrollers.Reconciler{
 		Client:  mgr.GetClient(),
 		Kclient: kclient,
@@ -222,6 +233,10 @@ func main() {
 		}
 		if err = (&instancehav1.InstanceHa{}).SetupWebhookWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "InstanceHa")
+			os.Exit(1)
+		}
+		if err = (&watcherv1.Watcher{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "Watcher")
 			os.Exit(1)
 		}
 		if err = (&redisv1.Redis{}).SetupWebhookWithManager(mgr); err != nil {

@@ -44,7 +44,7 @@ import (
 	labels "github.com/openstack-k8s-operators/lib-common/modules/common/labels"
 	nad "github.com/openstack-k8s-operators/lib-common/modules/common/networkattachment"
 
-	keystonev1 "github.com/openstack-k8s-operators/keystone-operator/api/v1beta1"
+	//keystonev1 "github.com/openstack-k8s-operators/keystone-operator/api/v1beta1"
 	"github.com/openstack-k8s-operators/lib-common/modules/common"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/configmap"
@@ -183,37 +183,37 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return rbacResult, nil
 	}
 
-	//
-	// Validate that keystoneAPI is up
-	//
-	keystoneAPI, err := keystonev1.GetKeystoneAPI(ctx, helper, instance.Namespace, map[string]string{})
-	if err != nil {
-		if k8s_errors.IsNotFound(err) {
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				watcherv1.WatcherReadyCondition,
-				condition.RequestedReason,
-				condition.SeverityInfo,
-				watcherv1.WatcherKeystoneWaitingMessage))
-			Log.Info("KeystoneAPI not found!")
-			return ctrl.Result{RequeueAfter: time.Duration(5) * time.Second}, nil
-		}
-		instance.Status.Conditions.Set(condition.FalseCondition(
-			watcherv1.WatcherReadyCondition,
-			condition.ErrorReason,
-			condition.SeverityWarning,
-			watcherv1.WatcherReadyErrorMessage,
-			err.Error()))
-		return ctrl.Result{}, err
-	}
-	if !keystoneAPI.IsReady() {
-		instance.Status.Conditions.Set(condition.FalseCondition(
-			watcherv1.WatcherReadyCondition,
-			condition.RequestedReason,
-			condition.SeverityInfo,
-			watcherv1.WatcherKeystoneWaitingMessage))
-		Log.Info("KeystoneAPI not yet ready")
-		return ctrl.Result{RequeueAfter: time.Duration(5) * time.Second}, nil
-	}
+	////
+	//// Validate that keystoneAPI is up
+	////
+	//keystoneAPI, err := keystonev1.GetKeystoneAPI(ctx, helper, instance.Namespace, map[string]string{})
+	//if err != nil {
+	//	if k8s_errors.IsNotFound(err) {
+	//		instance.Status.Conditions.Set(condition.FalseCondition(
+	//			watcherv1.WatcherReadyCondition,
+	//			condition.RequestedReason,
+	//			condition.SeverityInfo,
+	//			watcherv1.WatcherKeystoneWaitingMessage))
+	//		Log.Info("KeystoneAPI not found!")
+	//		return ctrl.Result{RequeueAfter: time.Duration(5) * time.Second}, nil
+	//	}
+	//	instance.Status.Conditions.Set(condition.FalseCondition(
+	//		watcherv1.WatcherReadyCondition,
+	//		condition.ErrorReason,
+	//		condition.SeverityWarning,
+	//		watcherv1.WatcherReadyErrorMessage,
+	//		err.Error()))
+	//	return ctrl.Result{}, err
+	//}
+	//if !keystoneAPI.IsReady() {
+	//	instance.Status.Conditions.Set(condition.FalseCondition(
+	//		watcherv1.WatcherReadyCondition,
+	//		condition.RequestedReason,
+	//		condition.SeverityInfo,
+	//		watcherv1.WatcherKeystoneWaitingMessage))
+	//	Log.Info("KeystoneAPI not yet ready")
+	//	return ctrl.Result{RequeueAfter: time.Duration(5) * time.Second}, nil
+	//}
 
 	Labels := map[string]string{
 		common.AppSelector: "watcher",
@@ -283,7 +283,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 
 	// Check if instance.Spec.WatcherConfigMap is present, if not create it.
 	// The first time this will produce an error b/c GetConfigMapAndHashWithName doesn't support retries.
-	_, configMapHash, err = configmap.GetConfigMapAndHashWithName(ctx, helper, instance.Spec.WatcherConfigMap, instance.Namespace)
+	_, configMapHash, err := configmap.GetConfigMapAndHashWithName(ctx, helper, instance.Spec.WatcherConfigMap, instance.Namespace)
 	if err != nil {
 		if k8s_errors.IsNotFound(err) {
 			cmLabels := labels.GetLabels(instance, labels.GetGroupLabel("watcher"), map[string]string{})
@@ -400,7 +400,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 
 	// TODO add check to make sure there is only a single copy of watcher using the same OpenStackCloud
-	cloud := instance.Spec.OpenStackCloud
+	//cloud := instance.Spec.OpenStackCloud
 
 	containerImage, err := r.GetContainerImage(ctx, instance.Spec.ContainerImage, instance)
 	if err != nil {
@@ -408,26 +408,29 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 
 	// deployments
-	commondeployment := commondeployment.NewDeployment(watcher.ApiDeployment(instance, Labels, serviceAnnotations, cloud, configVarsHash, containerImage), time.Duration(5)*time.Second)
+	commondeployment := commondeployment.NewDeployment(watcher.Deployment(instance, Labels, serviceAnnotations, configVarsHash, containerImage), time.Duration(5)*time.Second)
 	sfres, sferr := commondeployment.CreateOrPatch(ctx, helper)
 	if sferr != nil {
 		return sfres, sferr
 	}
-	apideployment := commondeployment.GetDeployment()
+	//apideployment := commondeployment1.GetDeployment()
+	deployment := commondeployment.GetDeployment()
 
-	commondeployment := commondeployment.NewDeployment(watcher.ApplierDeployment(instance, Labels, serviceAnnotations, cloud, configVarsHash, containerImage), time.Duration(5)*time.Second)
-	sfres, sferr := commondeployment.CreateOrPatch(ctx, helper)
-	if sferr != nil {
-		return sfres, sferr
-	}
-	applierdeployment := commondeployment.GetDeployment()
+	//commondeployment2 := commondeployment.NewDeployment(watcher.ApplierDeployment("watcher-applier", Labels, serviceAnnotations, configVarsHash, containerImage), time.Duration(5)*time.Second)
+	//sfres, sferr = commondeployment2.CreateOrPatch(ctx, helper)
+	//if sferr != nil {
+	//	return sfres, sferr
+	//}
+	////applierdeployment := commondeployment2.GetDeployment()
+	//deployment = commondeployment2.GetDeployment()
 
-	commondeployment := commondeployment.NewDeployment(watcher.DecisionEngineDeployment(instance, Labels, serviceAnnotations, cloud, configVarsHash, containerImage), time.Duration(5)*time.Second)
-	sfres, sferr := commondeployment.CreateOrPatch(ctx, helper)
-	if sferr != nil {
-		return sfres, sferr
-	}
-	decisionenginedeployment := commondeployment.GetDeployment()
+	//commondeployment3 := commondeployment.NewDeployment(watcher.DecisionEngineDeployment("watcher-decision-engine", Labels, serviceAnnotations, configVarsHash, containerImage), time.Duration(5)*time.Second)
+	//sfres, sferr = commondeployment3.CreateOrPatch(ctx, helper)
+	//if sferr != nil {
+	//	return sfres, sferr
+	//}
+	////decisionenginedeployment := commondeployment3.GetDeployment()
+	//deployment = commondeployment3.GetDeployment()
 
 	// END deployment
 

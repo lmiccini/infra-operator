@@ -27,7 +27,7 @@ const (
 	// Container image fall-back defaults
 
 	// WatcherContainerImage is the fall-back container image for Watcher
-	WatcherContainerImage = "quay.io/podified-antelope-centos9/openstack-openstackclient:current-podified"
+	WatcherContainerImage = "quay.io/lmiccini/watcher"
 	OpenStackCloud        = "default"
 )
 

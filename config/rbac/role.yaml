@@ -123,33 +123,6 @@ rules:
   - patch
   - update
 - apiGroups:
-  - watcher.openstack.org
-  resources:
-  - watchers
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - watcher.openstack.org
-  resources:
-  - watchers/finalizers
-  verbs:
-  - patch
-  - update
-- apiGroups:
-  - watcher.openstack.org
-  resources:
-  - watchers/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
   - keystone.openstack.org
   resources:
   - keystoneapis
@@ -421,3 +394,30 @@ rules:
   - securitycontextconstraints
   verbs:
   - use
+- apiGroups:
+  - watcher.openstack.org
+  resources:
+  - watchers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - watcher.openstack.org
+  resources:
+  - watchers/finalizers
+  verbs:
+  - patch
+  - update
+- apiGroups:
+  - watcher.openstack.org
+  resources:
+  - watchers/status
+  verbs:
+  - get
+  - patch
+  - update
