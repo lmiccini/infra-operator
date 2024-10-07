@@ -5,6 +5,7 @@ resources:
 - bases/rabbitmq.openstack.org_transporturls.yaml
 - bases/memcached.openstack.org_memcacheds.yaml
 - bases/instanceha.openstack.org_instancehas.yaml
+- bases/watcher.openstack.org_watchers.yaml
 - bases/redis.openstack.org_redises.yaml
 - bases/network.openstack.org_dnsmasqs.yaml
 - bases/network.openstack.org_dnsdata.yaml

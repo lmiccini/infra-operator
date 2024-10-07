@@ -1,0 +1,6 @@
++apiVersion: watcher.openstack.org/v1beta1
++kind: InstanceHA
++metadata:
++  name: watcher
++spec:
++  caBundleSecretName: combined-ca-bundle

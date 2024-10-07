@@ -31,6 +31,26 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /mutate-client-openstack-org-v1beta1-watcher
+  failurePolicy: Fail
+  name: mwatcher.kb.io
+  rules:
+  - apiGroups:
+    - client.openstack.org
+    apiVersions:
+    - v1beta1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - watchers
+  sideEffects: None  
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /mutate-memcached-openstack-org-v1beta1-memcached
   failurePolicy: Fail
   name: mmemcached.kb.io
@@ -171,6 +191,26 @@ webhooks:
     - UPDATE
     resources:
     - instancehas
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-client-openstack-org-v1beta1-watcher
+  failurePolicy: Fail
+  name: vwatcher.kb.io
+  rules:
+  - apiGroups:
+    - client.openstack.org
+    apiVersions:
+    - v1beta1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - watchers
   sideEffects: None
 - admissionReviewVersions:
   - v1

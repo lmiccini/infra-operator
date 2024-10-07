@@ -117,3 +117,17 @@ resources:
     validation: true
     webhookVersion: v1
 version: "3"
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: openstack.org
+  group: watcher
+  kind: Watcher
+  path: github.com/openstack-k8s-operators/infra-operator/apis/watcher/v1beta1
+  version: v1beta1
+  webhooks:
+    defaulting: true
+    validation: true
+    webhookVersion: v1
+version: "3"
