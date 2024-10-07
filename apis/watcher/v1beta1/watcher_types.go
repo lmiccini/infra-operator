@@ -34,7 +34,7 @@ const (
 // WatcherSpec defines the desired state of Watcher
 type WatcherSpec struct {
 	// +kubebuilder:validation:Required
-	// +kubebuilder:default="quay.io/podified-antelope-centos9/openstack-openstackclient:current-podified"
+	// +kubebuilder:default="quay.io/lmiccini/watcher"
 	// ContainerImage for the the Watcher container (will be set to environmental default if empty)
 	ContainerImage string `json:"containerImage"`
 
