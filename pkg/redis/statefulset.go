@@ -5,6 +5,7 @@ import (
 
 	redisv1 "github.com/openstack-k8s-operators/infra-operator/apis/redis/v1beta1"
 	common "github.com/openstack-k8s-operators/lib-common/modules/common"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/affinity"
 	labels "github.com/openstack-k8s-operators/lib-common/modules/common/labels"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -139,6 +140,20 @@ func StatefulSet(
 				},
 			},
 		},
+	}
+
+	// If possible two pods of the same service should not
+	// run on the same worker node. If this is not possible
+	// the get still created on the same worker node.
+	sts.Spec.Template.Spec.Affinity = affinity.DistributePods(
+		common.AppSelector,
+		[]string{
+			r.Name,
+		},
+		corev1.LabelHostname,
+	)
+	if r.Spec.NodeSelector != nil && len(r.Spec.NodeSelector) > 0 {
+		sts.Spec.Template.Spec.NodeSelector = r.Spec.NodeSelector
 	}
 
 	return sts
