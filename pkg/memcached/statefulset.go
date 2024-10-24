@@ -65,7 +65,7 @@ func StatefulSet(
 						Image:   m.Spec.ContainerImage,
 						Name:    "memcached",
 						Command: []string{"/bin/bash"},
-						Args:    []string{"-c", "$*", "--", "eval", "source", "/var/lib/kolla/config_files/src/etc/sysconfig/memcached", ";", "exec", "usr/bin/memcached -p ${PORT} -u ${USER} -m ${CACHESIZE} -c ${MAXCONN} $OPTIONS"},
+						Args:    []string{"-c", "$*", "--", "eval", "source", "/var/lib/config-data/src/etc/sysconfig/memcached", ";", "exec", "usr/bin/memcached -p ${PORT} -u ${USER} -m ${CACHESIZE} -c ${MAXCONN} $OPTIONS"},
 						SecurityContext: &corev1.SecurityContext{
 							RunAsNonRoot:             ptr.To(true),
 							AllowPrivilegeEscalation: ptr.To(false),
