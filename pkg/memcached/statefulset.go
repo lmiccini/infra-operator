@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 )
 
 // StatefulSet returns a Stateful resource for the Memcached CR
@@ -22,7 +23,6 @@ func StatefulSet(
 		common.OwnerSelector: "infra-operator",
 	}
 	ls := labels.GetLabels(m, "memcached", matchls)
-	runAsUser := int64(0)
 
 	livenessProbe := &corev1.Probe{
 		// TODO might need tuning
@@ -64,9 +64,14 @@ func StatefulSet(
 					Containers: []corev1.Container{{
 						Image:   m.Spec.ContainerImage,
 						Name:    "memcached",
-						Command: []string{"/usr/bin/dumb-init", "--", "/usr/local/bin/kolla_start"},
+						Command: []string{"/bin/bash"},
+						Args:    []string{"-c", "$*", "--", "eval", "source", "/var/lib/kolla/config_files/src/etc/sysconfig/memcached", ";", "exec", "usr/bin/memcached -p ${PORT} -u ${USER} -m ${CACHESIZE} -c ${MAXCONN} $OPTIONS"},
 						SecurityContext: &corev1.SecurityContext{
-							RunAsUser: &runAsUser,
+							RunAsNonRoot:             ptr.To(true),
+							AllowPrivilegeEscalation: ptr.To(false),
+							SeccompProfile: &corev1.SeccompProfile{
+								Type: corev1.SeccompProfileTypeRuntimeDefault,
+							},
 						},
 						Env: []corev1.EnvVar{{
 							Name:  "KOLLA_CONFIG_STRATEGY",

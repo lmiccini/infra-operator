@@ -379,8 +379,8 @@ func (r *Reconciler) generateConfigMaps(
 	if instance.Spec.TLS.Enabled() {
 		memcachedTLSListen = "| sed 's/\\(.*\\)/\\1\\nnotls:\\1:11211/'"
 		memcachedTLSOptions = "-Z " +
-			"-o ssl_chain_cert=/etc/pki/tls/certs/memcached.crt " +
-			"-o ssl_key=/etc/pki/tls/private/memcached.key " +
+			"-o ssl_chain_cert=/var/lib/config-data/tls/certs/memcached.crt " +
+			"-o ssl_key=/var/lib/config-data/tls/private/memcached.key " +
 			"-o ssl_ca_cert=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
 		memcachedPort = fmt.Sprint(memcached.MemcachedTLSPort)
 		instance.Status.TLSSupport = true
