@@ -274,6 +274,32 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		}
 		inputHashEnv["Cert"] = env.SetValue(hash)
 	}
+
+	// Validate client cert secret
+	//if instance.Spec.TLS.Enabled() {
+	if instance.Spec.TLS.MTLS.SslVerifyMode == "Request" || instance.Spec.TLS.MTLS.SslVerifyMode == "Require" {
+		hash, err := instance.Spec.TLS.MTLS.AuthCertSecret.ValidateCertSecret(ctx, helper, instance.Namespace)
+		if err != nil {
+			if k8s_errors.IsNotFound(err) {
+				instance.Status.Conditions.Set(condition.FalseCondition(
+					condition.TLSInputReadyCondition,
+					condition.RequestedReason,
+					condition.SeverityInfo,
+					fmt.Sprintf(condition.TLSInputReadyWaitingMessage, err.Error())))
+				return ctrl.Result{}, nil
+			}
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				condition.TLSInputReadyCondition,
+				condition.ErrorReason,
+				condition.SeverityWarning,
+				condition.TLSInputErrorMessage,
+				err.Error()))
+			return ctrl.Result{}, err
+		}
+		inputHashEnv["ClientCert"] = env.SetValue(hash)
+		instance.Status.MTLSSupport = true
+	}
+
 	// all cert input checks out so report InputReady
 	instance.Status.Conditions.MarkTrue(condition.TLSInputReadyCondition, condition.InputReadyMessage)
 
@@ -382,6 +408,13 @@ func (r *Reconciler) generateConfigMaps(
 			"-o ssl_chain_cert=/etc/pki/tls/certs/memcached.crt " +
 			"-o ssl_key=/etc/pki/tls/private/memcached.key " +
 			"-o ssl_ca_cert=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+
+		if instance.Spec.TLS.MTLS.SslVerifyMode == "Request" {
+			memcachedTLSOptions = memcachedTLSOptions + " -o ssl_verify_mode=1"
+		} else if instance.Spec.TLS.MTLS.SslVerifyMode == "Require" {
+			memcachedTLSOptions = memcachedTLSOptions + " -o ssl_verify_mode=2"
+		}
+
 		memcachedPort = fmt.Sprint(memcached.MemcachedTLSPort)
 		instance.Status.TLSSupport = true
 	} else {
