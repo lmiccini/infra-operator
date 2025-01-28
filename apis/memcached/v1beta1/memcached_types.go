@@ -62,6 +62,12 @@ type MemcachedSpecCore struct {
 	TLS tls.SimpleService `json:"tls,omitempty"`
 
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum="None";"Request";"Require"
+	// +kubebuilder:default="None"
+	// Used to enforce client side tls cert validation
+	SslVerifyMode string `json:"sslVerifyMode"`
+
+	// +kubebuilder:validation:Optional
 	// +kubebuilder:default=9932
 	// Maximum Memcached cache size in MB
 	CacheSize int32 `json:"cacheSize"`

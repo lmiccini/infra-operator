@@ -75,6 +75,14 @@ spec:
                 maximum: 32
                 minimum: 1
                 type: integer
+              sslVerifyMode:
+                default: None
+                description: Used to enforce client side tls cert validation
+                enum:
+                - None
+                - Request
+                - Require
+                type: string
               tls:
                 description: TLS settings for memcached service
                 properties:
