@@ -159,10 +159,9 @@ spec:
                   type: string
                 description: Map of hashes to track input changes
                 type: object
-              mtlsSupport:
-                description: Whether MTLS is used to authenticate to the memcached
-                  instance
-                type: boolean
+              mtlsCert:
+                description: Name of the certificate used for MTLS
+                type: string
               observedGeneration:
                 description: |-
                   ObservedGeneration - the most recent generation observed for this

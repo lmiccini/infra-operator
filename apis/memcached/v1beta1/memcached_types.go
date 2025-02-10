@@ -112,8 +112,8 @@ type MemcachedStatus struct {
 	// Whether TLS is supported by the memcached instance
 	TLSSupport bool `json:"tlsSupport,omitempty"`
 
-	// Whether MTLS is used to authenticate to the memcached instance
-	MTLSSupport bool `json:"mtlsSupport,omitempty"`
+	// Name of the certificate used for MTLS
+	MTLSCert string `json:"mtlsCert,omitempty"`
 
 	// ObservedGeneration - the most recent generation observed for this
 	// service. If the observed generation is less than the spec generation,

@@ -166,6 +166,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		condition.UnknownCondition(condition.ReadyCondition, condition.InitReason, condition.ReadyInitMessage),
 		// TLS cert secrets
 		condition.UnknownCondition(condition.TLSInputReadyCondition, condition.InitReason, condition.InputReadyInitMessage),
+		// MTLS cert secrets
+		condition.UnknownCondition(memcachedv1.MTLSInputReadyCondition, condition.InitReason, condition.InputReadyInitMessage),
 		// endpoint for adoption redirect
 		condition.UnknownCondition(condition.CreateServiceReadyCondition, condition.InitReason, condition.CreateServiceReadyInitMessage),
 		// configmap generation
@@ -180,6 +182,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 
 	instance.Status.Conditions.Init(&cl)
 	instance.Status.ObservedGeneration = instance.Generation
+	instance.Status.MTLSCert = ""
 
 	if instance.Status.ServerList == nil {
 		instance.Status.ServerList = []string{}
@@ -276,28 +279,38 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 
 	// Validate client cert secret
-	//if instance.Spec.TLS.Enabled() {
 	if instance.Spec.TLS.MTLS.SslVerifyMode == "Request" || instance.Spec.TLS.MTLS.SslVerifyMode == "Require" {
-		hash, err := instance.Spec.TLS.MTLS.AuthCertSecret.ValidateCertSecret(ctx, helper, instance.Namespace)
-		if err != nil {
-			if k8s_errors.IsNotFound(err) {
+		if instance.Spec.TLS.MTLS.AuthCertSecret.SecretName != nil {
+			hash, err := instance.Spec.TLS.MTLS.AuthCertSecret.ValidateCertSecret(ctx, helper, instance.Namespace)
+			if err != nil {
+				if k8s_errors.IsNotFound(err) {
+					instance.Status.Conditions.Set(condition.FalseCondition(
+						memcachedv1.MTLSInputReadyCondition,
+						condition.RequestedReason,
+						condition.SeverityInfo,
+						fmt.Sprintf(condition.TLSInputReadyWaitingMessage, err.Error())))
+					return ctrl.Result{}, nil
+				}
 				instance.Status.Conditions.Set(condition.FalseCondition(
-					condition.TLSInputReadyCondition,
-					condition.RequestedReason,
-					condition.SeverityInfo,
-					fmt.Sprintf(condition.TLSInputReadyWaitingMessage, err.Error())))
-				return ctrl.Result{}, nil
+					memcachedv1.MTLSInputReadyCondition,
+					condition.ErrorReason,
+					condition.SeverityWarning,
+					condition.TLSInputErrorMessage,
+					err.Error()))
+				return ctrl.Result{}, err
 			}
+			inputHashEnv["ClientCert"] = env.SetValue(hash)
+			instance.Status.MTLSCert = *instance.Spec.TLS.MTLS.AuthCertSecret.SecretName
+			instance.Status.Conditions.MarkTrue(memcachedv1.MTLSInputReadyCondition, condition.InputReadyMessage)
+		} else {
 			instance.Status.Conditions.Set(condition.FalseCondition(
-				condition.TLSInputReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				condition.TLSInputErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
+				memcachedv1.MTLSInputReadyCondition,
+				condition.RequestedReason,
+				condition.SeverityInfo,
+				fmt.Sprintf(memcachedv1.MTLSInputReadyWaitingMessage)))
+			return ctrl.Result{}, nil
 		}
-		inputHashEnv["ClientCert"] = env.SetValue(hash)
-		instance.Status.MTLSSupport = true
+
 	}
 
 	// all cert input checks out so report InputReady
