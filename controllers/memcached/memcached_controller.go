@@ -166,8 +166,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		condition.UnknownCondition(condition.ReadyCondition, condition.InitReason, condition.ReadyInitMessage),
 		// TLS cert secrets
 		condition.UnknownCondition(condition.TLSInputReadyCondition, condition.InitReason, condition.InputReadyInitMessage),
-		// MTLS cert secrets
-		condition.UnknownCondition(memcachedv1.MTLSInputReadyCondition, condition.InitReason, condition.InputReadyInitMessage),
 		// endpoint for adoption redirect
 		condition.UnknownCondition(condition.CreateServiceReadyCondition, condition.InitReason, condition.CreateServiceReadyInitMessage),
 		// configmap generation
@@ -182,7 +180,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 
 	instance.Status.Conditions.Init(&cl)
 	instance.Status.ObservedGeneration = instance.Generation
-	instance.Status.MTLSCert = ""
+
+	if instance.Spec.TLS.MTLS.SslVerifyMode == "Request" || instance.Spec.TLS.MTLS.SslVerifyMode == "Require" {
+		// MTLS cert secrets
+		cl = append(cl, *condition.UnknownCondition(memcachedv1.MTLSInputReadyCondition, condition.InitReason, condition.InputReadyInitMessage))
+	} else {
+		instance.Status.MTLSCert = ""
+	}
 
 	if instance.Status.ServerList == nil {
 		instance.Status.ServerList = []string{}
@@ -310,7 +314,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 				fmt.Sprintf(memcachedv1.MTLSInputReadyWaitingMessage)))
 			return ctrl.Result{}, nil
 		}
-
 	}
 
 	// all cert input checks out so report InputReady
