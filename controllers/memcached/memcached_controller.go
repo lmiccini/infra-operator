@@ -185,6 +185,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		// MTLS cert secrets
 		cl = append(cl, *condition.UnknownCondition(memcachedv1.MTLSInputReadyCondition, condition.InitReason, condition.InputReadyInitMessage))
 	} else {
+		fmt.Sprintf("TEST BANDINI")
 		instance.Status.MTLSCert = ""
 	}
 
