@@ -61,6 +61,10 @@ type RabbitMqSpecCore struct {
 	// TopologyRef to apply the Topology defined by the associated CR referenced
 	// by name
 	TopologyRef *topologyv1.TopoRef `json:"topologyRef,omitempty"`
+	// +kubebuilder:validation:Enum=None;Mirrored
+	// +kubebuilder:default=Mirrored
+	// QueueType to eventually apply the ha-all policy to the cluster
+	QueueType string `json:"queueType"`
 }
 
 // Method to convert RabbitMqSpec to RabbitmqClusterSpec

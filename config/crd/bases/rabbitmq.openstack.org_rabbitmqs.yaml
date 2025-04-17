@@ -9593,6 +9593,14 @@ spec:
                       from.
                     type: string
                 type: object
+              queueType:
+                default: Mirrored
+                description: QueueType to eventually apply the ha-all policy to the
+                  cluster
+                enum:
+                - None
+                - Mirrored
+                type: string
               rabbitmq:
                 description: Configuration options for RabbitMQ Pods created in the
                   cluster.
@@ -9913,6 +9921,7 @@ spec:
                 type: object
             required:
             - containerImage
+            - queueType
             type: object
           status:
             description: RabbitMqStatus defines the observed state of RabbitMq
