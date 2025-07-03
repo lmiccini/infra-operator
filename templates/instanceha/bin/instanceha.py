@@ -697,31 +697,6 @@ class InstanceHAService:
         if evac_images is None:
             evac_images = self.get_evacuable_images()
         
-        # Check if server uses evacuable image
-        image_matches = False
-        if self.config.is_tagged_images_enabled():
-            if evac_images:
-                # Use pre-cached list if available
-                server_image_id = self._get_server_image_id(server)
-                if server_image_id and server_image_id in evac_images:
-                    image_matches = True
-            else:
-                # Fall back to per-server checking if cache is empty
-                if self.is_server_image_evacuable(server):
-                    image_matches = True
-        
-        # Check if server uses evacuable flavor
-        flavor_matches = False
-        if self.config.is_tagged_flavors_enabled():
-            if evac_flavors:
-                try:
-                    flavor_extra_specs = server.flavor.get('extra_specs', {})
-                    evacuable_tag = self.config.get_evacuable_tag()
-                    if evacuable_tag in flavor_extra_specs:
-                        flavor_matches = True
-                except (AttributeError, KeyError, TypeError):
-                    logging.debug("Could not check flavor extra specs for server %s", server.id)
-
         # Determine evacuation logic based on configuration
         images_enabled = self.config.is_tagged_images_enabled()
         flavors_enabled = self.config.is_tagged_flavors_enabled()
@@ -730,9 +705,48 @@ class InstanceHAService:
         if not images_enabled and not flavors_enabled:
             return True
         
-        # If tagging is enabled, only evacuate servers that match the criteria
-        # This applies even if no tagged resources are found (which means evacuate nothing)
+        # If tagging is enabled but no tagged resources exist, evacuate all servers
+        if images_enabled and flavors_enabled:
+            # Both enabled - if neither has tagged resources, evacuate all
+            if not evac_images and not evac_flavors:
+                logging.info("No tagged images or flavors found - evacuating all servers")
+                return True
+        elif images_enabled:
+            # Only image tagging enabled - if no tagged images, evacuate all
+            if not evac_images:
+                logging.info("No tagged images found - evacuating all servers")
+                return True
+        elif flavors_enabled:
+            # Only flavor tagging enabled - if no tagged flavors, evacuate all
+            if not evac_flavors:
+                logging.info("No tagged flavors found - evacuating all servers")
+                return True
         
+        # Tagged resources exist, so we need to check if this server matches
+        
+        # Check if server uses evacuable image
+        image_matches = False
+        if images_enabled and evac_images:
+            # Use pre-cached list if available
+            server_image_id = self._get_server_image_id(server)
+            if server_image_id and server_image_id in evac_images:
+                image_matches = True
+            else:
+                # Fall back to per-server checking if cache is empty
+                if self.is_server_image_evacuable(server):
+                    image_matches = True
+        
+        # Check if server uses evacuable flavor
+        flavor_matches = False
+        if flavors_enabled and evac_flavors:
+            try:
+                flavor_extra_specs = server.flavor.get('extra_specs', {})
+                evacuable_tag = self.config.get_evacuable_tag()
+                if evacuable_tag in flavor_extra_specs:
+                    flavor_matches = True
+            except (AttributeError, KeyError, TypeError):
+                logging.debug("Could not check flavor extra specs for server %s", server.id)
+
         # Determine if server should be evacuated based on enabled tagging
         should_evacuate = False
         
@@ -3010,14 +3024,16 @@ def main():
                 images_enabled = instanceha_service.config.is_tagged_images_enabled()
                 flavors_enabled = instanceha_service.config.is_tagged_flavors_enabled()
                 
-                # Filter if ANY tagging is enabled (even if no tagged resources found)
+                # Filter if ANY tagging is enabled
                 if images_enabled or flavors_enabled:
                     # Use cached server data to avoid repeated API calls
                     compute_nodes = instanceha_service.filter_hosts_with_evacuable_servers(compute_nodes, host_servers_cache, flavors, images)
                     logging.debug("After evacuable filtering: %d hosts remain (tagged evacuation enabled)", len(compute_nodes))
                     
+                    # Note: If no tagged resources are found, all servers will be evacuated
+                    # This is handled in the is_server_evacuable method
                     if not flavors and not images:
-                        logging.info("No tagged resources found - no VMs will be evacuated")
+                        logging.info("No tagged resources found - will evacuate all servers")
                 else:
                     logging.debug("No tagged evacuation enabled, processing all %d hosts", len(compute_nodes))
 
