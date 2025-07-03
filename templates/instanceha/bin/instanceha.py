@@ -644,7 +644,6 @@ class InstanceHAService:
         self._cache_timestamp = 0
         
         # Constants
-        self.TRUE_TAGS = 'true'
         self.UDP_IP = ''
         
         # Threading
@@ -711,19 +710,21 @@ class InstanceHAService:
                     return True
         
         # Check if server uses evacuable flavor
-        if evac_flavors:
-            try:
-                flavor_extra_specs = server.flavor.get('extra_specs', {})
-                evacuable_tag = self.config.get_evacuable_tag()
-                if evacuable_tag in flavor_extra_specs and self.TRUE_TAGS in flavor_extra_specs[evacuable_tag]:
-                    return True
-            except (AttributeError, KeyError, TypeError):
-                logging.debug("Could not check flavor extra specs for server %s", server.id)
+        if self.config.is_tagged_flavors_enabled():
+            if evac_flavors:
+                try:
+                    flavor_extra_specs = server.flavor.get('extra_specs', {})
+                    evacuable_tag = self.config.get_evacuable_tag()
+                    if evacuable_tag in flavor_extra_specs:
+                        return True
+                except (AttributeError, KeyError, TypeError):
+                    logging.debug("Could not check flavor extra specs for server %s", server.id)
 
-        # If no evacuable images or flavors are configured, evacuate all instances
-        if not self.config.is_tagged_images_enabled() and not evac_flavors:
+        # If NEITHER tagged images NOR tagged flavors are enabled, evacuate all instances (backward compatibility)
+        if not self.config.is_tagged_images_enabled() and not self.config.is_tagged_flavors_enabled():
             return True
 
+        # If tagged resources are configured but server doesn't match any, don't evacuate
         logging.warning("Instance %s is not evacuable: not using either of the defined flavors or images tagged with the %s attribute", server.id, self.config.get_evacuable_tag())
         return False
     
@@ -756,7 +757,7 @@ class InstanceHAService:
                 for flavor in flavors:
                     try:
                         flavor_keys = flavor.get_keys()
-                        if evacuable_tag in flavor_keys and self.TRUE_TAGS in flavor_keys.get(evacuable_tag, ''):
+                        if evacuable_tag in flavor_keys:
                             self._evacuable_flavors_cache.append(flavor.id)
                     except Exception as e:
                         logging.debug("Could not check keys for flavor %s: %s", flavor.id, e)
@@ -2980,9 +2981,11 @@ def main():
                 
                 logging.debug("Using cached evacuable resources: %d flavors, %d images", len(flavors), len(images))
 
-                if flavors or images:
+                # Filter hosts if tagged evacuation is enabled (even if no evacuable resources found)
+                if instanceha_service.config.is_tagged_images_enabled() or instanceha_service.config.is_tagged_flavors_enabled():
                     # Use cached server data to avoid repeated API calls
                     compute_nodes = instanceha_service.filter_hosts_with_evacuable_servers(compute_nodes, host_servers_cache, flavors, images)
+                    logging.debug("After evacuable filtering: %d hosts remain", len(compute_nodes))
 
                 if instanceha_service.config.is_tagged_aggregates_enabled():
                     compute_nodes_down = compute_nodes
