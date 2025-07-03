@@ -796,7 +796,7 @@ class InstanceHAService:
                 for flavor in flavors:
                     try:
                         flavor_keys = flavor.get_keys()
-                        if evacuable_tag in flavor_keys:
+                        if evacuable_tag in flavor_keys and flavor_keys[evacuable_tag] == 'true':
                             self._evacuable_flavors_cache.append(flavor.id)
                     except Exception as e:
                         logging.debug("Could not check keys for flavor %s: %s", flavor.id, e)
