@@ -2134,13 +2134,13 @@ def _fence_redfish(host, action, fencing_data):
     logging.debug("Executing Redfish %s command for %s", operation, host)
     
     try:
-        response = _redfish_reset(url, user, passwd, timeout, redfish_action)
+        result = _redfish_reset(url, user, passwd, timeout, redfish_action)
         
-        if response.status_code == 204:
+        if result:
             logging.info("Successfully executed Redfish %s for %s", operation, host)
             return True
         else:
-            logging.error("Redfish %s failed for %s: HTTP %d", operation, host, response.status_code)
+            logging.error("Redfish %s failed for %s", operation, host)
             return False
             
     except Exception as e:
