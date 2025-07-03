@@ -698,33 +698,50 @@ class InstanceHAService:
             evac_images = self.get_evacuable_images()
         
         # Check if server uses evacuable image
+        image_matches = False
         if self.config.is_tagged_images_enabled():
             if evac_images:
                 # Use pre-cached list if available
                 server_image_id = self._get_server_image_id(server)
                 if server_image_id and server_image_id in evac_images:
-                    return True
+                    image_matches = True
             else:
                 # Fall back to per-server checking if cache is empty
                 if self.is_server_image_evacuable(server):
-                    return True
+                    image_matches = True
         
         # Check if server uses evacuable flavor
+        flavor_matches = False
         if self.config.is_tagged_flavors_enabled():
             if evac_flavors:
                 try:
                     flavor_extra_specs = server.flavor.get('extra_specs', {})
                     evacuable_tag = self.config.get_evacuable_tag()
                     if evacuable_tag in flavor_extra_specs:
-                        return True
+                        flavor_matches = True
                 except (AttributeError, KeyError, TypeError):
                     logging.debug("Could not check flavor extra specs for server %s", server.id)
 
+        # Determine evacuation logic based on configuration and available tagged resources
+        images_enabled = self.config.is_tagged_images_enabled()
+        flavors_enabled = self.config.is_tagged_flavors_enabled()
+        
         # If NEITHER tagged images NOR tagged flavors are enabled, evacuate all instances (backward compatibility)
-        if not self.config.is_tagged_images_enabled() and not self.config.is_tagged_flavors_enabled():
+        if not images_enabled and not flavors_enabled:
+            return True
+        
+        # If tagging is enabled but NO tagged resources were found, evacuate all instances
+        if (images_enabled and not evac_images and not flavors_enabled) or \
+           (flavors_enabled and not evac_flavors and not images_enabled) or \
+           (images_enabled and flavors_enabled and not evac_images and not evac_flavors):
+            logging.debug("No tagged resources found, evacuating all instances")
+            return True
+        
+        # If tagged resources exist, only evacuate servers that match
+        if image_matches or flavor_matches:
             return True
 
-        # If tagged resources are configured but server doesn't match any, don't evacuate
+        # Server doesn't match any evacuable criteria
         logging.warning("Instance %s is not evacuable: not using either of the defined flavors or images tagged with the %s attribute", server.id, self.config.get_evacuable_tag())
         return False
     
@@ -2981,11 +2998,19 @@ def main():
                 
                 logging.debug("Using cached evacuable resources: %d flavors, %d images", len(flavors), len(images))
 
-                # Filter hosts if tagged evacuation is enabled (even if no evacuable resources found)
-                if instanceha_service.config.is_tagged_images_enabled() or instanceha_service.config.is_tagged_flavors_enabled():
+                # Filter hosts if tagged evacuation is enabled AND tagged resources are found
+                images_enabled = instanceha_service.config.is_tagged_images_enabled()
+                flavors_enabled = instanceha_service.config.is_tagged_flavors_enabled()
+                
+                # Only filter if tagging is enabled AND we have tagged resources
+                should_filter = (images_enabled or flavors_enabled) and (flavors or images)
+                
+                if should_filter:
                     # Use cached server data to avoid repeated API calls
                     compute_nodes = instanceha_service.filter_hosts_with_evacuable_servers(compute_nodes, host_servers_cache, flavors, images)
                     logging.debug("After evacuable filtering: %d hosts remain", len(compute_nodes))
+                elif images_enabled or flavors_enabled:
+                    logging.debug("No tagged resources found, processing all %d hosts", len(compute_nodes))
 
                 if instanceha_service.config.is_tagged_aggregates_enabled():
                     compute_nodes_down = compute_nodes
