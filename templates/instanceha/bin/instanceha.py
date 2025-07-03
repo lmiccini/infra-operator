@@ -903,7 +903,8 @@ class InstanceHAService:
                     self._evacuable_images_cache = []
                     for image in images:
                         # Check for tags (Glance v2 API) - tags are just strings, not key-value pairs
-                        if hasattr(image, 'tags') and evacuable_tag in image.tags:
+                        # Need to check if evacuable_tag is contained in any of the tag strings
+                        if hasattr(image, 'tags') and self._check_tag_in_tags(image.tags, evacuable_tag):
                             self._evacuable_images_cache.append(image.id)
                         # Check for metadata/properties (fallback) - these might have composite keys
                         elif hasattr(image, 'metadata') and self._check_tag_in_dict(image.metadata, evacuable_tag):
@@ -971,6 +972,31 @@ class InstanceHAService:
         except (AttributeError, TypeError):
             return False
     
+    def _check_tag_in_tags(self, tags, evacuable_tag):
+        """
+        Check if evacuable tag exists in image tags list (exact match or as part of a tag string).
+        
+        Args:
+            tags: List of image tags (strings)
+            evacuable_tag: Tag to search for
+            
+        Returns:
+            bool: True if tag is found, False otherwise
+        """
+        try:
+            # Check for exact tag match
+            if evacuable_tag in tags:
+                return True
+            
+            # Check for composite tags (e.g., "trait:CUSTOM_HA")
+            for tag in tags:
+                if evacuable_tag in tag:
+                    return True
+            
+            return False
+        except (AttributeError, TypeError):
+            return False
+    
     def is_server_image_evacuable(self, server, connection=None):
         """
         Check if a server's image is tagged as evacuable (fallback method).
@@ -1003,7 +1029,7 @@ class InstanceHAService:
             try:
                 # Some Nova clients can get image info
                 image = connection.glance.get(server_image_id)
-                if hasattr(image, 'tags') and evacuable_tag in image.tags:
+                if hasattr(image, 'tags') and self._check_tag_in_tags(image.tags, evacuable_tag):
                     return True
             except:
                 # If direct Glance access fails, try Nova's image interface
