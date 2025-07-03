@@ -697,10 +697,31 @@ class InstanceHAService:
             evac_flavors = self.get_evacuable_flavors()
         if evac_images is None:
             evac_images = self.get_evacuable_images()
-            
-        if evac_images and hasattr(server.image, 'get') and server.image.get('id') in evac_images:
-            return True
-        if evac_flavors and server.flavor.get('extra_specs').get(self.config.get_evacuable_tag()) and self.TRUE_TAGS in server.flavor.get('extra_specs').get(self.config.get_evacuable_tag()):
+        
+        # Check if server uses evacuable image
+        if self.config.is_tagged_images_enabled():
+            if evac_images:
+                # Use pre-cached list if available
+                server_image_id = self._get_server_image_id(server)
+                if server_image_id and server_image_id in evac_images:
+                    return True
+            else:
+                # Fall back to per-server checking if cache is empty
+                if self.is_server_image_evacuable(server):
+                    return True
+        
+        # Check if server uses evacuable flavor
+        if evac_flavors:
+            try:
+                flavor_extra_specs = server.flavor.get('extra_specs', {})
+                evacuable_tag = self.config.get_evacuable_tag()
+                if evacuable_tag in flavor_extra_specs and self.TRUE_TAGS in flavor_extra_specs[evacuable_tag]:
+                    return True
+            except (AttributeError, KeyError, TypeError):
+                logging.debug("Could not check flavor extra specs for server %s", server.id)
+
+        # If no evacuable images or flavors are configured, evacuate all instances
+        if not self.config.is_tagged_images_enabled() and not evac_flavors:
             return True
 
         logging.warning("Instance %s is not evacuable: not using either of the defined flavors or images tagged with the %s attribute", server.id, self.config.get_evacuable_tag())
@@ -722,15 +743,26 @@ class InstanceHAService:
         if connection is None:
             connection = self.get_nova_connection()
         
+        if connection is None:
+            logging.error("No Nova connection available for flavor caching")
+            return []
+        
         if self._evacuable_flavors_cache is None:
             try:
                 flavors = connection.flavors.list(is_public=None)
-                self._evacuable_flavors_cache = [
-                    flavor.id for flavor in flavors 
-                    if self.config.get_evacuable_tag() in flavor.get_keys() 
-                    and self.TRUE_TAGS in flavor.get_keys().get(self.config.get_evacuable_tag())
-                ]
-                logging.debug("Cached %d evacuable flavors", len(self._evacuable_flavors_cache))
+                evacuable_tag = self.config.get_evacuable_tag()
+                
+                self._evacuable_flavors_cache = []
+                for flavor in flavors:
+                    try:
+                        flavor_keys = flavor.get_keys()
+                        if evacuable_tag in flavor_keys and self.TRUE_TAGS in flavor_keys.get(evacuable_tag, ''):
+                            self._evacuable_flavors_cache.append(flavor.id)
+                    except Exception as e:
+                        logging.debug("Could not check keys for flavor %s: %s", flavor.id, e)
+                        
+                logging.debug("Cached %d evacuable flavors from %d total flavors", 
+                             len(self._evacuable_flavors_cache), len(flavors))
             except Exception as e:
                 logging.error("Failed to get evacuable flavors: %s", e)
                 self._evacuable_flavors_cache = []
@@ -740,6 +772,8 @@ class InstanceHAService:
     def get_evacuable_images(self, connection=None):
         """
         Get list of evacuable image IDs with caching.
+        
+        Attempts multiple methods to access image information and cache evacuable image IDs.
         
         Args:
             connection: Optional Nova connection
@@ -753,22 +787,156 @@ class InstanceHAService:
         if connection is None:
             connection = self.get_nova_connection()
         
+        if connection is None:
+            logging.error("No Nova connection available for image caching")
+            return []
+        
         if self._evacuable_images_cache is None:
             try:
                 images = []
-                if hasattr(connection, "glance"):
-                    images = connection.glance.list()
+                evacuable_tag = self.config.get_evacuable_tag()
                 
-                self._evacuable_images_cache = [
-                    image.id for image in images 
-                    if hasattr(image, 'tags') and self.config.get_evacuable_tag() in image.tags
-                ]
-                logging.debug("Cached %d evacuable images", len(self._evacuable_images_cache))
+                # Method 1: Try direct Glance access through Nova client
+                try:
+                    if hasattr(connection, 'glance'):
+                        images = connection.glance.list()
+                        logging.debug("Retrieved %d images via Nova glance client", len(images))
+                except Exception as e:
+                    logging.debug("Nova glance client access failed: %s", e)
+                
+                # Method 2: Try Nova's images interface
+                if not images:
+                    try:
+                        if hasattr(connection, 'images'):
+                            images = connection.images.list()
+                            logging.debug("Retrieved %d images via Nova images interface", len(images))
+                    except Exception as e:
+                        logging.debug("Nova images interface access failed: %s", e)
+                
+                # Method 3: Try to create a separate Glance client
+                if not images:
+                    try:
+                        from glanceclient import client as glance_client
+                        from keystoneauth1 import session as ksc_session
+                        
+                        # Get session from Nova client
+                        if hasattr(connection, 'api') and hasattr(connection.api, 'session'):
+                            session = connection.api.session
+                            glance = glance_client.Client('2', session=session)
+                            images = list(glance.images.list())
+                            logging.debug("Retrieved %d images via separate Glance client", len(images))
+                    except ImportError:
+                        logging.debug("Glance client not available for import")
+                    except Exception as e:
+                        logging.debug("Separate Glance client access failed: %s", e)
+                
+                # Process images to find evacuable ones
+                if images:
+                    self._evacuable_images_cache = []
+                    for image in images:
+                        # Check for tags (Glance v2 API)
+                        if hasattr(image, 'tags') and evacuable_tag in image.tags:
+                            self._evacuable_images_cache.append(image.id)
+                        # Check for metadata/properties (fallback)
+                        elif hasattr(image, 'metadata') and evacuable_tag in image.metadata:
+                            self._evacuable_images_cache.append(image.id)
+                        elif hasattr(image, 'properties') and evacuable_tag in image.properties:
+                            self._evacuable_images_cache.append(image.id)
+                    
+                    logging.debug("Cached %d evacuable images from %d total images", 
+                                 len(self._evacuable_images_cache), len(images))
+                else:
+                    # No images retrieved, fall back to per-server checking
+                    logging.warning("Could not retrieve images for caching. Image evacuation will use per-server checking.")
+                    self._evacuable_images_cache = []
+                    
             except Exception as e:
                 logging.error("Failed to get evacuable images: %s", e)
                 self._evacuable_images_cache = []
         
         return self._evacuable_images_cache
+    
+    def _get_server_image_id(self, server):
+        """
+        Extract image ID from server object, handling different data formats.
+        
+        Args:
+            server: Server instance
+            
+        Returns:
+            str: Image ID or None if not found
+        """
+        try:
+            if hasattr(server, 'image') and server.image:
+                if isinstance(server.image, dict):
+                    return server.image.get('id')
+                elif isinstance(server.image, str):
+                    return server.image
+                elif hasattr(server.image, 'id'):
+                    return server.image.id
+        except (AttributeError, TypeError):
+            pass
+        return None
+    
+    def is_server_image_evacuable(self, server, connection=None):
+        """
+        Check if a server's image is tagged as evacuable (fallback method).
+        
+        This method is used when pre-caching fails. It attempts to check
+        individual server images for evacuable tags.
+        
+        Args:
+            server: Server instance to check
+            connection: Optional Nova connection
+            
+        Returns:
+            bool: True if server's image is evacuable, False otherwise
+        """
+        if not self.config.is_tagged_images_enabled():
+            return False
+            
+        if connection is None:
+            connection = self.get_nova_connection()
+            
+        try:
+            server_image_id = self._get_server_image_id(server)
+            if not server_image_id:
+                logging.debug("Server %s has no image ID", server.id)
+                return False
+                
+            evacuable_tag = self.config.get_evacuable_tag()
+            
+            # Try to get image details through Nova
+            try:
+                # Some Nova clients can get image info
+                image = connection.glance.get(server_image_id)
+                if hasattr(image, 'tags') and evacuable_tag in image.tags:
+                    return True
+            except:
+                # If direct Glance access fails, try Nova's image interface
+                try:
+                    image = connection.images.get(server_image_id)
+                    if hasattr(image, 'metadata'):
+                        # Check if image has evacuable tag in metadata
+                        metadata = getattr(image, 'metadata', {})
+                        if evacuable_tag in metadata:
+                            return True
+                    if hasattr(image, 'properties'):
+                        # Check if image has evacuable tag in properties
+                        properties = getattr(image, 'properties', {})
+                        if evacuable_tag in properties:
+                            return True
+                except:
+                    # If all else fails, we can't determine image evacuability
+                    logging.debug("Could not determine evacuability of image %s for server %s", 
+                                 server_image_id, server.id)
+                    return False
+                    
+        except Exception as e:
+            logging.debug("Error checking image evacuability for server %s: %s", server.id, e)
+            return False
+            
+        return False
     
     def is_aggregate_evacuable(self, connection, host):
         """
@@ -918,6 +1086,19 @@ class InstanceHAService:
         self._evacuable_images_cache = None
         self._cache_timestamp = 0
         logging.debug("Service cache cleared")
+    
+    def refresh_evacuable_cache(self, connection=None):
+        """Force refresh of evacuable flavors and images cache."""
+        logging.info("Refreshing evacuable flavors and images cache")
+        self._evacuable_flavors_cache = None
+        self._evacuable_images_cache = None
+        
+        # Force re-cache
+        evac_flavors = self.get_evacuable_flavors(connection)
+        evac_images = self.get_evacuable_images(connection)
+        
+        logging.info("Cache refreshed: %d flavors, %d images", 
+                    len(evac_flavors), len(evac_images))
 
 
 # Initialize global configuration manager
@@ -2796,6 +2977,8 @@ def main():
                 # Check if there are images, flavors or aggregates configured with the EVACUABLE tag
                 images = instanceha_service.get_evacuable_images(conn) if instanceha_service.config.is_tagged_images_enabled() else []
                 flavors = instanceha_service.get_evacuable_flavors(conn) if instanceha_service.config.is_tagged_flavors_enabled() else []
+                
+                logging.debug("Using cached evacuable resources: %d flavors, %d images", len(flavors), len(images))
 
                 if flavors or images:
                     # Use cached server data to avoid repeated API calls
