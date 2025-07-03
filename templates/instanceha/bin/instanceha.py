@@ -742,8 +742,22 @@ class InstanceHAService:
             try:
                 flavor_extra_specs = server.flavor.get('extra_specs', {})
                 evacuable_tag = self.config.get_evacuable_tag()
+                
+                # Check if evacuable_tag is an exact key match or part of a key (e.g., trait:CUSTOM_HA)
+                matching_key = None
                 if evacuable_tag in flavor_extra_specs:
-                    flavor_matches = True
+                    matching_key = evacuable_tag
+                else:
+                    # Look for the tag in composite keys like "trait:CUSTOM_HA"
+                    for key in flavor_extra_specs:
+                        if evacuable_tag in key:
+                            matching_key = key
+                            break
+                
+                if matching_key:
+                    value = flavor_extra_specs[matching_key]
+                    if str(value).lower() == 'true':
+                        flavor_matches = True
             except (AttributeError, KeyError, TypeError):
                 logging.debug("Could not check flavor extra specs for server %s", server.id)
 
@@ -796,8 +810,22 @@ class InstanceHAService:
                 for flavor in flavors:
                     try:
                         flavor_keys = flavor.get_keys()
-                        if evacuable_tag in flavor_keys and flavor_keys[evacuable_tag] == 'true':
-                            self._evacuable_flavors_cache.append(flavor.id)
+                        # Check if evacuable_tag is an exact key match or part of a key (e.g., trait:CUSTOM_HA)
+                        matching_key = None
+                        if evacuable_tag in flavor_keys:
+                            matching_key = evacuable_tag
+                        else:
+                            # Look for the tag in composite keys like "trait:CUSTOM_HA"
+                            for key in flavor_keys:
+                                if evacuable_tag in key:
+                                    matching_key = key
+                                    break
+                        
+                        if matching_key:
+                            value = flavor_keys[matching_key]
+                            if str(value).lower() == 'true':
+                                self._evacuable_flavors_cache.append(flavor.id)
+                                logging.debug("Added flavor %s to evacuable cache (key: %s, value: %s)", flavor.id, matching_key, value)
                     except Exception as e:
                         logging.debug("Could not check keys for flavor %s: %s", flavor.id, e)
                         
@@ -874,13 +902,13 @@ class InstanceHAService:
                 if images:
                     self._evacuable_images_cache = []
                     for image in images:
-                        # Check for tags (Glance v2 API)
+                        # Check for tags (Glance v2 API) - tags are just strings, not key-value pairs
                         if hasattr(image, 'tags') and evacuable_tag in image.tags:
                             self._evacuable_images_cache.append(image.id)
-                        # Check for metadata/properties (fallback)
-                        elif hasattr(image, 'metadata') and evacuable_tag in image.metadata:
+                        # Check for metadata/properties (fallback) - these might have composite keys
+                        elif hasattr(image, 'metadata') and self._check_tag_in_dict(image.metadata, evacuable_tag):
                             self._evacuable_images_cache.append(image.id)
-                        elif hasattr(image, 'properties') and evacuable_tag in image.properties:
+                        elif hasattr(image, 'properties') and self._check_tag_in_dict(image.properties, evacuable_tag):
                             self._evacuable_images_cache.append(image.id)
                     
                     logging.debug("Cached %d evacuable images from %d total images", 
@@ -917,6 +945,31 @@ class InstanceHAService:
         except (AttributeError, TypeError):
             pass
         return None
+    
+    def _check_tag_in_dict(self, data_dict, evacuable_tag):
+        """
+        Check if evacuable tag exists in a dictionary (exact match or as part of a composite key).
+        
+        Args:
+            data_dict: Dictionary to search in
+            evacuable_tag: Tag to search for
+            
+        Returns:
+            bool: True if tag is found with value 'true', False otherwise
+        """
+        try:
+            # Check for exact key match
+            if evacuable_tag in data_dict:
+                return str(data_dict[evacuable_tag]).lower() == 'true'
+            
+            # Check for composite keys (e.g., "trait:CUSTOM_HA")
+            for key in data_dict:
+                if evacuable_tag in key:
+                    return str(data_dict[key]).lower() == 'true'
+            
+            return False
+        except (AttributeError, TypeError):
+            return False
     
     def is_server_image_evacuable(self, server, connection=None):
         """
@@ -959,12 +1012,12 @@ class InstanceHAService:
                     if hasattr(image, 'metadata'):
                         # Check if image has evacuable tag in metadata
                         metadata = getattr(image, 'metadata', {})
-                        if evacuable_tag in metadata:
+                        if self._check_tag_in_dict(metadata, evacuable_tag):
                             return True
                     if hasattr(image, 'properties'):
                         # Check if image has evacuable tag in properties
                         properties = getattr(image, 'properties', {})
-                        if evacuable_tag in properties:
+                        if self._check_tag_in_dict(properties, evacuable_tag):
                             return True
                 except:
                     # If all else fails, we can't determine image evacuability
@@ -991,10 +1044,26 @@ class InstanceHAService:
         """
         try:
             aggregates = connection.aggregates.list()
-            evacuable_aggregates = [
-                i for i in aggregates 
-                if self.config.get_evacuable_tag() in i.metadata
-            ]
+            evacuable_tag = self.config.get_evacuable_tag()
+            evacuable_aggregates = []
+            
+            for aggregate in aggregates:
+                # Check if evacuable_tag is an exact key match or part of a key
+                matching_key = None
+                if evacuable_tag in aggregate.metadata:
+                    matching_key = evacuable_tag
+                else:
+                    # Look for the tag in composite keys
+                    for key in aggregate.metadata:
+                        if evacuable_tag in key:
+                            matching_key = key
+                            break
+                
+                if matching_key:
+                    value = aggregate.metadata[matching_key]
+                    if str(value).lower() == 'true':
+                        evacuable_aggregates.append(aggregate)
+            
             result = any(host in i.hosts for i in evacuable_aggregates)
             return result
         except Exception as e:
