@@ -964,7 +964,7 @@ def _aggregate_ids(conn, service):
 
 def _custom_check():
     logging.info("Ran _custom_check()")
-    return result
+    return True
 
 
 def _host_evacuate(connection, service):
@@ -1485,10 +1485,14 @@ def _check_kdump(stale_services):
         sock.settimeout(KDUMP_TIMEOUT)
         
         try:
-            sock.bind((UDP_IP, UDP_PORT))
-            logging.debug("Successfully bound to %s:%s for kdump messages", UDP_IP, UDP_PORT)
+            udp_ip = instanceha_service.UDP_IP
+            udp_port = instanceha_service.config.get_udp_port()
+            sock.bind((udp_ip, udp_port))
+            logging.debug("Successfully bound to %s:%s for kdump messages", udp_ip, udp_port)
         except (OSError, socket.error) as e:
-            logging.error("Could not bind to %s:%s for kdump checking: %s", UDP_IP, UDP_PORT, e)
+            udp_ip = instanceha_service.UDP_IP
+            udp_port = instanceha_service.config.get_udp_port()
+            logging.error("Could not bind to %s:%s for kdump checking: %s", udp_ip, udp_port, e)
             return stale_services  # Return original list if we can't check kdump
         
         # Listen for kdump messages
@@ -2241,7 +2245,7 @@ def _host_fence(host, action):
     # Look up fencing configuration
     try:
         short_hostname = host.split('.', 1)[0]
-        matching_configs = [value for key, value in fencing.items() if key in short_hostname]
+        matching_configs = [value for key, value in instanceha_service.config.fencing.items() if key in short_hostname]
         
         if not matching_configs:
             logging.error("No fencing data found for %s", host)
@@ -2313,22 +2317,22 @@ def _get_nova_connection():
     try:
         cloud_name = os.getenv('OS_CLOUD', 'overcloud')
         
-        if cloud_name not in clouds:
+        if cloud_name not in instanceha_service.config.clouds:
             logging.error("Cloud configuration not found for: %s", cloud_name)
             return None
         
-        if cloud_name not in secure:
+        if cloud_name not in instanceha_service.config.secure:
             logging.error("Secure configuration not found for: %s", cloud_name)
             return None
         
         # Extract connection parameters
-        auth_config = clouds[cloud_name]["auth"]
+        auth_config = instanceha_service.config.clouds[cloud_name]["auth"]
         username = auth_config["username"]
         project_name = auth_config["project_name"]
         auth_url = auth_config["auth_url"]
         user_domain_name = auth_config["user_domain_name"]
         project_domain_name = auth_config["project_domain_name"]
-        password = secure[cloud_name]["auth"]["password"]
+        password = instanceha_service.config.secure[cloud_name]["auth"]["password"]
         
         conn = nova_login(username, password, project_name, auth_url, 
                          user_domain_name, project_domain_name)
@@ -2452,7 +2456,7 @@ def _manage_reserved_hosts(conn, service, reserved_hosts):
     Returns:
         bool: True if operation completed successfully (regardless of whether a host was enabled)
     """
-    if not _is_config_enabled(RESERVED_HOSTS):
+    if not instanceha_service.config.is_reserved_hosts_enabled():
         logging.debug("Reserved hosts feature is disabled")
         return True
     
@@ -2462,7 +2466,7 @@ def _manage_reserved_hosts(conn, service, reserved_hosts):
     
     try:
         # Try to enable a host from the same aggregate if tagged aggregates are enabled
-        if _is_config_enabled(TAGGED_AGGREGATES):
+        if instanceha_service.config.is_tagged_aggregates_enabled():
             if _enable_reserved_host_by_aggregate(conn, service, reserved_hosts):
                 return True
         else:
@@ -2491,9 +2495,9 @@ def _post_evacuation_recovery(conn, service):
     Returns:
         bool: True if recovery completed successfully, False otherwise
     """
-    if _is_config_enabled(LEAVE_DISABLED):
-        logging.info("Evacuation successful. Not re-enabling %s since LEAVE_DISABLED is set to %s", 
-                    service.host, LEAVE_DISABLED)
+    if instanceha_service.config.is_leave_disabled_enabled():
+        logging.info("Evacuation successful. Not re-enabling %s since LEAVE_DISABLED is enabled", 
+                    service.host)
         return True
     
     logging.info("Evacuation successful. Starting recovery for %s", service.host)
@@ -2843,7 +2847,7 @@ def main():
                 for i in to_reenable:
                     migr = conn.migrations.list(source_compute=i.host, migration_type='evacuation', limit='100')
                     # users can bypass the safety net by setting FORCE_ENABLE=true
-                    incomplete = [a.id for a in migr if 'completed' not in a.status and 'error' not in a.status] if 'false' in instanceha_service.config.is_force_enable_enabled() else []
+                    incomplete = [a.id for a in migr if 'completed' not in a.status and 'error' not in a.status] if not instanceha_service.config.is_force_enable_enabled() else []
 
                     if incomplete == []:
                         logging.info('All migrations completed, reenabling %s' % i.host)
