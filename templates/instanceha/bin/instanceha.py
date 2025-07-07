@@ -515,8 +515,17 @@ class InstanceHAService:
         if should_evacuate:
             return True
 
-        # Server doesn't match evacuable criteria
-        logging.warning("Instance %s is not evacuable: not using either of the defined flavors or images tagged with the %s attribute", server.id, self.config.get_evacuable_tag())
+        # Server doesn't match evacuable criteria - provide specific feedback
+        criteria = []
+        if images_enabled and evac_images:
+            criteria.append("evacuable images")
+        if flavors_enabled and evac_flavors:
+            criteria.append("evacuable flavors")
+        
+        if criteria:
+            criteria_str = " or ".join(criteria)
+            logging.warning("Instance %s is not evacuable: not using any of the defined %s tagged with '%s'", 
+                           server.id, criteria_str, self.config.get_evacuable_tag())
         return False
 
     def get_evacuable_flavors(self, connection=None):
@@ -1304,58 +1313,105 @@ def _host_disable(connection, service):
 def _check_kdump(stale_services, service):
     """Check for kdump messages from crashed compute nodes to identify which nodes are currently kdumping."""
     if not stale_services:
+        logging.debug("No stale services to check for kdump")
         return []
 
-    broken_computes = {service.host for service in stale_services}
+    logging.info("Checking %d hosts for kdump activity", len(stale_services))
+    broken_computes = {svc.host for svc in stale_services}
     kdumping_hosts = set()
+    
+    udp_ip = service.UDP_IP if service.UDP_IP else '0.0.0.0'  # Bind to all interfaces if empty
+    udp_port = service.config.get_udp_port()
+    
+    logging.debug("Listening for kdump messages on %s:%d for 30 seconds", udp_ip, udp_port)
     
     sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(30)
-        sock.bind((service.UDP_IP, service.config.get_udp_port()))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow port reuse
+        sock.bind((udp_ip, udp_port))
+        
+        logging.debug("Successfully bound to UDP port %d, listening for kdump messages", udp_port)
         
         timeout_end = time.time() + 30
+        message_count = 0
+        
         while time.time() < timeout_end:
             try:
                 data, _, _, address = sock.recvmsg(65535, 1024, 0)
+                message_count += 1
+                logging.debug("Received UDP message %d from %s (%d bytes)", message_count, address[0] if address else 'unknown', len(data))
                 
                 if len(data) < 8:  # Need at least 8 bytes for magic number
+                    logging.debug("Message too short for kdump magic number")
                     continue
                     
                 magic_number = struct.unpack('ii', data[:8])[0]
-                if hex(magic_number).upper() != "0x1B302A40":
+                magic_hex = hex(magic_number).upper()
+                logging.debug("Magic number: %s", magic_hex)
+                
+                if magic_hex != "0x1B302A40":
+                    logging.debug("Invalid kdump magic number: %s", magic_hex)
                     continue
                 
                 if not address:
+                    logging.debug("No source address in kdump message")
                     continue
                     
                 try:
                     hostname = socket.gethostbyaddr(address[0])[0].split('.', 1)[0]
+                    logging.debug("Kdump message from host: %s (IP: %s)", hostname, address[0])
+                    
                     matching_hosts = [host for host in broken_computes if hostname in host]
                     if matching_hosts:
                         kdumping_hosts.add(matching_hosts[0])
-                except:
+                        logging.info("Detected kdump activity on host: %s", matching_hosts[0])
+                    else:
+                        logging.debug("Kdump host %s not in broken computes list", hostname)
+                except Exception as e:
+                    logging.debug("Failed to resolve hostname for %s: %s", address[0], e)
                     continue
                     
             except socket.timeout:
+                logging.debug("Kdump listening timeout reached")
                 break
-            except:
+            except Exception as e:
+                logging.debug("Error receiving kdump message: %s", e)
                 break
+        
+        logging.debug("Kdump check completed: received %d messages, found %d kdumping hosts", 
+                     message_count, len(kdumping_hosts))
                 
+    except PermissionError:
+        logging.error("Kdump checking failed: Permission denied to bind UDP port %d. Check user privileges.", udp_port)
+        logging.warning("Proceeding with evacuation without kdump filtering due to permission error")
+        return stale_services
+    except OSError as e:
+        if "Address already in use" in str(e):
+            logging.error("Kdump checking failed: UDP port %d already in use. Another instance may be running.", udp_port)
+        else:
+            logging.error("Kdump checking failed: Network error: %s", e)
+        logging.warning("Proceeding with evacuation without kdump filtering due to network error")
+        return stale_services
     except Exception as e:
-        logging.error("Kdump checking failed: %s", e)
+        logging.error("Kdump checking failed with unexpected error: %s", e)
+        logging.warning("Proceeding with evacuation without kdump filtering due to unexpected error")
         return stale_services
     finally:
         if sock:
             sock.close()
+            logging.debug("Closed kdump UDP socket")
 
     # Return services not kdumping
     non_kdumping_hosts = broken_computes - kdumping_hosts
     filtered_services = [svc for svc in stale_services if svc.host in non_kdumping_hosts]
     
     if kdumping_hosts:
-        logging.info("Kdumping hosts excluded: %s", sorted(kdumping_hosts))
+        logging.info("Kdumping hosts excluded from evacuation: %s", sorted(kdumping_hosts))
+        logging.info("Proceeding with evacuation of %d non-kdumping hosts", len(filtered_services))
+    else:
+        logging.info("No kdump activity detected, proceeding with evacuation of all %d hosts", len(filtered_services))
     
     return filtered_services
 
@@ -1992,16 +2048,16 @@ def main():
                         to_evacuate = _check_kdump(compute_nodes, service) if service.config.is_kdump_check_enabled() else compute_nodes
 
                         if not service.config.is_disabled():
-                            # process computes that are seen as down for the first time
+                            poll_interval = service.config.get_poll_interval()
                             with concurrent.futures.ThreadPoolExecutor() as executor:
+                                # process computes that are seen as down for the first time
                                 results = list(executor.map(lambda svc: process_service(svc, reserved_hosts, False, service), to_evacuate))
-                            if not all(results):
-                                logging.warning('Some services failed to evacuate. Retrying in 30 seconds.')
-                            # process computes that were half-evacuated
-                            with concurrent.futures.ThreadPoolExecutor() as executor:
+                                if not all(results):
+                                    logging.warning('Some services failed to evacuate. Retrying in %s seconds.' % poll_interval)
+                                # process computes that were half-evacuated
                                 results = list(executor.map(lambda svc: process_service(svc, reserved_hosts, True, service), to_resume))
-                            if not all(results):
-                                logging.warning('Some services failed to evacuate. Retrying in %s seconds.' % service.config.get_poll_interval())
+                                if not all(results):
+                                    logging.warning('Some services failed to evacuate. Retrying in %s seconds.' % poll_interval)
 
                         else:
                             logging.info('InstanceHa DISABLE is true, not evacuating')
