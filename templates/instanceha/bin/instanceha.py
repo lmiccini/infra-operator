@@ -80,7 +80,7 @@ class ConfigManager:
                 data = yaml.load(stream, Loader=SafeLoader)
                 if not isinstance(data, dict):
                     raise ConfigurationError(f"Invalid {config_name} format in {path}")
-                
+
                 if required_key:
                     if required_key not in data:
                         raise ConfigurationError(f"Missing '{required_key}' in {config_name} at {path}")
@@ -115,7 +115,7 @@ class ConfigManager:
                 self.get_config_value(key)  # This will validate against _config_map constraints
             except ValueError as e:
                 raise ConfigurationError(str(e))
-        
+
         # Validate special conditions
         if self.get_bool('CHECK_KDUMP') and self.get_int('POLL', 45) == 30:
             logging.warning('CHECK_KDUMP Enabled and POLL set to 30 seconds. This may result in unexpected failures. Please increase POLL to 45 or greater.')
@@ -169,7 +169,7 @@ class ConfigManager:
     _config_map = {
         'EVACUABLE_TAG': ('str', 'evacuable'),
         'DELTA': ('int', 30, 10, 300),
-        'POLL': ('int', 45, 15, 600), 
+        'POLL': ('int', 45, 15, 600),
         'THRESHOLD': ('int', 50, 0, 100),
         'WORKERS': ('int', 4, 1, 50),
         'DELAY': ('int', 0, 0, 300),
@@ -190,10 +190,10 @@ class ConfigManager:
         """Get configuration value with automatic type handling and validation."""
         if key not in self._config_map:
             raise ValueError(f"Unknown configuration key: {key}")
-        
+
         config_def = self._config_map[key]
         value_type, default = config_def[0], config_def[1]
-        
+
         if value_type == 'str':
             result = self.get_str(key, default)
             if key == 'LOGLEVEL':
@@ -208,7 +208,7 @@ class ConfigManager:
             return self.get_int(key, default, min_val, max_val)
         elif value_type == 'bool':
             return self.get_bool(key, default)
-        
+
         return default
 
     def get_cloud_name(self) -> str: return os.getenv('OS_CLOUD', 'overcloud')
@@ -248,19 +248,19 @@ class ConfigManager:
         """Dynamic accessor for configuration properties."""
         config_mappings = {
             'get_evacuable_tag': ('EVACUABLE_TAG', str), 'get_delta': ('DELTA', int), 'get_poll_interval': ('POLL', int),
-            'get_threshold': ('THRESHOLD', int), 'get_workers': ('WORKERS', int), 'get_delay': ('DELAY', int), 
-            'get_log_level': ('LOGLEVEL', str), 'is_smart_evacuation_enabled': ('SMART_EVACUATION', bool), 
+            'get_threshold': ('THRESHOLD', int), 'get_workers': ('WORKERS', int), 'get_delay': ('DELAY', int),
+            'get_log_level': ('LOGLEVEL', str), 'is_smart_evacuation_enabled': ('SMART_EVACUATION', bool),
             'is_reserved_hosts_enabled': ('RESERVED_HOSTS', bool), 'is_tagged_images_enabled': ('TAGGED_IMAGES', bool),
             'is_tagged_flavors_enabled': ('TAGGED_FLAVORS', bool), 'is_tagged_aggregates_enabled': ('TAGGED_AGGREGATES', bool),
             'is_leave_disabled_enabled': ('LEAVE_DISABLED', bool), 'is_force_enable_enabled': ('FORCE_ENABLE', bool),
-            'is_kdump_check_enabled': ('CHECK_KDUMP', bool), 'is_disabled': ('DISABLED', bool), 
+            'is_kdump_check_enabled': ('CHECK_KDUMP', bool), 'is_disabled': ('DISABLED', bool),
             'is_ssl_verification_enabled': ('SSL_VERIFY', bool)
         }
-        
+
         if name in config_mappings:
             key, cast_type = config_mappings[name]
             return lambda: cast_type(self.get_config_value(key))
-            
+
         raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
 
 
@@ -284,7 +284,7 @@ class Metrics:
     def record_duration(self, metric: str, duration: float) -> None:
         """Record a duration metric."""
         self.durations[metric] = self.durations.get(metric, 0.0) + duration
-        
+
         # Keep timing history for percentiles (last 100 values)
         if metric not in self.timing_history:
             self.timing_history[metric] = []
@@ -303,7 +303,7 @@ class Metrics:
             'counters': self.counters.copy(),
             'total_durations': self.durations.copy(),
         }
-        
+
         # Add averages and percentiles
         for metric, history in self.timing_history.items():
             if history:
@@ -311,7 +311,7 @@ class Metrics:
                 n = len(sorted_history)
                 summary[f'{metric}_avg'] = sum(history) / n
                 summary[f'{metric}_p95'] = sorted_history[int(n * 0.95)]
-        
+
         return summary
 
     def log_summary(self) -> None:
@@ -319,12 +319,12 @@ class Metrics:
         summary = self.get_summary()
         logging.info("=== Metrics Summary ===")
         logging.info("Uptime: %.1f seconds", summary['uptime_seconds'])
-        
+
         evacuations = summary['counters'].get('evacuations_total', 0)
         if evacuations > 0:
             success = summary['counters'].get('evacuations_successful', 0)
             logging.info("Evacuations: %d total, %d successful", evacuations, success)
-        
+
         logging.info("=== End Summary ===")
 
 
@@ -345,7 +345,7 @@ class TimingContext:
             duration = time.time() - self.start_time
             self.metrics.record_duration(f'{self.operation}_duration', duration)
             self.metrics.increment(f'{self.operation}_total')
-            
+
             if exc_type is None:
                 self.metrics.increment(f'{self.operation}_successful')
             else:
@@ -521,10 +521,10 @@ class InstanceHAService:
             criteria.append("evacuable images")
         if flavors_enabled and evac_flavors:
             criteria.append("evacuable flavors")
-        
+
         if criteria:
             criteria_str = " or ".join(criteria)
-            logging.warning("Instance %s is not evacuable: not using any of the defined %s tagged with '%s'", 
+            logging.warning("Instance %s is not evacuable: not using any of the defined %s tagged with '%s'",
                            server.id, criteria_str, self.config.get_evacuable_tag())
         return False
 
@@ -753,7 +753,7 @@ class InstanceHAService:
                             return True
                 except:
                     continue
-            
+
             logging.debug("Could not determine evacuability of image %s for server %s", server_image_id, server.id)
             return False
 
@@ -777,9 +777,9 @@ class InstanceHAService:
         try:
             aggregates = connection.aggregates.list()
             evacuable_tag = self.config.get_evacuable_tag()
-            
+
             # Use existing tag checking logic and filter in one pass
-            return any(host in agg.hosts for agg in aggregates 
+            return any(host in agg.hosts for agg in aggregates
                       if self._check_evacuable_tag(agg.metadata, evacuable_tag))
         except Exception as e:
             logging.error("Failed to check aggregate evacuability for %s: %s", host, e)
@@ -906,7 +906,7 @@ class InstanceHAService:
         """Refresh evacuable flavors and images cache with intelligent timing."""
         current_time = time.time()
         cache_age = current_time - self._cache_timestamp
-        
+
         # Refresh cache every 300 seconds (5 minutes) or when forced
         if force or cache_age > 300 or not self._evacuable_flavors_cache:
             logging.info("Refreshing evacuable cache (age: %.1f seconds)", cache_age)
@@ -1073,22 +1073,22 @@ def _server_evacuation_status(connection, server):
             changes_since=query_time,
             limit='1000'
         )
-        
+
         if not migrations:
             return {"completed": False, "error": True}
-        
+
         # Get status from most recent migration
         migration = migrations[0]
         status = getattr(migration, 'status', None) or getattr(migration, '_info', {}).get('status')
-        
+
         if not status:
             return {"completed": False, "error": True}
-            
+
         completed = status in ['completed', 'done']
         error = status in ['error', 'failed', 'cancelled']
-        
+
         return {"completed": completed, "error": error}
-        
+
     except Exception as e:
         logging.error("Failed to check evacuation status for %s: %s", server, e)
         return {"completed": False, "error": True}
@@ -1319,50 +1319,50 @@ def _check_kdump(stale_services, service):
     logging.info("Checking %d hosts for kdump activity", len(stale_services))
     broken_computes = {svc.host for svc in stale_services}
     kdumping_hosts = set()
-    
+
     udp_ip = service.UDP_IP if service.UDP_IP else '0.0.0.0'  # Bind to all interfaces if empty
     udp_port = service.config.get_udp_port()
-    
+
     logging.debug("Listening for kdump messages on %s:%d for 30 seconds", udp_ip, udp_port)
-    
+
     sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(30)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow port reuse
         sock.bind((udp_ip, udp_port))
-        
+
         logging.debug("Successfully bound to UDP port %d, listening for kdump messages", udp_port)
-        
+
         timeout_end = time.time() + 30
         message_count = 0
-        
+
         while time.time() < timeout_end:
             try:
                 data, _, _, address = sock.recvmsg(65535, 1024, 0)
                 message_count += 1
                 logging.debug("Received UDP message %d from %s (%d bytes)", message_count, address[0] if address else 'unknown', len(data))
-                
+
                 if len(data) < 8:  # Need at least 8 bytes for magic number
                     logging.debug("Message too short for kdump magic number")
                     continue
-                    
+
                 magic_number = struct.unpack('ii', data[:8])[0]
                 magic_hex = hex(magic_number).upper()
                 logging.debug("Magic number: %s", magic_hex)
-                
-                if magic_hex != "0x1B302A40":
+
+                if magic_hex != "0X1B302A40":
                     logging.debug("Invalid kdump magic number: %s", magic_hex)
                     continue
-                
+
                 if not address:
                     logging.debug("No source address in kdump message")
                     continue
-                    
+
                 try:
                     hostname = socket.gethostbyaddr(address[0])[0].split('.', 1)[0]
                     logging.debug("Kdump message from host: %s (IP: %s)", hostname, address[0])
-                    
+
                     matching_hosts = [host for host in broken_computes if hostname in host]
                     if matching_hosts:
                         kdumping_hosts.add(matching_hosts[0])
@@ -1372,17 +1372,17 @@ def _check_kdump(stale_services, service):
                 except Exception as e:
                     logging.debug("Failed to resolve hostname for %s: %s", address[0], e)
                     continue
-                    
+
             except socket.timeout:
                 logging.debug("Kdump listening timeout reached")
                 break
             except Exception as e:
                 logging.debug("Error receiving kdump message: %s", e)
                 break
-        
-        logging.debug("Kdump check completed: received %d messages, found %d kdumping hosts", 
+
+        logging.debug("Kdump check completed: received %d messages, found %d kdumping hosts",
                      message_count, len(kdumping_hosts))
-                
+
     except PermissionError:
         logging.error("Kdump checking failed: Permission denied to bind UDP port %d. Check user privileges.", udp_port)
         logging.warning("Proceeding with evacuation without kdump filtering due to permission error")
@@ -1406,13 +1406,13 @@ def _check_kdump(stale_services, service):
     # Return services not kdumping
     non_kdumping_hosts = broken_computes - kdumping_hosts
     filtered_services = [svc for svc in stale_services if svc.host in non_kdumping_hosts]
-    
+
     if kdumping_hosts:
         logging.info("Kdumping hosts excluded from evacuation: %s", sorted(kdumping_hosts))
         logging.info("Proceeding with evacuation of %d non-kdumping hosts", len(filtered_services))
     else:
         logging.info("No kdump activity detected, proceeding with evacuation of all %d hosts", len(filtered_services))
-    
+
     return filtered_services
 
 
@@ -1463,19 +1463,19 @@ def _redfish_reset(url, user, passwd, timeout, action):
 
     payload = {"ResetType": action}
     headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
-    
+
     try:
         # Handle SSL config type issue - convert tuple to cert parameter
         ssl_config = config_manager.get_requests_ssl_config()
         if isinstance(ssl_config, tuple):
             # Client cert authentication
-            response = requests.post(reset_url, json=payload, headers=headers, 
+            response = requests.post(reset_url, json=payload, headers=headers,
                                    auth=(user, passwd), cert=ssl_config, timeout=timeout)
         else:
             # Standard SSL verification
-            response = requests.post(reset_url, json=payload, headers=headers, 
+            response = requests.post(reset_url, json=payload, headers=headers,
                                    auth=(user, passwd), verify=ssl_config, timeout=timeout)
-        
+
         if response.status_code in [200, 204]:
             logging.info("Redfish reset successful: %s on %s", action, url)
             return True
@@ -1508,8 +1508,8 @@ def _bmh_fence(token, namespace, host, action):
             annotation_value = None
 
         data = {"metadata": {"annotations": {"reboot.metal3.io/iha": annotation_value}}}
-        
-        response = requests.patch(f"{base_url}?fieldManager=kubectl-patch", 
+
+        response = requests.patch(f"{base_url}?fieldManager=kubectl-patch",
                                 headers=headers, json=data, verify=cacert, timeout=10)
         response.raise_for_status()
 
@@ -1593,29 +1593,29 @@ def _bmh_wait_for_power_off(get_url, headers, cacert, host, timeout, poll_interv
 def _execute_fence_operation(host, action, fencing_data):
     """Unified fencing execution with agent-specific dispatch and validation."""
     agent = fencing_data.get("agent", "").lower()
-    
+
     def _validate_params(required_params, agent_name):
         missing = [p for p in required_params if p not in fencing_data]
         if missing:
             logging.error("Missing %s params for %s: %s", agent_name, host, missing)
             return False
         return True
-    
+
     try:
         if "noop" in agent:
             logging.warning("Using noop fencing agent for %s %s. VMs may get corrupted.", host, action)
             return True
-        
+
         elif "ipmi" in agent:
             if not _validate_params(["ipaddr", "ipport", "login", "passwd"], "IPMI"):
                 return False
-            cmd = ["ipmitool", "-I", "lanplus", "-H", fencing_data["ipaddr"], 
-                   "-U", fencing_data["login"], "-P", fencing_data["passwd"], 
+            cmd = ["ipmitool", "-I", "lanplus", "-H", fencing_data["ipaddr"],
+                   "-U", fencing_data["login"], "-P", fencing_data["passwd"],
                    "-p", fencing_data["ipport"], "power", action]
             subprocess.run(cmd, timeout=30, capture_output=True, text=True, check=True)
             logging.info("IPMI %s successful for %s", action, host)
             return True
-        
+
         elif "redfish" in agent:
             if not _validate_params(["ipaddr", "login", "passwd"], "Redfish"):
                 return False
@@ -1626,19 +1626,19 @@ def _execute_fence_operation(host, action, fencing_data):
             protocol = "https" if tls else "http"
             url = f'{protocol}://{ip}:{port}/redfish/v1/Systems/{uuid}'
             redfish_action = "ForceOff" if action == "off" else "On"
-            return _redfish_reset(url, fencing_data["login"], fencing_data["passwd"], 
+            return _redfish_reset(url, fencing_data["login"], fencing_data["passwd"],
                                 fencing_data.get("timeout", 30), redfish_action)
-        
+
         elif "bmh" in agent:
             if not _validate_params(["token", "host", "namespace"], "BMH"):
                 return False
-            return _bmh_fence(fencing_data["token"], fencing_data["namespace"], 
+            return _bmh_fence(fencing_data["token"], fencing_data["namespace"],
                              fencing_data["host"], action)
-        
+
         else:
             logging.error("Unknown fencing agent: %s", agent)
             return False
-            
+
     except Exception as e:
         logging.error("%s fencing failed for %s: %s", agent.upper(), host, e)
         return False
@@ -1656,20 +1656,20 @@ def _host_fence(host, action, service):
         # Look up fencing configuration
         short_hostname = host.split('.', 1)[0]
         matching_configs = [v for k, v in service.config.fencing.items() if k in short_hostname]
-        
+
         if not matching_configs:
             logging.error("No fencing data found for %s", host)
             return False
 
         fencing_data = matching_configs[0]
-        
+
         if not isinstance(fencing_data, dict) or "agent" not in fencing_data:
             logging.error("Invalid fencing data for %s", host)
             return False
 
         logging.debug("Using fencing agent '%s' for %s", fencing_data["agent"], host)
         return _execute_fence_operation(host, action, fencing_data)
-        
+
     except Exception as e:
         logging.error("Fencing failed for %s: %s", host, e)
         return False
@@ -1680,21 +1680,21 @@ def _get_nova_connection(service):
     """Establish a connection to Nova using environment configuration."""
     try:
         cloud_name = os.getenv('OS_CLOUD', 'overcloud')
-        
+
         if cloud_name not in service.config.clouds or cloud_name not in service.config.secure:
             logging.error("Configuration not found for cloud: %s", cloud_name)
             return None
 
         auth = service.config.clouds[cloud_name]["auth"]
         secure = service.config.secure[cloud_name]["auth"]
-        
-        conn = nova_login(auth["username"], secure["password"], auth["project_name"], 
+
+        conn = nova_login(auth["username"], secure["password"], auth["project_name"],
                          auth["auth_url"], auth["user_domain_name"], auth["project_domain_name"])
-        
+
         if not conn:
             logging.error("Nova connection failed")
         return conn
-        
+
     except Exception as e:
         logging.error("Failed to establish Nova connection: %s", e)
         return None
@@ -1703,55 +1703,55 @@ def _get_nova_connection(service):
 def _enable_matching_reserved_host(conn, failed_service, reserved_hosts, service, use_aggregates=True):
     """
     Enable a reserved host that matches the failed service criteria.
-    
+
     Args:
-        conn: Nova client connection  
+        conn: Nova client connection
         failed_service: Failed service to match
         reserved_hosts: List of available reserved hosts
         service: Service instance for configuration access
         use_aggregates: True to match by aggregate, False to match by zone
-        
+
     Returns:
         bool: True if a host was enabled, False otherwise
     """
     try:
         matching_hosts = []
-        
+
         if use_aggregates:
             # Match by aggregate
             compute_aggregate_ids = _aggregate_ids(conn, failed_service)
             if not compute_aggregate_ids:
                 return False
-                
+
             for host in reserved_hosts:
-                if (service.is_aggregate_evacuable(conn, host.host) and 
+                if (service.is_aggregate_evacuable(conn, host.host) and
                     set(_aggregate_ids(conn, host)).intersection(compute_aggregate_ids)):
                     matching_hosts.append(host)
-            
+
             match_type = "aggregate"
         else:
             # Match by availability zone
-            matching_hosts = [host for host in reserved_hosts 
+            matching_hosts = [host for host in reserved_hosts
                             if host.zone == failed_service.zone]
             match_type = "AZ"
-        
+
         if not matching_hosts:
-            logging.warning("No reserved compute found in the same %s as %s", 
+            logging.warning("No reserved compute found in the same %s as %s",
                           match_type, failed_service.host)
             return False
-        
+
         # Enable the first matching host
         selected_host = matching_hosts[0]
         reserved_hosts.remove(selected_host)
-        
+
         if not _host_enable(conn, selected_host, reenable=False):
             logging.error("Failed to enable reserved host %s", selected_host.host)
             return False
-        
+
         logging.info("Enabled host %s from the reserved pool (same %s as %s)",
                     selected_host.host, match_type, failed_service.host)
         return True
-        
+
     except Exception as e:
         logging.error("Error enabling reserved host by %s: %s", match_type, e)
         return False
@@ -1856,7 +1856,7 @@ def process_service(failed_service, reserved_hosts, resume, service):
 
     host_name = failed_service.host
     reserved_hosts = reserved_hosts or []
-    
+
     logging.info("Processing service %s (resume=%s)", host_name, resume)
 
     # Get Nova connection first
@@ -1872,15 +1872,15 @@ def process_service(failed_service, reserved_hosts, resume, service):
         if not _execute_step("Host disable", _host_disable, host_name, conn, failed_service):
             return False
 
-    if not _execute_step("Reserved host management", _manage_reserved_hosts, host_name, 
+    if not _execute_step("Reserved host management", _manage_reserved_hosts, host_name,
                         conn, failed_service, reserved_hosts, service):
         return False
-    
-    if not _execute_step("Evacuation", _host_evacuate, host_name, 
+
+    if not _execute_step("Evacuation", _host_evacuate, host_name,
                         conn, failed_service, service):
         return False
-    
-    if not _execute_step("Recovery", _post_evacuation_recovery, host_name, 
+
+    if not _execute_step("Recovery", _post_evacuation_recovery, host_name,
                         conn, failed_service, service):
         return False
 
@@ -1933,14 +1933,14 @@ def main():
     # Performance optimization: reuse hash objects and reduce hash calculation frequency
     last_hash_time = 0
     hash_interval = 60  # Update hash every 60 seconds instead of every loop
-    
+
     while True:
         current_timestamp = time.time()
-        
+
         # Update hash less frequently for better performance
         if current_timestamp - last_hash_time > hash_interval:
             new_hash = hashlib.sha256(str(current_timestamp).encode()).hexdigest()
-            
+
             if new_hash == previous_hash:
                 logging.error("Hash has not changed. Something went wrong.")
                 hash_update_successful = False
@@ -1957,24 +1957,24 @@ def main():
                     continue
 
                 target_date = datetime.now() - timedelta(seconds=service.config.get_delta())
-            
+
             # Single pass filtering for better performance
             compute_nodes = []
             to_resume = []
             to_reenable = []
-            
+
             for svc in services:
                 # Check for nodes to re-enable (forced_down but enabled)
                 if 'enabled' in svc.status and svc.forced_down:
                     to_reenable.append(svc)
-                
+
                 # Check for nodes needing evacuation
-                elif ((datetime.fromisoformat(svc.updated_at) < target_date and svc.state != 'down') or 
+                elif ((datetime.fromisoformat(svc.updated_at) < target_date and svc.state != 'down') or
                       svc.state == 'down') and 'disabled' not in svc.status and not svc.forced_down:
                     compute_nodes.append(svc)
-                
-                # Check for nodes to resume evacuation  
-                elif (svc.forced_down and svc.state == 'down' and 'disabled' in svc.status and 
+
+                # Check for nodes to resume evacuation
+                elif (svc.forced_down and svc.state == 'down' and 'disabled' in svc.status and
                       'instanceha evacuation' in svc.disabled_reason and 'evacuation FAILED' not in svc.disabled_reason):
                     to_resume.append(svc)
 
@@ -1988,20 +1988,20 @@ def main():
                     # Batch cache operations for better performance
                     host_servers_cache = service.get_hosts_with_servers_cached(conn, compute_nodes)
                     compute_nodes = service.filter_hosts_with_servers(compute_nodes, host_servers_cache)
-                    
+
                     if not compute_nodes:
                         logging.debug("No compute nodes with servers to evacuate")
-                    
+
                 # Get reserved hosts only if feature is enabled and we have nodes to process
-                reserved_hosts = ([svc for svc in services if 'disabled' in svc.status and 'reserved' in svc.disabled_reason] 
+                reserved_hosts = ([svc for svc in services if 'disabled' in svc.status and 'reserved' in svc.disabled_reason]
                                 if service.config.is_reserved_hosts_enabled() and compute_nodes else [])
 
                 # Intelligent cache management - refresh only when needed
                 service.refresh_evacuable_cache(conn)
-                
+
                 images_enabled = service.config.is_tagged_images_enabled()
                 flavors_enabled = service.config.is_tagged_flavors_enabled()
-                
+
                 images = service.get_evacuable_images(conn) if images_enabled else []
                 flavors = service.get_evacuable_flavors(conn) if flavors_enabled else []
 
@@ -2011,26 +2011,26 @@ def main():
                     if not images and not flavors:
                         logging.info("No tagged resources found - will evacuate all servers")
 
-                # Optimize aggregate filtering with batch API call  
+                # Optimize aggregate filtering with batch API call
                 if service.config.is_tagged_aggregates_enabled() and compute_nodes:
                     try:
                         aggregates = conn.aggregates.list()
                         evacuable_tag = service.config.get_evacuable_tag()
                         evacuable_hosts = set()
-                        
+
                         # Single pass through aggregates to find evacuable hosts
                         for agg in aggregates:
-                            is_evacuable = (evacuable_tag in agg.metadata and 
+                            is_evacuable = (evacuable_tag in agg.metadata and
                                           str(agg.metadata[evacuable_tag]).lower() == 'true') or \
-                                         any(evacuable_tag in key and str(agg.metadata[key]).lower() == 'true' 
+                                         any(evacuable_tag in key and str(agg.metadata[key]).lower() == 'true'
                                              for key in agg.metadata)
                             if is_evacuable:
                                 evacuable_hosts.update(agg.hosts)
-                        
-                        compute_nodes_down = compute_nodes  
+
+                        compute_nodes_down = compute_nodes
                         compute_nodes = [svc for svc in compute_nodes if svc.host in evacuable_hosts]
                         services = [svc for svc in services if svc.host in evacuable_hosts]
-                        
+
                         down_not_tagged = [svc.host for svc in compute_nodes_down if svc not in compute_nodes]
                         if down_not_tagged:
                             logging.warning('The following computes are not part of an evacuable aggregate: %s', down_not_tagged)
@@ -2066,7 +2066,7 @@ def main():
             if to_reenable:
                 logging.debug('Checking %d computes for re-enabling', len(to_reenable))
                 force_enable = service.config.is_force_enable_enabled()
-                
+
                 for svc in to_reenable:
                     try:
                         if force_enable:
@@ -2077,31 +2077,31 @@ def main():
                             # Check migration status efficiently
                             migrations = conn.migrations.list(source_compute=svc.host, migration_type='evacuation', limit=10)
                             incomplete = [m for m in migrations if m.status not in ['completed', 'error', 'failed']]
-                            
+
                             if not incomplete:
                                 _host_enable(conn, svc, reenable=True)
                                 logging.info('All migrations completed, re-enabled %s', svc.host)
                             else:
                                 logging.debug('Migration(s) incomplete for %s, not re-enabling', svc.host)
-                                
+
                     except Exception as e:
                         logging.error('Failed to enable %s: %s', svc.host, e)
-                         
+
                 # Memory cleanup for large deployments
                 if 'host_servers_cache' in locals():
                     del host_servers_cache, compute_nodes, to_resume, to_reenable, services
-                
+
         except Exception as e:
             logging.warning("Failed to query compute status. Please check the Nova Api availability.")
             metrics.increment('main_loop_errors')
 
-        # Log performance metrics periodically  
+        # Log performance metrics periodically
         if not hasattr(metrics, '_last_summary'):
             metrics._last_summary = 0
         if time.time() - metrics._last_summary > 3600:
             metrics.log_summary()
             metrics._last_summary = time.time()
-            
+
         time.sleep(service.config.get_poll_interval())
 
 
