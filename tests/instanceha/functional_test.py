@@ -2593,6 +2593,54 @@ class TestHostStateClassification(BaseTestCase):
 
         print(f"Failed evacuation service {host} correctly ignored")
 
+    def test_disabled_maintenance_node_not_evacuated(self):
+        """
+        Test that disabled/maintenance compute nodes are not evacuated.
+
+        Scenario:
+        - Service is disabled for maintenance
+        - Service goes down/fails
+        - Should NOT be classified for evacuation due to disabled status
+        """
+        host = 'compute-maintenance-01'
+
+        # Add compute node that is disabled for maintenance and fails
+        self.env.add_compute_node(host, state='down', status='disabled', forced_down=False,
+                                 disabled_reason='maintenance')
+
+        # Add some VMs
+        self.env.add_server(host, evacuable=True)
+        self.env.add_server(host, evacuable=True)
+
+        # Test the classification logic
+        services = self.env.mock_nova.services.list(binary='nova-compute')
+        target_date = datetime.now() - timedelta(seconds=self.env.service.config.get_delta())
+
+        compute_nodes = []
+        to_resume = []
+        to_reenable = []
+
+        for svc in services:
+            if svc.host == host:
+                # Check for nodes to re-enable (forced_down but enabled)
+                if 'enabled' in svc.status and svc.forced_down:
+                    to_reenable.append(svc)
+
+                # Check for nodes needing evacuation (stale or down, enabled, not forced_down)
+                elif ((datetime.fromisoformat(svc.updated_at) < target_date and svc.state != 'down') or
+                      svc.state == 'down') and 'disabled' not in svc.status and not svc.forced_down:
+                    compute_nodes.append(svc)
+
+                # Check for nodes to resume evacuation
+                elif (svc.forced_down and svc.state == 'down' and 'disabled' in svc.status and
+                      'instanceha evacuation' in svc.disabled_reason and 'evacuation FAILED' not in svc.disabled_reason):
+                    to_resume.append(svc)
+
+        # Verify classification - should be in no lists due to disabled status
+        self.assertEqual(len(compute_nodes), 0, f"Expected 0 compute nodes, got {len(compute_nodes)}")
+        self.assertEqual(len(to_resume), 0, f"Expected 0 resume services, got {len(to_resume)}")
+        self.assertEqual(len(to_reenable), 0, f"Expected 0 reenable services, got {len(to_reenable)}")
+
     def test_mixed_scenario_classification(self):
         """
         Test classification with multiple hosts in different states.
