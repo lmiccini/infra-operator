@@ -117,8 +117,8 @@ class ConfigManager:
                 raise ConfigurationError(str(e))
 
         # Validate special conditions
-        if self.get_bool('CHECK_KDUMP') and self.get_int('POLL', 45) == 30:
-            logging.warning('CHECK_KDUMP Enabled and POLL set to 30 seconds. This may result in unexpected failures. Please increase POLL to 45 or greater.')
+        if self.get_bool('CHECK_KDUMP') and self.get_int('POLL', 45) <= 30:
+            logging.warning('CHECK_KDUMP Enabled and POLL set to 30 seconds or less. This may result in unexpected failures. Please increase POLL to 45 or greater.')
 
     def get_str(self, key: str, default: str = '') -> str:
         """Get a string configuration value with validation."""
@@ -380,6 +380,7 @@ class InstanceHAService:
         self._evacuable_flavors_cache = None
         self._evacuable_images_cache = None
         self._cache_timestamp = 0
+        self._cache_lock = threading.Lock()
 
         # Constants
         self.UDP_IP = ''
@@ -1323,18 +1324,19 @@ def _check_kdump(stale_services, service):
     udp_ip = service.UDP_IP if service.UDP_IP else '0.0.0.0'  # Bind to all interfaces if empty
     udp_port = service.config.get_udp_port()
 
-    logging.debug("Listening for kdump messages on %s:%d for 30 seconds", udp_ip, udp_port)
+    timeout = service.config.get_poll() - 10
+    logging.debug("Listening for kdump messages on %s:%d for %d seconds", udp_ip, udp_port, timeout)
 
     sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(30)
+        sock.settimeout(timeout)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow port reuse
         sock.bind((udp_ip, udp_port))
 
         logging.debug("Successfully bound to UDP port %d, listening for kdump messages", udp_port)
 
-        timeout_end = time.time() + 30
+        timeout_end = time.time() + timeout
         message_count = 0
 
         while time.time() < timeout_end:
@@ -2040,7 +2042,7 @@ def main():
                 logging.debug('List of stale services is %s' % [svc.host for svc in compute_nodes])
 
                 if compute_nodes or to_resume:
-                    if (len(compute_nodes) / len(services) * 100) > service.config.get_threshold():
+                    if services and (len(compute_nodes) / len(services) * 100) > service.config.get_threshold():
                         logging.error('Number of impacted computes exceeds the defined threshold. There is something wrong. Not evacuating.')
                         pass
                     else:

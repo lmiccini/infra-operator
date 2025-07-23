@@ -876,7 +876,7 @@ class TestLargeScaleEvacuableAggregates(unittest.TestCase):
             self.assertFalse(self.env.service.is_aggregate_evacuable(self.env.mock_nova, service.host),
                            f"Non-evacuable host {service.host} should not be evacuable")
 
-        print("✅ Large-scale evacuable aggregates test completed successfully")
+        print("Large-scale evacuable aggregates test completed successfully")
         print(f"   - Processed {len(failed_services)} failed evacuable computes")
         print(f"   - Managed {len(reserved_services)} reserved hosts")
         print(f"   - Would evacuate {total_vms_to_evacuate} VMs")
@@ -910,7 +910,7 @@ class TestLargeScaleEvacuableAggregates(unittest.TestCase):
         self.assertGreater(failure_percentage, 20,
                           f"Failure percentage {failure_percentage}% should exceed threshold")
 
-        print(f"✅ Threshold test: {failure_percentage:.1f}% failure rate exceeds 20% threshold")
+        print(f"Threshold test: {failure_percentage:.1f}% failure rate exceeds 20% threshold")
 
     def test_reserved_host_aggregate_matching(self):
         """Test that reserved hosts are properly matched with failed hosts in same aggregate."""
@@ -953,7 +953,7 @@ class TestLargeScaleEvacuableAggregates(unittest.TestCase):
                 self.assertTrue(result, "Reserved host management should succeed")
                 mock_enable.assert_called_once()
 
-        print("✅ Reserved host aggregate matching test completed successfully")
+        print("Reserved host aggregate matching test completed successfully")
 
     def test_mass_failure_threshold_protection(self):
         """
@@ -966,7 +966,7 @@ class TestLargeScaleEvacuableAggregates(unittest.TestCase):
         - THRESHOLD set to 50%
         - Should log warning and prevent evacuation
         """
-        print("\n🚨 Testing mass failure threshold protection (80% host failures)...")
+        print("\nTesting mass failure threshold protection (80% host failures)...")
 
         # Step 1: Set up 100 compute nodes with 10 VMs each
         all_hosts = []
@@ -981,21 +981,21 @@ class TestLargeScaleEvacuableAggregates(unittest.TestCase):
                 vm_id = f'vm-{host}-{vm_idx:02d}'
                 self.env.add_server(host, id=vm_id, evacuable=True)
 
-        print(f"✅ Created 100 compute nodes with 1000 VMs (10 VMs per compute)")
+        print(f"Created 100 compute nodes with 1000 VMs (10 VMs per compute)")
 
         # Step 2: Create evacuable aggregate with all hosts
         self.env.add_evacuable_aggregate(all_hosts, tag_value='true')
 
         # Step 3: Set threshold to 50%
         self.env.config_manager.config['THRESHOLD'] = 50
-        print(f"✅ Set THRESHOLD to 50%")
+        print(f"Set THRESHOLD to 50%")
 
         # Step 4: Simulate failure of 80 hosts (80% failure rate)
         failed_hosts = all_hosts[:80]  # Take first 80 hosts
         for host in failed_hosts:
             self.env.simulate_host_failure(host)
 
-        print(f"💥 Simulated failure of {len(failed_hosts)} hosts ({len(failed_hosts)}% failure rate)")
+        print(f"Simulated failure of {len(failed_hosts)} hosts ({len(failed_hosts)}% failure rate)")
 
         # Step 5: Get all services and verify failure detection
         services = self.env.mock_nova.services.list(binary='nova-compute')
@@ -1008,8 +1008,8 @@ class TestLargeScaleEvacuableAggregates(unittest.TestCase):
         self.assertEqual(len(healthy_services), 20,
                         f"Expected 20 healthy services, got {len(healthy_services)}")
 
-        print(f"✅ Confirmed {len(failed_services)} services marked as failed")
-        print(f"✅ Confirmed {len(healthy_services)} services remain healthy")
+        print(f"Confirmed {len(failed_services)} services marked as failed")
+        print(f"Confirmed {len(healthy_services)} services remain healthy")
 
         # Step 6: Calculate and verify threshold is exceeded
         failure_percentage = (len(failed_services) / len(services)) * 100
@@ -1020,14 +1020,14 @@ class TestLargeScaleEvacuableAggregates(unittest.TestCase):
         self.assertGreater(failure_percentage, threshold,
                           f"Failure rate {failure_percentage}% should exceed threshold {threshold}%")
 
-        print(f"✅ Verified: {failure_percentage}% failure rate exceeds {threshold}% threshold")
+        print(f"Verified: {failure_percentage}% failure rate exceeds {threshold}% threshold")
 
         # Step 7: Test that threshold protection prevents evacuation
         threshold_exceeded = (len(failed_services) / len(services) * 100) > threshold
 
         if threshold_exceeded:
             # This is what should happen - no evacuation due to threshold protection
-            print(f"🛡️  THRESHOLD PROTECTION ACTIVATED: {failure_percentage}% > {threshold}%")
+            print(f"THRESHOLD PROTECTION ACTIVATED: {failure_percentage}% > {threshold}%")
 
             # Verify no evacuation functions would be called
             with patch('instanceha._get_nova_connection', return_value=self.env.mock_nova):
@@ -1037,7 +1037,7 @@ class TestLargeScaleEvacuableAggregates(unittest.TestCase):
                             with patch('instanceha._post_evacuation_recovery', return_value=True) as mock_recovery:
                                 # In real code, this branch wouldn't execute due to threshold check
                                 # But we verify the protection logic works
-                                print("🚫 Evacuation BLOCKED by threshold protection")
+                                print("Evacuation BLOCKED by threshold protection")
 
                                 # These should NOT be called due to threshold protection
                                 mock_fence.assert_not_called()
@@ -1054,7 +1054,7 @@ class TestLargeScaleEvacuableAggregates(unittest.TestCase):
         self.assertEqual(total_vms_on_failed_hosts, 800,
                         f"Expected 800 VMs on failed hosts (80 hosts × 10 VMs), got {total_vms_on_failed_hosts}")
 
-        print(f"✅ Confirmed {total_vms_on_failed_hosts} VMs would NOT be evacuated due to threshold protection")
+        print(f"Confirmed {total_vms_on_failed_hosts} VMs would NOT be evacuated due to threshold protection")
 
         # Step 9: Verify healthy hosts remain unaffected
         healthy_hosts = [s.host for s in healthy_services]
@@ -1066,7 +1066,7 @@ class TestLargeScaleEvacuableAggregates(unittest.TestCase):
         self.assertEqual(total_vms_on_healthy_hosts, 200,
                         f"Expected 200 VMs on healthy hosts (20 hosts × 10 VMs), got {total_vms_on_healthy_hosts}")
 
-        print(f"✅ Confirmed {total_vms_on_healthy_hosts} VMs remain running on healthy hosts")
+        print(f"Confirmed {total_vms_on_healthy_hosts} VMs remain running on healthy hosts")
 
         # Step 10: Test logging of threshold warning
         import logging
@@ -1074,14 +1074,14 @@ class TestLargeScaleEvacuableAggregates(unittest.TestCase):
             # Simulate the warning that would be logged
             if threshold_exceeded:
                 expected_message = f'Number of impacted computes exceeds the defined threshold. There is something wrong. Not evacuating.'
-                print(f"⚠️  Expected warning: '{expected_message}'")
+                print(f"Expected warning: '{expected_message}'")
 
-        print("\n🎉 Mass failure threshold protection test completed successfully!")
-        print(f"   - 🚨 {failure_percentage}% failure rate exceeded {threshold}% threshold")
-        print(f"   - 🛡️  Threshold protection prevented evacuation")
-        print(f"   - 🚫 {total_vms_on_failed_hosts} VMs protected from unnecessary evacuation")
-        print(f"   - ✅ {total_vms_on_healthy_hosts} VMs continue running normally")
-        print(f"   - 📊 Infrastructure status: {len(healthy_services)} healthy, {len(failed_services)} failed")
+        print("\nMass failure threshold protection test completed successfully!")
+        print(f"   - {failure_percentage}% failure rate exceeded {threshold}% threshold")
+        print(f"   - Threshold protection prevented evacuation")
+        print(f"   - {total_vms_on_failed_hosts} VMs protected from unnecessary evacuation")
+        print(f"   - {total_vms_on_healthy_hosts} VMs continue running normally")
+        print(f"   - Infrastructure status: {len(healthy_services)} healthy, {len(failed_services)} failed")
 
 
 class TestResumeEvacuation(unittest.TestCase):
@@ -1105,7 +1105,7 @@ class TestResumeEvacuation(unittest.TestCase):
         - These 2 computes should be added to to_resume list
         - VMs on these computes should be evacuated
         """
-        print("\n🔄 Testing resume evacuation scenario...")
+        print("\nTesting resume evacuation scenario...")
 
         # Step 1: Set up 10 compute nodes with 5 VMs each
         all_hosts = []
@@ -1119,7 +1119,7 @@ class TestResumeEvacuation(unittest.TestCase):
                 vm_id = f'vm-{host}-{vm_idx}'
                 self.env.add_server(host, id=vm_id, evacuable=True)
 
-        print(f"✅ Created 10 compute nodes with 50 VMs (5 VMs per compute)")
+        print(f"Created 10 compute nodes with 50 VMs (5 VMs per compute)")
 
         # Step 2: Simulate 2 computes that were already being evacuated
         # These should have: forced_down=True, state='down', status='disabled',
@@ -1136,7 +1136,7 @@ class TestResumeEvacuation(unittest.TestCase):
                     svc_data['disabled_reason'] = 'instanceha evacuation: 2025-01-07T10:30:00'
                     break
 
-        print(f"✅ Simulated 2 computes in half-evacuated state: {resume_hosts}")
+        print(f"Simulated 2 computes in half-evacuated state: {resume_hosts}")
 
         # Step 3: Verify the services are correctly identified for resumption
         services = self.env.mock_nova.services.list(binary='nova-compute')
@@ -1154,7 +1154,7 @@ class TestResumeEvacuation(unittest.TestCase):
         self.assertCountEqual(resume_hostnames, resume_hosts,
                              f"Expected resume hosts {resume_hosts}, got {resume_hostnames}")
 
-        print(f"✅ Identified {len(to_resume)} services for resumption: {resume_hostnames}")
+        print(f"Identified {len(to_resume)} services for resumption: {resume_hostnames}")
 
         # Step 4: Verify VMs are present on the hosts to be resumed
         total_vms_to_resume = 0
@@ -1214,7 +1214,7 @@ class TestResumeEvacuation(unittest.TestCase):
                                 self.assertEqual(mock_recovery.call_count, 2,
                                                f"Expected 2 recovery calls, got {mock_recovery.call_count}")
 
-        print("✅ Resume evacuation process verified")
+        print("Resume evacuation process verified")
 
         # Step 6: Verify the remaining 8 hosts are unaffected
         unaffected_hosts = [h for h in all_hosts if h not in resume_hosts]
@@ -1226,7 +1226,7 @@ class TestResumeEvacuation(unittest.TestCase):
             self.assertEqual(svc.state, 'up', f"Host {svc.host} should be up")
             self.assertEqual(svc.status, 'enabled', f"Host {svc.host} should be enabled")
 
-        print(f"✅ Verified {len(healthy_services)} unaffected hosts remain healthy")
+        print(f"Verified {len(healthy_services)} unaffected hosts remain healthy")
 
         # Step 7: Verify VMs on unaffected hosts are still running
         unaffected_vms = 0
@@ -1237,14 +1237,14 @@ class TestResumeEvacuation(unittest.TestCase):
         self.assertEqual(unaffected_vms, 40,
                         f"Expected 40 VMs on unaffected hosts (8 hosts × 5 VMs), got {unaffected_vms}")
 
-        print(f"✅ Verified {unaffected_vms} VMs continue running on unaffected hosts")
+        print(f"Verified {unaffected_vms} VMs continue running on unaffected hosts")
 
-        print("\n🎉 Resume evacuation test completed successfully!")
-        print(f"   - 🔄 2 computes resumed evacuation process")
-        print(f"   - 📤 10 VMs evacuated from resumed hosts")
-        print(f"   - ✅ 8 hosts remained unaffected")
-        print(f"   - 🏃 40 VMs continued running normally")
-        print(f"   - 🎯 Resume logic correctly identified half-evacuated computes")
+        print("\nResume evacuation test completed successfully!")
+        print(f"   - 2 computes resumed evacuation process")
+        print(f"   - 10 VMs evacuated from resumed hosts")
+        print(f"   - 8 hosts remained unaffected")
+        print(f"   - 40 VMs continued running normally")
+        print(f"   - Resume logic correctly identified half-evacuated computes")
 
 
 class TestKdumpFunctionality(unittest.TestCase):
@@ -2150,6 +2150,473 @@ class TestEvacuationLogicCombinations(unittest.TestCase):
                         "Should find compute node with evacuable servers")
 
 
+class TestHostStateClassification(unittest.TestCase):
+    """Test classification of compute hosts into different states based on their service properties."""
+
+    def setUp(self):
+        """Set up test environment."""
+        self.env = FunctionalTestEnvironment()
+
+    def tearDown(self):
+        """Clean up test environment."""
+        self.env.cleanup()
+
+    def test_stale_services_classification(self):
+        """
+        Test classification of services that are up but not updating their status.
+
+        Scenario:
+        - Service is enabled and not forced_down
+        - Service state is 'up' but updated_at is older than DELTA threshold
+        - These should be classified as needing evacuation (compute_nodes)
+        """
+        print("\nTesting stale services classification...")
+
+        # Create a service that hasn't updated in 60 seconds (older than DELTA=30)
+        old_timestamp = (datetime.now() - timedelta(seconds=60)).isoformat()
+        host = 'compute-stale-01'
+
+        # Add compute node with old timestamp
+        self.env.add_compute_node(host, state='up', status='enabled',
+                                 updated_at=old_timestamp, forced_down=False)
+
+        # Add some VMs to make it eligible for evacuation
+        self.env.add_server(host, evacuable=True)
+        self.env.add_server(host, evacuable=True)
+
+        print(f"Created stale service {host} with timestamp {old_timestamp}")
+
+        # Test the classification logic
+        services = self.env.mock_nova.services.list(binary='nova-compute')
+        target_date = datetime.now() - timedelta(seconds=self.env.service.config.get_delta())
+
+        compute_nodes = []
+        to_resume = []
+        to_reenable = []
+
+        for svc in services:
+            if svc.host == host:
+                # Check for nodes to re-enable (forced_down but enabled)
+                if 'enabled' in svc.status and svc.forced_down:
+                    to_reenable.append(svc)
+
+                # Check for nodes needing evacuation (stale or down, enabled, not forced_down)
+                elif ((datetime.fromisoformat(svc.updated_at) < target_date and svc.state != 'down') or
+                      svc.state == 'down') and 'disabled' not in svc.status and not svc.forced_down:
+                    compute_nodes.append(svc)
+
+                # Check for nodes to resume evacuation
+                elif (svc.forced_down and svc.state == 'down' and 'disabled' in svc.status and
+                      'instanceha evacuation' in svc.disabled_reason and 'evacuation FAILED' not in svc.disabled_reason):
+                    to_resume.append(svc)
+
+        # Verify classification
+        self.assertEqual(len(compute_nodes), 1, f"Expected 1 stale service, got {len(compute_nodes)}")
+        self.assertEqual(len(to_resume), 0, f"Expected 0 resume services, got {len(to_resume)}")
+        self.assertEqual(len(to_reenable), 0, f"Expected 0 reenable services, got {len(to_reenable)}")
+
+        self.assertEqual(compute_nodes[0].host, host)
+        self.assertEqual(compute_nodes[0].state, 'up')
+        self.assertIn('enabled', compute_nodes[0].status)
+        self.assertFalse(compute_nodes[0].forced_down)
+
+        print(f"Stale service {host} correctly classified as needing evacuation")
+
+    def test_down_services_classification(self):
+        """
+        Test classification of services that are completely down.
+
+        Scenario:
+        - Service state is 'down'
+        - Service is enabled and not forced_down
+        - These should be classified as needing evacuation (compute_nodes)
+        """
+        print("\nTesting down services classification...")
+
+        host = 'compute-down-01'
+
+        # Add compute node that is down
+        self.env.add_compute_node(host, state='down', status='enabled', forced_down=False)
+
+        # Add some VMs to make it eligible for evacuation
+        self.env.add_server(host, evacuable=True)
+        self.env.add_server(host, evacuable=True)
+
+        print(f"Created down service {host}")
+
+        # Test the classification logic
+        services = self.env.mock_nova.services.list(binary='nova-compute')
+        target_date = datetime.now() - timedelta(seconds=self.env.service.config.get_delta())
+
+        compute_nodes = []
+        to_resume = []
+        to_reenable = []
+
+        for svc in services:
+            if svc.host == host:
+                # Check for nodes to re-enable (forced_down but enabled)
+                if 'enabled' in svc.status and svc.forced_down:
+                    to_reenable.append(svc)
+
+                # Check for nodes needing evacuation (stale or down, enabled, not forced_down)
+                elif ((datetime.fromisoformat(svc.updated_at) < target_date and svc.state != 'down') or
+                      svc.state == 'down') and 'disabled' not in svc.status and not svc.forced_down:
+                    compute_nodes.append(svc)
+
+                # Check for nodes to resume evacuation
+                elif (svc.forced_down and svc.state == 'down' and 'disabled' in svc.status and
+                      'instanceha evacuation' in svc.disabled_reason and 'evacuation FAILED' not in svc.disabled_reason):
+                    to_resume.append(svc)
+
+        # Verify classification
+        self.assertEqual(len(compute_nodes), 1, f"Expected 1 down service, got {len(compute_nodes)}")
+        self.assertEqual(len(to_resume), 0, f"Expected 0 resume services, got {len(to_resume)}")
+        self.assertEqual(len(to_reenable), 0, f"Expected 0 reenable services, got {len(to_reenable)}")
+
+        self.assertEqual(compute_nodes[0].host, host)
+        self.assertEqual(compute_nodes[0].state, 'down')
+        self.assertIn('enabled', compute_nodes[0].status)
+        self.assertFalse(compute_nodes[0].forced_down)
+
+        print(f"Down service {host} correctly classified as needing evacuation")
+
+    def test_resume_evacuation_classification(self):
+        """
+        Test classification of services that need evacuation resumed.
+
+        Scenario:
+        - Service is forced_down=True
+        - Service state is 'down'
+        - Service status is 'disabled'
+        - Service disabled_reason contains 'instanceha evacuation' but not 'evacuation FAILED'
+        - These should be classified as needing evacuation resumed (to_resume)
+        """
+        print("\nTesting resume evacuation classification...")
+
+        host = 'compute-resume-01'
+        timestamp = datetime.now().isoformat()
+
+        # Add compute node that needs evacuation resumed
+        self.env.add_compute_node(host, state='down', status='disabled', forced_down=True,
+                                 disabled_reason=f'instanceha evacuation: {timestamp}')
+
+        # Add some VMs to make it eligible for evacuation
+        self.env.add_server(host, evacuable=True)
+        self.env.add_server(host, evacuable=True)
+
+        print(f"Created resume service {host}")
+
+        # Test the classification logic
+        services = self.env.mock_nova.services.list(binary='nova-compute')
+        target_date = datetime.now() - timedelta(seconds=self.env.service.config.get_delta())
+
+        compute_nodes = []
+        to_resume = []
+        to_reenable = []
+
+        for svc in services:
+            if svc.host == host:
+                # Check for nodes to re-enable (forced_down but enabled)
+                if 'enabled' in svc.status and svc.forced_down:
+                    to_reenable.append(svc)
+
+                # Check for nodes needing evacuation (stale or down, enabled, not forced_down)
+                elif ((datetime.fromisoformat(svc.updated_at) < target_date and svc.state != 'down') or
+                      svc.state == 'down') and 'disabled' not in svc.status and not svc.forced_down:
+                    compute_nodes.append(svc)
+
+                # Check for nodes to resume evacuation
+                elif (svc.forced_down and svc.state == 'down' and 'disabled' in svc.status and
+                      'instanceha evacuation' in svc.disabled_reason and 'evacuation FAILED' not in svc.disabled_reason):
+                    to_resume.append(svc)
+
+        # Verify classification
+        self.assertEqual(len(compute_nodes), 0, f"Expected 0 compute nodes, got {len(compute_nodes)}")
+        self.assertEqual(len(to_resume), 1, f"Expected 1 resume service, got {len(to_resume)}")
+        self.assertEqual(len(to_reenable), 0, f"Expected 0 reenable services, got {len(to_reenable)}")
+
+        self.assertEqual(to_resume[0].host, host)
+        self.assertEqual(to_resume[0].state, 'down')
+        self.assertIn('disabled', to_resume[0].status)
+        self.assertTrue(to_resume[0].forced_down)
+        self.assertIn('instanceha evacuation', to_resume[0].disabled_reason)
+
+        print(f"Resume service {host} correctly classified as needing evacuation resumed")
+
+    def test_reenable_services_classification(self):
+        """
+        Test classification of services that can be re-enabled.
+
+        Scenario:
+        - Service is forced_down=True
+        - Service status is 'enabled'
+        - These should be classified as needing re-enabling (to_reenable)
+        """
+        print("\nTesting reenable services classification...")
+
+        host = 'compute-reenable-01'
+
+        # Add compute node that can be re-enabled
+        self.env.add_compute_node(host, state='down', status='enabled', forced_down=True)
+
+        # Add some VMs (though this shouldn't affect re-enable classification)
+        self.env.add_server(host, evacuable=True)
+
+        print(f"Created reenable service {host}")
+
+        # Test the classification logic
+        services = self.env.mock_nova.services.list(binary='nova-compute')
+        target_date = datetime.now() - timedelta(seconds=self.env.service.config.get_delta())
+
+        compute_nodes = []
+        to_resume = []
+        to_reenable = []
+
+        for svc in services:
+            if svc.host == host:
+                # Check for nodes to re-enable (forced_down but enabled)
+                if 'enabled' in svc.status and svc.forced_down:
+                    to_reenable.append(svc)
+
+                # Check for nodes needing evacuation (stale or down, enabled, not forced_down)
+                elif ((datetime.fromisoformat(svc.updated_at) < target_date and svc.state != 'down') or
+                      svc.state == 'down') and 'disabled' not in svc.status and not svc.forced_down:
+                    compute_nodes.append(svc)
+
+                # Check for nodes to resume evacuation
+                elif (svc.forced_down and svc.state == 'down' and 'disabled' in svc.status and
+                      'instanceha evacuation' in svc.disabled_reason and 'evacuation FAILED' not in svc.disabled_reason):
+                    to_resume.append(svc)
+
+        # Verify classification
+        self.assertEqual(len(compute_nodes), 0, f"Expected 0 compute nodes, got {len(compute_nodes)}")
+        self.assertEqual(len(to_resume), 0, f"Expected 0 resume services, got {len(to_resume)}")
+        self.assertEqual(len(to_reenable), 1, f"Expected 1 reenable service, got {len(to_reenable)}")
+
+        self.assertEqual(to_reenable[0].host, host)
+        self.assertTrue(to_reenable[0].forced_down)
+        self.assertIn('enabled', to_reenable[0].status)
+
+        print(f"Reenable service {host} correctly classified as needing re-enabling")
+
+    def test_failed_evacuation_classification(self):
+        """
+        Test classification of services with failed evacuation.
+
+        Scenario:
+        - Service is forced_down=True
+        - Service state is 'down'
+        - Service status is 'disabled'
+        - Service disabled_reason contains 'evacuation FAILED'
+        - These should NOT be classified for any action (left alone)
+        """
+        print("\nTesting failed evacuation classification...")
+
+        host = 'compute-failed-01'
+        timestamp = datetime.now().isoformat()
+
+        # Add compute node with failed evacuation
+        self.env.add_compute_node(host, state='down', status='disabled', forced_down=True,
+                                 disabled_reason=f'evacuation FAILED: {timestamp}')
+
+        # Add some VMs
+        self.env.add_server(host, evacuable=True)
+
+        print(f"Created failed evacuation service {host}")
+
+        # Test the classification logic
+        services = self.env.mock_nova.services.list(binary='nova-compute')
+        target_date = datetime.now() - timedelta(seconds=self.env.service.config.get_delta())
+
+        compute_nodes = []
+        to_resume = []
+        to_reenable = []
+
+        for svc in services:
+            if svc.host == host:
+                # Check for nodes to re-enable (forced_down but enabled)
+                if 'enabled' in svc.status and svc.forced_down:
+                    to_reenable.append(svc)
+
+                # Check for nodes needing evacuation (stale or down, enabled, not forced_down)
+                elif ((datetime.fromisoformat(svc.updated_at) < target_date and svc.state != 'down') or
+                      svc.state == 'down') and 'disabled' not in svc.status and not svc.forced_down:
+                    compute_nodes.append(svc)
+
+                # Check for nodes to resume evacuation
+                elif (svc.forced_down and svc.state == 'down' and 'disabled' in svc.status and
+                      'instanceha evacuation' in svc.disabled_reason and 'evacuation FAILED' not in svc.disabled_reason):
+                    to_resume.append(svc)
+
+        # Verify classification - should be in no lists
+        self.assertEqual(len(compute_nodes), 0, f"Expected 0 compute nodes, got {len(compute_nodes)}")
+        self.assertEqual(len(to_resume), 0, f"Expected 0 resume services, got {len(to_resume)}")
+        self.assertEqual(len(to_reenable), 0, f"Expected 0 reenable services, got {len(to_reenable)}")
+
+        print(f"Failed evacuation service {host} correctly ignored")
+
+    def test_mixed_scenario_classification(self):
+        """
+        Test classification with multiple hosts in different states.
+
+        Scenario:
+        - 10 compute nodes in various states:
+          - 2 stale (up but old timestamp)
+          - 2 down (state='down')
+          - 2 resume (forced_down, disabled, with evacuation reason)
+          - 2 reenable (forced_down but enabled)
+          - 1 failed evacuation (evacuation FAILED)
+          - 1 healthy (normal operation)
+        """
+        print("\nTesting mixed scenario classification...")
+
+        # Create hosts in different states
+        hosts_data = {
+            'compute-stale-01': {'state': 'up', 'status': 'enabled', 'forced_down': False,
+                                'updated_at': (datetime.now() - timedelta(seconds=60)).isoformat()},
+            'compute-stale-02': {'state': 'up', 'status': 'enabled', 'forced_down': False,
+                                'updated_at': (datetime.now() - timedelta(seconds=90)).isoformat()},
+            'compute-down-01': {'state': 'down', 'status': 'enabled', 'forced_down': False},
+            'compute-down-02': {'state': 'down', 'status': 'enabled', 'forced_down': False},
+            'compute-resume-01': {'state': 'down', 'status': 'disabled', 'forced_down': True,
+                                 'disabled_reason': f'instanceha evacuation: {datetime.now().isoformat()}'},
+            'compute-resume-02': {'state': 'down', 'status': 'disabled', 'forced_down': True,
+                                 'disabled_reason': f'instanceha evacuation: {datetime.now().isoformat()}'},
+            'compute-reenable-01': {'state': 'down', 'status': 'enabled', 'forced_down': True},
+            'compute-reenable-02': {'state': 'down', 'status': 'enabled', 'forced_down': True},
+            'compute-failed-01': {'state': 'down', 'status': 'disabled', 'forced_down': True,
+                                 'disabled_reason': f'evacuation FAILED: {datetime.now().isoformat()}'},
+            'compute-healthy-01': {'state': 'up', 'status': 'enabled', 'forced_down': False}
+        }
+
+        # Add all hosts
+        for host, data in hosts_data.items():
+            self.env.add_compute_node(host, **data)
+            # Add some VMs to each host
+            self.env.add_server(host, evacuable=True)
+            self.env.add_server(host, evacuable=True)
+
+        print(f"Created {len(hosts_data)} hosts in various states")
+
+        # Test the classification logic
+        services = self.env.mock_nova.services.list(binary='nova-compute')
+        target_date = datetime.now() - timedelta(seconds=self.env.service.config.get_delta())
+
+        compute_nodes = []
+        to_resume = []
+        to_reenable = []
+
+        for svc in services:
+            # Check for nodes to re-enable (forced_down but enabled)
+            if 'enabled' in svc.status and svc.forced_down:
+                to_reenable.append(svc)
+
+            # Check for nodes needing evacuation (stale or down, enabled, not forced_down)
+            elif ((datetime.fromisoformat(svc.updated_at) < target_date and svc.state != 'down') or
+                  svc.state == 'down') and 'disabled' not in svc.status and not svc.forced_down:
+                compute_nodes.append(svc)
+
+            # Check for nodes to resume evacuation
+            elif (svc.forced_down and svc.state == 'down' and 'disabled' in svc.status and
+                  'instanceha evacuation' in svc.disabled_reason and 'evacuation FAILED' not in svc.disabled_reason):
+                to_resume.append(svc)
+
+        # Verify classification counts
+        self.assertEqual(len(compute_nodes), 4, f"Expected 4 compute nodes (2 stale + 2 down), got {len(compute_nodes)}")
+        self.assertEqual(len(to_resume), 2, f"Expected 2 resume services, got {len(to_resume)}")
+        self.assertEqual(len(to_reenable), 2, f"Expected 2 reenable services, got {len(to_reenable)}")
+
+        # Verify specific classifications
+        compute_node_hosts = {svc.host for svc in compute_nodes}
+        to_resume_hosts = {svc.host for svc in to_resume}
+        to_reenable_hosts = {svc.host for svc in to_reenable}
+
+        expected_compute_hosts = {'compute-stale-01', 'compute-stale-02', 'compute-down-01', 'compute-down-02'}
+        expected_resume_hosts = {'compute-resume-01', 'compute-resume-02'}
+        expected_reenable_hosts = {'compute-reenable-01', 'compute-reenable-02'}
+
+        self.assertEqual(compute_node_hosts, expected_compute_hosts)
+        self.assertEqual(to_resume_hosts, expected_resume_hosts)
+        self.assertEqual(to_reenable_hosts, expected_reenable_hosts)
+
+        print(f"Mixed scenario classification successful:")
+        print(f"   - {len(compute_nodes)} hosts need evacuation: {sorted(compute_node_hosts)}")
+        print(f"   - {len(to_resume)} hosts need evacuation resumed: {sorted(to_resume_hosts)}")
+        print(f"   - {len(to_reenable)} hosts need re-enabling: {sorted(to_reenable_hosts)}")
+
+    def test_threshold_checking(self):
+        """
+        Test threshold checking logic for evacuation safety.
+
+        Scenario:
+        - Create 10 compute nodes
+        - Set threshold to 50%
+        - Test with 4 failed nodes (40% - should proceed)
+        - Test with 6 failed nodes (60% - should be blocked)
+        """
+        print("\nTesting threshold checking...")
+
+        # Create 10 healthy compute nodes
+        all_hosts = []
+        for i in range(10):
+            host = f'compute-threshold-{i:02d}'
+            self.env.add_compute_node(host, state='up', status='enabled', forced_down=False)
+            self.env.add_server(host, evacuable=True)
+            all_hosts.append(host)
+
+        # Test 40% failure (should proceed)
+        print("Testing 40% failure rate...")
+
+        # Make 4 nodes fail by updating the underlying service data
+        failed_hosts = all_hosts[:4]
+        for host in failed_hosts:
+            # Update the service data directly in the service manager
+            for svc_data in self.env.mock_nova.services.services_data:
+                if svc_data['host'] == host:
+                    svc_data['state'] = 'down'
+                    break
+
+        services = self.env.mock_nova.services.list(binary='nova-compute')
+        target_date = datetime.now() - timedelta(seconds=self.env.service.config.get_delta())
+
+        compute_nodes = []
+        for svc in services:
+            if ((datetime.fromisoformat(svc.updated_at) < target_date and svc.state != 'down') or
+                svc.state == 'down') and 'disabled' not in svc.status and not svc.forced_down:
+                compute_nodes.append(svc)
+
+        # Check threshold
+        threshold_exceeded = (len(compute_nodes) / len(services) * 100) > self.env.service.config.get_threshold()
+
+        self.assertFalse(threshold_exceeded, "40% failure should not exceed 50% threshold")
+        print(f"40% failure rate ({len(compute_nodes)}/{len(services)}) is within threshold")
+
+        # Test 60% failure (should be blocked)
+        print("Testing 60% failure rate...")
+
+        # Make 2 more nodes fail (total 6)
+        additional_failed = all_hosts[4:6]
+        for host in additional_failed:
+            # Update the service data directly in the service manager
+            for svc_data in self.env.mock_nova.services.services_data:
+                if svc_data['host'] == host:
+                    svc_data['state'] = 'down'
+                    break
+
+        services = self.env.mock_nova.services.list(binary='nova-compute')
+        compute_nodes = []
+        for svc in services:
+            if ((datetime.fromisoformat(svc.updated_at) < target_date and svc.state != 'down') or
+                svc.state == 'down') and 'disabled' not in svc.status and not svc.forced_down:
+                compute_nodes.append(svc)
+
+        # Check threshold
+        threshold_exceeded = (len(compute_nodes) / len(services) * 100) > self.env.service.config.get_threshold()
+
+        self.assertTrue(threshold_exceeded, "60% failure should exceed 50% threshold")
+        print(f"60% failure rate ({len(compute_nodes)}/{len(services)}) exceeds threshold - evacuation blocked")
+
+
 def run_functional_tests():
     """Run all functional tests."""
     print("=" * 60)
@@ -2167,9 +2634,11 @@ def run_functional_tests():
         TestAggregateEvacuation,
         TestLargeScaleEvacuableAggregates,
         TestResumeEvacuation,
-        TestKdumpFunctionality,
-        TestEvacuationLogicCombinations
+        TestEvacuationLogicCombinations,
+        TestHostStateClassification
     ]
+        #Do not run Kdump tests by default as they take 5 minutes
+        #TestKdumpFunctionality,
 
     for test_class in test_classes:
         tests = unittest.TestLoader().loadTestsFromTestCase(test_class)
@@ -2182,9 +2651,9 @@ def run_functional_tests():
     # Print summary
     print("\n" + "=" * 60)
     if result.wasSuccessful():
-        print("✅ All functional tests passed!")
+        print("All functional tests passed!")
     else:
-        print(f"❌ {len(result.failures)} test(s) failed, {len(result.errors)} error(s)")
+        print(f"{len(result.failures)} test(s) failed, {len(result.errors)} error(s)")
         for test, traceback in result.failures + result.errors:
             print(f"FAILED: {test}")
             print(f"  {traceback.split('AssertionError:')[-1].strip()}")
