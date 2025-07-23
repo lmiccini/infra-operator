@@ -83,8 +83,8 @@ DISABLED = config["DISABLED"] if 'DISABLED' in config else "false"
 
 logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=LOGLEVEL)
 
-if POLL == 30 and 'true' in CHECK_KDUMP.lower():
-    logging.warning('CHECK_KDUMP Enabled and POLL set to 30 seconds. This may result in unexpected failures. Please increase POLL to 45 or greater.')
+if POLL <= 30 and 'true' in CHECK_KDUMP.lower():
+    logging.warning('CHECK_KDUMP Enabled and POLL set to 30 seconds or less. This may result in unexpected failures. Please increase POLL to 45 or greater.')
 
 with open("/secrets/fencing.yaml", 'r') as stream:
     try:
@@ -436,10 +436,10 @@ def _host_disable(connection, service):
 def _check_kdump(stale_services):
     FENCE_KDUMP_MAGIC = "0x1B302A40"
 
-    TIMEOUT = 30
+    TIMEOUT = max(5, POLL - 10)
 
     sock = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
-    sock.settimeout(30)
+    sock.settimeout(TIMEOUT)
 
     try:
         sock.bind((UDP_IP, UDP_PORT))
@@ -461,7 +461,7 @@ def _check_kdump(stale_services):
         try:
             data, ancdata, msg_flags, address = sock.recvmsg(65535, 1024, 0)
         except OSError as msg:
-            logging.info('No kdump msg received in 30 seconds')
+            logging.info('No kdump msg received in %s seconds' % TIMEOUT)
             sock.close()
             sock = None
             continue
