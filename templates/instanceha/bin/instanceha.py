@@ -1324,7 +1324,7 @@ def _check_kdump(stale_services, service):
     udp_ip = service.UDP_IP if service.UDP_IP else '0.0.0.0'  # Bind to all interfaces if empty
     udp_port = service.config.get_udp_port()
 
-    timeout = service.config.get_poll() - 10
+    timeout = max(5, service.config.get_poll_interval() - 10)
     logging.debug("Listening for kdump messages on %s:%d for %d seconds", udp_ip, udp_port, timeout)
 
     sock = None
