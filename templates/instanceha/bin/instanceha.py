@@ -80,11 +80,12 @@ FORCE_ENABLE = config["FORCE_ENABLE"] if 'FORCE_ENABLE' in config else "false"
 CHECK_KDUMP = config["CHECK_KDUMP"] if 'CHECK_KDUMP' in config else "false"
 LOGLEVEL = config["LOGLEVEL"].upper() if 'LOGLEVEL' in config else "INFO"
 DISABLED = config["DISABLED"] if 'DISABLED' in config else "false"
+KDUMP_TIMEOUT = int(config["KDUMP_TIMEOUT"]) if 'KDUMP_TIMEOUT' in config else 30
 
 logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=LOGLEVEL)
 
-if POLL == 30 and 'true' in CHECK_KDUMP.lower():
-    logging.warning('CHECK_KDUMP Enabled and POLL set to 30 seconds. This may result in unexpected failures. Please increase POLL to 45 or greater.')
+if POLL == 30 and 'true' in CHECK_KDUMP.lower() and KDUMP_TIMEOUT == 30:
+    logging.warning('CHECK_KDUMP is enabled with a KDUMP_TIMEOUT value of 30 seconds and POLL is also set to 30 seconds. This may result in unexpected failures. Please increase POLL to 45 or greater.')
 
 with open("/secrets/fencing.yaml", 'r') as stream:
     try:
@@ -433,25 +434,10 @@ def _host_disable(connection, service):
             return False
 
 
-def _check_kdump(stale_services):
+def _check_kdump(host):
     FENCE_KDUMP_MAGIC = "0x1B302A40"
 
-    TIMEOUT = 30
-
-    sock = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
-    sock.settimeout(30)
-
-    try:
-        sock.bind((UDP_IP, UDP_PORT))
-    except:
-        logging.error('Could not bind to %s on port %s' % (UDP_IP,UDP_PORT))
-        return 1
-
-    t_end = time.time() + TIMEOUT
-
-    broken_computes = set()
-    for service in stale_services:
-        broken_computes.add(service.host)
+    t_end = time.time() + KDUMP_TIMEOUT
 
     # we use a set since it doesn't allow duplicates
     dumping = set()
@@ -461,10 +447,8 @@ def _check_kdump(stale_services):
         try:
             data, ancdata, msg_flags, address = sock.recvmsg(65535, 1024, 0)
         except OSError as msg:
-            logging.info('No kdump msg received in 30 seconds')
-            sock.close()
-            sock = None
-            continue
+            logging.info('No kdump msg received in %s seconds' % KDUMP_TIMEOUT)
+            return False
 
         #logging.debug("received message: %s %s %s %s" % (hex(struct.unpack('ii',data)[0]), ancdata, msg_flags, address))
         #logging.debug("address is %s" % address[0])
@@ -474,34 +458,22 @@ def _check_kdump(stale_services):
             name = socket.gethostbyaddr(address[0])[0].split('.', 1)[0]
         except Exception as msg:
             logging.error('Failed reverse dns lookup for: %s - %s' % (address[0], msg))
-            continue
+            return False
 
         # fence_kdump checks if the magic number matches, so let's do it here too
         if hex(struct.unpack('ii',data)[0]).upper() != FENCE_KDUMP_MAGIC.upper() :
             logging.debug("invalid magic number - did not match %s" % hex(struct.unpack('ii',data)[0]).upper())
-            continue
+            return False
 
         # this prints the msg version (0x1) so not sure if we need this at all
         # logging.debug(hex(struct.unpack('ii',data)[1]))
 
-        # let's check if the source host is valid / known address is a tuple ('ip', 'port')
-        name = [i for i in broken_computes if name in i]
-        if name:
-            logging.debug('host %s matched' % name)
-            dumping.add(name[0])
-        else:
-            logging.debug('received message from unknown host')
+        dumping.add(name)
 
-    broken_computes = broken_computes.difference(dumping)
-    logging.info('the following compute(s) are kdumping: %s' % dumping)
-    logging.info('the following compute(s) are not kdumping: %s' % broken_computes)
+    if dumping:
+        return True if host.split('.', 1)[0] in dumping else False
 
-    if broken_computes:
-        stale_services = [service for service in stale_services if service.host in broken_computes]
-    else:
-        stale_services = []
-
-    return stale_services
+    return False
 
 
 def _host_enable(connection, service, reenable=False):
@@ -579,6 +551,13 @@ def _host_fence(host, action):
     except:
         logging.error('No fencing data found for %s' % host)
         return False
+
+    # let's check if a host is dumping and wait until it is done before fencing it
+    if action == 'off' and 'true' in CHECK_KDUMP.lower():
+        logging.info('CHECK_KDUMP=true - waiting for kdump messages')
+        while _check_kdump(host):
+            logging.info('Compute: %s is kdumping, waiting before evacuation' % host)
+            time.sleep(10)
 
     if 'noop' in fencing_data["agent"]:
         logging.warning('Using noop fencing agent. VMs may get corrupted.')
@@ -886,7 +865,22 @@ def main():
                         pass
                     else:
                         # Check if some of these computes are crashed and currently kdumping
-                        to_evacuate = _check_kdump(compute_nodes) if 'true' in CHECK_KDUMP.lower() else compute_nodes
+                        to_evacuate = compute_nodes
+
+                        # if check_kdump is true let's listen for messages
+                        if 'true' in CHECK_KDUMP.lower():
+                            try:
+                                global sock
+                                #if socket.has_dualstack_ipv6():
+                                #    sock = socket.socket(socket.AF_INET6,socket.SOCK_DGRAM)
+                                #else:
+                                #    sock = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+                                sock = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+                                sock.settimeout(KDUMP_TIMEOUT)
+                                sock.bind((UDP_IP, UDP_PORT))
+                            except:
+                                logging.error('Could not bind to %s on port %s' % (UDP_IP,UDP_PORT))
+                                return 1
 
                         if 'false' in DISABLED.lower():
                             # process computes that are seen as down for the first time
