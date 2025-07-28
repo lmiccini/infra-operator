@@ -19,6 +19,7 @@ import threading
 import hashlib
 from http import server
 import json
+from collections import defaultdict
 
 from novaclient import client
 from novaclient.exceptions import Conflict, NotFound, Forbidden, Unauthorized
@@ -107,6 +108,79 @@ with open("/home/cloud-admin/.config/openstack/secure.yaml", 'r') as stream:
     except yaml.YAMLError as exc:
         logging.error('Could not read from secure.yaml')
         logging.debug(exc)
+
+# Global variables for thread-safe kdump message queue
+kdump_hosts_timestamp = defaultdict(float)
+kdump_listener_stop_event = threading.Event()
+
+
+def _kdump_udp_listener():
+    """Background UDP listener for kdump messages."""
+    global kdump_hosts_timestamp
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(1.0)
+        sock.bind((UDP_IP, UDP_PORT))
+        logging.info('Kdump UDP listener started on %s:%s' % (UDP_IP or '0.0.0.0', UDP_PORT))
+
+        while not kdump_listener_stop_event.is_set():
+            try:
+                data, _, _, address = sock.recvmsg(65535, 1024, 0)
+                logging.debug('Received UDP message from %s, length: %d' % (address[0], len(data)))
+
+                if len(data) >= 8:
+                    # Try both byte orders for magic number (fence_kdump compatibility)
+                    magic_native = struct.unpack('I', data[:4])[0]
+                    magic_network = struct.unpack('!I', data[:4])[0]
+
+                    if magic_native == 0x1B302A40 or magic_network == 0x1B302A40:
+                        try:
+                            hostname = socket.gethostbyaddr(address[0])[0].split('.', 1)[0]
+                            kdump_hosts_timestamp[hostname] = time.time()
+                            logging.debug('Kdump message received from host: %s' % hostname)
+
+                            # Cleanup old entries every 100 messages (approx)
+                            if len(kdump_hosts_timestamp) > 100:
+                                cutoff = time.time() - 300
+                                old_keys = [k for k, v in kdump_hosts_timestamp.items() if v < cutoff]
+                                for k in old_keys:
+                                    del kdump_hosts_timestamp[k]
+                        except Exception as e:
+                            logging.debug('Failed to process kdump message from %s: %s' % (address[0], e))
+                    else:
+                        logging.debug('Invalid magic number from %s: 0x%x / 0x%x' % (address[0], magic_native, magic_network))
+            except socket.timeout:
+                continue
+            except OSError as e:
+                if not kdump_listener_stop_event.is_set():
+                    logging.debug('UDP listener socket error: %s' % e)
+                continue
+    except Exception as e:
+        logging.error('Kdump listener failed to start: %s' % e)
+    finally:
+        try:
+            sock.close()
+        except:
+            pass
+        logging.info('Kdump UDP listener stopped')
+
+
+def _check_kdump(host):
+    """Check if host is kdumping within timeout period."""
+    hostname = host.split('.', 1)[0]
+    last_seen = kdump_hosts_timestamp.get(hostname, 0)
+
+    if last_seen > 0 and (time.time() - last_seen) <= KDUMP_TIMEOUT:
+        return True
+
+    start_time = time.time()
+    while (time.time() - start_time) < KDUMP_TIMEOUT:
+        time.sleep(1)
+        if kdump_hosts_timestamp.get(hostname, 0) > start_time:
+            return True
+
+    return False
 
 
 def _is_server_evacuable(server, evac_flavors, evac_images):
@@ -434,48 +508,6 @@ def _host_disable(connection, service):
             return False
 
 
-def _check_kdump(host):
-    FENCE_KDUMP_MAGIC = "0x1B302A40"
-
-    t_end = time.time() + KDUMP_TIMEOUT
-
-    # we use a set since it doesn't allow duplicates
-    dumping = set()
-
-    while time.time() < t_end:
-
-        try:
-            data, ancdata, msg_flags, address = sock.recvmsg(65535, 1024, 0)
-        except OSError as msg:
-            logging.info('No kdump msg received in %s seconds' % KDUMP_TIMEOUT)
-            return False
-
-        #logging.debug("received message: %s %s %s %s" % (hex(struct.unpack('ii',data)[0]), ancdata, msg_flags, address))
-        #logging.debug("address is %s" % address[0])
-
-        # short hostname
-        try:
-            name = socket.gethostbyaddr(address[0])[0].split('.', 1)[0]
-        except Exception as msg:
-            logging.error('Failed reverse dns lookup for: %s - %s' % (address[0], msg))
-            return False
-
-        # fence_kdump checks if the magic number matches, so let's do it here too
-        if hex(struct.unpack('ii',data)[0]).upper() != FENCE_KDUMP_MAGIC.upper() :
-            logging.debug("invalid magic number - did not match %s" % hex(struct.unpack('ii',data)[0]).upper())
-            return False
-
-        # this prints the msg version (0x1) so not sure if we need this at all
-        # logging.debug(hex(struct.unpack('ii',data)[1]))
-
-        dumping.add(name)
-
-    if dumping:
-        return True if host.split('.', 1)[0] in dumping else False
-
-    return False
-
-
 def _host_enable(connection, service, reenable=False):
     if reenable:
         try:
@@ -551,13 +583,6 @@ def _host_fence(host, action):
     except:
         logging.error('No fencing data found for %s' % host)
         return False
-
-    # let's check if a host is dumping and wait until it is done before fencing it
-    if action == 'off' and 'true' in CHECK_KDUMP.lower():
-        logging.info('CHECK_KDUMP=true - waiting for kdump messages')
-        while _check_kdump(host):
-            logging.info('Compute: %s is kdumping, waiting before evacuation' % host)
-            time.sleep(10)
 
     if 'noop' in fencing_data["agent"]:
         logging.warning('Using noop fencing agent. VMs may get corrupted.')
@@ -780,6 +805,12 @@ def main():
     health_check_thread.daemon = True
     health_check_thread.start()
 
+    # Start kdump listener if enabled
+    if 'true' in CHECK_KDUMP.lower():
+        kdump_thread = threading.Thread(target=_kdump_udp_listener)
+        kdump_thread.daemon = True
+        kdump_thread.start()
+
     previous_hash = ""
 
     CLOUD = os.getenv('OS_CLOUD', 'overcloud')
@@ -867,29 +898,47 @@ def main():
                         # Check if some of these computes are crashed and currently kdumping
                         to_evacuate = compute_nodes
 
-                        # if check_kdump is true let's listen for messages
+                        # Filter out kdumping hosts (with delayed start detection)
                         if 'true' in CHECK_KDUMP.lower():
-                            try:
-                                global sock
-                                #if socket.has_dualstack_ipv6():
-                                #    sock = socket.socket(socket.AF_INET6,socket.SOCK_DGRAM)
-                                #else:
-                                #    sock = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
-                                sock = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
-                                sock.settimeout(KDUMP_TIMEOUT)
-                                sock.bind((UDP_IP, UDP_PORT))
-                            except:
-                                logging.error('Could not bind to %s on port %s' % (UDP_IP,UDP_PORT))
-                                return 1
+                            kdumping_hosts = []
+                            uncertain_hosts = []
+
+                            # Quick check: hosts with recent kdump messages
+                            for service in to_evacuate:
+                                hostname = service.host.split('.', 1)[0]
+                                last_seen = kdump_hosts_timestamp.get(hostname, 0)
+                                if last_seen > 0 and (time.time() - last_seen) <= KDUMP_TIMEOUT:
+                                    kdumping_hosts.append(service.host)
+                                    logging.info('Host %s is kdumping, skipping evacuation' % service.host)
+                                else:
+                                    uncertain_hosts.append(service)
+
+                            # Wait for delayed kdump starts (parallel)
+                            if uncertain_hosts:
+                                logging.info('Checking %d hosts for delayed kdump start' % len(uncertain_hosts))
+                                with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
+                                    futures = {executor.submit(_check_kdump, s.host): s for s in uncertain_hosts}
+                                    for future in concurrent.futures.as_completed(futures, timeout=KDUMP_TIMEOUT + 5):
+                                        try:
+                                            if future.result():
+                                                kdumping_hosts.append(futures[future].host)
+                                                logging.info('Host %s started kdumping, skipping evacuation' % futures[future].host)
+                                        except:
+                                            pass
+
+                            # Remove kdumping hosts from evacuation
+                            to_evacuate = [s for s in to_evacuate if s.host not in kdumping_hosts]
+                            if kdumping_hosts:
+                                logging.info('Total hosts skipped due to kdumping: %d' % len(kdumping_hosts))
 
                         if 'false' in DISABLED.lower():
                             # process computes that are seen as down for the first time
-                            with concurrent.futures.ThreadPoolExecutor() as executor:
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
                                 results = list(executor.map(lambda service: process_service(service, reserved_hosts, False), to_evacuate))
                             if not all(results):
                                 logging.warning('Some services failed to evacuate. Retrying in 30 seconds.')
                             # process computes that were half-evacuated
-                            with concurrent.futures.ThreadPoolExecutor() as executor:
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
                                 results = list(executor.map(lambda service: process_service(service, reserved_hosts, True), to_resume))
                             if not all(results):
                                 logging.warning('Some services failed to evacuate. Retrying in %s seconds.' % POLL)
@@ -926,4 +975,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        kdump_listener_stop_event.set()
+    except Exception as e:
+        logging.error('Error: %s' % e)
+        kdump_listener_stop_event.set()
+        raise
