@@ -560,19 +560,23 @@ class TestKdumpFunctionality(unittest.TestCase):
     def test_kdump_single_host_recent_message(self):
         """Test _check_kdump_single with recent kdump message."""
         instanceha.kdump_hosts_timestamp['compute-01'] = time.time() - 5
-        result = instanceha._check_kdump_single('compute-01.example.com', self.mock_service)
+        # Mock socket operations to avoid real UDP timeouts
+        with patch('socket.socket'):
+            result = instanceha._check_kdump_single('compute-01.example.com', self.mock_service)
         self.assertTrue(result)
 
     def test_kdump_single_host_old_message(self):
         """Test _check_kdump_single with old kdump message."""
         instanceha.kdump_hosts_timestamp['compute-01'] = time.time() - 60
-        with patch('time.sleep'):
+        # Mock socket operations to avoid real UDP timeouts
+        with patch('socket.socket'), patch('time.sleep'):
             result = instanceha._check_kdump_single('compute-01.example.com', self.mock_service)
             self.assertFalse(result)
 
     def test_kdump_single_host_no_message(self):
         """Test _check_kdump_single with no kdump message."""
-        with patch('time.sleep'):
+        # Mock socket operations to avoid real UDP timeouts
+        with patch('socket.socket'), patch('time.sleep'):
             result = instanceha._check_kdump_single('compute-01.example.com', self.mock_service)
             self.assertFalse(result)
 
@@ -585,7 +589,8 @@ class TestKdumpFunctionality(unittest.TestCase):
             if call_count >= 3:  # After 3 calls to sleep
                 instanceha.kdump_hosts_timestamp['compute-01'] = time.time()
         
-        with patch('time.sleep', side_effect=simulate_delayed_message):
+        # Mock socket operations to avoid real UDP timeouts
+        with patch('socket.socket'), patch('time.sleep', side_effect=simulate_delayed_message):
             result = instanceha._check_kdump_single('compute-01.example.com', self.mock_service)
             self.assertTrue(result)
 
@@ -680,7 +685,8 @@ class TestKdumpFunctionality(unittest.TestCase):
             if call_count >= 60:  # After 60 sleep calls (simulating 60+ seconds)
                 instanceha.kdump_hosts_timestamp['compute-slow'] = time.time()
         
-        with patch('time.sleep', side_effect=simulate_very_delayed_kdump):
+        # Mock socket operations to avoid real UDP timeouts
+        with patch('socket.socket'), patch('time.sleep', side_effect=simulate_very_delayed_kdump):
             result = instanceha._check_kdump_single('compute-slow.example.com', mock_service)
             self.assertTrue(result)
 
@@ -691,7 +697,8 @@ class TestKdumpFunctionality(unittest.TestCase):
         mock_service.config.get_config_value.return_value = 5  # 5 second timeout
         
         # Simulate a host that never starts kdumping within timeout
-        with patch('time.sleep'):
+        # Mock socket operations to avoid real UDP timeouts
+        with patch('socket.socket'), patch('time.sleep'):
             result = instanceha._check_kdump_single('compute-never-kdump.example.com', mock_service)
             self.assertFalse(result)
 

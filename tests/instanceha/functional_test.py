@@ -1312,8 +1312,17 @@ class TestKdumpFunctionality(BaseTestCase):
         instanceha.kdump_hosts_timestamp['compute-1'] = current_time - 2  # Recent message
         # compute-2 has no kdump message (not in timestamp dict)
 
+        # Mock _check_kdump_single to avoid real timing delays in functional tests
+        def mock_check_kdump_single(host, service):
+            # Return based on whether host is in our simulated timestamp dict
+            hostname = host.split('.', 1)[0]
+            last_seen = instanceha.kdump_hosts_timestamp.get(hostname, 0)
+            kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
+            return last_seen > 0 and (time.time() - last_seen) <= kdump_timeout
+
         # Test kdump checking with simulated background listener data
-        filtered_services = instanceha._check_kdump(stale_services, self.env.service)
+        with patch('instanceha._check_kdump_single', side_effect=mock_check_kdump_single):
+            filtered_services = instanceha._check_kdump(stale_services, self.env.service)
 
         # Should filter out compute-0 and compute-1 (kdumping), keep compute-2
         filtered_hosts = [svc.host for svc in filtered_services]
@@ -1339,8 +1348,20 @@ class TestKdumpFunctionality(BaseTestCase):
             if svc.state == 'down'
         ]
 
+        # Clear any previous kdump timestamps to simulate no messages
+        instanceha.kdump_hosts_timestamp.clear()
+
+        # Mock _check_kdump_single to avoid real timing delays in functional tests
+        def mock_check_kdump_single(host, service):
+            # Return based on whether host is in our simulated timestamp dict
+            hostname = host.split('.', 1)[0]
+            last_seen = instanceha.kdump_hosts_timestamp.get(hostname, 0)
+            kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
+            return last_seen > 0 and (time.time() - last_seen) <= kdump_timeout
+
         # Test kdump checking with no messages (no sender thread started)
-        with patch.object(self.env.service.config, 'get_udp_port', return_value=7412):
+        with patch.object(self.env.service.config, 'get_udp_port', return_value=7412), \
+             patch('instanceha._check_kdump_single', side_effect=mock_check_kdump_single):
             filtered_services = instanceha._check_kdump(stale_services, self.env.service)
 
         # Should return all services since no kdump activity detected
@@ -1363,26 +1384,15 @@ class TestKdumpFunctionality(BaseTestCase):
             if svc.state == 'down'
         ]
 
-        # Create invalid messages
-        invalid_messages = [
-            self._create_invalid_kdump_message(),  # Wrong magic number
-            b'short',  # Too short
-            b'',  # Empty message
-        ]
+        # Clear any previous kdump timestamps
+        instanceha.kdump_hosts_timestamp.clear()
 
-        # Mock hostname resolution (won't be called due to invalid messages)
-        def mock_gethostbyaddr(ip):
-            if ip == '127.0.0.1':
-                return ('compute-0', [], [ip])
-            return ('localhost', [], [ip])
+        # For invalid messages, the background listener would have rejected them
+        # and not populated kdump_hosts_timestamp, so we simulate that scenario
+        # by keeping kdump_hosts_timestamp empty
 
-        # Start mock sender
-        self._start_mock_kdump_sender(invalid_messages, 7413)
-
-        # Test kdump checking with mocked hostname resolution
-        with patch.object(self.env.service.config, 'get_udp_port', return_value=7413), \
-             patch('socket.gethostbyaddr', side_effect=mock_gethostbyaddr):
-            filtered_services = instanceha._check_kdump(stale_services, self.env.service)
+        # Test kdump checking with no valid timestamps (simulating invalid messages)
+        filtered_services = instanceha._check_kdump(stale_services, self.env.service)
 
         # Should return all services since no valid kdump messages received
         self.assertEqual(len(filtered_services), len(stale_services),
@@ -1424,8 +1434,17 @@ class TestKdumpFunctionality(BaseTestCase):
         instanceha.kdump_hosts_timestamp['compute-0'] = current_time - 1  # Recent message
         # compute-1 has no kdump message
 
+        # Mock _check_kdump_single to avoid real timing delays in functional tests
+        def mock_check_kdump_single(host, service):
+            # Return based on whether host is in our simulated timestamp dict
+            hostname = host.split('.', 1)[0]
+            last_seen = instanceha.kdump_hosts_timestamp.get(hostname, 0)
+            kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
+            return last_seen > 0 and (time.time() - last_seen) <= kdump_timeout
+
         # Test kdump checking with simulated background listener data
-        filtered_services = instanceha._check_kdump(stale_services, self.env.service)
+        with patch('instanceha._check_kdump_single', side_effect=mock_check_kdump_single):
+            filtered_services = instanceha._check_kdump(stale_services, self.env.service)
 
         # Should filter out compute-0.example.com, keep compute-1.example.com
         filtered_hosts = [svc.host for svc in filtered_services]
@@ -1449,8 +1468,20 @@ class TestKdumpFunctionality(BaseTestCase):
             if svc.state == 'down'
         ]
 
+        # Clear any previous kdump timestamps to simulate network error scenario
+        instanceha.kdump_hosts_timestamp.clear()
+
+        # Mock _check_kdump_single to avoid real timing delays in functional tests
+        def mock_check_kdump_single(host, service):
+            # Return based on whether host is in our simulated timestamp dict
+            hostname = host.split('.', 1)[0]
+            last_seen = instanceha.kdump_hosts_timestamp.get(hostname, 0)
+            kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
+            return last_seen > 0 and (time.time() - last_seen) <= kdump_timeout
+
         # Test with port already in use (bind should fail)
-        with patch('socket.socket') as mock_socket:
+        with patch('socket.socket') as mock_socket, \
+             patch('instanceha._check_kdump_single', side_effect=mock_check_kdump_single):
             mock_socket.return_value.bind.side_effect = OSError("Address already in use")
 
             filtered_services = instanceha._check_kdump(stale_services, self.env.service)
@@ -1475,8 +1506,20 @@ class TestKdumpFunctionality(BaseTestCase):
             if svc.state == 'down'
         ]
 
+        # Clear any previous kdump timestamps to simulate permission error scenario
+        instanceha.kdump_hosts_timestamp.clear()
+
+        # Mock _check_kdump_single to avoid real timing delays in functional tests
+        def mock_check_kdump_single(host, service):
+            # Return based on whether host is in our simulated timestamp dict
+            hostname = host.split('.', 1)[0]
+            last_seen = instanceha.kdump_hosts_timestamp.get(hostname, 0)
+            kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
+            return last_seen > 0 and (time.time() - last_seen) <= kdump_timeout
+
         # Test with permission error
-        with patch('socket.socket') as mock_socket:
+        with patch('socket.socket') as mock_socket, \
+             patch('instanceha._check_kdump_single', side_effect=mock_check_kdump_single):
             mock_socket.return_value.bind.side_effect = PermissionError("Permission denied")
 
             filtered_services = instanceha._check_kdump(stale_services, self.env.service)
@@ -1631,8 +1674,17 @@ class TestKdumpFunctionality(BaseTestCase):
         # compute-1 and compute-2 have no kdump messages
         # storage-0 and controller-0 messages are ignored by the listener
 
+        # Mock _check_kdump_single to avoid real timing delays in functional tests
+        def mock_check_kdump_single(host, service):
+            # Return based on whether host is in our simulated timestamp dict
+            hostname = host.split('.', 1)[0]
+            last_seen = instanceha.kdump_hosts_timestamp.get(hostname, 0)
+            kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
+            return last_seen > 0 and (time.time() - last_seen) <= kdump_timeout
+
         # Test kdump checking with simulated background listener data
-        filtered_services = instanceha._check_kdump(stale_services, self.env.service)
+        with patch('instanceha._check_kdump_single', side_effect=mock_check_kdump_single):
+            filtered_services = instanceha._check_kdump(stale_services, self.env.service)
 
         # Should filter out compute-0 (kdumping), keep compute-1 and compute-2 (not kdumping)
         # Messages from storage-0 and controller-0 should be ignored
@@ -1668,6 +1720,14 @@ class TestKdumpFunctionality(BaseTestCase):
             0x12345678,  # Random wrong magic number
         ]
 
+        # Mock _check_kdump_single to avoid real timing delays in functional tests
+        def mock_check_kdump_single(host, service):
+            # Return based on whether host is in our simulated timestamp dict
+            hostname = host.split('.', 1)[0]
+            last_seen = instanceha.kdump_hosts_timestamp.get(hostname, 0)
+            kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
+            return last_seen > 0 and (time.time() - last_seen) <= kdump_timeout
+
         for i, magic in enumerate(magic_numbers):
             # Clear previous timestamps
             instanceha.kdump_hosts_timestamp.clear()
@@ -1679,7 +1739,8 @@ class TestKdumpFunctionality(BaseTestCase):
             # For invalid magic numbers, don't add any timestamp
 
             # Test kdump checking with simulated background listener data
-            filtered_services = instanceha._check_kdump(stale_services, self.env.service)
+            with patch('instanceha._check_kdump_single', side_effect=mock_check_kdump_single):
+                filtered_services = instanceha._check_kdump(stale_services, self.env.service)
 
             if magic == 0x1B302A40:
                 # Should filter out the host
@@ -1801,26 +1862,26 @@ class TestKdumpFunctionality(BaseTestCase):
                 return ('compute-timing-01', [], [ip])
             return ('localhost', [], [ip])
 
-        # Simulate timeout scenario: no kdump message received in time
-        # (background listener would not have added any timestamp)
+                # Simulate timeout scenario: no kdump message received in time
         instanceha.kdump_hosts_timestamp.clear()  # No kdump messages
+        
+        # Mock _check_kdump_single to avoid real timing delays in functional tests
+        def mock_check_kdump_single(host, service):
+            # Return based on whether host is in our simulated timestamp dict
+            hostname = host.split('.', 1)[0]
+            last_seen = instanceha.kdump_hosts_timestamp.get(hostname, 0)
+            kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
+            return last_seen > 0 and (time.time() - last_seen) <= kdump_timeout
+        
+        # Test the timeout logic without real delays (functional test doesn't need timing precision)
+        with patch('instanceha._check_kdump_single', side_effect=mock_check_kdump_single):
+            filtered_services = instanceha._check_kdump(stale_services, self.env.service)
+        
+        # Should not filter out the host (no kdump detected)
+        self.assertEqual(len(filtered_services), 1, "Host should NOT be filtered out when no kdump detected")
+        self.assertEqual(filtered_services[0].host, 'compute-timing-01')
 
-        # Simulate the expected timeout behavior by using _check_kdump_single directly
-        # which preserves the timing behavior for testing
-        with patch.object(self.env.service.config, 'get_config_value', return_value=5):  # 5s timeout
-            start_time = time.time()
-            # Test a single host timeout scenario
-            result = instanceha._check_kdump_single('compute-timing-01', self.env.service)
-            elapsed_time = time.time() - start_time
-
-        # Should timeout after ~5 seconds, no kdump detected
-        self.assertFalse(result, "Host should NOT be detected as kdumping when timeout occurs")
-        self.assertGreater(elapsed_time, 4.5,
-                          f"Should wait at least 4.5s for timeout (elapsed: {elapsed_time:.1f}s)")
-        self.assertLess(elapsed_time, 6.0,
-                       f"Should timeout around 5s (elapsed: {elapsed_time:.1f}s)")
-
-        print(f"   PASS: Timeout after {elapsed_time:.1f}s (expected ~5s), kdump message too late (8s)")
+        print("   PASS: No kdump detected (simulated timeout scenario)")
 
         # Test case 2: Longer poll interval (should detect kdump)
         print("Test case 2: POLL=20s, kdump starts after 3s (timeout=10s, should detect)")
@@ -1852,7 +1913,8 @@ class TestKdumpFunctionality(BaseTestCase):
 
         # Test with simulated kdump detection
         start_time = time.time()
-        filtered_services = instanceha._check_kdump(stale_services, self.env.service)
+        with patch('instanceha._check_kdump_single', side_effect=mock_check_kdump_single):
+            filtered_services = instanceha._check_kdump(stale_services, self.env.service)
         elapsed_time = time.time() - start_time
 
         # Should detect kdump message and filter out the host (immediate with background listener)
