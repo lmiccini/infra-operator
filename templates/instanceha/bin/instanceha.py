@@ -20,6 +20,7 @@ import hashlib
 from http import server
 import json
 from typing import Dict, Any, Optional, Union, List
+from collections import defaultdict
 
 from novaclient import client
 from novaclient.exceptions import Conflict, NotFound, Forbidden, Unauthorized
@@ -117,8 +118,10 @@ class ConfigManager:
                 raise ConfigurationError(str(e))
 
         # Validate special conditions
-        if self.get_bool('CHECK_KDUMP') and self.get_int('POLL', 45) <= 30:
-            logging.warning('CHECK_KDUMP Enabled and POLL set to 30 seconds or less. This may result in unexpected failures. Please increase POLL to 45 or greater.')
+        poll_interval = self.get_int('POLL', 45)
+        kdump_timeout = self.get_int('KDUMP_TIMEOUT', 30)
+        if self.get_bool('CHECK_KDUMP') and poll_interval == 30 and kdump_timeout == 30:
+            logging.warning('CHECK_KDUMP is enabled with a KDUMP_TIMEOUT value of 30 seconds and POLL is also set to 30 seconds. This may result in unexpected failures. Please increase POLL to 45 or greater.')
 
     def get_str(self, key: str, default: str = '') -> str:
         """Get a string configuration value with validation."""
@@ -182,6 +185,7 @@ class ConfigManager:
         'LEAVE_DISABLED': ('bool', False),
         'FORCE_ENABLE': ('bool', False),
         'CHECK_KDUMP': ('bool', False),
+        'KDUMP_TIMEOUT': ('int', 30, 5, 300),
         'DISABLED': ('bool', False),
         'SSL_VERIFY': ('bool', True),
     }
@@ -935,6 +939,81 @@ except ConfigurationError as e:
 
 # Global service instance will be created in main()
 
+# Global variables for thread-safe kdump message queue
+kdump_hosts_timestamp = defaultdict(float)
+kdump_listener_stop_event = threading.Event()
+
+def _kdump_udp_listener(service):
+    """Background UDP listener for kdump messages."""
+    global kdump_hosts_timestamp
+
+    try:
+        udp_ip = service.UDP_IP if service.UDP_IP else '0.0.0.0'
+        udp_port = service.config.get_udp_port()
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(1.0)
+        sock.bind((udp_ip, udp_port))
+        logging.info('Kdump UDP listener started on %s:%s' % (udp_ip, udp_port))
+
+        while not kdump_listener_stop_event.is_set():
+            try:
+                data, _, _, address = sock.recvmsg(65535, 1024, 0)
+                logging.debug('Received UDP message from %s, length: %d' % (address[0], len(data)))
+
+                if len(data) >= 8:
+                    # Try both byte orders for magic number (fence_kdump compatibility)
+                    magic_native = struct.unpack('I', data[:4])[0]
+                    magic_network = struct.unpack('!I', data[:4])[0]
+
+                    if magic_native == 0x1B302A40 or magic_network == 0x1B302A40:
+                        try:
+                            hostname = socket.gethostbyaddr(address[0])[0].split('.', 1)[0]
+                            kdump_hosts_timestamp[hostname] = time.time()
+                            logging.info('Kdump message received from host: %s' % hostname)
+
+                            # Cleanup old entries every 100 messages (approx)
+                            if len(kdump_hosts_timestamp) > 100:
+                                cutoff = time.time() - 300
+                                old_keys = [k for k, v in kdump_hosts_timestamp.items() if v < cutoff]
+                                for k in old_keys:
+                                    del kdump_hosts_timestamp[k]
+                        except Exception as e:
+                            logging.debug('Failed to process kdump message from %s: %s' % (address[0], e))
+                    else:
+                        logging.debug('Invalid magic number from %s: 0x%x / 0x%x' % (address[0], magic_native, magic_network))
+            except socket.timeout:
+                continue
+            except OSError as e:
+                if not kdump_listener_stop_event.is_set():
+                    logging.debug('UDP listener socket error: %s' % e)
+                continue
+    except Exception as e:
+        logging.error('Kdump listener failed to start: %s' % e)
+    finally:
+        try:
+            sock.close()
+        except:
+            pass
+        logging.info('Kdump UDP listener stopped')
+
+def _check_kdump_single(host, service):
+    """Check if host is kdumping within timeout period."""
+    hostname = host.split('.', 1)[0]
+    last_seen = kdump_hosts_timestamp.get(hostname, 0)
+    kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
+
+    if last_seen > 0 and (time.time() - last_seen) <= kdump_timeout:
+        return True
+
+    start_time = time.time()
+    while (time.time() - start_time) < kdump_timeout:
+        time.sleep(1)
+        if kdump_hosts_timestamp.get(hostname, 0) > start_time:
+            return True
+
+    return False
+
 def _aggregate_ids(conn, service):
 
     aggregates = conn.aggregates.list()
@@ -1312,110 +1391,47 @@ def _host_disable(connection, service):
 
 
 def _check_kdump(stale_services, service):
-    """Check for kdump messages from crashed compute nodes to identify which nodes are currently kdumping."""
+    """Check for kdump messages using background UDP listener and filter hosts individually."""
     if not stale_services:
         logging.debug("No stale services to check for kdump")
         return []
 
     logging.info("Checking %d hosts for kdump activity", len(stale_services))
-    broken_computes = {svc.host for svc in stale_services}
-    kdumping_hosts = set()
+    kdumping_hosts = []
+    uncertain_hosts = []
 
-    udp_ip = service.UDP_IP if service.UDP_IP else '0.0.0.0'  # Bind to all interfaces if empty
-    udp_port = service.config.get_udp_port()
-
-    timeout = max(5, service.config.get_poll_interval() - 10)
-    logging.debug("Listening for kdump messages on %s:%d for %d seconds", udp_ip, udp_port, timeout)
-
-    sock = None
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(timeout)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow port reuse
-        sock.bind((udp_ip, udp_port))
-
-        logging.debug("Successfully bound to UDP port %d, listening for kdump messages", udp_port)
-
-        timeout_end = time.time() + timeout
-        message_count = 0
-
-        while time.time() < timeout_end:
-            try:
-                data, _, _, address = sock.recvmsg(65535, 1024, 0)
-                message_count += 1
-                logging.debug("Received UDP message %d from %s (%d bytes)", message_count, address[0] if address else 'unknown', len(data))
-
-                if len(data) < 8:  # Need at least 8 bytes for magic number
-                    logging.debug("Message too short for kdump magic number")
-                    continue
-
-                magic_number = struct.unpack('ii', data[:8])[0]
-                magic_hex = hex(magic_number).upper()
-                logging.debug("Magic number: %s", magic_hex)
-
-                if magic_hex != "0X1B302A40":
-                    logging.debug("Invalid kdump magic number: %s", magic_hex)
-                    continue
-
-                if not address:
-                    logging.debug("No source address in kdump message")
-                    continue
-
-                try:
-                    hostname = socket.gethostbyaddr(address[0])[0].split('.', 1)[0]
-                    logging.debug("Kdump message from host: %s (IP: %s)", hostname, address[0])
-
-                    matching_hosts = [host for host in broken_computes if hostname in host]
-                    if matching_hosts:
-                        kdumping_hosts.add(matching_hosts[0])
-                        logging.info("Detected kdump activity on host: %s", matching_hosts[0])
-                    else:
-                        logging.debug("Kdump host %s not in broken computes list", hostname)
-                except Exception as e:
-                    logging.debug("Failed to resolve hostname for %s: %s", address[0], e)
-                    continue
-
-            except socket.timeout:
-                logging.debug("Kdump listening timeout reached")
-                break
-            except Exception as e:
-                logging.debug("Error receiving kdump message: %s", e)
-                break
-
-        logging.debug("Kdump check completed: received %d messages, found %d kdumping hosts",
-                     message_count, len(kdumping_hosts))
-
-    except PermissionError:
-        logging.error("Kdump checking failed: Permission denied to bind UDP port %d. Check user privileges.", udp_port)
-        logging.warning("Proceeding with evacuation without kdump filtering due to permission error")
-        return stale_services
-    except OSError as e:
-        if "Address already in use" in str(e):
-            logging.error("Kdump checking failed: UDP port %d already in use. Another instance may be running.", udp_port)
+    # Quick check: hosts with recent kdump messages
+    for svc in stale_services:
+        hostname = svc.host.split('.', 1)[0]
+        last_seen = kdump_hosts_timestamp.get(hostname, 0)
+        kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
+        if last_seen > 0 and (time.time() - last_seen) <= kdump_timeout:
+            kdumping_hosts.append(svc.host)
+            logging.info('Host %s is kdumping, skipping evacuation' % svc.host)
         else:
-            logging.error("Kdump checking failed: Network error: %s", e)
-        logging.warning("Proceeding with evacuation without kdump filtering due to network error")
-        return stale_services
-    except Exception as e:
-        logging.error("Kdump checking failed with unexpected error: %s", e)
-        logging.warning("Proceeding with evacuation without kdump filtering due to unexpected error")
-        return stale_services
-    finally:
-        if sock:
-            sock.close()
-            logging.debug("Closed kdump UDP socket")
+            uncertain_hosts.append(svc)
 
-    # Return services not kdumping
-    non_kdumping_hosts = broken_computes - kdumping_hosts
-    filtered_services = [svc for svc in stale_services if svc.host in non_kdumping_hosts]
+    # Wait for delayed kdump starts (parallel)
+    if uncertain_hosts:
+        logging.info('Checking %d hosts for delayed kdump start' % len(uncertain_hosts))
+        workers = service.config.get_workers()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_check_kdump_single, s.host, service): s for s in uncertain_hosts}
+            kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
+            for future in concurrent.futures.as_completed(futures, timeout=kdump_timeout + 5):
+                try:
+                    if future.result():
+                        kdumping_hosts.append(futures[future].host)
+                        logging.info('Host %s started kdumping, skipping evacuation' % futures[future].host)
+                except:
+                    pass
 
+    # Remove kdumping hosts from evacuation
+    to_evacuate = [s for s in stale_services if s.host not in kdumping_hosts]
     if kdumping_hosts:
-        logging.info("Kdumping hosts excluded from evacuation: %s", sorted(kdumping_hosts))
-        logging.info("Proceeding with evacuation of %d non-kdumping hosts", len(filtered_services))
-    else:
-        logging.info("No kdump activity detected, proceeding with evacuation of all %d hosts", len(filtered_services))
+        logging.info('Total hosts skipped due to kdumping: %d' % len(kdumping_hosts))
 
-    return filtered_services
+    return to_evacuate
 
 
 def _host_enable(connection, service, reenable=False):
@@ -1907,6 +1923,12 @@ def main():
     health_check_thread.daemon = True
     health_check_thread.start()
 
+    # Start kdump listener if enabled
+    if service.config.is_kdump_check_enabled():
+        kdump_thread = threading.Thread(target=_kdump_udp_listener, args=(service,))
+        kdump_thread.daemon = True
+        kdump_thread.start()
+
     previous_hash = ""
 
     CLOUD = os.getenv('OS_CLOUD', 'overcloud')
@@ -2108,4 +2130,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        kdump_listener_stop_event.set()
+    except Exception as e:
+        logging.error('Error: %s' % e)
+        kdump_listener_stop_event.set()
+        raise
