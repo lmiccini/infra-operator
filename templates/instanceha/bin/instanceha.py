@@ -1418,13 +1418,21 @@ def _check_kdump(stale_services, service):
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(_check_kdump_single, s.host, service): s for s in uncertain_hosts}
             kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
-            for future in concurrent.futures.as_completed(futures, timeout=kdump_timeout + 5):
-                try:
-                    if future.result():
-                        kdumping_hosts.append(futures[future].host)
-                        logging.info('Host %s started kdumping, skipping evacuation' % futures[future].host)
-                except:
-                    pass
+
+            # Process results as they complete, handling timeouts gracefully
+            try:
+                for future in concurrent.futures.as_completed(futures, timeout=kdump_timeout + 5):
+                    try:
+                        if future.result():
+                            kdumping_hosts.append(futures[future].host)
+                            logging.info('Host %s started kdumping, skipping evacuation' % futures[future].host)
+                    except Exception:
+                        pass
+            except concurrent.futures.TimeoutError:
+                # Some futures didn't complete within timeout - that's OK, just log it
+                pending = [futures[f] for f in futures if not f.done()]
+                if pending:
+                    logging.debug('Kdump check timed out for %d hosts: %s' % (len(pending), [s.host for s in pending]))
 
     # Remove kdumping hosts from evacuation
     to_evacuate = [s for s in stale_services if s.host not in kdumping_hosts]
