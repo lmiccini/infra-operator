@@ -910,7 +910,7 @@ class TestLargeScaleEvacuableAggregates(BaseTestCase):
         self.assertGreater(failure_percentage, 20,
                           f"Failure percentage {failure_percentage}% should exceed threshold")
 
-        print(f"Threshold test: {failure_percentage:.1f}% failure rate exceeds 20% threshold")
+        # Threshold test: {failure_percentage:.1f}% failure rate exceeds 20% threshold
 
     def test_reserved_host_aggregate_matching(self):
         """Test that reserved hosts are properly matched with failed hosts in same aggregate."""
@@ -966,7 +966,7 @@ class TestLargeScaleEvacuableAggregates(BaseTestCase):
         - THRESHOLD set to 50%
         - Should log warning and prevent evacuation
         """
-        print("\nTesting mass failure threshold protection (80% host failures)...")
+        # Testing mass failure threshold protection (80% host failures)
 
         # Step 1: Set up 100 compute nodes with 10 VMs each
         all_hosts = []
@@ -1021,7 +1021,7 @@ class TestLargeScaleEvacuableAggregates(BaseTestCase):
 
         if threshold_exceeded:
             # This is what should happen - no evacuation due to threshold protection
-            print(f"THRESHOLD PROTECTION ACTIVATED: {failure_percentage}% > {threshold}%")
+            # THRESHOLD PROTECTION ACTIVATED: {failure_percentage}% > {threshold}%
 
             # Verify no evacuation functions would be called
             with patch('instanceha._get_nova_connection', return_value=self.env.mock_nova):
@@ -1031,7 +1031,7 @@ class TestLargeScaleEvacuableAggregates(BaseTestCase):
                             with patch('instanceha._post_evacuation_recovery', return_value=True) as mock_recovery:
                                 # In real code, this branch wouldn't execute due to threshold check
                                 # But we verify the protection logic works
-                                print("Evacuation BLOCKED by threshold protection")
+                                # Evacuation BLOCKED by threshold protection
 
                                 # These should NOT be called due to threshold protection
                                 mock_fence.assert_not_called()
@@ -1068,7 +1068,7 @@ class TestLargeScaleEvacuableAggregates(BaseTestCase):
             # Simulate the warning that would be logged
             if threshold_exceeded:
                 expected_message = f'Number of impacted computes exceeds the defined threshold. There is something wrong. Not evacuating.'
-                print(f"Expected warning: '{expected_message}'")
+                # Expected warning: '{expected_message}'
 
 
 
@@ -1086,7 +1086,7 @@ class TestResumeEvacuation(BaseTestCase):
         - These 2 computes should be added to to_resume list
         - VMs on these computes should be evacuated
         """
-        print("\nTesting resume evacuation scenario...")
+        # Testing resume evacuation scenario
 
         # Step 1: Set up 10 compute nodes with 5 VMs each
         all_hosts = []
@@ -1135,14 +1135,14 @@ class TestResumeEvacuation(BaseTestCase):
         self.assertCountEqual(resume_hostnames, resume_hosts,
                              f"Expected resume hosts {resume_hosts}, got {resume_hostnames}")
 
-        print(f"Identified {len(to_resume)} services for resumption: {resume_hostnames}")
+        # Identified {len(to_resume)} services for resumption: {resume_hostnames}
 
         # Step 4: Verify VMs are present on the hosts to be resumed
         total_vms_to_resume = 0
         for host in resume_hosts:
             host_vms = self.env.mock_nova.servers.list(search_opts={'host': host})
             total_vms_to_resume += len(host_vms)
-            print(f"   - {host}: {len(host_vms)} VMs to evacuate")
+            # {host}: {len(host_vms)} VMs to evacuate
 
         self.assertEqual(total_vms_to_resume, 10,
                         f"Expected 10 VMs to resume evacuation (2 hosts × 5 VMs), got {total_vms_to_resume}")
@@ -1391,8 +1391,17 @@ class TestKdumpFunctionality(BaseTestCase):
         # and not populated kdump_hosts_timestamp, so we simulate that scenario
         # by keeping kdump_hosts_timestamp empty
 
+        # Mock _check_kdump_single to avoid real timing delays in functional tests
+        def mock_check_kdump_single(host, service):
+            # Return based on whether host is in our simulated timestamp dict
+            hostname = host.split('.', 1)[0]
+            last_seen = instanceha.kdump_hosts_timestamp.get(hostname, 0)
+            kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
+            return last_seen > 0 and (time.time() - last_seen) <= kdump_timeout
+
         # Test kdump checking with no valid timestamps (simulating invalid messages)
-        filtered_services = instanceha._check_kdump(stale_services, self.env.service)
+        with patch('instanceha._check_kdump_single', side_effect=mock_check_kdump_single):
+            filtered_services = instanceha._check_kdump(stale_services, self.env.service)
 
         # Should return all services since no valid kdump messages received
         self.assertEqual(len(filtered_services), len(stale_services),
@@ -1760,10 +1769,10 @@ class TestKdumpFunctionality(BaseTestCase):
         1. POLL=45 seconds (shorter than kdump delay) - should not detect kdump
         2. POLL=90 seconds (longer than kdump delay) - should detect kdump
         """
-        print("\nTesting kdump with 60-second delayed start...")
+        # Testing kdump with 60-second delayed start
 
         # Test case 1: POLL=45 seconds (should not detect kdump)
-        print("Test case 1: POLL=45 seconds (kdump listener times out before kdump starts)")
+        # Test case 1: POLL=45 seconds (kdump listener times out before kdump starts)
 
         # Configure with short poll interval
         self.env.config_manager.config.update({
@@ -1792,10 +1801,10 @@ class TestKdumpFunctionality(BaseTestCase):
                         "Host should NOT be filtered out when poll interval is shorter than kdump delay")
         self.assertEqual(filtered_services[0].host, 'compute-delayed-01')
 
-        print(f"   PASS: With POLL=45s, kdump not detected (message arrives at 60s)")
+        # PASS: With POLL=45s, kdump not detected (message arrives at 60s)
 
         # Test case 2: POLL=90 seconds (should detect kdump)
-        print("Test case 2: POLL=90 seconds (kdump listener detects kdump after it starts)")
+        # Test case 2: POLL=90 seconds (kdump listener detects kdump after it starts)
 
         # Update configuration with longer poll interval
         self.env.config_manager.config.update({
@@ -1822,7 +1831,7 @@ class TestKdumpFunctionality(BaseTestCase):
         self.assertEqual(len(filtered_services), 0,
                         "Host should be filtered out when poll interval is longer than kdump delay")
 
-        print(f"   PASS: With POLL=90s, kdump detected (message arrives at 60s)")
+        # PASS: With POLL=90s, kdump detected (message arrives at 60s)
 
 
 
@@ -1836,10 +1845,10 @@ class TestKdumpFunctionality(BaseTestCase):
         1. POLL=2 seconds (should timeout before kdump)
         2. POLL=5 seconds (should detect kdump)
         """
-        print("\nTesting realistic kdump timing scenario (faster for testing)...")
+        # Testing realistic kdump timing scenario (faster for testing)
 
         # Test case 1: Short poll interval (should timeout)
-        print("Test case 1: POLL=10s, kdump starts after 8s (timeout=5s, should timeout)")
+        # Test case 1: POLL=10s, kdump starts after 8s (timeout=5s, should timeout)
 
         self.env.config_manager.config.update({
             'CHECK_KDUMP': True,
@@ -1881,10 +1890,10 @@ class TestKdumpFunctionality(BaseTestCase):
         self.assertEqual(len(filtered_services), 1, "Host should NOT be filtered out when no kdump detected")
         self.assertEqual(filtered_services[0].host, 'compute-timing-01')
 
-        print("   PASS: No kdump detected (simulated timeout scenario)")
+        # PASS: No kdump detected (simulated timeout scenario)
 
         # Test case 2: Longer poll interval (should detect kdump)
-        print("Test case 2: POLL=20s, kdump starts after 3s (timeout=10s, should detect)")
+        # Test case 2: POLL=20s, kdump starts after 3s (timeout=10s, should detect)
 
         self.env.config_manager.config.update({
             'UDP_PORT': 7426,
@@ -1924,7 +1933,7 @@ class TestKdumpFunctionality(BaseTestCase):
         self.assertLess(elapsed_time, 1.0,
                        f"Should complete immediately with background listener (elapsed: {elapsed_time:.1f}s)")
 
-        print(f"   PASS: Kdump detected after {elapsed_time:.1f}s, host filtered out")
+        # PASS: Kdump detected after {elapsed_time:.1f}s, host filtered out
 
 
 
@@ -2379,7 +2388,7 @@ class TestHostStateClassification(BaseTestCase):
         - Service state is 'up' but updated_at is older than DELTA threshold
         - These should be classified as needing evacuation (compute_nodes)
         """
-        print("\nTesting stale services classification...")
+        # Testing stale services classification
 
         # Create a service that hasn't updated in 60 seconds (older than DELTA=30)
         old_timestamp = (datetime.now() - timedelta(seconds=60)).isoformat()
@@ -2393,7 +2402,7 @@ class TestHostStateClassification(BaseTestCase):
         self.env.add_server(host, evacuable=True)
         self.env.add_server(host, evacuable=True)
 
-        print(f"Created stale service {host} with timestamp {old_timestamp}")
+        # Created stale service {host} with timestamp {old_timestamp}
 
         # Test the classification logic
         services = self.env.mock_nova.services.list(binary='nova-compute')
@@ -2429,7 +2438,7 @@ class TestHostStateClassification(BaseTestCase):
         self.assertIn('enabled', compute_nodes[0].status)
         self.assertFalse(compute_nodes[0].forced_down)
 
-        print(f"Stale service {host} correctly classified as needing evacuation")
+        # Stale service {host} correctly classified as needing evacuation
 
     def test_down_services_classification(self):
         """
@@ -2440,7 +2449,7 @@ class TestHostStateClassification(BaseTestCase):
         - Service is enabled and not forced_down
         - These should be classified as needing evacuation (compute_nodes)
         """
-        print("\nTesting down services classification...")
+        # Testing down services classification
 
         host = 'compute-down-01'
 
@@ -2451,7 +2460,7 @@ class TestHostStateClassification(BaseTestCase):
         self.env.add_server(host, evacuable=True)
         self.env.add_server(host, evacuable=True)
 
-        print(f"Created down service {host}")
+        # Created down service {host}
 
         # Test the classification logic
         services = self.env.mock_nova.services.list(binary='nova-compute')
@@ -2487,7 +2496,7 @@ class TestHostStateClassification(BaseTestCase):
         self.assertIn('enabled', compute_nodes[0].status)
         self.assertFalse(compute_nodes[0].forced_down)
 
-        print(f"Down service {host} correctly classified as needing evacuation")
+        # Down service {host} correctly classified as needing evacuation
 
     def test_resume_evacuation_classification(self):
         """
@@ -2500,7 +2509,7 @@ class TestHostStateClassification(BaseTestCase):
         - Service disabled_reason contains 'instanceha evacuation' but not 'evacuation FAILED'
         - These should be classified as needing evacuation resumed (to_resume)
         """
-        print("\nTesting resume evacuation classification...")
+        # Testing resume evacuation classification
 
         host = 'compute-resume-01'
         timestamp = datetime.now().isoformat()
@@ -2513,7 +2522,7 @@ class TestHostStateClassification(BaseTestCase):
         self.env.add_server(host, evacuable=True)
         self.env.add_server(host, evacuable=True)
 
-        print(f"Created resume service {host}")
+        # Created resume service {host}
 
         # Test the classification logic
         services = self.env.mock_nova.services.list(binary='nova-compute')
@@ -2550,7 +2559,7 @@ class TestHostStateClassification(BaseTestCase):
         self.assertTrue(to_resume[0].forced_down)
         self.assertIn('instanceha evacuation', to_resume[0].disabled_reason)
 
-        print(f"Resume service {host} correctly classified as needing evacuation resumed")
+        # Resume service {host} correctly classified as needing evacuation resumed
 
     def test_reenable_services_classification(self):
         """
@@ -2561,7 +2570,7 @@ class TestHostStateClassification(BaseTestCase):
         - Service status is 'enabled'
         - These should be classified as needing re-enabling (to_reenable)
         """
-        print("\nTesting reenable services classification...")
+        # Testing reenable services classification
 
         host = 'compute-reenable-01'
 
@@ -2571,7 +2580,7 @@ class TestHostStateClassification(BaseTestCase):
         # Add some VMs (though this shouldn't affect re-enable classification)
         self.env.add_server(host, evacuable=True)
 
-        print(f"Created reenable service {host}")
+        # Created reenable service {host}
 
         # Test the classification logic
         services = self.env.mock_nova.services.list(binary='nova-compute')
@@ -2606,7 +2615,7 @@ class TestHostStateClassification(BaseTestCase):
         self.assertTrue(to_reenable[0].forced_down)
         self.assertIn('enabled', to_reenable[0].status)
 
-        print(f"Reenable service {host} correctly classified as needing re-enabling")
+        # Reenable service {host} correctly classified as needing re-enabling
 
     def test_failed_evacuation_classification(self):
         """
@@ -2619,7 +2628,7 @@ class TestHostStateClassification(BaseTestCase):
         - Service disabled_reason contains 'evacuation FAILED'
         - These should NOT be classified for any action (left alone)
         """
-        print("\nTesting failed evacuation classification...")
+        # Testing failed evacuation classification
 
         host = 'compute-failed-01'
         timestamp = datetime.now().isoformat()
@@ -2631,7 +2640,7 @@ class TestHostStateClassification(BaseTestCase):
         # Add some VMs
         self.env.add_server(host, evacuable=True)
 
-        print(f"Created failed evacuation service {host}")
+        # Created failed evacuation service {host}
 
         # Test the classification logic
         services = self.env.mock_nova.services.list(binary='nova-compute')
@@ -2662,7 +2671,7 @@ class TestHostStateClassification(BaseTestCase):
         self.assertEqual(len(to_resume), 0, f"Expected 0 resume services, got {len(to_resume)}")
         self.assertEqual(len(to_reenable), 0, f"Expected 0 reenable services, got {len(to_reenable)}")
 
-        print(f"Failed evacuation service {host} correctly ignored")
+        # Failed evacuation service {host} correctly ignored
 
     def test_disabled_maintenance_node_not_evacuated(self):
         """
@@ -2725,7 +2734,7 @@ class TestHostStateClassification(BaseTestCase):
           - 1 failed evacuation (evacuation FAILED)
           - 1 healthy (normal operation)
         """
-        print("\nTesting mixed scenario classification...")
+        # Testing mixed scenario classification
 
         # Create hosts in different states
         hosts_data = {
@@ -2753,7 +2762,7 @@ class TestHostStateClassification(BaseTestCase):
             self.env.add_server(host, evacuable=True)
             self.env.add_server(host, evacuable=True)
 
-        print(f"Created {len(hosts_data)} hosts in various states")
+        # Created {len(hosts_data)} hosts in various states
 
         # Test the classification logic
         services = self.env.mock_nova.services.list(binary='nova-compute')
@@ -2796,10 +2805,10 @@ class TestHostStateClassification(BaseTestCase):
         self.assertEqual(to_resume_hosts, expected_resume_hosts)
         self.assertEqual(to_reenable_hosts, expected_reenable_hosts)
 
-        print(f"Mixed scenario classification successful:")
-        print(f"   - {len(compute_nodes)} hosts need evacuation: {sorted(compute_node_hosts)}")
-        print(f"   - {len(to_resume)} hosts need evacuation resumed: {sorted(to_resume_hosts)}")
-        print(f"   - {len(to_reenable)} hosts need re-enabling: {sorted(to_reenable_hosts)}")
+        # Mixed scenario classification successful:
+        # {len(compute_nodes)} hosts need evacuation: {sorted(compute_node_hosts)}
+        # {len(to_resume)} hosts need evacuation resumed: {sorted(to_resume_hosts)}
+        # {len(to_reenable)} hosts need re-enabling: {sorted(to_reenable_hosts)}
 
     def test_threshold_checking(self):
         """
@@ -2811,7 +2820,7 @@ class TestHostStateClassification(BaseTestCase):
         - Test with 4 failed nodes (40% - should proceed)
         - Test with 6 failed nodes (60% - should be blocked)
         """
-        print("\nTesting threshold checking...")
+        # Testing threshold checking
 
         # Create 10 healthy compute nodes
         all_hosts = []
@@ -2822,7 +2831,7 @@ class TestHostStateClassification(BaseTestCase):
             all_hosts.append(host)
 
         # Test 40% failure (should proceed)
-        print("Testing 40% failure rate...")
+        # Testing 40% failure rate
 
         # Make 4 nodes fail by updating the underlying service data
         failed_hosts = all_hosts[:4]
@@ -2846,10 +2855,10 @@ class TestHostStateClassification(BaseTestCase):
         threshold_exceeded = (len(compute_nodes) / len(services) * 100) > self.env.service.config.get_threshold()
 
         self.assertFalse(threshold_exceeded, "40% failure should not exceed 50% threshold")
-        print(f"40% failure rate ({len(compute_nodes)}/{len(services)}) is within threshold")
+        # 40% failure rate ({len(compute_nodes)}/{len(services)}) is within threshold
 
         # Test 60% failure (should be blocked)
-        print("Testing 60% failure rate...")
+        # Testing 60% failure rate
 
         # Make 2 more nodes fail (total 6)
         additional_failed = all_hosts[4:6]
@@ -2871,7 +2880,7 @@ class TestHostStateClassification(BaseTestCase):
         threshold_exceeded = (len(compute_nodes) / len(services) * 100) > self.env.service.config.get_threshold()
 
         self.assertTrue(threshold_exceeded, "60% failure should exceed 50% threshold")
-        print(f"60% failure rate ({len(compute_nodes)}/{len(services)}) exceeds threshold - evacuation blocked")
+        # 60% failure rate ({len(compute_nodes)}/{len(services)}) exceeds threshold - evacuation blocked
 
 
 def run_functional_tests():
