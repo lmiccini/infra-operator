@@ -501,6 +501,30 @@ class TestInstanceHAService(unittest.TestCase):
             self.service.update_health_hash(hash_interval=0)
             self.assertFalse(self.service.hash_update_successful)
 
+    def test_new_configuration_values(self):
+        """Test new configuration values are accessible."""
+        import instanceha
+
+        # Create a real config manager to test new configuration values
+        real_config = instanceha.ConfigManager()
+
+        # Test new timeout configurations
+        ipmi_timeout = real_config.get_config_value('IPMI_TIMEOUT')
+        self.assertIsInstance(ipmi_timeout, int)
+        self.assertGreaterEqual(ipmi_timeout, 5)
+
+        http_timeout = real_config.get_config_value('HTTP_TIMEOUT')
+        self.assertIsInstance(http_timeout, int)
+        self.assertGreaterEqual(http_timeout, 5)
+
+        hash_interval = real_config.get_config_value('HASH_INTERVAL')
+        self.assertIsInstance(hash_interval, int)
+        self.assertGreaterEqual(hash_interval, 30)
+
+        metrics_interval = real_config.get_config_value('METRICS_LOG_INTERVAL')
+        self.assertIsInstance(metrics_interval, int)
+        self.assertGreaterEqual(metrics_interval, 300)
+
     def test_filter_hosts_with_servers(self):
         """Test filtering hosts that have servers."""
         mock_service1 = Mock()

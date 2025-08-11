@@ -213,6 +213,10 @@ class ConfigManager:
         'KDUMP_TIMEOUT': ('int', 30, 5, 300),
         'DISABLED': ('bool', False),
         'SSL_VERIFY': ('bool', True),
+        'IPMI_TIMEOUT': ('int', 30, 5, 120),
+        'HTTP_TIMEOUT': ('int', 10, 5, 60),
+        'HASH_INTERVAL': ('int', 60, 30, 300),
+        'METRICS_LOG_INTERVAL': ('int', 3600, 300, 86400),
     }
 
     def get_config_value(self, key: str) -> Union[str, int, bool]:
@@ -425,8 +429,11 @@ class InstanceHAService(CloudConnectionProvider):
 
         logging.info("InstanceHA service initialized successfully")
 
-    def update_health_hash(self, hash_interval: int = 60) -> None:
+    def update_health_hash(self, hash_interval: Optional[int] = None) -> None:
         """Update health monitoring hash for service status tracking."""
+        if hash_interval is None:
+            hash_interval = self.config.get_config_value('HASH_INTERVAL')
+
         current_timestamp = time.time()
 
         if current_timestamp - self._last_hash_time > hash_interval:
@@ -1519,7 +1526,7 @@ def _host_disable(connection, service):
         return False
 
 
-def _check_kdump(stale_services, service):
+def _check_kdump(stale_services: List[Any], service: InstanceHAService) -> List[Any]:
     """Check for kdump messages using background UDP listener and filter hosts individually."""
     if not stale_services:
         logging.debug("No stale services to check for kdump")
@@ -1804,7 +1811,8 @@ def _execute_fence_operation(host, action, fencing_data):
             cmd = ["ipmitool", "-I", "lanplus", "-H", fencing_data["ipaddr"],
                    "-U", fencing_data["login"], "-E",  # Use environment variable
                    "-p", fencing_data["ipport"], "power", action]
-            subprocess.run(cmd, timeout=30, env=env, capture_output=True, text=True, check=True)
+            timeout = fencing_data.get("timeout", 30)
+            subprocess.run(cmd, timeout=timeout, env=env, capture_output=True, text=True, check=True)
             logging.info("IPMI %s successful for %s", action, host)
             return True
 
@@ -2128,7 +2136,7 @@ def _establish_nova_connection(service):
         logging.error("Failed: Unable to connect to Nova: %s", e)
         sys.exit(1)
 
-def _categorize_services(services, target_date):
+def _categorize_services(services: List[Any], target_date: datetime) -> tuple:
     """Categorize services into compute nodes, resume candidates, and re-enable candidates."""
     return (
         _get_compute_nodes(services, target_date),
@@ -2299,13 +2307,15 @@ def main():
             _process_reenabling(conn, service, to_reenable)
 
         except Exception as e:
-            logging.warning("Failed to query compute status. Please check the Nova API availability.")
+            logging.warning("Failed to query compute status from Nova API: %s. Please check the Nova API availability.", e)
+            logging.debug('Exception traceback:', exc_info=True)
             metrics.increment('main_loop_errors')
 
         # Log performance metrics periodically
         if not hasattr(metrics, '_last_summary'):
             metrics._last_summary = 0
-        if time.time() - metrics._last_summary > 3600:
+        metrics_interval = service.config.get_config_value('METRICS_LOG_INTERVAL')
+        if time.time() - metrics._last_summary > metrics_interval:
             metrics.log_summary()
             metrics._last_summary = time.time()
 
