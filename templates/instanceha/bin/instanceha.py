@@ -1884,9 +1884,10 @@ def _host_fence(host, action, service):
     logging.info("Fencing host %s %s", host, action)
 
     try:
-        # Look up fencing configuration
+        # Look up fencing configuration by comparing short hostnames
         short_hostname = host.split('.', 1)[0]
-        matching_configs = [v for k, v in service.config.fencing.items() if k in short_hostname]
+        matching_configs = [v for k, v in service.config.fencing.items()
+                           if k.split('.', 1)[0] == short_hostname]
 
         if not matching_configs:
             logging.error("No fencing data found for %s", host)

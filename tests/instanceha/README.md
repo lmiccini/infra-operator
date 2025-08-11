@@ -16,7 +16,7 @@ The test suite is organized into three main categories:
 - Thread safety and memory management
 
 ### 2. Functional Tests (`functional_test.py`)
-- **50 tests** validating end-to-end scenarios
+- **56 tests** validating end-to-end scenarios
 - Basic evacuation workflows
 - Large-scale evacuation scenarios (100+ hosts)
 - Host state classification and filtering
@@ -104,7 +104,7 @@ Recent test run results:
             Test Summary
 ========================================
 [PASS] Unit Tests: PASSED (48/48 tests)
-[PASS] Functional Tests: PASSED (50/50 tests)
+[PASS] Functional Tests: PASSED (56/56 tests)
 [PASS] Integration Tests: PASSED (19/19 tests)
 
 Total: 3/3 test suites passed

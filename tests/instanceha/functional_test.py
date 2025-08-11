@@ -2108,6 +2108,175 @@ class TestFencingRaceCondition(BaseTestCase):
                 self.assertIn('compute-2', self.env.service.hosts_processing)
 
 
+class TestFencingHostnameMatching(BaseTestCase):
+    """Test fencing configuration hostname matching for both short and FQDN formats."""
+
+    def test_fencing_hostname_matching_combinations(self):
+        """Test all combinations of short/FQDN hostnames in Nova and fencing config."""
+        from unittest.mock import patch
+        import tempfile
+        import yaml
+        import os
+
+        # Test scenarios: (nova_hostname, config_key, should_match)
+        test_scenarios = [
+            # Short hostname in Nova, short hostname in config
+            ('compute-0', 'compute-0', True),
+            ('compute-0', 'compute-1', False),
+
+            # Short hostname in Nova, FQDN in config
+            ('compute-0', 'compute-0.foo.bar', True),
+            ('compute-0', 'compute-1.foo.bar', False),
+
+            # FQDN in Nova, short hostname in config
+            ('compute-0.foo.bar', 'compute-0', True),
+            ('compute-0.foo.bar', 'compute-1', False),
+
+            # FQDN in Nova, FQDN in config
+            ('compute-0.foo.bar', 'compute-0.baz.com', True),  # Different domains, same hostname
+            ('compute-0.foo.bar', 'compute-0.foo.bar', True),  # Exact match
+            ('compute-0.foo.bar', 'compute-1.foo.bar', False), # Different hostnames
+        ]
+
+        for nova_hostname, config_key, should_match in test_scenarios:
+            with self.subTest(nova_hostname=nova_hostname, config_key=config_key, should_match=should_match):
+                # Create temporary fencing config for this test
+                fencing_config = {
+                    'FencingConfig': {
+                        config_key: {
+                            'agent': 'ipmi',
+                            'ipaddr': '10.1.2.3',
+                            'ipport': '623',
+                            'login': 'admin',
+                            'passwd': 'secret'
+                        }
+                    }
+                }
+
+                # Write temporary config file
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                    yaml.dump(fencing_config, f)
+                    fencing_config_path = f.name
+
+                try:
+                    # Create fresh service instance with this fencing config
+                    from instanceha import ConfigManager, InstanceHAService
+
+                    # Mock the fencing config path
+                    with patch.object(ConfigManager, '_load_fencing_config') as mock_load_fencing:
+                        mock_load_fencing.return_value = fencing_config['FencingConfig']
+
+                        config_manager = ConfigManager()
+                        service = InstanceHAService(config_manager)
+
+                        # Test the fencing lookup with mocked _execute_fence_operation
+                        with patch('instanceha._execute_fence_operation', return_value=True) as mock_fence_op:
+                            result = instanceha._host_fence(nova_hostname, 'off', service)
+
+                            if should_match:
+                                self.assertTrue(result, f"Fencing should succeed for {nova_hostname} -> {config_key}")
+                                mock_fence_op.assert_called_once()
+
+                                # Verify the correct fencing data was found
+                                call_args = mock_fence_op.call_args
+                                fencing_data = call_args[0][2]  # Third argument is fencing_data
+                                self.assertEqual(fencing_data['agent'], 'ipmi')
+                                self.assertEqual(fencing_data['ipaddr'], '10.1.2.3')
+                                self.assertEqual(fencing_data['login'], 'admin')
+                            else:
+                                self.assertFalse(result, f"Fencing should fail for {nova_hostname} -> {config_key}")
+                                mock_fence_op.assert_not_called()
+
+                finally:
+                    # Clean up temporary file
+                    if os.path.exists(fencing_config_path):
+                        os.unlink(fencing_config_path)
+
+    def test_fencing_multiple_hosts_in_config(self):
+        """Test fencing lookup when multiple hosts exist in config."""
+        import tempfile
+        import yaml
+        import os
+        from unittest.mock import patch
+
+        # Create fencing config with multiple hosts (mix of short and FQDN)
+        fencing_config = {
+            'FencingConfig': {
+                'compute-0': {
+                    'agent': 'ipmi',
+                    'ipaddr': '10.1.2.3',
+                    'login': 'admin0',
+                    'passwd': 'secret0'
+                },
+                'compute-1.domain.com': {
+                    'agent': 'redfish',
+                    'ipaddr': '10.1.2.4',
+                    'login': 'admin1',
+                    'passwd': 'secret1'
+                },
+                'compute-2.other.domain': {
+                    'agent': 'bmh',
+                    'token': 'token2',
+                    'namespace': 'test',
+                    'host': 'bmh-compute-2'
+                }
+            }
+        }
+
+        # Write temporary config file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            yaml.dump(fencing_config, f)
+            fencing_config_path = f.name
+
+        try:
+            # Create service instance
+            from instanceha import ConfigManager, InstanceHAService
+
+            with patch.object(ConfigManager, '_load_fencing_config') as mock_load_fencing:
+                mock_load_fencing.return_value = fencing_config['FencingConfig']
+
+                config_manager = ConfigManager()
+                service = InstanceHAService(config_manager)
+
+                # Test different hostname formats finding correct configs
+                test_cases = [
+                    ('compute-0', 'admin0'),           # Short -> Short
+                    ('compute-0.foo.bar', 'admin0'),   # FQDN -> Short
+                    ('compute-1', 'admin1'),           # Short -> FQDN
+                    ('compute-1.domain.com', 'admin1'), # FQDN -> FQDN (exact)
+                    ('compute-1.other.com', 'admin1'),  # FQDN -> FQDN (different domain)
+                    ('compute-2.xyz', 'bmh-compute-2'), # FQDN -> FQDN (BMH)
+                ]
+
+                for nova_hostname, expected_identifier in test_cases:
+                    with self.subTest(nova_hostname=nova_hostname):
+                        with patch('instanceha._execute_fence_operation', return_value=True) as mock_fence_op:
+                            result = instanceha._host_fence(nova_hostname, 'off', service)
+
+                            self.assertTrue(result, f"Fencing should succeed for {nova_hostname}")
+                            mock_fence_op.assert_called_once()
+
+                            # Verify correct config was selected
+                            call_args = mock_fence_op.call_args
+                            fencing_data = call_args[0][2]
+
+                            if 'login' in fencing_data:
+                                self.assertEqual(fencing_data['login'], expected_identifier)
+                            elif 'host' in fencing_data:
+                                self.assertEqual(fencing_data['host'], expected_identifier)
+
+                # Test non-existent host
+                with patch('instanceha._execute_fence_operation') as mock_fence_op:
+                    result = instanceha._host_fence('compute-999.anywhere', 'off', service)
+                    self.assertFalse(result, "Fencing should fail for non-existent host")
+                    mock_fence_op.assert_not_called()
+
+        finally:
+            # Clean up
+            if os.path.exists(fencing_config_path):
+                os.unlink(fencing_config_path)
+
+
 class TestEvacuationLogicCombinations(BaseTestCase):
     """Comprehensive tests for all evacuation logic combinations."""
 
@@ -2544,6 +2713,235 @@ class TestEvacuationLogicCombinations(BaseTestCase):
         # Should find the host since it has evacuable servers
         self.assertEqual(len(filtered_services), 1,
                         "Should find compute node with evacuable servers")
+
+    def test_images_and_aggregates_combination(self):
+        """Test evacuation with IMAGES + AGGREGATES enabled (T,F,T)."""
+        # Configure image and aggregate tagging
+        self.env.config_manager.config.update({
+            'TAGGED_IMAGES': True,
+            'TAGGED_FLAVORS': False,
+            'TAGGED_AGGREGATES': True
+        })
+
+        # Add evacuable image
+        self.env.add_evacuable_image('evacuable-image-1')
+
+        # Set up compute nodes in different aggregates
+        self.env.add_compute_node('compute-evacuable-agg')
+        self.env.add_compute_node('compute-non-evacuable-agg')
+
+        # Add evacuable aggregate with first host
+        self.env.add_evacuable_aggregate(['compute-evacuable-agg'])
+
+        # Add non-evacuable aggregate with second host
+        self.env.mock_nova.aggregates.add_aggregate(
+            name='non-evacuable-agg',
+            hosts=['compute-non-evacuable-agg'],
+            metadata={}  # No evacuable tag
+        )
+
+        # Set up servers on evacuable aggregate host
+        evacuable_server = self.env.add_server('compute-evacuable-agg', id='server-evacuable',
+                                             image={'id': 'evacuable-image-1'})
+        non_evacuable_server = self.env.add_server('compute-evacuable-agg', id='server-non-evacuable',
+                                                 image={'id': 'regular-image'})
+
+        # Set up servers on non-evacuable aggregate host (should not be evacuated regardless of image)
+        server_on_non_evac_agg = self.env.add_server('compute-non-evacuable-agg', id='server-non-evac-agg',
+                                                    image={'id': 'evacuable-image-1'})
+
+        # Test evacuability - servers must match BOTH criteria (image AND aggregate)
+        evacuable_srv = self.env.mock_nova.servers.list(search_opts={'host': 'compute-evacuable-agg'})[0]
+        non_evacuable_srv = self.env.mock_nova.servers.list(search_opts={'host': 'compute-evacuable-agg'})[1]
+
+        # Host filtering should be done at service level, not server level
+        # But let's test the aggregate filtering logic
+        self.assertTrue(self.env.service.is_aggregate_evacuable(self.env.mock_nova, 'compute-evacuable-agg'),
+                       "Host in evacuable aggregate should be evacuable")
+        self.assertFalse(self.env.service.is_aggregate_evacuable(self.env.mock_nova, 'compute-non-evacuable-agg'),
+                        "Host in non-evacuable aggregate should not be evacuable")
+
+        # For servers on evacuable aggregate, image tagging should apply
+        servers_evac_agg = self.env.mock_nova.servers.list(search_opts={'host': 'compute-evacuable-agg'})
+        evacuable_srv = [s for s in servers_evac_agg if s.id == 'server-evacuable'][0]
+        non_evacuable_srv = [s for s in servers_evac_agg if s.id == 'server-non-evacuable'][0]
+
+        self.assertTrue(self.env.service.is_server_evacuable(evacuable_srv),
+                       "Server with evacuable image on evacuable aggregate should be evacuable")
+        self.assertFalse(self.env.service.is_server_evacuable(non_evacuable_srv),
+                        "Server with non-evacuable image on evacuable aggregate should not be evacuable")
+
+    def test_flavors_and_aggregates_combination(self):
+        """Test evacuation with FLAVORS + AGGREGATES enabled (F,T,T)."""
+        # Configure flavor and aggregate tagging
+        self.env.config_manager.config.update({
+            'TAGGED_IMAGES': False,
+            'TAGGED_FLAVORS': True,
+            'TAGGED_AGGREGATES': True
+        })
+
+        # Add evacuable flavor
+        self.env.add_evacuable_flavor('evacuable-flavor-1')
+
+        # Set up compute nodes in different aggregates
+        self.env.add_compute_node('compute-evacuable-agg')
+        self.env.add_compute_node('compute-non-evacuable-agg')
+
+        # Add evacuable aggregate with first host
+        self.env.add_evacuable_aggregate(['compute-evacuable-agg'])
+
+        # Add non-evacuable aggregate with second host
+        self.env.mock_nova.aggregates.add_aggregate(
+            name='non-evacuable-agg',
+            hosts=['compute-non-evacuable-agg'],
+            metadata={}  # No evacuable tag
+        )
+
+        # Set up servers on evacuable aggregate host
+        evacuable_server = self.env.add_server('compute-evacuable-agg', id='server-evacuable',
+                                             flavor={'id': 'evacuable-flavor-1', 'extra_specs': {'evacuable': 'true'}})
+        non_evacuable_server = self.env.add_server('compute-evacuable-agg', id='server-non-evacuable',
+                                                 flavor={'id': 'regular-flavor', 'extra_specs': {}})
+
+        # Test aggregate filtering
+        self.assertTrue(self.env.service.is_aggregate_evacuable(self.env.mock_nova, 'compute-evacuable-agg'),
+                       "Host in evacuable aggregate should be evacuable")
+        self.assertFalse(self.env.service.is_aggregate_evacuable(self.env.mock_nova, 'compute-non-evacuable-agg'),
+                        "Host in non-evacuable aggregate should not be evacuable")
+
+        # For servers on evacuable aggregate, flavor tagging should apply
+        servers_evac_agg = self.env.mock_nova.servers.list(search_opts={'host': 'compute-evacuable-agg'})
+        evacuable_srv = [s for s in servers_evac_agg if s.id == 'server-evacuable'][0]
+        non_evacuable_srv = [s for s in servers_evac_agg if s.id == 'server-non-evacuable'][0]
+
+        self.assertTrue(self.env.service.is_server_evacuable(evacuable_srv),
+                       "Server with evacuable flavor on evacuable aggregate should be evacuable")
+        self.assertFalse(self.env.service.is_server_evacuable(non_evacuable_srv),
+                        "Server with non-evacuable flavor on evacuable aggregate should not be evacuable")
+
+    def test_all_tagging_enabled_combination(self):
+        """Test evacuation with ALL tagging enabled (T,T,T) - most complex scenario."""
+        # Configure all tagging features
+        self.env.config_manager.config.update({
+            'TAGGED_IMAGES': True,
+            'TAGGED_FLAVORS': True,
+            'TAGGED_AGGREGATES': True
+        })
+
+        # Add evacuable resources
+        self.env.add_evacuable_image('evacuable-image-1')
+        self.env.add_evacuable_flavor('evacuable-flavor-1')
+
+        # Set up compute nodes in different aggregates
+        self.env.add_compute_node('compute-evacuable-agg')
+        self.env.add_compute_node('compute-non-evacuable-agg')
+
+        # Add evacuable aggregate with first host
+        self.env.add_evacuable_aggregate(['compute-evacuable-agg'])
+
+        # Add non-evacuable aggregate with second host
+        self.env.mock_nova.aggregates.add_aggregate(
+            name='non-evacuable-agg',
+            hosts=['compute-non-evacuable-agg'],
+            metadata={}  # No evacuable tag
+        )
+
+        # Set up servers on evacuable aggregate host with all combinations
+        # Server with evacuable image only (should be evacuable - OR logic for image/flavor)
+        server_image_only = self.env.add_server('compute-evacuable-agg', id='server-image-only',
+                                              image={'id': 'evacuable-image-1'},
+                                              flavor={'id': 'regular-flavor', 'extra_specs': {}})
+
+        # Server with evacuable flavor only (should be evacuable - OR logic for image/flavor)
+        server_flavor_only = self.env.add_server('compute-evacuable-agg', id='server-flavor-only',
+                                                image={'id': 'regular-image'},
+                                                flavor={'id': 'evacuable-flavor-1', 'extra_specs': {'evacuable': 'true'}})
+
+        # Server with both evacuable image and flavor (should be evacuable)
+        server_both = self.env.add_server('compute-evacuable-agg', id='server-both',
+                                        image={'id': 'evacuable-image-1'},
+                                        flavor={'id': 'evacuable-flavor-1', 'extra_specs': {'evacuable': 'true'}})
+
+        # Server with neither evacuable image nor flavor (should not be evacuable)
+        server_neither = self.env.add_server('compute-evacuable-agg', id='server-neither',
+                                           image={'id': 'regular-image'},
+                                           flavor={'id': 'regular-flavor', 'extra_specs': {}})
+
+        # Set up server on non-evacuable aggregate (should not be evacuated regardless of image/flavor)
+        server_non_evac_agg = self.env.add_server('compute-non-evacuable-agg', id='server-non-evac-agg',
+                                                image={'id': 'evacuable-image-1'},
+                                                flavor={'id': 'evacuable-flavor-1', 'extra_specs': {'evacuable': 'true'}})
+
+        # Test aggregate filtering first
+        self.assertTrue(self.env.service.is_aggregate_evacuable(self.env.mock_nova, 'compute-evacuable-agg'),
+                       "Host in evacuable aggregate should be evacuable")
+        self.assertFalse(self.env.service.is_aggregate_evacuable(self.env.mock_nova, 'compute-non-evacuable-agg'),
+                        "Host in non-evacuable aggregate should not be evacuable")
+
+        # Test server evacuability on evacuable aggregate (image/flavor OR logic applies)
+        servers_evac_agg = self.env.mock_nova.servers.list(search_opts={'host': 'compute-evacuable-agg'})
+        server_map = {s.id: s for s in servers_evac_agg}
+
+        self.assertTrue(self.env.service.is_server_evacuable(server_map['server-image-only']),
+                       "Server with evacuable image should be evacuable (OR logic)")
+        self.assertTrue(self.env.service.is_server_evacuable(server_map['server-flavor-only']),
+                       "Server with evacuable flavor should be evacuable (OR logic)")
+        self.assertTrue(self.env.service.is_server_evacuable(server_map['server-both']),
+                       "Server with both evacuable image and flavor should be evacuable")
+        self.assertFalse(self.env.service.is_server_evacuable(server_map['server-neither']),
+                        "Server with neither evacuable image nor flavor should not be evacuable")
+
+    def test_all_combinations_backward_compatibility(self):
+        """Test that all combinations maintain backward compatibility when no tagged resources exist."""
+        test_combinations = [
+            ('F,F,F', {'TAGGED_IMAGES': False, 'TAGGED_FLAVORS': False, 'TAGGED_AGGREGATES': False}),
+            ('T,F,F', {'TAGGED_IMAGES': True, 'TAGGED_FLAVORS': False, 'TAGGED_AGGREGATES': False}),
+            ('F,T,F', {'TAGGED_IMAGES': False, 'TAGGED_FLAVORS': True, 'TAGGED_AGGREGATES': False}),
+            ('T,T,F', {'TAGGED_IMAGES': True, 'TAGGED_FLAVORS': True, 'TAGGED_AGGREGATES': False}),
+            ('F,F,T', {'TAGGED_IMAGES': False, 'TAGGED_FLAVORS': False, 'TAGGED_AGGREGATES': True}),
+            ('T,F,T', {'TAGGED_IMAGES': True, 'TAGGED_FLAVORS': False, 'TAGGED_AGGREGATES': True}),
+            ('F,T,T', {'TAGGED_IMAGES': False, 'TAGGED_FLAVORS': True, 'TAGGED_AGGREGATES': True}),
+            ('T,T,T', {'TAGGED_IMAGES': True, 'TAGGED_FLAVORS': True, 'TAGGED_AGGREGATES': True}),
+        ]
+
+        for combo_name, config in test_combinations:
+            with self.subTest(combination=combo_name):
+                # Reset environment
+                self.env = FunctionalTestEnvironment()
+
+                # Configure for this combination
+                self.env.config_manager.config.update(config)
+
+                # Don't add any evacuable resources (test backward compatibility)
+                # Set up a simple server
+                self.env.add_compute_node('compute-0')
+                self.env.add_server('compute-0', id='server-1',
+                                  image={'id': 'regular-image'},
+                                  flavor={'id': 'regular-flavor', 'extra_specs': {}})
+
+                # For aggregate testing, add a non-evacuable aggregate
+                if config.get('TAGGED_AGGREGATES'):
+                    self.env.mock_nova.aggregates.add_aggregate(
+                        name='non-evacuable-agg',
+                        hosts=['compute-0'],
+                        metadata={}  # No evacuable tag
+                    )
+
+                # Test evacuability
+                servers = self.env.mock_nova.servers.list(search_opts={'host': 'compute-0'})
+                server = servers[0]
+
+                if config.get('TAGGED_AGGREGATES'):
+                    # Aggregate filtering is applied at host level, not server level
+                    # If host is not in evacuable aggregate, it won't be processed
+                    aggregate_evacuable = self.env.service.is_aggregate_evacuable(self.env.mock_nova, 'compute-0')
+                    self.assertFalse(aggregate_evacuable,
+                                   f"Host should not be aggregate-evacuable for {combo_name}")
+                else:
+                    # Without aggregate constraints, should evacuate all (backward compatibility)
+                    result = self.env.service.is_server_evacuable(server)
+                    self.assertTrue(result,
+                                   f"Server should be evacuable for {combo_name} when no tagged resources exist (backward compatibility)")
 
 
 class TestHostStateClassification(BaseTestCase):
