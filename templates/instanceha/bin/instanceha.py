@@ -8,6 +8,7 @@ import logging
 import inspect
 from datetime import datetime, timedelta
 import concurrent.futures
+import requests
 import requests.exceptions
 import yaml
 import subprocess
@@ -558,13 +559,20 @@ class InstanceHAService:
             logging.error("No Nova connection available for flavor caching")
             return []
 
-        if self._evacuable_flavors_cache is None:
-            try:
-                flavors = connection.flavors.list(is_public=None)
-                evacuable_tag = self.config.get_evacuable_tag()
+        with self._cache_lock:
+            if self._evacuable_flavors_cache is None:
+                # Release lock during API call to avoid blocking other operations
+                pass
+            else:
+                return self._evacuable_flavors_cache
 
-                self._evacuable_flavors_cache = []
-                for flavor in flavors:
+        # Perform expensive API call outside lock
+        try:
+            flavors = connection.flavors.list(is_public=None)
+            evacuable_tag = self.config.get_evacuable_tag()
+
+            cache_data = []
+            for flavor in flavors:
                     try:
                         flavor_keys = flavor.get_keys()
                         # Check if evacuable_tag is an exact key match or part of a key (e.g., trait:CUSTOM_HA)
@@ -581,18 +589,22 @@ class InstanceHAService:
                         if matching_key:
                             value = flavor_keys[matching_key]
                             if str(value).lower() == 'true':
-                                self._evacuable_flavors_cache.append(flavor.id)
+                                cache_data.append(flavor.id)
                                 logging.debug("Added flavor %s to evacuable cache (key: %s, value: %s)", flavor.id, matching_key, value)
                     except Exception as e:
                         logging.debug("Could not check keys for flavor %s: %s", flavor.id, e)
 
-                logging.debug("Cached %d evacuable flavors from %d total flavors",
-                             len(self._evacuable_flavors_cache), len(flavors))
-            except Exception as e:
-                logging.error("Failed to get evacuable flavors: %s", e)
-                logging.debug('Exception traceback:', exc_info=True)
-                self._evacuable_flavors_cache = []
+            logging.debug("Cached %d evacuable flavors from %d total flavors",
+                         len(cache_data), len(flavors))
+        except Exception as e:
+            logging.error("Failed to get evacuable flavors: %s", e)
+            logging.debug('Exception traceback:', exc_info=True)
+            cache_data = []
 
+        # Update cache with lock
+        with self._cache_lock:
+            self._evacuable_flavors_cache = cache_data
+            
         return self._evacuable_flavors_cache
 
     def get_evacuable_images(self, connection=None):
@@ -617,71 +629,81 @@ class InstanceHAService:
             logging.error("No Nova connection available for image caching")
             return []
 
-        if self._evacuable_images_cache is None:
+        with self._cache_lock:
+            if self._evacuable_images_cache is None:
+                # Release lock during API call to avoid blocking other operations
+                pass
+            else:
+                return self._evacuable_images_cache
+
+        # Perform expensive API call outside lock
+        try:
+            images = []
+            evacuable_tag = self.config.get_evacuable_tag()
+
+            # Method 1: Try direct Glance access through Nova client
             try:
-                images = []
-                evacuable_tag = self.config.get_evacuable_tag()
-
-                # Method 1: Try direct Glance access through Nova client
-                try:
-                    if hasattr(connection, 'glance'):
-                        images = connection.glance.list()
-                        logging.debug("Retrieved %d images via Nova glance client", len(images))
-                except Exception as e:
-                    logging.debug("Nova glance client access failed: %s", e)
-
-                # Method 2: Try Nova's images interface
-                if not images:
-                    try:
-                        if hasattr(connection, 'images'):
-                            images = connection.images.list()
-                            logging.debug("Retrieved %d images via Nova images interface", len(images))
-                    except Exception as e:
-                        logging.debug("Nova images interface access failed: %s", e)
-
-                # Method 3: Try to create a separate Glance client
-                if not images:
-                    try:
-                        from glanceclient import client as glance_client
-                        from keystoneauth1 import session as ksc_session
-
-                        # Get session from Nova client
-                        if hasattr(connection, 'api') and hasattr(connection.api, 'session'):
-                            session = connection.api.session
-                            glance = glance_client.Client('2', session=session)
-                            images = list(glance.images.list())
-                            logging.debug("Retrieved %d images via separate Glance client", len(images))
-                    except ImportError:
-                        logging.debug("Glance client not available for import")
-                    except Exception as e:
-                        logging.debug("Separate Glance client access failed: %s", e)
-
-                # Process images to find evacuable ones
-                if images:
-                    self._evacuable_images_cache = []
-                    for image in images:
-                        # Check for tags (Glance v2 API) - tags are just strings, not key-value pairs
-                        # Need to check if evacuable_tag is contained in any of the tag strings
-                        if hasattr(image, 'tags') and self._check_evacuable_tag(image.tags, evacuable_tag):
-                            self._evacuable_images_cache.append(image.id)
-                        # Check for metadata/properties (fallback) - these might have composite keys
-                        elif hasattr(image, 'metadata') and self._check_evacuable_tag(image.metadata, evacuable_tag):
-                            self._evacuable_images_cache.append(image.id)
-                        elif hasattr(image, 'properties') and self._check_evacuable_tag(image.properties, evacuable_tag):
-                            self._evacuable_images_cache.append(image.id)
-
-                    logging.debug("Cached %d evacuable images from %d total images",
-                                 len(self._evacuable_images_cache), len(images))
-                else:
-                    # No images retrieved, fall back to per-server checking
-                    logging.warning("Could not retrieve images for caching. Image evacuation will use per-server checking.")
-                    self._evacuable_images_cache = []
-
+                if hasattr(connection, 'glance'):
+                    images = connection.glance.list()
+                    logging.debug("Retrieved %d images via Nova glance client", len(images))
             except Exception as e:
-                logging.error("Failed to get evacuable images: %s", e)
-                logging.debug('Exception traceback:', exc_info=True)
-                self._evacuable_images_cache = []
+                logging.debug("Nova glance client access failed: %s", e)
 
+            # Method 2: Try Nova's images interface
+            if not images:
+                try:
+                    if hasattr(connection, 'images'):
+                        images = connection.images.list()
+                        logging.debug("Retrieved %d images via Nova images interface", len(images))
+                except Exception as e:
+                    logging.debug("Nova images interface access failed: %s", e)
+
+            # Method 3: Try to create a separate Glance client
+            if not images:
+                try:
+                    from glanceclient import client as glance_client
+                    from keystoneauth1 import session as ksc_session
+
+                    # Get session from Nova client
+                    if hasattr(connection, 'api') and hasattr(connection.api, 'session'):
+                        session = connection.api.session
+                        glance = glance_client.Client('2', session=session)
+                        images = list(glance.images.list())
+                        logging.debug("Retrieved %d images via separate Glance client", len(images))
+                except ImportError:
+                    logging.debug("Glance client not available for import")
+                except Exception as e:
+                    logging.debug("Separate Glance client access failed: %s", e)
+
+            # Process images to find evacuable ones
+            cache_data = []
+            if images:
+                for image in images:
+                    # Check for tags (Glance v2 API) - tags are just strings, not key-value pairs
+                    # Need to check if evacuable_tag is contained in any of the tag strings
+                    if hasattr(image, 'tags') and self._check_evacuable_tag(image.tags, evacuable_tag):
+                        cache_data.append(image.id)
+                    # Check for metadata/properties (fallback) - these might have composite keys
+                    elif hasattr(image, 'metadata') and self._check_evacuable_tag(image.metadata, evacuable_tag):
+                        cache_data.append(image.id)
+                    elif hasattr(image, 'properties') and self._check_evacuable_tag(image.properties, evacuable_tag):
+                        cache_data.append(image.id)
+
+                logging.debug("Cached %d evacuable images from %d total images",
+                             len(cache_data), len(images))
+            else:
+                # No images retrieved, fall back to per-server checking
+                logging.warning("Could not retrieve images for caching. Image evacuation will use per-server checking.")
+
+        except Exception as e:
+            logging.error("Failed to get evacuable images: %s", e)
+            logging.debug('Exception traceback:', exc_info=True)
+            cache_data = []
+
+        # Update cache with lock
+        with self._cache_lock:
+            self._evacuable_images_cache = cache_data
+            
         return self._evacuable_images_cache
 
     def _get_server_image_id(self, server):
@@ -911,31 +933,37 @@ class InstanceHAService:
 
     def clear_cache(self):
         """Clear all cached data to force refresh."""
-        self._host_servers_cache.clear()
-        self._evacuable_flavors_cache = None
-        self._evacuable_images_cache = None
-        self._cache_timestamp = 0
-        logging.debug("Service cache cleared")
-
-    def refresh_evacuable_cache(self, connection=None, force=False):
-        """Refresh evacuable flavors and images cache with intelligent timing."""
-        current_time = time.time()
-        cache_age = current_time - self._cache_timestamp
-
-        # Refresh cache every 300 seconds (5 minutes) or when forced
-        if force or cache_age > 300 or not self._evacuable_flavors_cache:
-            logging.info("Refreshing evacuable cache (age: %.1f seconds)", cache_age)
+        with self._cache_lock:
+            self._host_servers_cache.clear()
             self._evacuable_flavors_cache = None
             self._evacuable_images_cache = None
-            self._cache_timestamp = current_time
+            self._cache_timestamp = 0
+        logging.debug("Service cache cleared")
 
-            # Force re-cache
-            evac_flavors = self.get_evacuable_flavors(connection)
-            evac_images = self.get_evacuable_images(connection)
+    def refresh_evacuable_cache(self, connection=None, force=False, cache_timeout=300):
+        """Refresh evacuable flavors and images cache with intelligent timing."""
+        current_time = time.time()
+        
+        with self._cache_lock:
+            cache_age = current_time - self._cache_timestamp
 
-            logging.info("Cache refreshed: %d flavors, %d images", len(evac_flavors), len(evac_images))
-            return True
-        return False
+            # Refresh cache when cache_timeout exceeded or when forced
+            if force or cache_age > cache_timeout or not self._evacuable_flavors_cache:
+                logging.info("Refreshing evacuable cache (age: %.1f seconds)", cache_age)
+                self._evacuable_flavors_cache = None
+                self._evacuable_images_cache = None
+                self._cache_timestamp = current_time
+            else:
+                # Cache is still fresh, no need to refresh
+                logging.debug("Cache is fresh (age: %.1f seconds), skipping refresh", cache_age)
+                return False
+
+        # Force re-cache (done outside lock to avoid blocking)
+        evac_flavors = self.get_evacuable_flavors(connection)
+        evac_images = self.get_evacuable_images(connection)
+
+        logging.info("Cache refreshed: %d flavors, %d images", len(evac_flavors), len(evac_images))
+        return True
 
 
 # Initialize global configuration manager
@@ -949,59 +977,70 @@ except ConfigurationError as e:
 
 # Global service instance will be created in main()
 
+class UDPSocketManager:
+    """Context manager for UDP socket handling with proper resource cleanup."""
+    
+    def __init__(self, udp_ip, udp_port):
+        self.udp_ip = udp_ip
+        self.udp_port = udp_port
+        self.socket = None
+    
+    def __enter__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.settimeout(1.0)
+        self.socket.bind((self.udp_ip, self.udp_port))
+        logging.info('Kdump UDP listener started on %s:%s' % (self.udp_ip, self.udp_port))
+        return self.socket
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.socket:
+            try:
+                self.socket.close()
+            except (OSError, AttributeError):
+                pass
+        logging.info('Kdump UDP listener stopped')
+
 def _kdump_udp_listener(service):
     """Background UDP listener for kdump messages."""
+    udp_ip = service.UDP_IP if service.UDP_IP else '0.0.0.0'
+    udp_port = service.config.get_udp_port()
 
     try:
-        udp_ip = service.UDP_IP if service.UDP_IP else '0.0.0.0'
-        udp_port = service.config.get_udp_port()
+        with UDPSocketManager(udp_ip, udp_port) as sock:
+            while not service.kdump_listener_stop_event.is_set():
+                try:
+                    data, _, _, address = sock.recvmsg(65535, 1024, 0)
+                    logging.debug('Received UDP message from %s, length: %d' % (address[0], len(data)))
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(1.0)
-        sock.bind((udp_ip, udp_port))
-        logging.info('Kdump UDP listener started on %s:%s' % (udp_ip, udp_port))
+                    if len(data) >= 8:
+                        # Try both byte orders for magic number (fence_kdump compatibility)
+                        magic_native = struct.unpack('I', data[:4])[0]
+                        magic_network = struct.unpack('!I', data[:4])[0]
 
-        while not service.kdump_listener_stop_event.is_set():
-            try:
-                data, _, _, address = sock.recvmsg(65535, 1024, 0)
-                logging.debug('Received UDP message from %s, length: %d' % (address[0], len(data)))
+                        if magic_native == 0x1B302A40 or magic_network == 0x1B302A40:
+                            try:
+                                hostname = socket.gethostbyaddr(address[0])[0].split('.', 1)[0]
+                                service.kdump_hosts_timestamp[hostname] = time.time()
+                                logging.info('Kdump message received from host: %s' % hostname)
 
-                if len(data) >= 8:
-                    # Try both byte orders for magic number (fence_kdump compatibility)
-                    magic_native = struct.unpack('I', data[:4])[0]
-                    magic_network = struct.unpack('!I', data[:4])[0]
-
-                    if magic_native == 0x1B302A40 or magic_network == 0x1B302A40:
-                        try:
-                            hostname = socket.gethostbyaddr(address[0])[0].split('.', 1)[0]
-                            service.kdump_hosts_timestamp[hostname] = time.time()
-                            logging.info('Kdump message received from host: %s' % hostname)
-
-                            # Cleanup old entries every 100 messages (approx)
-                            if len(service.kdump_hosts_timestamp) > 100:
-                                cutoff = time.time() - 300
-                                old_keys = [k for k, v in service.kdump_hosts_timestamp.items() if v < cutoff]
-                                for k in old_keys:
-                                    del service.kdump_hosts_timestamp[k]
-                        except Exception as e:
-                            logging.debug('Failed to process kdump message from %s: %s' % (address[0], e))
-                    else:
-                        logging.debug('Invalid magic number from %s: 0x%x / 0x%x' % (address[0], magic_native, magic_network))
-            except socket.timeout:
-                continue
-            except OSError as e:
-                if not service.kdump_listener_stop_event.is_set():
-                    logging.debug('UDP listener socket error: %s' % e)
-                continue
+                                # Cleanup old entries every 100 messages (approx)
+                                if len(service.kdump_hosts_timestamp) > 100:
+                                    cutoff = time.time() - 300
+                                    old_keys = [k for k, v in service.kdump_hosts_timestamp.items() if v < cutoff]
+                                    for k in old_keys:
+                                        del service.kdump_hosts_timestamp[k]
+                            except Exception as e:
+                                logging.debug('Failed to process kdump message from %s: %s' % (address[0], e))
+                        else:
+                            logging.debug('Invalid magic number from %s: 0x%x / 0x%x' % (address[0], magic_native, magic_network))
+                except socket.timeout:
+                    continue
+                except OSError as e:
+                    if not service.kdump_listener_stop_event.is_set():
+                        logging.debug('UDP listener socket error: %s' % e)
+                    continue
     except Exception as e:
         logging.error('Kdump listener failed to start: %s' % e)
-    finally:
-        try:
-            sock.close()
-        except (OSError, AttributeError):
-            # Socket may already be closed or never opened
-            pass
-        logging.info('Kdump UDP listener stopped')
 
 def _check_kdump_single(host, service):
     """Check if host is kdumping within timeout period."""
@@ -1590,45 +1629,46 @@ def _bmh_wait_for_power_off(get_url, headers, cacert, host, timeout, poll_interv
 
     timeout_end = time.time() + timeout
 
-    while time.time() < timeout_end:
-        time.sleep(poll_interval)
+    with requests.Session() as session:
+        while time.time() < timeout_end:
+            time.sleep(poll_interval)
 
-        try:
-            response = requests.get(get_url, headers=headers, verify=cacert, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
+            try:
+                response = session.get(get_url, headers=headers, verify=cacert, timeout=REQUEST_TIMEOUT)
+                response.raise_for_status()
 
-        except requests.exceptions.Timeout:
-            logging.warning("Timeout checking power status for %s, continuing to wait", host)
-            continue
-        except requests.exceptions.HTTPError as e:
-            logging.warning("HTTP error checking power status for %s: %s, continuing to wait", host, e)
-            continue
-        except requests.exceptions.RequestException as e:
-            logging.warning("Request error checking power status for %s: %s, continuing to wait", host, e)
-            continue
+            except requests.exceptions.Timeout:
+                logging.warning("Timeout checking power status for %s, continuing to wait", host)
+                continue
+            except requests.exceptions.HTTPError as e:
+                logging.warning("HTTP error checking power status for %s: %s, continuing to wait", host, e)
+                continue
+            except requests.exceptions.RequestException as e:
+                logging.warning("Request error checking power status for %s: %s, continuing to wait", host, e)
+                continue
 
-        # Parse JSON response
-        try:
-            status_data = response.json()
-        except (json.JSONDecodeError, ValueError) as e:
-            logging.warning("Invalid JSON response checking power status for %s: %s, continuing to wait", host, e)
-            continue
+            # Parse JSON response
+            try:
+                status_data = response.json()
+            except (json.JSONDecodeError, ValueError) as e:
+                logging.warning("Invalid JSON response checking power status for %s: %s, continuing to wait", host, e)
+                continue
 
-        # Extract power status
-        try:
-            power_status = status_data['status']['poweredOn']
-            logging.debug("Power status for %s: %s", host, power_status)
+            # Extract power status
+            try:
+                power_status = status_data['status']['poweredOn']
+                logging.debug("Power status for %s: %s", host, power_status)
 
-            if not power_status:
-                logging.info("BMH power off confirmed for %s", host)
-                return True
+                if not power_status:
+                    logging.info("BMH power off confirmed for %s", host)
+                    return True
 
-        except KeyError as e:
-            logging.warning("Missing power status field for %s: %s, continuing to wait", host, e)
-            continue
-        except Exception as e:
-            logging.warning("Error parsing power status for %s: %s, continuing to wait", host, e)
-            continue
+            except KeyError as e:
+                logging.warning("Missing power status field for %s: %s, continuing to wait", host, e)
+                continue
+            except Exception as e:
+                logging.warning("Error parsing power status for %s: %s, continuing to wait", host, e)
+                continue
 
     # Timeout reached
     logging.error("BMH power off timeout: %s did not power off within %d seconds", host, timeout)

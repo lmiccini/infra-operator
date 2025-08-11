@@ -345,13 +345,54 @@ class TestInstanceHAService(unittest.TestCase):
         mock_flavor.get_keys.return_value = {'evacuable': 'true'}
         self.mock_nova_client.flavors.list.return_value = [mock_flavor]
 
-        # Force refresh should update cache
-        refreshed = self.service.refresh_evacuable_cache(self.mock_nova_client, force=True)
-        self.assertTrue(refreshed)
+        # Mock images to avoid slow API calls in refresh
+        with patch.object(self.service, 'get_evacuable_images', return_value=['test-image']):
+            # Force refresh should update cache
+            refreshed = self.service.refresh_evacuable_cache(self.mock_nova_client, force=True)
+            self.assertTrue(refreshed)
 
         # Cache should be updated
         flavors = self.service.get_evacuable_flavors(self.mock_nova_client)
         self.assertEqual(flavors, ['new-flavor'])
+
+    def test_cache_thread_safety(self):
+        """Test that cache operations are thread-safe."""
+        import threading
+        import time
+        
+        # Set up mock data
+        mock_flavor = Mock()
+        mock_flavor.id = 'thread-safe-flavor'
+        mock_flavor.get_keys.return_value = {'evacuable': 'true'}
+        self.mock_nova_client.flavors.list.return_value = [mock_flavor]
+        
+        errors = []
+        
+        def cache_operation(thread_id):
+            try:
+                # Simulate concurrent cache operations
+                self.service.clear_cache()
+                with patch.object(self.service, 'get_evacuable_images', return_value=[]):
+                    self.service.refresh_evacuable_cache(self.mock_nova_client, force=True)
+                flavors = self.service.get_evacuable_flavors(self.mock_nova_client)
+                # Should not raise any exceptions
+                self.assertIsInstance(flavors, list)
+            except Exception as e:
+                errors.append(f"Thread {thread_id}: {e}")
+        
+        # Run multiple threads concurrently
+        threads = []
+        for i in range(5):
+            thread = threading.Thread(target=cache_operation, args=(i,))
+            threads.append(thread)
+            thread.start()
+        
+        # Wait for all threads to complete
+        for thread in threads:
+            thread.join()
+        
+        # Should not have any errors from race conditions
+        self.assertEqual(errors, [], f"Thread safety errors: {errors}")
 
     def test_filter_hosts_with_servers(self):
         """Test filtering hosts that have servers."""
