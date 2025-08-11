@@ -480,6 +480,27 @@ class TestInstanceHAService(unittest.TestCase):
             for item in result_list:
                 self.assertIn(item, mock_services)
 
+    def test_health_hash_update(self):
+        """Test health hash update functionality."""
+        # Initial state
+        self.assertEqual(self.service.current_hash, "")
+        self.assertTrue(self.service.hash_update_successful)
+
+        # First update should set hash
+        self.service.update_health_hash(hash_interval=0)  # Force immediate update
+        self.assertNotEqual(self.service.current_hash, "")
+        self.assertTrue(self.service.hash_update_successful)
+
+        # Same hash should trigger failure
+        old_hash = self.service.current_hash
+        self.service._previous_hash = old_hash  # Simulate same hash scenario
+
+        import unittest.mock
+        with unittest.mock.patch('hashlib.sha256') as mock_sha:
+            mock_sha.return_value.hexdigest.return_value = old_hash
+            self.service.update_health_hash(hash_interval=0)
+            self.assertFalse(self.service.hash_update_successful)
+
     def test_filter_hosts_with_servers(self):
         """Test filtering hosts that have servers."""
         mock_service1 = Mock()

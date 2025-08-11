@@ -403,6 +403,8 @@ class InstanceHAService(CloudConnectionProvider):
         # Service state
         self.current_hash = ""
         self.hash_update_successful = True
+        self._last_hash_time = 0
+        self._previous_hash = ""
 
         # Cache for performance optimization
         self._host_servers_cache = {}
@@ -422,6 +424,21 @@ class InstanceHAService(CloudConnectionProvider):
         self.kdump_listener_stop_event = threading.Event()
 
         logging.info("InstanceHA service initialized successfully")
+
+    def update_health_hash(self, hash_interval: int = 60) -> None:
+        """Update health monitoring hash for service status tracking."""
+        current_timestamp = time.time()
+
+        if current_timestamp - self._last_hash_time > hash_interval:
+            new_hash = hashlib.sha256(str(current_timestamp).encode()).hexdigest()
+            if new_hash == self._previous_hash:
+                logging.error("Hash has not changed. Something went wrong.")
+                self.hash_update_successful = False
+            else:
+                self.current_hash = new_hash
+                self.hash_update_successful = True
+                self._previous_hash = self.current_hash
+                self._last_hash_time = current_timestamp
 
     def get_connection(self) -> Optional[OpenStackClient]:
         """
@@ -2256,31 +2273,13 @@ def _process_reenabling(conn, service, to_reenable):
             logging.error('Failed to enable %s: %s', svc.host, e)
 
 def main():
-    global current_hash, hash_update_successful
-
     # Initialize service and establish connections
     service, metrics = _initialize_service()
     conn = _establish_nova_connection(service)
 
-    # Hash tracking for health checks
-    previous_hash = ""
-    last_hash_time = 0
-    hash_interval = 60
-
     while True:
-        current_timestamp = time.time()
-
-        # Update hash less frequently for better performance
-        if current_timestamp - last_hash_time > hash_interval:
-            new_hash = hashlib.sha256(str(current_timestamp).encode()).hexdigest()
-            if new_hash == previous_hash:
-                logging.error("Hash has not changed. Something went wrong.")
-                hash_update_successful = False
-            else:
-                current_hash = new_hash
-                hash_update_successful = True
-                previous_hash = current_hash
-                last_hash_time = current_timestamp
+        # Update health monitoring hash
+        service.update_health_hash()
 
         try:
             with metrics.timer('main_loop'):
