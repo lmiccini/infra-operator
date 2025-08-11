@@ -394,6 +394,37 @@ class TestInstanceHAService(unittest.TestCase):
         # Should not have any errors from race conditions
         self.assertEqual(errors, [], f"Thread safety errors: {errors}")
 
+    def test_unified_resource_evacuable_checking(self):
+        """Test the unified resource evacuable checking methods."""
+        # Test _is_resource_evacuable with different resource types
+        mock_image = Mock()
+        mock_image.tags = ['evacuable']
+        mock_image.metadata = {'custom': 'evacuable'}
+        mock_image.properties = {'trait:evacuable': 'true'}
+        
+        # Test with tags
+        self.assertTrue(self.service._is_resource_evacuable(mock_image, 'evacuable', ['tags']))
+        
+        # Test with metadata
+        mock_image2 = Mock()
+        mock_image2.metadata = {'evacuable': 'true'}
+        self.assertTrue(self.service._is_resource_evacuable(mock_image2, 'evacuable', ['metadata']))
+        
+        # Test _is_flavor_evacuable
+        mock_flavor = Mock()
+        mock_flavor.get_keys.return_value = {'evacuable': 'true'}
+        self.assertTrue(self.service._is_flavor_evacuable(mock_flavor, 'evacuable'))
+        
+        # Test with composite key
+        mock_flavor2 = Mock()
+        mock_flavor2.get_keys.return_value = {'trait:CUSTOM_EVACUABLE': 'true'}
+        self.assertTrue(self.service._is_flavor_evacuable(mock_flavor2, 'EVACUABLE'))
+        
+        # Test negative cases
+        mock_flavor3 = Mock()
+        mock_flavor3.get_keys.return_value = {'other': 'false'}
+        self.assertFalse(self.service._is_flavor_evacuable(mock_flavor3, 'evacuable'))
+
     def test_filter_hosts_with_servers(self):
         """Test filtering hosts that have servers."""
         mock_service1 = Mock()

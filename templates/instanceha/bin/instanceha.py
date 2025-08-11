@@ -573,26 +573,12 @@ class InstanceHAService:
 
             cache_data = []
             for flavor in flavors:
-                    try:
-                        flavor_keys = flavor.get_keys()
-                        # Check if evacuable_tag is an exact key match or part of a key (e.g., trait:CUSTOM_HA)
-                        matching_key = None
-                        if evacuable_tag in flavor_keys:
-                            matching_key = evacuable_tag
-                        else:
-                            # Look for the tag in composite keys like "trait:CUSTOM_HA"
-                            for key in flavor_keys:
-                                if evacuable_tag in key:
-                                    matching_key = key
-                                    break
-
-                        if matching_key:
-                            value = flavor_keys[matching_key]
-                            if str(value).lower() == 'true':
-                                cache_data.append(flavor.id)
-                                logging.debug("Added flavor %s to evacuable cache (key: %s, value: %s)", flavor.id, matching_key, value)
-                    except Exception as e:
-                        logging.debug("Could not check keys for flavor %s: %s", flavor.id, e)
+                try:
+                    if self._is_flavor_evacuable(flavor, evacuable_tag):
+                        cache_data.append(flavor.id)
+                        logging.debug("Added flavor %s to evacuable cache", flavor.id)
+                except Exception as e:
+                    logging.debug("Could not check keys for flavor %s: %s", flavor.id, e)
 
             logging.debug("Cached %d evacuable flavors from %d total flavors",
                          len(cache_data), len(flavors))
@@ -679,14 +665,8 @@ class InstanceHAService:
             cache_data = []
             if images:
                 for image in images:
-                    # Check for tags (Glance v2 API) - tags are just strings, not key-value pairs
-                    # Need to check if evacuable_tag is contained in any of the tag strings
-                    if hasattr(image, 'tags') and self._check_evacuable_tag(image.tags, evacuable_tag):
-                        cache_data.append(image.id)
-                    # Check for metadata/properties (fallback) - these might have composite keys
-                    elif hasattr(image, 'metadata') and self._check_evacuable_tag(image.metadata, evacuable_tag):
-                        cache_data.append(image.id)
-                    elif hasattr(image, 'properties') and self._check_evacuable_tag(image.properties, evacuable_tag):
+                    # Check image for evacuable tags using unified method
+                    if self._is_resource_evacuable(image, evacuable_tag, ['tags', 'metadata', 'properties']):
                         cache_data.append(image.id)
 
                 logging.debug("Cached %d evacuable images from %d total images",
@@ -743,6 +723,57 @@ class InstanceHAService:
         except (AttributeError, TypeError):
             return False
 
+    def _is_resource_evacuable(self, resource, evacuable_tag, attribute_checks):
+        """
+        Unified method to check if a resource (image, flavor, aggregate) is evacuable.
+        
+        Args:
+            resource: The resource object to check
+            evacuable_tag: The tag to look for
+            attribute_checks: List of attribute names to check on the resource
+            
+        Returns:
+            bool: True if resource is evacuable, False otherwise
+        """
+        for attr_name in attribute_checks:
+            if hasattr(resource, attr_name):
+                attr_value = getattr(resource, attr_name, {})
+                if self._check_evacuable_tag(attr_value, evacuable_tag):
+                    return True
+        return False
+
+    def _is_flavor_evacuable(self, flavor, evacuable_tag):
+        """
+        Check if a flavor is evacuable based on its extra specs.
+        
+        Args:
+            flavor: The flavor object to check
+            evacuable_tag: The tag to look for
+            
+        Returns:
+            bool: True if flavor is evacuable, False otherwise
+        """
+        try:
+            flavor_keys = flavor.get_keys()
+            
+            # Check if evacuable_tag is an exact key match or part of a key (e.g., trait:CUSTOM_HA)
+            matching_key = None
+            if evacuable_tag in flavor_keys:
+                matching_key = evacuable_tag
+            else:
+                # Look for the tag in composite keys like "trait:CUSTOM_HA"
+                for key in flavor_keys:
+                    if evacuable_tag in key:
+                        matching_key = key
+                        break
+
+            if matching_key:
+                value = flavor_keys[matching_key]
+                return str(value).lower() == 'true'
+            return False
+        except Exception:
+            return False
+
     def is_server_image_evacuable(self, server, connection=None):
         """
         Check if a server's image is tagged as evacuable (fallback method).
@@ -782,9 +813,8 @@ class InstanceHAService:
             ]:
                 try:
                     image = get_method()
-                    for attr in check_attrs:
-                        if hasattr(image, attr) and self._check_evacuable_tag(getattr(image, attr, {}), evacuable_tag):
-                            return True
+                    if self._is_resource_evacuable(image, evacuable_tag, check_attrs):
+                        return True
                 except (AttributeError, TypeError, KeyError) as e:
                     logging.debug("Error checking image attributes: %s", e)
                     continue
@@ -813,9 +843,9 @@ class InstanceHAService:
             aggregates = connection.aggregates.list()
             evacuable_tag = self.config.get_evacuable_tag()
 
-            # Use existing tag checking logic and filter in one pass
+            # Use unified resource checking logic 
             return any(host in agg.hosts for agg in aggregates
-                      if self._check_evacuable_tag(agg.metadata, evacuable_tag))
+                      if self._is_resource_evacuable(agg, evacuable_tag, ['metadata']))
         except Exception as e:
             logging.error("Failed to check aggregate evacuability for %s: %s", host, e)
             logging.debug('Exception traceback:', exc_info=True)
