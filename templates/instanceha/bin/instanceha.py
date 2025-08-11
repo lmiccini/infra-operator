@@ -20,8 +20,9 @@ import threading
 import hashlib
 from http import server
 import json
-from typing import Dict, Any, Optional, Union, List
+from typing import Dict, Any, Optional, Union, List, Protocol
 from collections import defaultdict
+from abc import ABC, abstractmethod
 
 from novaclient import client
 from novaclient.exceptions import Conflict, NotFound, Forbidden, Unauthorized
@@ -40,6 +41,29 @@ class ConfigurationError(Exception):
 class NovaConnectionError(Exception):
     """Raised when Nova API connection fails."""
     pass
+
+
+class OpenStackClient(Protocol):
+    """Protocol defining the interface for OpenStack clients."""
+
+    def services(self): ...
+    def flavors(self): ...
+    def aggregates(self): ...
+    def servers(self): ...
+
+
+class CloudConnectionProvider(ABC):
+    """Abstract interface for cloud connection management."""
+
+    @abstractmethod
+    def get_connection(self) -> Optional[OpenStackClient]:
+        """Get a connection to the cloud provider."""
+        pass
+
+    @abstractmethod
+    def create_connection(self) -> Optional[OpenStackClient]:
+        """Create a new connection to the cloud provider."""
+        pass
 
 
 class ConfigManager:
@@ -357,7 +381,7 @@ class TimingContext:
                 self.metrics.increment(f'{self.operation}_failed')
 
 
-class InstanceHAService:
+class InstanceHAService(CloudConnectionProvider):
     """
     Main service class that encapsulates all InstanceHA functionality.
 
@@ -365,16 +389,16 @@ class InstanceHAService:
     for better testability, maintainability, and architectural cleanliness.
     """
 
-    def __init__(self, config_manager: ConfigManager, nova_client=None):
+    def __init__(self, config_manager: ConfigManager, cloud_client: Optional[OpenStackClient] = None):
         """
         Initialize the InstanceHA service.
 
         Args:
             config_manager: Configuration manager instance
-            nova_client: Optional Nova client for testing (None for production)
+            cloud_client: Optional OpenStack client for testing (None for production)
         """
         self.config = config_manager
-        self.nova_client = nova_client
+        self.cloud_client = cloud_client
 
         # Service state
         self.current_hash = ""
@@ -392,26 +416,26 @@ class InstanceHAService:
 
         # Threading
         self.health_check_thread = None
-        
+
         # Kdump state management
         self.kdump_hosts_timestamp = defaultdict(float)
         self.kdump_listener_stop_event = threading.Event()
 
         logging.info("InstanceHA service initialized successfully")
 
-    def get_nova_connection(self):
+    def get_connection(self) -> Optional[OpenStackClient]:
         """
-        Get Nova client connection with dependency injection support.
+        Get cloud client connection with dependency injection support.
 
         Returns:
-            Nova client connection or None if failed
+            OpenStack client connection or None if failed
         """
-        if self.nova_client:
-            return self.nova_client
+        if self.cloud_client:
+            return self.cloud_client
 
-        return self._create_nova_connection()
+        return self.create_connection()
 
-    def _create_nova_connection(self):
+    def create_connection(self) -> Optional[OpenStackClient]:
         """Create a new Nova connection using configuration."""
         try:
             cloud_name = self.config.get_cloud_name()
@@ -539,7 +563,7 @@ class InstanceHAService:
                            server.id, criteria_str, self.config.get_evacuable_tag())
         return False
 
-    def get_evacuable_flavors(self, connection=None):
+    def get_evacuable_flavors(self, connection: Optional[OpenStackClient] = None):
         """
         Get list of evacuable flavor IDs with caching.
 
@@ -553,7 +577,7 @@ class InstanceHAService:
             return []
 
         if connection is None:
-            connection = self.get_nova_connection()
+            connection = self.get_connection()
 
         if connection is None:
             logging.error("No Nova connection available for flavor caching")
@@ -590,10 +614,10 @@ class InstanceHAService:
         # Update cache with lock
         with self._cache_lock:
             self._evacuable_flavors_cache = cache_data
-            
+
         return self._evacuable_flavors_cache
 
-    def get_evacuable_images(self, connection=None):
+    def get_evacuable_images(self, connection: Optional[OpenStackClient] = None):
         """
         Get list of evacuable image IDs with caching.
 
@@ -609,7 +633,7 @@ class InstanceHAService:
             return []
 
         if connection is None:
-            connection = self.get_nova_connection()
+            connection = self.get_connection()
 
         if connection is None:
             logging.error("No Nova connection available for image caching")
@@ -683,7 +707,7 @@ class InstanceHAService:
         # Update cache with lock
         with self._cache_lock:
             self._evacuable_images_cache = cache_data
-            
+
         return self._evacuable_images_cache
 
     def _get_server_image_id(self, server):
@@ -726,12 +750,12 @@ class InstanceHAService:
     def _is_resource_evacuable(self, resource, evacuable_tag, attribute_checks):
         """
         Unified method to check if a resource (image, flavor, aggregate) is evacuable.
-        
+
         Args:
             resource: The resource object to check
             evacuable_tag: The tag to look for
             attribute_checks: List of attribute names to check on the resource
-            
+
         Returns:
             bool: True if resource is evacuable, False otherwise
         """
@@ -745,17 +769,17 @@ class InstanceHAService:
     def _is_flavor_evacuable(self, flavor, evacuable_tag):
         """
         Check if a flavor is evacuable based on its extra specs.
-        
+
         Args:
             flavor: The flavor object to check
             evacuable_tag: The tag to look for
-            
+
         Returns:
             bool: True if flavor is evacuable, False otherwise
         """
         try:
             flavor_keys = flavor.get_keys()
-            
+
             # Check if evacuable_tag is an exact key match or part of a key (e.g., trait:CUSTOM_HA)
             matching_key = None
             if evacuable_tag in flavor_keys:
@@ -774,7 +798,7 @@ class InstanceHAService:
         except Exception:
             return False
 
-    def is_server_image_evacuable(self, server, connection=None):
+    def is_server_image_evacuable(self, server, connection: Optional[OpenStackClient] = None):
         """
         Check if a server's image is tagged as evacuable (fallback method).
 
@@ -792,7 +816,7 @@ class InstanceHAService:
             return False
 
         if connection is None:
-            connection = self.get_nova_connection()
+            connection = self.get_connection()
 
         if connection is None:
             logging.debug("No Nova connection available for image evacuability check")
@@ -828,7 +852,7 @@ class InstanceHAService:
 
         return False
 
-    def is_aggregate_evacuable(self, connection, host):
+    def is_aggregate_evacuable(self, connection: OpenStackClient, host: str):
         """
         Check if a host is part of an aggregate that has been tagged as evacuable.
 
@@ -843,7 +867,7 @@ class InstanceHAService:
             aggregates = connection.aggregates.list()
             evacuable_tag = self.config.get_evacuable_tag()
 
-            # Use unified resource checking logic 
+            # Use unified resource checking logic
             return any(host in agg.hosts for agg in aggregates
                       if self._is_resource_evacuable(agg, evacuable_tag, ['metadata']))
         except Exception as e:
@@ -973,7 +997,7 @@ class InstanceHAService:
     def refresh_evacuable_cache(self, connection=None, force=False, cache_timeout=300):
         """Refresh evacuable flavors and images cache with intelligent timing."""
         current_time = time.time()
-        
+
         with self._cache_lock:
             cache_age = current_time - self._cache_timestamp
 
@@ -1009,19 +1033,19 @@ except ConfigurationError as e:
 
 class UDPSocketManager:
     """Context manager for UDP socket handling with proper resource cleanup."""
-    
+
     def __init__(self, udp_ip, udp_port):
         self.udp_ip = udp_ip
         self.udp_port = udp_port
         self.socket = None
-    
+
     def __enter__(self):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.settimeout(1.0)
         self.socket.bind((self.udp_ip, self.udp_port))
         logging.info('Kdump UDP listener started on %s:%s' % (self.udp_ip, self.udp_port))
         return self.socket
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.socket:
             try:
@@ -1720,14 +1744,14 @@ def _execute_fence_operation(host, action, fencing_data):
         """Validate input parameters to prevent injection attacks."""
         import ipaddress
         import re
-        
+
         # Validate IP address
         try:
             ipaddress.ip_address(fencing_data["ipaddr"])
         except ValueError:
             logging.error("Invalid IP address for %s: %s", agent_name, fencing_data["ipaddr"])
             return False
-        
+
         # Validate port (if present)
         if "ipport" in fencing_data:
             try:
@@ -1737,14 +1761,14 @@ def _execute_fence_operation(host, action, fencing_data):
             except ValueError:
                 logging.error("Invalid port for %s: %s", agent_name, fencing_data["ipport"])
                 return False
-        
+
         # Validate username (alphanumeric, underscore, dash, max 64 chars)
         if "login" in fencing_data:
             username = fencing_data["login"]
             if not re.match(r'^[a-zA-Z0-9_-]{1,64}$', username):
                 logging.error("Invalid username for %s: %s", agent_name, username)
                 return False
-        
+
         return True
 
     try:
@@ -2067,19 +2091,19 @@ def _initialize_service():
 def _establish_nova_connection(service):
     """Establish Nova connection using service configuration."""
     cloud = os.getenv('OS_CLOUD', 'overcloud')
-    
+
     try:
         auth = service.config.clouds[cloud]["auth"]
         secure = service.config.secure[cloud]["auth"]
-        
+
         conn = nova_login(auth["username"], secure["password"], auth["project_name"],
                          auth["auth_url"], auth["user_domain_name"], auth["project_domain_name"])
-        
+
         if conn is None:
             logging.error("Failed: Unable to connect to Nova - connection is None")
             sys.exit(1)
         return conn
-        
+
     except KeyError as e:
         logging.error("Could not find valid data for Cloud: %s", cloud)
         sys.exit(1)
@@ -2089,30 +2113,43 @@ def _establish_nova_connection(service):
 
 def _categorize_services(services, target_date):
     """Categorize services into compute nodes, resume candidates, and re-enable candidates."""
-    compute_nodes, to_resume, to_reenable = [], [], []
-    
+    return (
+        _get_compute_nodes(services, target_date),
+        _get_resume_candidates(services, target_date),
+        _get_reenable_candidates(services, target_date)
+    )
+
+def _get_compute_nodes(services, target_date):
+    """Generator for compute nodes needing evacuation to reduce memory usage."""
     for svc in services:
-        # Check for nodes to re-enable (forced_down but enabled)
+        if ((datetime.fromisoformat(svc.updated_at) < target_date and svc.state != 'down') or
+            svc.state == 'down') and 'disabled' not in svc.status and not svc.forced_down:
+            yield svc
+
+def _get_resume_candidates(services, target_date):
+    """Generator for services to resume evacuation."""
+    for svc in services:
+        if (svc.forced_down and svc.state == 'down' and 'disabled' in svc.status and
+            'instanceha evacuation' in svc.disabled_reason and 'evacuation FAILED' not in svc.disabled_reason):
+            yield svc
+
+def _get_reenable_candidates(services, target_date):
+    """Generator for services that can be re-enabled."""
+    for svc in services:
         if 'enabled' in svc.status and svc.forced_down:
-            to_reenable.append(svc)
-        # Check for nodes needing evacuation
-        elif ((datetime.fromisoformat(svc.updated_at) < target_date and svc.state != 'down') or
-              svc.state == 'down') and 'disabled' not in svc.status and not svc.forced_down:
-            compute_nodes.append(svc)
-        # Check for nodes to resume evacuation
-        elif (svc.forced_down and svc.state == 'down' and 'disabled' in svc.status and
-              'instanceha evacuation' in svc.disabled_reason and 'evacuation FAILED' not in svc.disabled_reason):
-            to_resume.append(svc)
-    
-    return compute_nodes, to_resume, to_reenable
+            yield svc
 
 def _process_stale_services(conn, service, services, compute_nodes, to_resume):
     """Process stale compute services for evacuation."""
+    # Convert generators to lists only when needed for processing
+    compute_nodes = list(compute_nodes)
+    to_resume = list(to_resume)
+
     if not (compute_nodes or to_resume):
         return
-        
+
     logging.warning('The following computes are down: %s', [svc.host for svc in compute_nodes])
-    
+
     # Filter compute nodes with servers
     host_servers_cache = None
     if compute_nodes:
@@ -2120,37 +2157,37 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
         compute_nodes = service.filter_hosts_with_servers(compute_nodes, host_servers_cache)
         if not compute_nodes:
             logging.debug("No compute nodes with servers to evacuate")
-    
+
     # Get reserved hosts if enabled
     reserved_hosts = ([svc for svc in services if 'disabled' in svc.status and 'reserved' in svc.disabled_reason]
                      if service.config.is_reserved_hosts_enabled() and compute_nodes else [])
-    
+
     # Refresh cache and get evacuable resources
     service.refresh_evacuable_cache(conn)
     images_enabled = service.config.is_tagged_images_enabled()
     flavors_enabled = service.config.is_tagged_flavors_enabled()
     images = service.get_evacuable_images(conn) if images_enabled else []
     flavors = service.get_evacuable_flavors(conn) if flavors_enabled else []
-    
+
     # Filter evacuable servers if tagging is enabled
     if (images_enabled or flavors_enabled) and compute_nodes and host_servers_cache:
         compute_nodes = service.filter_hosts_with_evacuable_servers(compute_nodes, host_servers_cache, flavors, images)
         if not images and not flavors:
             logging.info("No tagged resources found - will evacuate all servers")
-    
+
     # Apply aggregate filtering if enabled
     if service.config.is_tagged_aggregates_enabled() and compute_nodes:
         compute_nodes = _filter_by_aggregates(conn, service, compute_nodes, services)
-    
+
     # Check evacuation threshold
     if services and (len(compute_nodes) / len(services) * 100) > service.config.get_threshold():
         logging.error('Number of impacted computes exceeds threshold. Not evacuating.')
         return
-    
+
     # Process evacuations
     if not service.config.is_disabled():
         to_evacuate = _check_kdump(compute_nodes, service) if service.config.is_kdump_check_enabled() else compute_nodes
-        
+
         with concurrent.futures.ThreadPoolExecutor() as executor:
             # Process new evacuations
             results = list(executor.map(lambda svc: process_service(svc, reserved_hosts, False, service), to_evacuate))
@@ -2169,7 +2206,7 @@ def _filter_by_aggregates(conn, service, compute_nodes, services):
         aggregates = conn.aggregates.list()
         evacuable_tag = service.config.get_evacuable_tag()
         evacuable_hosts = set()
-        
+
         for agg in aggregates:
             is_evacuable = (evacuable_tag in agg.metadata and
                           str(agg.metadata[evacuable_tag]).lower() == 'true') or \
@@ -2177,27 +2214,30 @@ def _filter_by_aggregates(conn, service, compute_nodes, services):
                              for key in agg.metadata)
             if is_evacuable:
                 evacuable_hosts.update(agg.hosts)
-        
+
         compute_nodes_down = compute_nodes
         compute_nodes = [svc for svc in compute_nodes if svc.host in evacuable_hosts]
-        
+
         down_not_tagged = [svc.host for svc in compute_nodes_down if svc not in compute_nodes]
         if down_not_tagged:
             logging.warning('Computes not part of evacuable aggregate: %s', down_not_tagged)
-            
+
     except Exception as e:
         logging.warning("Failed to check aggregate evacuability: %s", e)
-    
+
     return compute_nodes
 
 def _process_reenabling(conn, service, to_reenable):
     """Process services that can be re-enabled."""
+    # Convert generator to list for processing
+    to_reenable = list(to_reenable)
+
     if not to_reenable:
         return
-        
+
     logging.debug('Checking %d computes for re-enabling', len(to_reenable))
     force_enable = service.config.is_force_enable_enabled()
-    
+
     for svc in to_reenable:
         try:
             if force_enable:
@@ -2206,7 +2246,7 @@ def _process_reenabling(conn, service, to_reenable):
             else:
                 migrations = conn.migrations.list(source_compute=svc.host, migration_type='evacuation', limit=10)
                 incomplete = [m for m in migrations if m.status not in ['completed', 'error', 'failed']]
-                
+
                 if not incomplete:
                     _host_enable(conn, svc, reenable=True)
                     logging.info('All migrations completed, re-enabled %s', svc.host)
@@ -2217,11 +2257,11 @@ def _process_reenabling(conn, service, to_reenable):
 
 def main():
     global current_hash, hash_update_successful
-    
+
     # Initialize service and establish connections
     service, metrics = _initialize_service()
     conn = _establish_nova_connection(service)
-    
+
     # Hash tracking for health checks
     previous_hash = ""
     last_hash_time = 0
@@ -2252,10 +2292,10 @@ def main():
                 compute_nodes, to_resume, to_reenable = _categorize_services(services, target_date)
 
             logging.debug('List of stale services: %s', [svc.host for svc in compute_nodes])
-            
+
             # Process stale services for evacuation
             _process_stale_services(conn, service, services, compute_nodes, to_resume)
-            
+
             # Process services that can be re-enabled
             _process_reenabling(conn, service, to_reenable)
 
@@ -2271,7 +2311,7 @@ def main():
             metrics._last_summary = time.time()
 
         time.sleep(service.config.get_poll_interval())
-    
+
     return service
 
 

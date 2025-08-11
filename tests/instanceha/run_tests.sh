@@ -29,10 +29,10 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 run_test_file() {
     local test_file="$1"
     local test_name="$2"
-    
+
     echo -e "${YELLOW}Running ${test_name}...${NC}"
     echo "----------------------------------------"
-    
+
     # Run tests with warning suppression for missing config files
     if python3 "${SCRIPT_DIR}/${test_file}" 2>&1 | grep -v "WARNING:root:.*file not found" | grep -v "WARNING:root:.*using defaults"; then
         EXIT_CODE=${PIPESTATUS[0]}
@@ -62,7 +62,7 @@ fi
 echo
 echo
 
-# Run functional tests  
+# Run functional tests
 echo -e "${BLUE}Running Functional Tests...${NC}"
 if run_test_file "functional_test.py" "Functional Tests"; then
     functional_tests_passed=1

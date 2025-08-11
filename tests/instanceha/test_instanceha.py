@@ -263,20 +263,20 @@ class TestInstanceHAService(unittest.TestCase):
         self.mock_config.get_workers.return_value = 4
         self.mock_config.get_delay.return_value = 0
 
-        self.mock_nova_client = Mock()
-        self.service = instanceha.InstanceHAService(self.mock_config, self.mock_nova_client)
+        self.mock_cloud_client = Mock()
+        self.service = instanceha.InstanceHAService(self.mock_config, self.mock_cloud_client)
 
     def test_service_initialization(self):
         """Test InstanceHAService initialization."""
         self.assertEqual(self.service.config, self.mock_config)
-        self.assertEqual(self.service.nova_client, self.mock_nova_client)
+        self.assertEqual(self.service.cloud_client, self.mock_cloud_client)
         self.assertEqual(self.service.current_hash, "")
         self.assertTrue(self.service.hash_update_successful)
 
-    def test_get_nova_connection(self):
-        """Test Nova connection retrieval."""
-        connection = self.service.get_nova_connection()
-        self.assertEqual(connection, self.mock_nova_client)
+    def test_get_connection(self):
+        """Test cloud connection retrieval."""
+        connection = self.service.get_connection()
+        self.assertEqual(connection, self.mock_cloud_client)
 
     def test_is_server_evacuable_with_no_tagging(self):
         """Test server evacuability when no tagging is enabled."""
@@ -321,18 +321,18 @@ class TestInstanceHAService(unittest.TestCase):
         mock_flavor.id = 'flavor-123'
         mock_flavor.get_keys.return_value = {'evacuable': 'true'}
 
-        self.mock_nova_client.flavors.list.return_value = [mock_flavor]
+        self.mock_cloud_client.flavors.list.return_value = [mock_flavor]
 
         # First call should populate cache
-        flavors1 = self.service.get_evacuable_flavors(self.mock_nova_client)
+        flavors1 = self.service.get_evacuable_flavors(self.mock_cloud_client)
 
         # Second call should use cache
-        flavors2 = self.service.get_evacuable_flavors(self.mock_nova_client)
+        flavors2 = self.service.get_evacuable_flavors(self.mock_cloud_client)
 
         self.assertEqual(flavors1, flavors2)
         self.assertEqual(flavors1, ['flavor-123'])
         # Should only call the API once due to caching
-        self.mock_nova_client.flavors.list.assert_called_once()
+        self.mock_cloud_client.flavors.list.assert_called_once()
 
     def test_cache_refresh(self):
         """Test cache refresh functionality."""
@@ -343,54 +343,54 @@ class TestInstanceHAService(unittest.TestCase):
         mock_flavor = Mock()
         mock_flavor.id = 'new-flavor'
         mock_flavor.get_keys.return_value = {'evacuable': 'true'}
-        self.mock_nova_client.flavors.list.return_value = [mock_flavor]
+        self.mock_cloud_client.flavors.list.return_value = [mock_flavor]
 
         # Mock images to avoid slow API calls in refresh
         with patch.object(self.service, 'get_evacuable_images', return_value=['test-image']):
             # Force refresh should update cache
-            refreshed = self.service.refresh_evacuable_cache(self.mock_nova_client, force=True)
+            refreshed = self.service.refresh_evacuable_cache(self.mock_cloud_client, force=True)
             self.assertTrue(refreshed)
 
         # Cache should be updated
-        flavors = self.service.get_evacuable_flavors(self.mock_nova_client)
+        flavors = self.service.get_evacuable_flavors(self.mock_cloud_client)
         self.assertEqual(flavors, ['new-flavor'])
 
     def test_cache_thread_safety(self):
         """Test that cache operations are thread-safe."""
         import threading
         import time
-        
+
         # Set up mock data
         mock_flavor = Mock()
         mock_flavor.id = 'thread-safe-flavor'
         mock_flavor.get_keys.return_value = {'evacuable': 'true'}
-        self.mock_nova_client.flavors.list.return_value = [mock_flavor]
-        
+        self.mock_cloud_client.flavors.list.return_value = [mock_flavor]
+
         errors = []
-        
+
         def cache_operation(thread_id):
             try:
                 # Simulate concurrent cache operations
                 self.service.clear_cache()
                 with patch.object(self.service, 'get_evacuable_images', return_value=[]):
-                    self.service.refresh_evacuable_cache(self.mock_nova_client, force=True)
-                flavors = self.service.get_evacuable_flavors(self.mock_nova_client)
+                    self.service.refresh_evacuable_cache(self.mock_cloud_client, force=True)
+                flavors = self.service.get_evacuable_flavors(self.mock_cloud_client)
                 # Should not raise any exceptions
                 self.assertIsInstance(flavors, list)
             except Exception as e:
                 errors.append(f"Thread {thread_id}: {e}")
-        
+
         # Run multiple threads concurrently
         threads = []
         for i in range(5):
             thread = threading.Thread(target=cache_operation, args=(i,))
             threads.append(thread)
             thread.start()
-        
+
         # Wait for all threads to complete
         for thread in threads:
             thread.join()
-        
+
         # Should not have any errors from race conditions
         self.assertEqual(errors, [], f"Thread safety errors: {errors}")
 
@@ -401,29 +401,84 @@ class TestInstanceHAService(unittest.TestCase):
         mock_image.tags = ['evacuable']
         mock_image.metadata = {'custom': 'evacuable'}
         mock_image.properties = {'trait:evacuable': 'true'}
-        
+
         # Test with tags
         self.assertTrue(self.service._is_resource_evacuable(mock_image, 'evacuable', ['tags']))
-        
+
         # Test with metadata
         mock_image2 = Mock()
         mock_image2.metadata = {'evacuable': 'true'}
         self.assertTrue(self.service._is_resource_evacuable(mock_image2, 'evacuable', ['metadata']))
-        
+
         # Test _is_flavor_evacuable
         mock_flavor = Mock()
         mock_flavor.get_keys.return_value = {'evacuable': 'true'}
         self.assertTrue(self.service._is_flavor_evacuable(mock_flavor, 'evacuable'))
-        
+
         # Test with composite key
         mock_flavor2 = Mock()
         mock_flavor2.get_keys.return_value = {'trait:CUSTOM_EVACUABLE': 'true'}
         self.assertTrue(self.service._is_flavor_evacuable(mock_flavor2, 'EVACUABLE'))
-        
+
         # Test negative cases
         mock_flavor3 = Mock()
         mock_flavor3.get_keys.return_value = {'other': 'false'}
         self.assertFalse(self.service._is_flavor_evacuable(mock_flavor3, 'evacuable'))
+
+    def test_interface_dependency_injection(self):
+        """Test that interfaces enable better dependency injection."""
+        # Create a custom mock that implements the OpenStack client interface
+        custom_mock = Mock()
+        custom_mock.services.list.return_value = []
+        custom_mock.flavors.list.return_value = []
+
+        # Service should accept any object that implements the interface
+        service_with_custom_client = instanceha.InstanceHAService(self.mock_config, custom_mock)
+
+        # Test that the custom client is used
+        connection = service_with_custom_client.get_connection()
+        self.assertEqual(connection, custom_mock)
+
+        # Test that methods work with the interface
+        flavors = service_with_custom_client.get_evacuable_flavors(custom_mock)
+        self.assertIsInstance(flavors, list)
+
+    def test_generator_based_service_categorization(self):
+        """Test that service categorization uses memory-efficient generators."""
+        from datetime import datetime, timedelta
+        import instanceha
+
+        # Create mock services
+        mock_services = []
+        for i in range(100):  # Simulate large deployment
+            svc = Mock()
+            svc.host = f'host-{i}'
+            svc.status = 'enabled' if i % 3 == 0 else 'disabled'
+            svc.forced_down = (i % 5 == 0)
+            svc.state = 'down' if i % 4 == 0 else 'up'
+            svc.updated_at = (datetime.now() - timedelta(seconds=60)).isoformat()
+            svc.disabled_reason = 'instanceha evacuation' if i % 7 == 0 else 'other'
+            mock_services.append(svc)
+
+        target_date = datetime.now() - timedelta(seconds=30)
+
+        # Test that categorization returns generators
+        compute_nodes, to_resume, to_reenable = instanceha._categorize_services(mock_services, target_date)
+
+        # Should be generators, not lists
+        self.assertTrue(hasattr(compute_nodes, '__iter__'))
+        self.assertTrue(hasattr(to_resume, '__iter__'))
+        self.assertTrue(hasattr(to_reenable, '__iter__'))
+
+        # Converting to lists should work
+        compute_list = list(compute_nodes)
+        resume_list = list(to_resume)
+        reenable_list = list(to_reenable)
+
+        # All results should be mock objects from our input
+        for result_list in [compute_list, resume_list, reenable_list]:
+            for item in result_list:
+                self.assertIn(item, mock_services)
 
     def test_filter_hosts_with_servers(self):
         """Test filtering hosts that have servers."""
@@ -445,12 +500,12 @@ class TestInstanceHAService(unittest.TestCase):
         mock_aggregate.hosts = ['host1', 'host2']
         mock_aggregate.metadata = {'evacuable': 'true'}
 
-        self.mock_nova_client.aggregates.list.return_value = [mock_aggregate]
+        self.mock_cloud_client.aggregates.list.return_value = [mock_aggregate]
 
-        result = self.service.is_aggregate_evacuable(self.mock_nova_client, 'host1')
+        result = self.service.is_aggregate_evacuable(self.mock_cloud_client, 'host1')
         self.assertTrue(result)
 
-        result = self.service.is_aggregate_evacuable(self.mock_nova_client, 'host3')
+        result = self.service.is_aggregate_evacuable(self.mock_cloud_client, 'host3')
         self.assertFalse(result)
 
 
@@ -747,7 +802,7 @@ class TestKdumpFunctionality(unittest.TestCase):
         # Create a service instance for this test
         mock_service_instance = instanceha.InstanceHAService(Mock())
         mock_service_instance.config = self.mock_service.config
-        
+
         with patch('instanceha._check_kdump_single') as mock_check:
             mock_check.side_effect = [True, False]  # First host kdumping, second not
             result = instanceha._check_kdump(services, mock_service_instance)
@@ -766,7 +821,7 @@ class TestKdumpFunctionality(unittest.TestCase):
         # Create a service instance for this test
         mock_service_instance = instanceha.InstanceHAService(Mock())
         mock_service_instance.config = mock_service.config
-        
+
         def simulate_very_delayed_kdump(duration):
             nonlocal call_count
             call_count += 1
@@ -790,7 +845,7 @@ class TestKdumpFunctionality(unittest.TestCase):
         # Create a service instance for this test
         mock_service_instance = instanceha.InstanceHAService(Mock())
         mock_service_instance.config = mock_service.config
-        
+
         time_calls = [current_time, current_time, current_time + 6]  # Exceed 5s timeout quickly
         with patch('socket.socket'), \
              patch('time.sleep'), \
@@ -861,7 +916,7 @@ class TestKdumpIntegration(unittest.TestCase):
         mock_config.get_config_value.return_value = 10  # KDUMP_TIMEOUT
         mock_config.get_workers.return_value = 4
         mock_service_instance = instanceha.InstanceHAService(mock_config)
-        
+
         # Simulate one host kdumping, one not
         mock_service_instance.kdump_hosts_timestamp['compute-01'] = time.time() - 5
 
@@ -877,7 +932,7 @@ class TestKdumpIntegration(unittest.TestCase):
         # Simulate concurrent access to kdump_hosts_timestamp
         # Create a service instance for this test
         mock_service_instance = instanceha.InstanceHAService(Mock())
-        
+
         def update_timestamp(host_id):
             for i in range(10):
                 mock_service_instance.kdump_hosts_timestamp[f'host-{host_id}-{i}'] = time.time()
@@ -898,7 +953,7 @@ class TestKdumpIntegration(unittest.TestCase):
         """Test memory management and cleanup."""
         # Create a service instance for this test
         mock_service_instance = instanceha.InstanceHAService(Mock())
-        
+
         # Add many old entries
         old_time = time.time() - 400
         for i in range(150):

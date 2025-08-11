@@ -15,7 +15,7 @@ The test suite is organized into three main categories:
 - Kdump detection and UDP message processing
 - Thread safety and memory management
 
-### 2. Functional Tests (`functional_test.py`) 
+### 2. Functional Tests (`functional_test.py`)
 - **50 tests** validating end-to-end scenarios
 - Basic evacuation workflows
 - Large-scale evacuation scenarios (100+ hosts)
@@ -28,7 +28,7 @@ The test suite is organized into three main categories:
 ### 3. Integration Tests (`integration_test.py`)
 - **19 tests** validating cross-component interactions
 - Complete service initialization workflows
-- Nova connection establishment 
+- Nova connection establishment
 - Service categorization and filtering pipelines
 - Full evacuation workflows with all components
 - Re-enabling workflows with migration checks
@@ -47,7 +47,7 @@ The test suite is organized into three main categories:
 # Unit tests only
 python3 test_instanceha.py
 
-# Functional tests only  
+# Functional tests only
 python3 functional_test.py
 
 # Integration tests only
@@ -68,7 +68,7 @@ The comprehensive test suite provides coverage for:
 
 ### Advanced Features
 - Flavor-based tagging and filtering
-- Image-based tagging and filtering  
+- Image-based tagging and filtering
 - Aggregate-based filtering
 - Reserved host management
 - Smart evacuation with threading
@@ -101,10 +101,10 @@ Recent test run results:
 
 ```
 ========================================
-            Test Summary                
+            Test Summary
 ========================================
 [PASS] Unit Tests: PASSED (48/48 tests)
-[PASS] Functional Tests: PASSED (50/50 tests)  
+[PASS] Functional Tests: PASSED (50/50 tests)
 [PASS] Integration Tests: PASSED (19/19 tests)
 
 Total: 3/3 test suites passed
@@ -135,7 +135,7 @@ The test suite validates the recent code quality improvements:
 - Input validation for IP addresses, ports, and usernames
 - Protection against command injection attacks
 
-### Architecture Improvements  
+### Architecture Improvements
 - Function complexity reduction (main() refactored into 6 focused functions)
 - Improved testability through dependency injection
 - Better separation of concerns
