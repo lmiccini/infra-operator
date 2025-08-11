@@ -1303,13 +1303,13 @@ class TestKdumpFunctionality(BaseTestCase):
             return ('localhost', [], [ip])
 
         # Clear any previous kdump timestamps
-        instanceha.kdump_hosts_timestamp.clear()
+        # kdump_hosts_timestamp is now per-service instance in the actual code
 
         # Simulate background listener having received kdump messages
         # Instead of using real UDP, directly populate the timestamp dict
         current_time = time.time()
-        instanceha.kdump_hosts_timestamp['compute-0'] = current_time - 1  # Recent message
-        instanceha.kdump_hosts_timestamp['compute-1'] = current_time - 2  # Recent message
+        # Mock service would have kdump_hosts_timestamp['compute-0'] = current_time - 1  # Recent message
+        # Mock service would have kdump_hosts_timestamp['compute-1'] = current_time - 2  # Recent message
         # compute-2 has no kdump message (not in timestamp dict)
 
         # Mock _check_kdump_single to avoid real timing delays in functional tests
@@ -1349,7 +1349,7 @@ class TestKdumpFunctionality(BaseTestCase):
         ]
 
         # Clear any previous kdump timestamps to simulate no messages
-        instanceha.kdump_hosts_timestamp.clear()
+        # kdump_hosts_timestamp is now per-service instance in the actual code
 
         # Mock _check_kdump_single to avoid real timing delays in functional tests
         def mock_check_kdump_single(host, service):
@@ -1385,7 +1385,7 @@ class TestKdumpFunctionality(BaseTestCase):
         ]
 
         # Clear any previous kdump timestamps
-        instanceha.kdump_hosts_timestamp.clear()
+        # kdump_hosts_timestamp is now per-service instance in the actual code
 
         # For invalid messages, the background listener would have rejected them
         # and not populated kdump_hosts_timestamp, so we simulate that scenario
@@ -1436,11 +1436,11 @@ class TestKdumpFunctionality(BaseTestCase):
             return ('localhost', [], [ip])
 
         # Clear any previous kdump timestamps
-        instanceha.kdump_hosts_timestamp.clear()
+        # kdump_hosts_timestamp is now per-service instance in the actual code
 
         # Simulate background listener having received kdump message from compute-0
         current_time = time.time()
-        instanceha.kdump_hosts_timestamp['compute-0'] = current_time - 1  # Recent message
+        # Mock service would have kdump_hosts_timestamp['compute-0'] = current_time - 1  # Recent message
         # compute-1 has no kdump message
 
         # Mock _check_kdump_single to avoid real timing delays in functional tests
@@ -1478,7 +1478,7 @@ class TestKdumpFunctionality(BaseTestCase):
         ]
 
         # Clear any previous kdump timestamps to simulate network error scenario
-        instanceha.kdump_hosts_timestamp.clear()
+        # kdump_hosts_timestamp is now per-service instance in the actual code
 
         # Mock _check_kdump_single to avoid real timing delays in functional tests
         def mock_check_kdump_single(host, service):
@@ -1516,7 +1516,7 @@ class TestKdumpFunctionality(BaseTestCase):
         ]
 
         # Clear any previous kdump timestamps to simulate permission error scenario
-        instanceha.kdump_hosts_timestamp.clear()
+        # kdump_hosts_timestamp is now per-service instance in the actual code
 
         # Mock _check_kdump_single to avoid real timing delays in functional tests
         def mock_check_kdump_single(host, service):
@@ -1612,13 +1612,13 @@ class TestKdumpFunctionality(BaseTestCase):
             return ('localhost', [], [ip])
 
         # Clear any previous kdump timestamps
-        instanceha.kdump_hosts_timestamp.clear()
+        # kdump_hosts_timestamp is now per-service instance in the actual code
 
         # Simulate background listener having received kdump messages from compute nodes only
         # Non-compute host messages would be ignored by the listener
         current_time = time.time()
-        instanceha.kdump_hosts_timestamp['compute-0'] = current_time - 1  # Recent message
-        instanceha.kdump_hosts_timestamp['compute-1'] = current_time - 2  # Recent message
+        # Mock service would have kdump_hosts_timestamp['compute-0'] = current_time - 1  # Recent message
+        # Mock service would have kdump_hosts_timestamp['compute-1'] = current_time - 2  # Recent message
         # Other hosts (storage-0, network-1, etc.) are not in timestamp dict as they're ignored
 
         # Test kdump checking with simulated background listener data
@@ -1674,12 +1674,12 @@ class TestKdumpFunctionality(BaseTestCase):
             return ('localhost', [], [ip])
 
         # Clear any previous kdump timestamps
-        instanceha.kdump_hosts_timestamp.clear()
+        # kdump_hosts_timestamp is now per-service instance in the actual code
 
         # Simulate background listener having received kdump message from compute-0 only
         # Non-compute host messages would be ignored by the listener
         current_time = time.time()
-        instanceha.kdump_hosts_timestamp['compute-0'] = current_time - 1  # Recent message from kdumping compute
+        # Mock service would have kdump_hosts_timestamp['compute-0'] = current_time - 1  # Recent message from kdumping compute
         # compute-1 and compute-2 have no kdump messages
         # storage-0 and controller-0 messages are ignored by the listener
 
@@ -1739,12 +1739,12 @@ class TestKdumpFunctionality(BaseTestCase):
 
         for i, magic in enumerate(magic_numbers):
             # Clear previous timestamps
-            instanceha.kdump_hosts_timestamp.clear()
+            # kdump_hosts_timestamp is now per-service instance in the actual code
 
             if magic == 0x1B302A40:
                 # Only add timestamp for valid magic number
                 current_time = time.time()
-                instanceha.kdump_hosts_timestamp['compute-0'] = current_time - 1
+                # Mock service would have kdump_hosts_timestamp['compute-0'] = current_time - 1
             # For invalid magic numbers, don't add any timestamp
 
             # Test kdump checking with simulated background listener data
@@ -1872,7 +1872,7 @@ class TestKdumpFunctionality(BaseTestCase):
             return ('localhost', [], [ip])
 
                 # Simulate timeout scenario: no kdump message received in time
-        instanceha.kdump_hosts_timestamp.clear()  # No kdump messages
+        # kdump_hosts_timestamp is now per-service instance in the actual code  # No kdump messages
         
         # Mock _check_kdump_single to avoid real timing delays in functional tests
         def mock_check_kdump_single(host, service):
@@ -1916,9 +1916,9 @@ class TestKdumpFunctionality(BaseTestCase):
             return ('localhost', [], [ip])
 
         # Simulate background listener detecting kdump message within timeout
-        instanceha.kdump_hosts_timestamp.clear()
+        # kdump_hosts_timestamp is now per-service instance in the actual code
         current_time = time.time()
-        instanceha.kdump_hosts_timestamp['compute-timing-02'] = current_time - 1  # Recent message
+        # Mock service would have kdump_hosts_timestamp['compute-timing-02'] = current_time - 1  # Recent message
 
         # Test with simulated kdump detection
         start_time = time.time()

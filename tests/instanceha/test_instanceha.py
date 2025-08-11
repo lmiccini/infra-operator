@@ -516,20 +516,18 @@ class TestKdumpFunctionality(unittest.TestCase):
         self.mock_service.UDP_IP = '0.0.0.0'
         self.mock_service.config.get_udp_port.return_value = 7410
 
-        # Mock global variables
-        self.original_kdump_hosts_timestamp = getattr(instanceha, 'kdump_hosts_timestamp', {})
-        self.original_stop_event = getattr(instanceha, 'kdump_listener_stop_event', None)
-
-        # Reset global state
-        instanceha.kdump_hosts_timestamp.clear()
-        if hasattr(instanceha, 'kdump_listener_stop_event'):
-            instanceha.kdump_listener_stop_event.clear()
+        # Create a mock service for kdump testing with proper config
+        mock_config = Mock()
+        mock_config.get_config_value.return_value = 10  # KDUMP_TIMEOUT
+        mock_config.get_workers.return_value = 4
+        self.mock_service_instance = instanceha.InstanceHAService(mock_config)
+        self.mock_service_instance.kdump_hosts_timestamp.clear()
 
     def tearDown(self):
         """Clean up test fixtures."""
-        # Restore original state
-        instanceha.kdump_hosts_timestamp.clear()
-        instanceha.kdump_hosts_timestamp.update(self.original_kdump_hosts_timestamp)
+        # Clean up service instance
+        if hasattr(self, 'mock_service_instance'):
+            self.mock_service_instance.kdump_hosts_timestamp.clear()
 
     def test_kdump_timeout_configuration(self):
         """Test KDUMP_TIMEOUT configuration loading."""
@@ -559,23 +557,23 @@ class TestKdumpFunctionality(unittest.TestCase):
 
     def test_kdump_single_host_recent_message(self):
         """Test _check_kdump_single with recent kdump message."""
-        instanceha.kdump_hosts_timestamp['compute-01'] = time.time() - 5
+        self.mock_service_instance.kdump_hosts_timestamp['compute-01'] = time.time() - 5
         # Mock socket operations to avoid real UDP timeouts
         with patch('socket.socket'):
-            result = instanceha._check_kdump_single('compute-01.example.com', self.mock_service)
+            result = instanceha._check_kdump_single('compute-01.example.com', self.mock_service_instance)
         self.assertTrue(result)
 
     def test_kdump_single_host_old_message(self):
         """Test _check_kdump_single with old kdump message."""
         current_time = time.time()
-        instanceha.kdump_hosts_timestamp['compute-01'] = current_time - 60
+        self.mock_service_instance.kdump_hosts_timestamp['compute-01'] = current_time - 60
 
         # Mock time.time to simulate timeout loop completion immediately
         time_calls = [current_time, current_time, current_time + 31]  # Exceed timeout quickly
         with patch('socket.socket'), \
              patch('time.sleep'), \
              patch('time.time', side_effect=time_calls):
-            result = instanceha._check_kdump_single('compute-01.example.com', self.mock_service)
+            result = instanceha._check_kdump_single('compute-01.example.com', self.mock_service_instance)
             self.assertFalse(result)
 
     def test_kdump_single_host_no_message(self):
@@ -587,7 +585,7 @@ class TestKdumpFunctionality(unittest.TestCase):
         with patch('socket.socket'), \
              patch('time.sleep'), \
              patch('time.time', side_effect=time_calls):
-            result = instanceha._check_kdump_single('compute-01.example.com', self.mock_service)
+            result = instanceha._check_kdump_single('compute-01.example.com', self.mock_service_instance)
             self.assertFalse(result)
 
     def test_kdump_single_host_delayed_message(self):
@@ -597,16 +595,16 @@ class TestKdumpFunctionality(unittest.TestCase):
             nonlocal call_count
             call_count += 1
             if call_count >= 3:  # After 3 calls to sleep
-                instanceha.kdump_hosts_timestamp['compute-01'] = time.time()
+                self.mock_service_instance.kdump_hosts_timestamp['compute-01'] = time.time()
 
         # Mock socket operations to avoid real UDP timeouts
         with patch('socket.socket'), patch('time.sleep', side_effect=simulate_delayed_message):
-            result = instanceha._check_kdump_single('compute-01.example.com', self.mock_service)
+            result = instanceha._check_kdump_single('compute-01.example.com', self.mock_service_instance)
             self.assertTrue(result)
 
     def test_kdump_check_no_services(self):
         """Test _check_kdump with empty service list."""
-        result = instanceha._check_kdump([], self.mock_service)
+        result = instanceha._check_kdump([], self.mock_service_instance)
         self.assertEqual(result, [])
 
     def test_kdump_check_immediate_detection(self):
@@ -615,9 +613,9 @@ class TestKdumpFunctionality(unittest.TestCase):
         mock_service1.host = 'compute-01.example.com'
 
         # Set recent kdump timestamp
-        instanceha.kdump_hosts_timestamp['compute-01'] = time.time() - 5
+        self.mock_service_instance.kdump_hosts_timestamp['compute-01'] = time.time() - 5
 
-        result = instanceha._check_kdump([mock_service1], self.mock_service)
+        result = instanceha._check_kdump([mock_service1], self.mock_service_instance)
         self.assertEqual(len(result), 0)  # Host should be filtered out
 
     def test_kdump_check_no_kdump_activity(self):
@@ -626,7 +624,7 @@ class TestKdumpFunctionality(unittest.TestCase):
         mock_service1.host = 'compute-01.example.com'
 
         with patch('instanceha._check_kdump_single', return_value=False):
-            result = instanceha._check_kdump([mock_service1], self.mock_service)
+            result = instanceha._check_kdump([mock_service1], self.mock_service_instance)
             self.assertEqual(len(result), 1)  # Host should not be filtered
 
     def test_kdump_message_processing_valid_magic(self):
@@ -652,18 +650,18 @@ class TestKdumpFunctionality(unittest.TestCase):
         """Test automatic cleanup of old kdump timestamps."""
         # Add old timestamps
         old_time = time.time() - 400  # Older than 300s cleanup threshold
-        instanceha.kdump_hosts_timestamp['old-host'] = old_time
-        instanceha.kdump_hosts_timestamp['recent-host'] = time.time()
+        self.mock_service_instance.kdump_hosts_timestamp['old-host'] = old_time
+        self.mock_service_instance.kdump_hosts_timestamp['recent-host'] = time.time()
 
         # Simulate cleanup logic
-        if len(instanceha.kdump_hosts_timestamp) > 0:  # Simplified condition for test
+        if len(self.mock_service_instance.kdump_hosts_timestamp) > 0:  # Simplified condition for test
             cutoff = time.time() - 300
-            old_keys = [k for k, v in instanceha.kdump_hosts_timestamp.items() if v < cutoff]
+            old_keys = [k for k, v in self.mock_service_instance.kdump_hosts_timestamp.items() if v < cutoff]
             for k in old_keys:
-                del instanceha.kdump_hosts_timestamp[k]
+                del self.mock_service_instance.kdump_hosts_timestamp[k]
 
-        self.assertNotIn('old-host', instanceha.kdump_hosts_timestamp)
-        self.assertIn('recent-host', instanceha.kdump_hosts_timestamp)
+        self.assertNotIn('old-host', self.mock_service_instance.kdump_hosts_timestamp)
+        self.assertIn('recent-host', self.mock_service_instance.kdump_hosts_timestamp)
 
     def test_kdump_parallel_checking(self):
         """Test parallel kdump checking for multiple hosts."""
@@ -674,9 +672,13 @@ class TestKdumpFunctionality(unittest.TestCase):
 
         services = [mock_service1, mock_service2]
 
+        # Create a service instance for this test
+        mock_service_instance = instanceha.InstanceHAService(Mock())
+        mock_service_instance.config = self.mock_service.config
+        
         with patch('instanceha._check_kdump_single') as mock_check:
             mock_check.side_effect = [True, False]  # First host kdumping, second not
-            result = instanceha._check_kdump(services, self.mock_service)
+            result = instanceha._check_kdump(services, mock_service_instance)
 
             # Should return only the non-kdumping host
             self.assertEqual(len(result), 1)
@@ -689,15 +691,19 @@ class TestKdumpFunctionality(unittest.TestCase):
         mock_service.config.get_config_value.return_value = 90  # 90 second timeout
 
         call_count = 0
+        # Create a service instance for this test
+        mock_service_instance = instanceha.InstanceHAService(Mock())
+        mock_service_instance.config = mock_service.config
+        
         def simulate_very_delayed_kdump(duration):
             nonlocal call_count
             call_count += 1
             if call_count >= 60:  # After 60 sleep calls (simulating 60+ seconds)
-                instanceha.kdump_hosts_timestamp['compute-slow'] = time.time()
+                mock_service_instance.kdump_hosts_timestamp['compute-slow'] = time.time()
 
         # Mock socket operations to avoid real UDP timeouts
         with patch('socket.socket'), patch('time.sleep', side_effect=simulate_very_delayed_kdump):
-            result = instanceha._check_kdump_single('compute-slow.example.com', mock_service)
+            result = instanceha._check_kdump_single('compute-slow.example.com', mock_service_instance)
             self.assertTrue(result)
 
     def test_kdump_timeout_exceeded_scenario(self):
@@ -709,11 +715,15 @@ class TestKdumpFunctionality(unittest.TestCase):
         current_time = time.time()
 
         # Mock time.time to simulate timeout exceeded immediately
+        # Create a service instance for this test
+        mock_service_instance = instanceha.InstanceHAService(Mock())
+        mock_service_instance.config = mock_service.config
+        
         time_calls = [current_time, current_time, current_time + 6]  # Exceed 5s timeout quickly
         with patch('socket.socket'), \
              patch('time.sleep'), \
              patch('time.time', side_effect=time_calls):
-            result = instanceha._check_kdump_single('compute-never-kdump.example.com', mock_service)
+            result = instanceha._check_kdump_single('compute-never-kdump.example.com', mock_service_instance)
             self.assertFalse(result)
 
 
@@ -734,7 +744,8 @@ class TestKdumpIntegration(unittest.TestCase):
         import shutil
         shutil.rmtree(self.temp_dir, ignore_errors=True)
         # Reset kdump state
-        instanceha.kdump_hosts_timestamp.clear()
+        if hasattr(self, 'mock_service_instance'):
+            self.mock_service_instance.kdump_hosts_timestamp.clear()
 
     def test_kdump_configuration_loading(self):
         """Test kdump configuration loading from file."""
@@ -773,11 +784,17 @@ class TestKdumpIntegration(unittest.TestCase):
 
         services = [mock_service1, mock_service2]
 
+        # Create a service instance for this test
+        mock_config = Mock()
+        mock_config.get_config_value.return_value = 10  # KDUMP_TIMEOUT
+        mock_config.get_workers.return_value = 4
+        mock_service_instance = instanceha.InstanceHAService(mock_config)
+        
         # Simulate one host kdumping, one not
-        instanceha.kdump_hosts_timestamp['compute-01'] = time.time() - 5
+        mock_service_instance.kdump_hosts_timestamp['compute-01'] = time.time() - 5
 
         with patch('instanceha._check_kdump_single', return_value=False):
-            result = instanceha._check_kdump(services, self.mock_service)
+            result = instanceha._check_kdump(services, mock_service_instance)
 
             # Should filter out the kdumping host
             self.assertEqual(len(result), 1)
@@ -786,9 +803,12 @@ class TestKdumpIntegration(unittest.TestCase):
     def test_kdump_thread_safety(self):
         """Test thread safety of kdump operations."""
         # Simulate concurrent access to kdump_hosts_timestamp
+        # Create a service instance for this test
+        mock_service_instance = instanceha.InstanceHAService(Mock())
+        
         def update_timestamp(host_id):
             for i in range(10):
-                instanceha.kdump_hosts_timestamp[f'host-{host_id}-{i}'] = time.time()
+                mock_service_instance.kdump_hosts_timestamp[f'host-{host_id}-{i}'] = time.time()
 
         threads = []
         for i in range(3):
@@ -800,30 +820,33 @@ class TestKdumpIntegration(unittest.TestCase):
             thread.join()
 
         # Should have entries from all threads
-        self.assertGreaterEqual(len(instanceha.kdump_hosts_timestamp), 30)
+        self.assertGreaterEqual(len(mock_service_instance.kdump_hosts_timestamp), 30)
 
     def test_kdump_memory_management(self):
         """Test memory management and cleanup."""
+        # Create a service instance for this test
+        mock_service_instance = instanceha.InstanceHAService(Mock())
+        
         # Add many old entries
         old_time = time.time() - 400
         for i in range(150):
-            instanceha.kdump_hosts_timestamp[f'old-host-{i}'] = old_time
+            mock_service_instance.kdump_hosts_timestamp[f'old-host-{i}'] = old_time
 
         # Add some recent entries
         recent_time = time.time()
         for i in range(10):
-            instanceha.kdump_hosts_timestamp[f'recent-host-{i}'] = recent_time
+            mock_service_instance.kdump_hosts_timestamp[f'recent-host-{i}'] = recent_time
 
         # Simulate cleanup when > 100 entries
-        if len(instanceha.kdump_hosts_timestamp) > 100:
+        if len(mock_service_instance.kdump_hosts_timestamp) > 100:
             cutoff = time.time() - 300
-            old_keys = [k for k, v in instanceha.kdump_hosts_timestamp.items() if v < cutoff]
+            old_keys = [k for k, v in mock_service_instance.kdump_hosts_timestamp.items() if v < cutoff]
             for k in old_keys:
-                del instanceha.kdump_hosts_timestamp[k]
+                del mock_service_instance.kdump_hosts_timestamp[k]
 
         # Should only have recent entries left
-        self.assertLessEqual(len(instanceha.kdump_hosts_timestamp), 10)
-        self.assertTrue(all('recent-host' in k for k in instanceha.kdump_hosts_timestamp.keys()))
+        self.assertLessEqual(len(mock_service_instance.kdump_hosts_timestamp), 10)
+        self.assertTrue(all('recent-host' in k for k in mock_service_instance.kdump_hosts_timestamp.keys()))
 
 
 if __name__ == '__main__':

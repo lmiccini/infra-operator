@@ -15,7 +15,7 @@ NC='\033[0m' # No Color
 
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}   InstanceHA Comprehensive Tests      ${NC}"
-echo -e "${BLUE}   (Unit + Functional + Kdump)         ${NC}"
+echo -e "${BLUE}   (Unit + Functional + Integration)   ${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo
 
@@ -71,13 +71,23 @@ fi
 echo
 echo
 
+# Run integration tests
+integration_tests_passed=0
+echo -e "${BLUE}Running Integration Tests...${NC}"
+if run_test_file "integration_test.py" "Integration Tests"; then
+    integration_tests_passed=1
+fi
+
+echo
+echo
+
 # Summary
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}            Test Summary                ${NC}"
 echo -e "${BLUE}========================================${NC}"
 
-total_passed=$((unit_tests_passed + functional_tests_passed))
-total_tests=2
+total_passed=$((unit_tests_passed + functional_tests_passed + integration_tests_passed))
+total_tests=3
 
 if [ $unit_tests_passed -eq 1 ]; then
     echo -e "${GREEN}[PASS] Unit Tests: PASSED${NC}"
@@ -89,6 +99,12 @@ if [ $functional_tests_passed -eq 1 ]; then
     echo -e "${GREEN}[PASS] Functional Tests: PASSED${NC}"
 else
     echo -e "${RED}[FAIL] Functional Tests: FAILED${NC}"
+fi
+
+if [ $integration_tests_passed -eq 1 ]; then
+    echo -e "${GREEN}[PASS] Integration Tests: PASSED${NC}"
+else
+    echo -e "${RED}[FAIL] Integration Tests: FAILED${NC}"
 fi
 
 echo
