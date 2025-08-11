@@ -344,6 +344,11 @@ class TestServiceCategorization(unittest.TestCase):
             self.mock_env.services, target_date
         )
 
+        # Convert generators to lists for testing
+        compute_nodes = list(compute_nodes)
+        to_resume = list(to_resume)
+        to_reenable = list(to_reenable)
+
         # Verify categorization
         self.assertEqual(len(compute_nodes), 2)  # stale and down
         self.assertIn(stale_service, compute_nodes)
@@ -397,6 +402,7 @@ class TestEvacuationWorkflow(unittest.TestCase):
         self.mock_config.is_disabled.return_value = False
         self.mock_config.is_kdump_check_enabled.return_value = False
         self.mock_config.get_poll_interval.return_value = 30
+        self.mock_config.get_config_value.return_value = 30  # Default FENCING_TIMEOUT
 
     def test_complete_evacuation_workflow(self):
         """Test complete evacuation workflow from start to finish."""
@@ -525,6 +531,7 @@ class TestReenablingWorkflow(unittest.TestCase):
         self.mock_env = MockOpenStackEnvironment()
         self.mock_config = Mock()
         self.mock_config.is_force_enable_enabled.return_value = False
+        self.mock_config.get_config_value.return_value = 30  # Default FENCING_TIMEOUT
 
     def test_reenable_services_with_completed_migrations(self):
         """Test re-enabling services with completed migrations."""
@@ -599,6 +606,7 @@ class TestPerformanceAndScaling(unittest.TestCase):
         self.mock_config.is_reserved_hosts_enabled.return_value = False
         self.mock_config.get_threshold.return_value = 30  # Lower threshold to allow processing
         self.mock_config.is_disabled.return_value = False
+        self.mock_config.get_config_value.return_value = 30  # Default FENCING_TIMEOUT
 
     def test_large_scale_evacuation_performance(self):
         """Test evacuation performance with large number of hosts."""
@@ -622,6 +630,9 @@ class TestPerformanceAndScaling(unittest.TestCase):
             self.mock_env.services, target_date
         )
         categorization_time = time.time() - start_time
+
+        # Convert generator to list for testing
+        compute_nodes = list(compute_nodes)
 
         # Should complete quickly (under 1 second for 100 services)
         self.assertLess(categorization_time, 1.0)
@@ -707,6 +718,7 @@ class TestErrorHandlingAndRecovery(unittest.TestCase):
         self.mock_config.is_reserved_hosts_enabled.return_value = False
         self.mock_config.get_threshold.return_value = 50
         self.mock_config.is_disabled.return_value = False
+        self.mock_config.get_config_value.return_value = 30  # Default FENCING_TIMEOUT
 
     def test_nova_api_failure_handling(self):
         """Test handling of Nova API failures."""

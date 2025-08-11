@@ -12,5 +12,6 @@ config:
   RESERVED_HOSTS: "false"
   LEAVE_DISABLED: "false"
   CHECK_KDUMP: "false"
+  FENCING_TIMEOUT: "30"
   LOGLEVEL: "info"
   DISABLED: "false"

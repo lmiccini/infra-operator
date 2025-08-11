@@ -213,8 +213,7 @@ class ConfigManager:
         'KDUMP_TIMEOUT': ('int', 30, 5, 300),
         'DISABLED': ('bool', False),
         'SSL_VERIFY': ('bool', True),
-        'IPMI_TIMEOUT': ('int', 30, 5, 120),
-        'HTTP_TIMEOUT': ('int', 10, 5, 60),
+        'FENCING_TIMEOUT': ('int', 30, 5, 120),
         'HASH_INTERVAL': ('int', 60, 30, 300),
         'METRICS_LOG_INTERVAL': ('int', 3600, 300, 86400),
     }
@@ -425,7 +424,12 @@ class InstanceHAService(CloudConnectionProvider):
 
         # Kdump state management
         self.kdump_hosts_timestamp = defaultdict(float)
+        self.kdump_hosts_checking = defaultdict(float)  # Track hosts currently being checked
         self.kdump_listener_stop_event = threading.Event()
+
+        # Host processing state management
+        self.hosts_processing = defaultdict(float)  # Track hosts currently being processed
+        self.processing_lock = threading.Lock()  # Thread-safe access to processing dict
 
         logging.info("InstanceHA service initialized successfully")
 
@@ -1535,17 +1539,29 @@ def _check_kdump(stale_services: List[Any], service: InstanceHAService) -> List[
     logging.info("Checking %d hosts for kdump activity", len(stale_services))
     kdumping_hosts = []
     uncertain_hosts = []
+    current_time = time.time()
+    kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
 
-    # Quick check: hosts with recent kdump messages
+    # Clean up expired checking entries
+    expired_checks = [h for h, t in service.kdump_hosts_checking.items() if current_time - t > kdump_timeout + 10]
+    for hostname in expired_checks:
+        del service.kdump_hosts_checking[hostname]
+
+    # Quick check: hosts with recent kdump messages or already being checked
     for svc in stale_services:
         hostname = svc.host.split('.', 1)[0]
         last_seen = service.kdump_hosts_timestamp.get(hostname, 0)
-        kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
-        if last_seen > 0 and (time.time() - last_seen) <= kdump_timeout:
+        check_start = service.kdump_hosts_checking.get(hostname, 0)
+
+        if last_seen > 0 and (current_time - last_seen) <= kdump_timeout:
             kdumping_hosts.append(svc.host)
             logging.info('Host %s is kdumping, skipping evacuation' % svc.host)
+        elif check_start > 0 and (current_time - check_start) < kdump_timeout:
+            kdumping_hosts.append(svc.host)
+            logging.info('Host %s kdump check in progress, skipping evacuation' % svc.host)
         else:
             uncertain_hosts.append(svc)
+            service.kdump_hosts_checking[hostname] = current_time
 
     # Wait for delayed kdump starts (parallel)
     if uncertain_hosts:
@@ -1569,6 +1585,12 @@ def _check_kdump(stale_services: List[Any], service: InstanceHAService) -> List[
                 pending = [futures[f] for f in futures if not f.done()]
                 if pending:
                     logging.debug('Kdump check timed out for %d hosts: %s' % (len(pending), [s.host for s in pending]))
+
+    # Clean up completed checks for hosts that completed
+    for svc in stale_services:
+        hostname = svc.host.split('.', 1)[0]
+        if svc.host not in [s.host for s in uncertain_hosts] and hostname in service.kdump_hosts_checking:
+            del service.kdump_hosts_checking[hostname]
 
     # Remove kdumping hosts from evacuation
     to_evacuate = [s for s in stale_services if s.host not in kdumping_hosts]
@@ -1649,7 +1671,7 @@ def _redfish_reset(url, user, passwd, timeout, action):
         logging.error("Redfish reset failed for %s: %s", url, e)
         return False
 
-def _bmh_fence(token, namespace, host, action):
+def _bmh_fence(token, namespace, host, action, service):
     """Fence a BareMetal Host using Kubernetes API."""
     if not all([token, namespace, host]) or action not in ['on', 'off']:
         logging.error("BMH fencing failed: invalid parameters")
@@ -1671,12 +1693,14 @@ def _bmh_fence(token, namespace, host, action):
 
         data = {"metadata": {"annotations": {"reboot.metal3.io/iha": annotation_value}}}
 
+        fencing_timeout = service.config.get_config_value('FENCING_TIMEOUT')
         response = requests.patch(f"{base_url}?fieldManager=kubectl-patch",
-                                headers=headers, json=data, verify=cacert, timeout=10)
+                                headers=headers, json=data, verify=cacert, timeout=fencing_timeout)
         response.raise_for_status()
 
         if action == 'off':
-            return _bmh_wait_for_power_off(base_url, headers, cacert, host, 30, 3)
+            fencing_timeout = service.config.get_config_value('FENCING_TIMEOUT')
+            return _bmh_wait_for_power_off(base_url, headers, cacert, host, fencing_timeout, 3, service)
         else:
             logging.info("BMH power on successful for %s", host)
             return True
@@ -1686,7 +1710,7 @@ def _bmh_fence(token, namespace, host, action):
         return False
 
 
-def _bmh_wait_for_power_off(get_url, headers, cacert, host, timeout, poll_interval):
+def _bmh_wait_for_power_off(get_url, headers, cacert, host, timeout, poll_interval, service):
     """
     Wait for BareMetal Host to power off by polling its status.
 
@@ -1701,7 +1725,7 @@ def _bmh_wait_for_power_off(get_url, headers, cacert, host, timeout, poll_interv
     Returns:
         bool: True if host powered off within timeout, False otherwise
     """
-    REQUEST_TIMEOUT = 10  # seconds for individual HTTP requests
+    fencing_timeout = service.config.get_config_value('FENCING_TIMEOUT')
 
     logging.debug("Waiting up to %d seconds for %s to power off", timeout, host)
 
@@ -1712,7 +1736,7 @@ def _bmh_wait_for_power_off(get_url, headers, cacert, host, timeout, poll_interv
             time.sleep(poll_interval)
 
             try:
-                response = session.get(get_url, headers=headers, verify=cacert, timeout=REQUEST_TIMEOUT)
+                response = session.get(get_url, headers=headers, verify=cacert, timeout=fencing_timeout)
                 response.raise_for_status()
 
             except requests.exceptions.Timeout:
@@ -1753,7 +1777,7 @@ def _bmh_wait_for_power_off(get_url, headers, cacert, host, timeout, poll_interv
     return False
 
 
-def _execute_fence_operation(host, action, fencing_data):
+def _execute_fence_operation(host, action, fencing_data, service):
     """Unified fencing execution with agent-specific dispatch and validation."""
     agent = fencing_data.get("agent", "").lower()
 
@@ -1811,7 +1835,7 @@ def _execute_fence_operation(host, action, fencing_data):
             cmd = ["ipmitool", "-I", "lanplus", "-H", fencing_data["ipaddr"],
                    "-U", fencing_data["login"], "-E",  # Use environment variable
                    "-p", fencing_data["ipport"], "power", action]
-            timeout = fencing_data.get("timeout", 30)
+            timeout = fencing_data.get("timeout", service.config.get_config_value('FENCING_TIMEOUT'))
             subprocess.run(cmd, timeout=timeout, env=env, capture_output=True, text=True, check=True)
             logging.info("IPMI %s successful for %s", action, host)
             return True
@@ -1828,14 +1852,15 @@ def _execute_fence_operation(host, action, fencing_data):
             protocol = "https" if tls else "http"
             url = f'{protocol}://{ip}:{port}/redfish/v1/Systems/{uuid}'
             redfish_action = "ForceOff" if action == "off" else "On"
+            timeout = fencing_data.get("timeout", service.config.get_config_value('FENCING_TIMEOUT'))
             return _redfish_reset(url, fencing_data["login"], fencing_data["passwd"],
-                                fencing_data.get("timeout", 30), redfish_action)
+                                timeout, redfish_action)
 
         elif "bmh" in agent:
             if not _validate_params(["token", "host", "namespace"], "BMH"):
                 return False
             return _bmh_fence(fencing_data["token"], fencing_data["namespace"],
-                             fencing_data["host"], action)
+                             fencing_data["host"], action, service)
 
         else:
             logging.error("Unknown fencing agent: %s", agent)
@@ -1870,7 +1895,7 @@ def _host_fence(host, action, service):
             return False
 
         logging.debug("Using fencing agent '%s' for %s", fencing_data["agent"], host)
-        return _execute_fence_operation(host, action, fencing_data)
+        return _execute_fence_operation(host, action, fencing_data, service)
 
     except Exception as e:
         logging.error("Fencing failed for %s: %s", host, e)
@@ -2057,37 +2082,50 @@ def process_service(failed_service, reserved_hosts, resume, service):
         return False
 
     host_name = failed_service.host
+    hostname = host_name.split('.', 1)[0]
     reserved_hosts = reserved_hosts or []
 
     logging.info("Processing service %s (resume=%s)", host_name, resume)
 
-    # Get Nova connection first
-    conn = _get_nova_connection(service)
-    if not conn:
-        logging.error("Nova connection failed for %s", host_name)
-        return False
-
-    # Execute processing steps
-    if not resume:
-        if not _execute_step("Fencing", _host_fence, host_name, host_name, 'off', service):
-            return False
-        if not _execute_step("Host disable", _host_disable, host_name, conn, failed_service):
+    try:
+        # Get Nova connection first
+        conn = _get_nova_connection(service)
+        if not conn:
+            logging.error("Nova connection failed for %s", host_name)
             return False
 
-    if not _execute_step("Reserved host management", _manage_reserved_hosts, host_name,
-                        conn, failed_service, reserved_hosts, service):
+        # Execute processing steps
+        if not resume:
+            if not _execute_step("Fencing", _host_fence, host_name, host_name, 'off', service):
+                return False
+            if not _execute_step("Host disable", _host_disable, host_name, conn, failed_service):
+                return False
+
+        if not _execute_step("Reserved host management", _manage_reserved_hosts, host_name,
+                            conn, failed_service, reserved_hosts, service):
+            return False
+
+        if not _execute_step("Evacuation", _host_evacuate, host_name,
+                            conn, failed_service, service):
+            return False
+
+        if not _execute_step("Recovery", _post_evacuation_recovery, host_name,
+                            conn, failed_service, service):
+            return False
+
+        logging.info("Service processing completed successfully for %s", host_name)
+        return True
+
+    except Exception as e:
+        logging.error("Service processing failed for %s: %s", host_name, e)
         return False
 
-    if not _execute_step("Evacuation", _host_evacuate, host_name,
-                        conn, failed_service, service):
-        return False
-
-    if not _execute_step("Recovery", _post_evacuation_recovery, host_name,
-                        conn, failed_service, service):
-        return False
-
-    logging.info("Service processing completed successfully for %s", host_name)
-    return True
+    finally:
+        # Always clean up processing tracking when done
+        with service.processing_lock:
+            if hostname in service.hosts_processing:
+                del service.hosts_processing[hostname]
+                logging.debug('Cleaned up processing tracking for %s', hostname)
 
 
 def _initialize_service():
@@ -2169,6 +2207,36 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
     # Convert generators to lists only when needed for processing
     compute_nodes = list(compute_nodes)
     to_resume = list(to_resume)
+
+    if not (compute_nodes or to_resume):
+        return
+
+    # Filter out hosts already being processed to prevent race conditions
+    current_time = time.time()
+    max_processing_time = max(service.config.get_config_value('FENCING_TIMEOUT'), 300)  # Use max of fencing timeout or 5 minutes
+
+    with service.processing_lock:
+        # Clean up expired processing entries
+        expired_processing = [h for h, t in service.hosts_processing.items() if current_time - t > max_processing_time + 30]
+        for hostname in expired_processing:
+            del service.hosts_processing[hostname]
+            logging.debug('Cleaned up expired processing entry for %s', hostname)
+
+        # Filter out hosts currently being processed
+        original_count = len(compute_nodes)
+        compute_nodes = [svc for svc in compute_nodes
+                        if svc.host.split('.', 1)[0] not in service.hosts_processing]
+        to_resume = [svc for svc in to_resume
+                    if svc.host.split('.', 1)[0] not in service.hosts_processing]
+
+        if original_count > len(compute_nodes):
+            skipped_hosts = original_count - len(compute_nodes)
+            logging.info('Skipped %d hosts already being processed by another poll cycle', skipped_hosts)
+
+        # Mark hosts as being processed
+        for svc in compute_nodes + to_resume:
+            hostname = svc.host.split('.', 1)[0]
+            service.hosts_processing[hostname] = current_time
 
     if not (compute_nodes or to_resume):
         return

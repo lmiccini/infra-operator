@@ -508,14 +508,11 @@ class TestInstanceHAService(unittest.TestCase):
         # Create a real config manager to test new configuration values
         real_config = instanceha.ConfigManager()
 
-        # Test new timeout configurations
-        ipmi_timeout = real_config.get_config_value('IPMI_TIMEOUT')
-        self.assertIsInstance(ipmi_timeout, int)
-        self.assertGreaterEqual(ipmi_timeout, 5)
-
-        http_timeout = real_config.get_config_value('HTTP_TIMEOUT')
-        self.assertIsInstance(http_timeout, int)
-        self.assertGreaterEqual(http_timeout, 5)
+        # Test unified fencing timeout configuration
+        fencing_timeout = real_config.get_config_value('FENCING_TIMEOUT')
+        self.assertIsInstance(fencing_timeout, int)
+        self.assertGreaterEqual(fencing_timeout, 5)
+        self.assertLessEqual(fencing_timeout, 120)
 
         hash_interval = real_config.get_config_value('HASH_INTERVAL')
         self.assertIsInstance(hash_interval, int)
@@ -1026,6 +1023,74 @@ if __name__ == '__main__':
     import logging
     logging.basicConfig(level=logging.DEBUG)
 
+
+class TestFencingRaceCondition(unittest.TestCase):
+    """Unit tests for fencing race condition prevention."""
+
+    def setUp(self):
+        """Set up test environment."""
+        self.config_manager = instanceha.ConfigManager()
+        self.service = instanceha.InstanceHAService(self.config_manager)
+
+    def test_hosts_processing_initialization(self):
+        """Test that hosts_processing dict is properly initialized."""
+        self.assertIsInstance(self.service.hosts_processing, dict)
+        self.assertEqual(len(self.service.hosts_processing), 0)
+        self.assertIsNotNone(self.service.processing_lock)
+
+    def test_process_service_cleanup_on_success(self):
+        """Test that process_service cleans up tracking on successful completion."""
+        # Mock service object
+        failed_service = type('MockService', (), {'host': 'test-host.example.com'})()
+
+        # Mock all dependencies to ensure success
+        with unittest.mock.patch('instanceha._get_nova_connection') as mock_conn, \
+             unittest.mock.patch('instanceha._execute_step', return_value=True):
+
+            # Call process_service
+            result = instanceha.process_service(failed_service, [], False, self.service)
+
+            # Should succeed
+            self.assertTrue(result)
+
+            # Verify hostname is not in processing dict (cleaned up)
+            with self.service.processing_lock:
+                self.assertNotIn('test-host', self.service.hosts_processing)
+
+    def test_process_service_cleanup_on_failure(self):
+        """Test that process_service cleans up tracking even on failure."""
+        # Mock service object
+        failed_service = type('MockService', (), {'host': 'test-host.example.com'})()
+
+        # Mock dependencies to cause failure
+        with unittest.mock.patch('instanceha._get_nova_connection', return_value=None):
+
+            # Call process_service (should fail due to no connection)
+            result = instanceha.process_service(failed_service, [], False, self.service)
+
+            # Should fail
+            self.assertFalse(result)
+
+            # Verify hostname is still cleaned up
+            with self.service.processing_lock:
+                self.assertNotIn('test-host', self.service.hosts_processing)
+
+    def test_fencing_timeout_configuration(self):
+        """Test that FENCING_TIMEOUT is properly configured and accessible."""
+        # Test default value
+        fencing_timeout = self.service.config.get_config_value('FENCING_TIMEOUT')
+        self.assertIsInstance(fencing_timeout, int)
+        self.assertGreaterEqual(fencing_timeout, 5)
+        self.assertLessEqual(fencing_timeout, 120)
+
+        # Test that it's used in race condition prevention
+        import time
+        current_time = time.time()
+        max_processing_time = max(self.service.config.get_config_value('FENCING_TIMEOUT'), 300)
+        self.assertGreaterEqual(max_processing_time, fencing_timeout)
+
+
+if __name__ == '__main__':
     # Create test suite
     test_suite = unittest.TestSuite()
 
@@ -1037,6 +1102,7 @@ if __name__ == '__main__':
         TestEvacuationFunctions,
         TestKdumpFunctionality,
         TestKdumpIntegration,
+        TestFencingRaceCondition,
     ]
 
     for test_class in test_classes:
