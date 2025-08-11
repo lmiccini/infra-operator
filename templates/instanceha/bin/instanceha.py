@@ -924,7 +924,11 @@ class InstanceHAService(CloudConnectionProvider):
                         'all_tenants': 1
                     })
                     host_servers[service.host] = servers
-                    logging.debug("Cached %d servers for host %s", len(servers), service.host)
+                    if servers:
+                        server_info = [(s.id, s.name, s.status) for s in servers]
+                        logging.info("Found %d servers on host %s: %s", len(servers), service.host, server_info)
+                    else:
+                        logging.info("No servers found on host %s", service.host)
                 except Exception as e:
                     logging.warning("Failed to get servers for host %s: %s", service.host, e)
                     logging.debug('Exception traceback:', exc_info=True)
@@ -2185,8 +2189,20 @@ def _categorize_services(services: List[Any], target_date: datetime) -> tuple:
 def _get_compute_nodes(services, target_date):
     """Generator for compute nodes needing evacuation to reduce memory usage."""
     for svc in services:
-        if ((datetime.fromisoformat(svc.updated_at) < target_date and svc.state != 'down') or
-            svc.state == 'down') and 'disabled' not in svc.status and not svc.forced_down:
+        # Skip services that are already disabled or forced down (already being handled)
+        if 'disabled' in svc.status or svc.forced_down:
+            continue
+
+        # Evacuate if service is down (regardless of updated_at)
+        if svc.state == 'down':
+            logging.debug("Service %s is down, marking for evacuation", svc.host)
+            yield svc
+            continue
+
+        # Evacuate if service is stale (not updated recently) and not down
+        if datetime.fromisoformat(svc.updated_at) < target_date:
+            logging.debug("Service %s is stale (last update: %s), marking for evacuation",
+                         svc.host, svc.updated_at)
             yield svc
 
 def _get_resume_candidates(services, target_date):
@@ -2246,10 +2262,16 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
     # Filter compute nodes with servers
     host_servers_cache = None
     if compute_nodes:
-        host_servers_cache = service.get_hosts_with_servers_cached(conn, compute_nodes)
-        compute_nodes = service.filter_hosts_with_servers(compute_nodes, host_servers_cache)
+        # Convert to list for processing and caching
+        compute_nodes_list = list(compute_nodes)
+        host_servers_cache = service.get_hosts_with_servers_cached(conn, compute_nodes_list)
+        original_count = len(compute_nodes_list)
+        compute_nodes = service.filter_hosts_with_servers(compute_nodes_list, host_servers_cache)
+        filtered_count = len(compute_nodes)
+        logging.info("Filtered compute nodes: %d -> %d (removed %d hosts with no servers)",
+                    original_count, filtered_count, original_count - filtered_count)
         if not compute_nodes:
-            logging.debug("No compute nodes with servers to evacuate")
+            logging.warning("No compute nodes with servers to evacuate - all filtered out")
 
     # Get reserved hosts if enabled
     reserved_hosts = ([svc for svc in services if 'disabled' in svc.status and 'reserved' in svc.disabled_reason]
@@ -2366,7 +2388,13 @@ def main():
                 target_date = datetime.now() - timedelta(seconds=service.config.get_delta())
                 compute_nodes, to_resume, to_reenable = _categorize_services(services, target_date)
 
-            logging.debug('List of stale services: %s', [svc.host for svc in compute_nodes])
+            # Convert generator to list for logging and processing
+            compute_nodes_list = list(compute_nodes)
+            logging.info('Found %d compute nodes needing evacuation: %s',
+                        len(compute_nodes_list), [svc.host for svc in compute_nodes_list])
+
+            # Convert back to generator for the processing function
+            compute_nodes = (svc for svc in compute_nodes_list)
 
             # Process stale services for evacuation
             _process_stale_services(conn, service, services, compute_nodes, to_resume)
