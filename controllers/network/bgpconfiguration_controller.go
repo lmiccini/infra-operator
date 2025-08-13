@@ -458,18 +458,21 @@ func (r *BGPConfigurationReconciler) reconcileNormal(ctx context.Context, instan
 func (r *BGPConfigurationReconciler) deleteStaleFRRConfigurations(ctx context.Context, instance *networkv1.BGPConfiguration, podNetworkDetailList []bgp.PodDetail, frrConfigList *frrk8sv1.FRRConfigurationList, groupLabel string) error {
 	for _, cfg := range frrConfigList.Items {
 		frrLabels := cfg.GetLabels()
-		if _, ok := frrLabels[labels.GetOwnerNameLabelSelector(labels.GetGroupLabel("bgpconfiguration"))]; ok {
-			if podName, ok := frrLabels[groupLabel+"/pod-name"]; ok {
-				f := func(p bgp.PodDetail) bool {
-					return p.Name == podName && p.Namespace == instance.Namespace
-				}
-				idx := slices.IndexFunc(podNetworkDetailList, f)
-				if idx < 0 {
-					// There is no pod in the namespace corrsponding to the FRRConfiguration, delete it
-					if err := r.Client.Delete(ctx, &cfg); err != nil && !k8s_errors.IsNotFound(err) {
-						return fmt.Errorf("unable to delete FRRConfiguration %w", err)
+		// Only delete FRRConfigurations owned by this specific BGPConfiguration instance
+		if ownerName, ok := frrLabels[labels.GetOwnerNameLabelSelector(labels.GetGroupLabel("bgpconfiguration"))]; ok && ownerName == instance.Name {
+			if ownerNamespace, ok := frrLabels[labels.GetOwnerNameSpaceLabelSelector(labels.GetGroupLabel("bgpconfiguration"))]; ok && ownerNamespace == instance.Namespace {
+				if podName, ok := frrLabels[groupLabel+"/pod-name"]; ok {
+					f := func(p bgp.PodDetail) bool {
+						return p.Name == podName && p.Namespace == instance.Namespace
 					}
-					r.GetLogger(ctx).Info(fmt.Sprintf("pod with name: %s either in state deleted, completed, failed or unknown, deleted FRRConfiguration %s", podName, cfg.Name))
+					idx := slices.IndexFunc(podNetworkDetailList, f)
+					if idx < 0 {
+						// There is no pod in the namespace corrsponding to the FRRConfiguration, delete it
+						if err := r.Client.Delete(ctx, &cfg); err != nil && !k8s_errors.IsNotFound(err) {
+							return fmt.Errorf("unable to delete FRRConfiguration %w", err)
+						}
+						r.GetLogger(ctx).Info(fmt.Sprintf("pod with name: %s either in state deleted, completed, failed or unknown, deleted FRRConfiguration %s", podName, cfg.Name))
+					}
 				}
 			}
 		}
@@ -627,7 +630,7 @@ func (r *BGPConfigurationReconciler) createOrPatchFRRConfiguration(
 
 	frrConfig := &frrk8sv1.FRRConfiguration{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      instance.Namespace + "-" + podDtl.Name,
+			Name:      instance.Namespace + "-" + instance.Name + "-" + podDtl.Name,
 			Namespace: instance.Spec.FRRConfigurationNamespace,
 		},
 	}
