@@ -1,6 +1,8 @@
 package bgp
 
 import (
+	"strings"
+
 	k8s_networkv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	frrk8sv1 "github.com/metallb/frr-k8s/api/v1beta1"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
@@ -16,11 +18,23 @@ type PodDetail struct {
 
 // GetFRRPodPrefixes - returns the FRRConfiguration prefix entries for a pod
 // secondary network interfaces in the format "10.10.10.10/32"
-func GetFRRPodPrefixes(networkStatus []k8s_networkv1.NetworkStatus) []string {
+// If allowedNADs is provided, only includes IPs from those NADs
+func GetFRRPodPrefixes(networkStatus []k8s_networkv1.NetworkStatus, allowedNADs ...string) []string {
 	podPrefixes := []string{}
 	for _, podNetStat := range networkStatus {
 		if podNetStat.Name == "ovn-kubernetes" {
 			continue
+		}
+
+		// Filter by NAD names if specified
+		if len(allowedNADs) > 0 {
+			nadName := podNetStat.Name
+			if slashIndex := strings.LastIndex(nadName, "/"); slashIndex != -1 {
+				nadName = nadName[slashIndex+1:]
+			}
+			if !util.StringInSlice(nadName, allowedNADs) {
+				continue
+			}
 		}
 
 		for _, ip := range podNetStat.IPs {

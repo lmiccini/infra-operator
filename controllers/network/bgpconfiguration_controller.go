@@ -641,7 +641,7 @@ func (r *BGPConfigurationReconciler) createOrPatchFRRConfiguration(
 	Log := r.GetLogger(ctx)
 	Log.Info("Reconciling createOrUpdateFRRConfiguration")
 
-	podPrefixes := bgp.GetFRRPodPrefixes(podDtl.NetworkStatus)
+	podPrefixes := bgp.GetFRRPodPrefixes(podDtl.NetworkStatus, instance.Spec.NetworkAttachmentDefinitions...)
 
 	nodeFRRCfg := nodeFRRCfgs[podDtl.Node]
 
