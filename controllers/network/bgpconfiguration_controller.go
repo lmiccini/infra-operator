@@ -661,6 +661,7 @@ func (r *BGPConfigurationReconciler) createOrPatchFRRConfiguration(
 	for _, r := range filteredRouters {
 		routers = append(routers, frrk8sv1.Router{
 			ASN:       r.ASN,
+			VRF:       r.VRF, // Preserve VRF field to avoid ASN conflicts
 			Neighbors: bgp.GetFilteredFRRNeighbors(r.Neighbors, podPrefixes, instance.Spec.NeighborAddresses),
 			Prefixes:  podPrefixes,
 		})
