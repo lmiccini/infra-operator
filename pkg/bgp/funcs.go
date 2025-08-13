@@ -47,6 +47,44 @@ func GetFRRNeighbors(nodeNeighbors []frrk8sv1.Neighbor, podPrefixes []string) []
 	return podNeighbors
 }
 
+// GetFilteredFRRNeighbors - returns a filtered list of FRR neighbors based on allowed neighbor addresses.
+// If allowedAddresses is empty, returns all neighbors with pod prefixes.
+func GetFilteredFRRNeighbors(nodeNeighbors []frrk8sv1.Neighbor, podPrefixes []string, allowedAddresses []string) []frrk8sv1.Neighbor {
+	if len(allowedAddresses) == 0 {
+		return GetFRRNeighbors(nodeNeighbors, podPrefixes)
+	}
+
+	podNeighbors := []frrk8sv1.Neighbor{}
+	for _, neighbor := range nodeNeighbors {
+		if util.StringInSlice(neighbor.Address, allowedAddresses) {
+			neighbor.ToAdvertise.Allowed.Prefixes = podPrefixes
+			podNeighbors = append(podNeighbors, neighbor)
+		}
+	}
+
+	return podNeighbors
+}
+
+// GetFilteredRouters - returns a filtered list of routers based on allowed ASNs.
+// If allowedASNs is empty, returns all routers.
+func GetFilteredRouters(routers []frrk8sv1.Router, allowedASNs []uint32) []frrk8sv1.Router {
+	if len(allowedASNs) == 0 {
+		return routers
+	}
+
+	filteredRouters := []frrk8sv1.Router{}
+	for _, router := range routers {
+		for _, allowedASN := range allowedASNs {
+			if router.ASN == allowedASN {
+				filteredRouters = append(filteredRouters, router)
+				break
+			}
+		}
+	}
+
+	return filteredRouters
+}
+
 // GetNodesRunningPods - get a uniq list of all nodes from all a PodDetail list
 func GetNodesRunningPods(podNetworkDetailList []PodDetail) []string {
 	nodes := []string{}

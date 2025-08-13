@@ -10,3 +10,11 @@ metadata:
   name: bgpconfiguration-sample
 spec:
   frrConfigurationNamespace: metallb-system
+  # Optional: Specify router ASNs to advertise to (if empty, advertises to all routers)
+  # routerASNs:
+  #   - 64999
+  #   - 65000
+  # Optional: Specify neighbor addresses to advertise to (if empty, advertises to all neighbors)
+  # neighborAddresses:
+  #   - "10.10.10.10"
+  #   - "10.10.11.10"

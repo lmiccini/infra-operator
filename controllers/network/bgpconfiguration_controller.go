@@ -605,10 +605,14 @@ func (r *BGPConfigurationReconciler) createOrPatchFRRConfiguration(
 
 	frrConfigSpec := &frrk8sv1.FRRConfigurationSpec{}
 	var routers []frrk8sv1.Router
-	for _, r := range nodeFRRCfg.Spec.BGP.Routers {
+
+	// Filter routers by ASN if specified
+	filteredRouters := bgp.GetFilteredRouters(nodeFRRCfg.Spec.BGP.Routers, instance.Spec.RouterASNs)
+
+	for _, r := range filteredRouters {
 		routers = append(routers, frrk8sv1.Router{
 			ASN:       r.ASN,
-			Neighbors: bgp.GetFRRNeighbors(r.Neighbors, podPrefixes),
+			Neighbors: bgp.GetFilteredFRRNeighbors(r.Neighbors, podPrefixes, instance.Spec.NeighborAddresses),
 			Prefixes:  podPrefixes,
 		})
 	}

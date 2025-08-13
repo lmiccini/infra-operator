@@ -317,3 +317,84 @@ func TestGetFRRNeighbors(t *testing.T) {
 		})
 	}
 }
+
+func TestGetFilteredFRRNeighbors(t *testing.T) {
+	tests := []struct {
+		name             string
+		nodeNeighbors    []frrk8sv1.Neighbor
+		podPrefixes      []string
+		allowedAddresses []string
+		want             []frrk8sv1.Neighbor
+	}{
+		{
+			name:             "Empty allowed addresses returns all neighbors",
+			nodeNeighbors:    []frrk8sv1.Neighbor{{Address: "10.10.10.10", ASN: 64999}},
+			podPrefixes:      []string{"172.17.0.40/32"},
+			allowedAddresses: []string{},
+			want:             []frrk8sv1.Neighbor{{Address: "10.10.10.10", ASN: 64999, ToAdvertise: frrk8sv1.Advertise{Allowed: frrk8sv1.AllowedOutPrefixes{Prefixes: []string{"172.17.0.40/32"}}}}},
+		},
+		{
+			name: "Filter by allowed address",
+			nodeNeighbors: []frrk8sv1.Neighbor{
+				{Address: "10.10.10.10", ASN: 64999},
+				{Address: "10.10.11.10", ASN: 64999},
+			},
+			podPrefixes:      []string{"172.17.0.40/32"},
+			allowedAddresses: []string{"10.10.10.10"},
+			want:             []frrk8sv1.Neighbor{{Address: "10.10.10.10", ASN: 64999, ToAdvertise: frrk8sv1.Advertise{Allowed: frrk8sv1.AllowedOutPrefixes{Prefixes: []string{"172.17.0.40/32"}}}}},
+		},
+		{
+			name: "No matching addresses returns empty",
+			nodeNeighbors: []frrk8sv1.Neighbor{
+				{Address: "10.10.10.10", ASN: 64999},
+			},
+			podPrefixes:      []string{"172.17.0.40/32"},
+			allowedAddresses: []string{"10.10.11.10"},
+			want:             []frrk8sv1.Neighbor{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			result := GetFilteredFRRNeighbors(tt.nodeNeighbors, tt.podPrefixes, tt.allowedAddresses)
+			g.Expect(result).To(BeEquivalentTo(tt.want))
+		})
+	}
+}
+
+func TestGetFilteredRouters(t *testing.T) {
+	tests := []struct {
+		name        string
+		routers     []frrk8sv1.Router
+		allowedASNs []uint32
+		want        []frrk8sv1.Router
+	}{
+		{
+			name:        "Empty allowed ASNs returns all routers",
+			routers:     []frrk8sv1.Router{{ASN: 64999}, {ASN: 65000}},
+			allowedASNs: []uint32{},
+			want:        []frrk8sv1.Router{{ASN: 64999}, {ASN: 65000}},
+		},
+		{
+			name:        "Filter by allowed ASN",
+			routers:     []frrk8sv1.Router{{ASN: 64999}, {ASN: 65000}},
+			allowedASNs: []uint32{64999},
+			want:        []frrk8sv1.Router{{ASN: 64999}},
+		},
+		{
+			name:        "No matching ASNs returns empty",
+			routers:     []frrk8sv1.Router{{ASN: 64999}},
+			allowedASNs: []uint32{65000},
+			want:        []frrk8sv1.Router{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			result := GetFilteredRouters(tt.routers, tt.allowedASNs)
+			g.Expect(result).To(BeEquivalentTo(tt.want))
+		})
+	}
+}

@@ -44,6 +44,14 @@ type BGPConfigurationSpec struct {
 	// gets queried using the FRRConfiguration.spec.NodeSelector `kubernetes.io/hostname: worker-0`. In case a more
 	// specific
 	FRRNodeConfigurationSelector []FRRNodeConfigurationSelectorType `json:"frrNodeConfigurationSelector,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// RouterASNs - list of router ASNs to advertise pod prefixes to. If empty, advertises to all routers.
+	RouterASNs []uint32 `json:"routerASNs,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// NeighborAddresses - list of neighbor IP addresses to advertise pod prefixes to. If empty, advertises to all neighbors.
+	NeighborAddresses []string `json:"neighborAddresses,omitempty"`
 }
 
 // BGPConfigurationStatus defines the observed state of BGPConfiguration
