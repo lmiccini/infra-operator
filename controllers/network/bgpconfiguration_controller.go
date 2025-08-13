@@ -516,7 +516,23 @@ func getPodNetworkDetails(
 				netAttach := []k8s_networkv1.NetworkSelectionElement{}
 				err := json.Unmarshal([]byte(netAttachString), &netAttach)
 				if err != nil {
-					return nil, fmt.Errorf("failed to decode networks %s: %w", netAttachString, err)
+					return detailList, fmt.Errorf("failed to decode networks %s: %w", netAttachString, err)
+				}
+
+				// filter by NAD names if specified
+				if len(instance.Spec.NetworkAttachmentDefinitions) > 0 {
+					hasMatchingNAD := false
+					for _, net := range netAttach {
+						nadName := strings.TrimPrefix(net.Name, pod.Namespace+"/")
+						if util.StringInSlice(nadName, instance.Spec.NetworkAttachmentDefinitions) {
+							hasMatchingNAD = true
+							break
+						}
+					}
+					if !hasMatchingNAD {
+						Log.Info(fmt.Sprintf("Skipping pod %s as it doesn't use any of the specified NADs", pod.Name))
+						continue
+					}
 				}
 
 				// verify the nodeName information is already present in the pod spec, otherwise report an error to reconcile

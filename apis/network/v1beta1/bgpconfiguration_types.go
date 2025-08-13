@@ -56,6 +56,10 @@ type BGPConfigurationSpec struct {
 	// +kubebuilder:validation:Optional
 	// PodSelector - label selector to filter which pods should have their prefixes advertised. If empty, advertises all pods with additional networks.
 	PodSelector *metav1.LabelSelector `json:"podSelector,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// NetworkAttachmentDefinitions - list of NAD names to filter pods by. Only pods using these NADs will have their prefixes advertised. If empty, all NADs are allowed.
+	NetworkAttachmentDefinitions []string `json:"networkAttachmentDefinitions,omitempty"`
 }
 
 // BGPConfigurationStatus defines the observed state of BGPConfiguration

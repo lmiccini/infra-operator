@@ -109,6 +109,13 @@ spec:
                 items:
                   type: string
                 type: array
+              networkAttachmentDefinitions:
+                description: NetworkAttachmentDefinitions - list of NAD names to filter
+                  pods by. Only pods using these NADs will have their prefixes advertised.
+                  If empty, all NADs are allowed.
+                items:
+                  type: string
+                type: array
               podSelector:
                 description: PodSelector - label selector to filter which pods should
                   have their prefixes advertised. If empty, advertises all pods with

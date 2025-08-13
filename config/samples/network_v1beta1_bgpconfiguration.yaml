@@ -27,3 +27,7 @@ spec:
   #   #   - key: service
   #   #     operator: In
   #   #     values: ["keystone", "nova"]
+  # Optional: Filter pods by network-attachment-definitions (if empty, all NADs are allowed)
+  # networkAttachmentDefinitions:
+  #   - "storage-network"
+  #   - "tenant-network"
