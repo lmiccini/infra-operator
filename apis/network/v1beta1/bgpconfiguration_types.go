@@ -52,6 +52,10 @@ type BGPConfigurationSpec struct {
 	// +kubebuilder:validation:Optional
 	// NeighborAddresses - list of neighbor IP addresses to advertise pod prefixes to. If empty, advertises to all neighbors.
 	NeighborAddresses []string `json:"neighborAddresses,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// PodSelector - label selector to filter which pods should have their prefixes advertised. If empty, advertises all pods with additional networks.
+	PodSelector *metav1.LabelSelector `json:"podSelector,omitempty"`
 }
 
 // BGPConfigurationStatus defines the observed state of BGPConfiguration

@@ -18,3 +18,12 @@ spec:
   # neighborAddresses:
   #   - "10.10.10.10"
   #   - "10.10.11.10"
+  # Optional: Filter which pods to advertise based on labels (if empty, advertises all pods with additional networks)
+  # podSelector:
+  #   matchLabels:
+  #     service: keystone
+  #   # Or use matchExpressions for more complex filtering:
+  #   # matchExpressions:
+  #   #   - key: service
+  #   #     operator: In
+  #   #     values: ["keystone", "nova"]

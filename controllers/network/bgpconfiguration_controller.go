@@ -25,6 +25,7 @@ import (
 	"golang.org/x/exp/slices"
 	"k8s.io/apimachinery/pkg/api/equality"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
+	k8s_labels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -366,7 +367,7 @@ func (r *BGPConfigurationReconciler) reconcileNormal(ctx context.Context, instan
 	}
 
 	// get podDetail all pods which have additional interfaces configured
-	podNetworkDetailList, err := getPodNetworkDetails(ctx, helper, podList)
+	podNetworkDetailList, err := getPodNetworkDetails(ctx, helper, podList, instance)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -478,11 +479,12 @@ func (r *BGPConfigurationReconciler) deleteStaleFRRConfigurations(ctx context.Co
 
 // getPodNetworkDetails - returns the podDetails for a list of pods in status.phase: Running
 // where the pod has the multus k8s_networkv1.NetworkAttachmentAnnot annotation
-// and its value is not '[]'
+// and its value is not '[]', optionally filtered by pod selector
 func getPodNetworkDetails(
 	ctx context.Context,
 	h *helper.Helper,
 	pods *corev1.PodList,
+	instance *networkv1.BGPConfiguration,
 ) ([]bgp.PodDetail, error) {
 	Log := h.GetLogger()
 	Log.Info("Reconciling getPodNetworkDetails")
@@ -497,6 +499,17 @@ func getPodNetworkDetails(
 			// skip pods which are not in Running phase (deleted/completed/failed/unknown)
 			if pod.Status.Phase != corev1.PodRunning {
 				continue
+			}
+			// skip pods that don't match the pod selector if one is specified
+			if instance.Spec.PodSelector != nil {
+				selector, err := metav1.LabelSelectorAsSelector(instance.Spec.PodSelector)
+				if err != nil {
+					return detailList, fmt.Errorf("invalid pod selector: %w", err)
+				}
+				if !selector.Matches(k8s_labels.Set(pod.Labels)) {
+					Log.Info(fmt.Sprintf("Skipping pod %s as it doesn't match pod selector", pod.Name))
+					continue
+				}
 			}
 			if netAttachString, ok := pod.Annotations[k8s_networkv1.NetworkAttachmentAnnot]; ok && netAttachString != "[]" {
 				// get the elements from val to validate the status annotation has the right length

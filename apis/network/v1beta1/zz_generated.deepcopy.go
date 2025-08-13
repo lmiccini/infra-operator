@@ -24,6 +24,7 @@ import (
 	topologyv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/service"
+	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
@@ -120,6 +121,11 @@ func (in *BGPConfigurationSpec) DeepCopyInto(out *BGPConfigurationSpec) {
 		in, out := &in.NeighborAddresses, &out.NeighborAddresses
 		*out = make([]string, len(*in))
 		copy(*out, *in)
+	}
+	if in.PodSelector != nil {
+		in, out := &in.PodSelector, &out.PodSelector
+		*out = new(v1.LabelSelector)
+		(*in).DeepCopyInto(*out)
 	}
 }
 
