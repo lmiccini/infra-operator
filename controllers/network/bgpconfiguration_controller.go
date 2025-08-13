@@ -517,9 +517,26 @@ func getPodNetworkDetails(
 			if netAttachString, ok := pod.Annotations[k8s_networkv1.NetworkAttachmentAnnot]; ok && netAttachString != "[]" {
 				// get the elements from val to validate the status annotation has the right length
 				netAttach := []k8s_networkv1.NetworkSelectionElement{}
-				err := json.Unmarshal([]byte(netAttachString), &netAttach)
-				if err != nil {
-					return detailList, fmt.Errorf("failed to decode networks %s: %w", netAttachString, err)
+
+				// Handle both JSON array format and shorthand string format
+				if strings.HasPrefix(netAttachString, "[") {
+					// Full JSON array format: [{"name": "foo-nad"}]
+					err := json.Unmarshal([]byte(netAttachString), &netAttach)
+					if err != nil {
+						Log.Info(fmt.Sprintf("Skipping pod %s due to malformed network attachment annotation: %s", pod.Name, netAttachString))
+						continue
+					}
+				} else {
+					// Shorthand format: "foo-nad" or "foo-nad,bar-nad"
+					nadNames := strings.Split(netAttachString, ",")
+					for _, nadName := range nadNames {
+						nadName = strings.TrimSpace(nadName)
+						if nadName != "" {
+							netAttach = append(netAttach, k8s_networkv1.NetworkSelectionElement{
+								Name: nadName,
+							})
+						}
+					}
 				}
 
 				// filter by NAD names if specified
