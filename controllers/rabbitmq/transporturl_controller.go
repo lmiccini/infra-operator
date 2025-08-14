@@ -75,6 +75,7 @@ func (r *TransportURLReconciler) GetLogger(ctx context.Context) logr.Logger {
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=transporturls,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=transporturls/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=transporturls/finalizers,verbs=update
+//+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs,verbs=get;list;watch
 //+kubebuilder:rbac:groups=rabbitmq.com,resources=rabbitmqclusters,verbs=get;list;watch
 //+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete;
 
@@ -286,6 +287,15 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 			condition.SeverityInfo,
 			rabbitmqv1.TransportURLReadyInitMessage))
 		return ctrl.Result{RequeueAfter: time.Second * 5}, nil
+	}
+
+	// Get RabbitMq CR to check queue type status
+	rabbitmqCR := &rabbitmqv1.RabbitMq{}
+	err = r.Client.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbitmqCR)
+	if err == nil && rabbitmqCR.Status.QueueType == "Quorum" {
+		instance.Status.QueueType = "Quorum"
+	} else {
+		instance.Status.QueueType = ""
 	}
 
 	// Update the CR and return
