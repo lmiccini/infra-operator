@@ -1634,6 +1634,24 @@ def _host_enable(connection, service, reenable=False):
     return True
 
 
+def _redfish_get_power_state(url, user, passwd, timeout):
+    """Get the power state from Redfish API"""
+    try:
+        ssl_config = config_manager.get_requests_ssl_config()
+        if isinstance(ssl_config, tuple):
+            # Client cert authentication
+            response = requests.get(url, auth=(user, passwd), cert=ssl_config, timeout=timeout)
+        else:
+            # Standard SSL verification
+            response = requests.get(url, auth=(user, passwd), verify=ssl_config, timeout=timeout)
+
+        if response.status_code == 200:
+            data = response.json()
+            return data.get('PowerState', '').upper()
+    except Exception as e:
+        logging.error('Failed to get power state: %s' % str(e))
+    return None
+
 def _redfish_reset(url, user, passwd, timeout, action):
     """Perform a Redfish reset operation on a computer system."""
     if not all([url, user, passwd, action]):
@@ -1667,6 +1685,15 @@ def _redfish_reset(url, user, passwd, timeout, action):
         if response.status_code in [200, 204]:
             logging.info("Redfish reset successful: %s on %s", action, url)
             return True
+        elif response.status_code == 409:
+            # Check if server is already powered off
+            power_state = _redfish_get_power_state(url, user, passwd, timeout)
+            if power_state == 'OFF':
+                logging.info("Redfish reset successful: %s on %s (already off)", action, url)
+                return True
+            else:
+                logging.error("Redfish reset failed: 409 conflict but not OFF (status: %s) for %s", power_state, url)
+                return False
         else:
             logging.error("Redfish reset failed: status %d for %s", response.status_code, url)
             return False
