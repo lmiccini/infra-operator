@@ -1786,6 +1786,10 @@ spec:
                   - type
                   type: object
                 type: array
+              lastAppliedImage:
+                description: LastAppliedImage - the last successfully applied container
+                  image
+                type: string
               lastAppliedTopology:
                 description: LastAppliedTopology - the last applied Topology
                 properties:

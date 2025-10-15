@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	rabbitmqv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
@@ -374,6 +375,144 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, fmt.Errorf("error configuring RabbitmqCluster: %w", err)
 	}
 
+	// Initialize LastAppliedImage if it's empty (for new instances)
+	if instance.Status.LastAppliedImage == "" {
+		instance.Status.LastAppliedImage = instance.Spec.ContainerImage
+		Log.Info("Initializing LastAppliedImage for new instance", "image", instance.Spec.ContainerImage)
+	}
+
+	// Check if image has changed and handle upgrade process
+	// Only proceed if we have a previously applied image and it's different from the current spec
+	if instance.Status.LastAppliedImage != instance.Spec.ContainerImage {
+		Log.Info("RabbitMQ image changed, initiating upgrade process",
+			"oldImage", instance.Status.LastAppliedImage,
+			"newImage", instance.Spec.ContainerImage)
+
+		// Create temporary pod for version comparison
+		tempPodName := instance.Name + "-temp-version-check"
+
+		// Check if temporary pod already exists
+		existingPod := &corev1.Pod{}
+		err = helper.GetClient().Get(ctx, types.NamespacedName{Name: tempPodName, Namespace: instance.Namespace}, existingPod)
+		if err == nil {
+			// Pod exists, check if it's being deleted
+			if existingPod.DeletionTimestamp != nil {
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			// Pod exists and is not being deleted, check if it's ready
+			if existingPod.Status.Phase != corev1.PodRunning {
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			}
+		} else if !k8s_errors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("error checking for existing temporary pod: %w", err)
+		} else {
+			// Pod doesn't exist, create it
+			tempPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      tempPodName,
+					Namespace: instance.Namespace,
+					Labels:    map[string]string{"app": "rabbitmq-version-check"},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:    "rabbitmq",
+							Image:   instance.Spec.ContainerImage,
+							Command: []string{"/bin/bash"},
+							Args:    []string{"-c", "sleep 3600"},
+							Env:     []corev1.EnvVar{{Name: "RABBITMQ_NODE_TYPE", Value: "stats"}},
+						},
+					},
+					RestartPolicy: corev1.RestartPolicyNever,
+				},
+			}
+
+			if instance.Spec.NodeSelector != nil {
+				tempPod.Spec.NodeSelector = *instance.Spec.NodeSelector
+			}
+
+			err = helper.GetClient().Create(ctx, tempPod)
+			if err != nil && !k8s_errors.IsAlreadyExists(err) {
+				return ctrl.Result{}, fmt.Errorf("error creating temporary pod: %w", err)
+			}
+		}
+
+		// Wait for temporary pod to be ready
+		podReady := existingPod.Status.Phase == corev1.PodRunning
+		if !podReady {
+			for i := 0; i < 30; i++ { // Wait up to 5 minutes (30 * 10s)
+				var currentPod corev1.Pod
+				err = helper.GetClient().Get(ctx, types.NamespacedName{Name: tempPodName, Namespace: instance.Namespace}, &currentPod)
+				if err != nil {
+					r.cleanupTempPod(ctx, helper, tempPodName, instance.Namespace)
+					return ctrl.Result{}, err
+				}
+
+				if currentPod.Status.Phase == corev1.PodRunning {
+					podReady = true
+					break
+				}
+
+				time.Sleep(10 * time.Second)
+			}
+		}
+
+		if podReady {
+			// Compare versions between production and temporary pod
+			prodVersion, err := r.getRabbitMQVersion(ctx, helper, instance.Name+"-server-0", instance.Namespace)
+			if err != nil {
+				Log.Error(err, "Failed to get production cluster version")
+				// Clean up temporary pod before returning error
+				r.cleanupTempPod(ctx, helper, tempPodName, instance.Namespace)
+				return ctrl.Result{}, err
+			}
+
+			tempVersion, err := r.getRabbitMQVersion(ctx, helper, tempPodName, instance.Namespace)
+			if err != nil {
+				Log.Error(err, "Failed to get temporary pod version")
+				// Clean up temporary pod before returning error
+				r.cleanupTempPod(ctx, helper, tempPodName, instance.Namespace)
+				return ctrl.Result{}, err
+			}
+
+			Log.Info("RabbitMQ version comparison",
+				"productionVersion", prodVersion,
+				"temporaryVersion", tempVersion)
+
+			// Clean up temporary pod after version comparison
+			err = r.cleanupTempPod(ctx, helper, tempPodName, instance.Namespace)
+			if err != nil {
+				Log.Error(err, "Failed to cleanup temporary pod", "tempPod", tempPodName)
+				// Don't fail the reconcile for cleanup errors, just log them
+			}
+
+			// Check if versions are different (e.g., 3.x vs 4.x)
+			if r.isVersionUpgrade(prodVersion, tempVersion) {
+				Log.Info("Major version upgrade detected, special orchestration required")
+				// TODO: Implement special upgrade orchestration for major version changes
+				// This should include:
+				// 1. Data migration strategy
+				// 2. Rolling upgrade with proper coordination
+				// 3. Backup and rollback procedures
+				// 4. Service downtime coordination
+
+				// For now, mark condition to indicate upgrade orchestration needed
+				instance.Status.Conditions.Set(condition.FalseCondition(
+					condition.DeploymentReadyCondition,
+					condition.ErrorReason,
+					condition.SeverityWarning,
+					"Major version upgrade detected - special orchestration required"))
+				return ctrl.Result{}, fmt.Errorf("major version upgrade requires special orchestration")
+			}
+
+			// If versions are compatible, proceed with normal upgrade
+			Log.Info("Versions are compatible, proceeding with normal upgrade")
+		} else {
+			Log.Info("Temporary pod not ready yet, requeuing")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+	}
+
 	rabbitmqImplCluster := impl.NewRabbitMqCluster(rabbitmqCluster, 5)
 	rmqres, rmqerr := rabbitmqImplCluster.CreateOrPatch(ctx, helper)
 	if rmqerr != nil {
@@ -459,6 +598,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		}
 
 		instance.Status.QueueType = instance.Spec.QueueType
+
+		// Update the last applied image when cluster is ready
+		instance.Status.LastAppliedImage = instance.Spec.ContainerImage
 	}
 
 	if instance.Status.Conditions.AllSubConditionIsTrue() {
@@ -616,4 +758,93 @@ func (r *Reconciler) findObjectsForSrc(ctx context.Context, src client.Object) [
 	}
 
 	return requests
+}
+
+// getRabbitMQVersion executes "rpm -qa |grep rabbitmq" in the specified pod to get the RabbitMQ version
+func (r *Reconciler) getRabbitMQVersion(ctx context.Context, helper *helper.Helper, podName, namespace string) (string, error) {
+	Log := r.GetLogger(ctx)
+
+	pod := types.NamespacedName{
+		Name:      podName,
+		Namespace: namespace,
+	}
+
+	container := "rabbitmq"
+	command := []string{"/bin/bash", "-c", "rpm -qa |grep rabbitmq"}
+
+	var stdout, stderr bytes.Buffer
+	err := rsh.ExecInPod(ctx, helper.GetKClient(), r.config, pod, container, command,
+		func(stdoutBuf *bytes.Buffer, stderrBuf *bytes.Buffer) error {
+			stdout = *stdoutBuf
+			stderr = *stderrBuf
+			return nil
+		})
+
+	if err != nil {
+		Log.Error(err, "Failed to execute version check command", "pod", podName, "stderr", stderr.String())
+		return "", fmt.Errorf("failed to get RabbitMQ version from pod %s: %w", podName, err)
+	}
+
+	version := strings.TrimSpace(stdout.String())
+	Log.Info("Retrieved RabbitMQ version", "pod", podName, "version", version)
+	return version, nil
+}
+
+// isVersionUpgrade checks if the version change represents a major upgrade (e.g., 3.x to 4.x)
+func (r *Reconciler) isVersionUpgrade(currentVersion, newVersion string) bool {
+	Log := r.GetLogger(context.Background())
+
+	// Extract major version numbers from rpm output
+	// Example: "rabbitmq-server-3.12.10-1.el8.noarch" -> "3"
+	currentMajor := r.extractMajorVersion(currentVersion)
+	newMajor := r.extractMajorVersion(newVersion)
+
+	Log.Info("Version comparison",
+		"currentVersion", currentVersion, "currentMajor", currentMajor,
+		"newVersion", newVersion, "newMajor", newMajor)
+
+	// Consider it a major upgrade if major version differs
+	return currentMajor != "" && newMajor != "" && currentMajor != newMajor
+}
+
+// extractMajorVersion extracts the major version number from rpm output
+func (r *Reconciler) extractMajorVersion(versionString string) string {
+	// Look for pattern like "rabbitmq-server-3.12.10" and extract "3"
+	parts := strings.Split(versionString, "\n")
+	for _, part := range parts {
+		if strings.Contains(part, "rabbitmq-server-") {
+			// Extract version part after "rabbitmq-server-"
+			versionPart := strings.Split(part, "rabbitmq-server-")
+			if len(versionPart) > 1 {
+				// Split by dots and take first part (major version)
+				majorVersion := strings.Split(versionPart[1], ".")[0]
+				return majorVersion
+			}
+		}
+	}
+	return ""
+}
+
+// cleanupTempPod deletes the temporary pod used for version checking
+func (r *Reconciler) cleanupTempPod(ctx context.Context, helper *helper.Helper, tempPodName, namespace string) error {
+	Log := r.GetLogger(ctx)
+
+	Log.Info("Cleaning up temporary pod", "tempPod", tempPodName)
+
+	// Delete the temporary pod
+	tempPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      tempPodName,
+			Namespace: namespace,
+		},
+	}
+
+	err := helper.GetClient().Delete(ctx, tempPod)
+	if err != nil && !k8s_errors.IsNotFound(err) {
+		Log.Error(err, "Failed to delete temporary pod", "tempPod", tempPodName)
+		return err
+	}
+
+	Log.Info("Successfully cleaned up temporary pod", "tempPod", tempPodName)
+	return nil
 }

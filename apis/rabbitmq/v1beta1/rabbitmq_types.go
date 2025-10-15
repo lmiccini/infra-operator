@@ -105,6 +105,9 @@ type RabbitMqStatus struct {
 
 	// QueueType - store whether default ha-all policy is present or not
 	QueueType string `json:"queueType,omitempty"`
+
+	// LastAppliedImage - the last successfully applied container image
+	LastAppliedImage string `json:"lastAppliedImage,omitempty"`
 }
 
 //+kubebuilder:object:root=true
