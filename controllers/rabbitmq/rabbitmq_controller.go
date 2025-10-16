@@ -1071,7 +1071,9 @@ func (r *Reconciler) importData(ctx context.Context, instance *rabbitmqv1beta1.R
 	// Import data in new cluster
 	commands := [][]string{
 		{"/bin/bash", "-c", "curl -s http://127.0.0.1:15672/cli/rabbitmqadmin -o /tmp/rabbitmqadmin && chmod +x /tmp/rabbitmqadmin"},
-		{"/bin/bash", "-c", fmt.Sprintf("/tmp/rabbitmqadmin --host localhost definitions import --file %s", exportFile)},
+		// new v2 format
+		//{"/bin/bash", "-c", fmt.Sprintf("/tmp/rabbitmqadmin --host localhost definitions import --file %s", exportFile)},
+		{"/bin/bash", "-c", fmt.Sprintf("/tmp/rabbitmqadmin --host localhost import %s", exportFile)},
 	}
 
 	for _, cmd := range commands {
