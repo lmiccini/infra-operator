@@ -121,15 +121,6 @@ type RabbitMqUpgradeStatus struct {
 	// State - current state of the upgrade process
 	State string `json:"state,omitempty"`
 
-	// NewClusterName - name of the new cluster created for the upgrade
-	NewClusterName string `json:"newClusterName,omitempty"`
-
-	// DataExportCompleted - whether data export from old cluster is completed
-	DataExportCompleted bool `json:"dataExportCompleted,omitempty"`
-
-	// DataImportCompleted - whether data import to new cluster is completed
-	DataImportCompleted bool `json:"dataImportCompleted,omitempty"`
-
 	// OldClusterLabeled - whether the old cluster has been labeled for upgrade
 	OldClusterLabeled bool `json:"oldClusterLabeled,omitempty"`
 

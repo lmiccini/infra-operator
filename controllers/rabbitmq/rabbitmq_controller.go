@@ -607,20 +607,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	return ctrl.Result{}, nil
 }
 
-// handleRollback cleans up upgrade state and new cluster during rollback
+// handleRollback cleans up upgrade state during rollback
 func (r *Reconciler) handleRollback(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 
-	// Delete new RabbitMQ CR if it exists
-	if instance.Status.UpgradeStatus.NewClusterName != "" {
-		newRabbitMQ := &rabbitmqv1beta1.RabbitMq{}
-		err := helper.GetClient().Get(ctx, types.NamespacedName{Name: instance.Status.UpgradeStatus.NewClusterName, Namespace: instance.Namespace}, newRabbitMQ)
-		if err == nil {
-			helper.GetClient().Delete(ctx, newRabbitMQ)
-		}
-	}
-
-	// Remove upgrade labels from old cluster
+	// Remove upgrade labels from cluster
 	oldCluster := &rabbitmqv2.RabbitmqCluster{}
 	err := helper.GetClient().Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, oldCluster)
 	if err == nil && oldCluster.Labels != nil {
@@ -883,14 +874,6 @@ func (r *Reconciler) handleMajorVersionUpgrade(ctx context.Context, instance *ra
 	// Check if image has been rolled back to the previous one
 	if instance.Status.LastAppliedImage != "" && instance.Spec.ContainerImage == instance.Status.LastAppliedImage {
 		Log.Info("Image rolled back to previous version, cleaning up upgrade and marking as completed")
-		// Clean up any existing upgrade cluster
-		if instance.Status.UpgradeStatus != nil && instance.Status.UpgradeStatus.NewClusterName != "" {
-			newRabbitMQ := &rabbitmqv1beta1.RabbitMq{}
-			err := helper.GetClient().Get(ctx, types.NamespacedName{Name: instance.Status.UpgradeStatus.NewClusterName, Namespace: instance.Namespace}, newRabbitMQ)
-			if err == nil {
-				helper.GetClient().Delete(ctx, newRabbitMQ)
-			}
-		}
 		// Clear upgrade status and mark as completed
 		instance.Status.UpgradeStatus = nil
 		instance.Status.VersionCheckLabel = ""
@@ -915,17 +898,8 @@ func (r *Reconciler) handleMajorVersionUpgrade(ctx context.Context, instance *ra
 		}
 		// If no version info, just continue with current state
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	case "labeled":
-		// Update cluster name to new pattern if it's still using old pattern
-		if !strings.HasSuffix(instance.Status.UpgradeStatus.NewClusterName, "-upgrade") {
-			Log.Info("Updating cluster name to new pattern", "oldName", instance.Status.UpgradeStatus.NewClusterName)
-			instance.Status.UpgradeStatus.NewClusterName = fmt.Sprintf("%s-upgrade", instance.Name)
-		}
-		return r.createNewCluster(ctx, instance, helper, newVersion)
-	case "exporting":
-		return r.exportData(ctx, instance, helper)
-	case "importing":
-		return r.importData(ctx, instance, helper)
+	case "deleting":
+		return r.deletePodsAndPVCs(ctx, instance, helper)
 	case "completed":
 		Log.Info("Major version upgrade completed successfully")
 		instance.Status.LastAppliedImage = instance.Spec.ContainerImage
@@ -959,195 +933,65 @@ func (r *Reconciler) initiateUpgrade(ctx context.Context, instance *rabbitmqv1be
 		return ctrl.Result{}, err
 	}
 
-	// Clean up any existing upgrade clusters with old naming pattern
-	oldUpgradeName := fmt.Sprintf("%s-v%s", instance.Name, r.extractMajorVersion(newVersion))
-	oldUpgradeCluster := &rabbitmqv1beta1.RabbitMq{}
-	err = helper.GetClient().Get(ctx, types.NamespacedName{Name: oldUpgradeName, Namespace: instance.Namespace}, oldUpgradeCluster)
-	if err == nil {
-		Log.Info("Cleaning up old upgrade cluster", "name", oldUpgradeName)
-		helper.GetClient().Delete(ctx, oldUpgradeCluster)
-	}
-
-	// Generate new cluster name
-	instance.Status.UpgradeStatus.NewClusterName = fmt.Sprintf("%s-upgrade", instance.Name)
+	// Set state to deleting pods and PVCs
 	instance.Status.UpgradeStatus.OldClusterLabeled = true
-	instance.Status.UpgradeStatus.State = "labeled"
-	instance.Status.UpgradeStatus.Message = "Old cluster labeled, creating new cluster"
+	instance.Status.UpgradeStatus.State = "deleting"
+	instance.Status.UpgradeStatus.Message = "Old cluster labeled, deleting pods and PVCs for re-bootstrap"
 
-	Log.Info("Initiated major version upgrade", "newClusterName", instance.Status.UpgradeStatus.NewClusterName)
+	Log.Info("Initiated major version upgrade")
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
-// createNewCluster creates a new RabbitMQ cluster directly using the infra-operator controller
-func (r *Reconciler) createNewCluster(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper, newVersion string) (ctrl.Result, error) {
+// deletePodsAndPVCs deletes existing pods and PVCs to allow cluster re-bootstrap with new image
+func (r *Reconciler) deletePodsAndPVCs(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 
-	newClusterName := instance.Status.UpgradeStatus.NewClusterName
-
-	// Check if new cluster already exists
-	rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
-	err := helper.GetClient().Get(ctx, types.NamespacedName{Name: newClusterName, Namespace: instance.Namespace}, rabbitmqCluster)
-	if err == nil {
-		// Cluster exists, check if it's ready
-		clusterReady := false
-		if rabbitmqCluster.Status.ObservedGeneration == rabbitmqCluster.Generation {
-			for _, cond := range rabbitmqCluster.Status.Conditions {
-				if string(cond.Type) == "ClusterAvailable" && cond.Status == corev1.ConditionTrue {
-					clusterReady = true
-					break
-				}
-			}
-		}
-
-		if clusterReady {
-			instance.Status.UpgradeStatus.State = "exporting"
-			instance.Status.UpgradeStatus.Message = "New cluster ready, starting data export"
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-
-		Log.Info("New cluster not ready yet, waiting", "cluster", newClusterName)
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	} else if !k8s_errors.IsNotFound(err) {
-		return ctrl.Result{}, fmt.Errorf("failed to check for existing cluster: %w", err)
-	}
-
-	// Create new RabbitMQ CR with copied spec and new image
-	newRabbitMQ := &rabbitmqv1beta1.RabbitMq{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      newClusterName,
-			Namespace: instance.Namespace,
-			Labels: map[string]string{
-				"rabbitmq.openstack.org/major-upgrade":   "true",
-				"rabbitmq.openstack.org/upgrade-cluster": "true",
-			},
-		},
-		Spec: instance.Spec,
-	}
-
-	Log.Info("Creating new RabbitMQ CR with image",
-		"cluster", newClusterName,
-		"newImage", newRabbitMQ.Spec.ContainerImage)
-
-	// Create the new RabbitMQ CR
-	err = helper.GetClient().Create(ctx, newRabbitMQ)
+	// Delete pods associated with the RabbitMQ cluster
+	podList := &corev1.PodList{}
+	err := helper.GetClient().List(ctx, podList, client.InNamespace(instance.Namespace),
+		client.MatchingLabels{"app.kubernetes.io/name": instance.Name})
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to create new RabbitMQ CR: %w", err)
+		Log.Error(err, "Failed to list pods for deletion")
+		return ctrl.Result{}, err
 	}
 
-	Log.Info("Created new RabbitMQ CR", "cluster", newClusterName, "image", newRabbitMQ.Spec.ContainerImage)
-	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-}
+	for _, pod := range podList.Items {
+		Log.Info("Deleting pod for re-bootstrap", "pod", pod.Name)
+		err := helper.GetClient().Delete(ctx, &pod)
+		if err != nil && !k8s_errors.IsNotFound(err) {
+			Log.Error(err, "Failed to delete pod", "pod", pod.Name)
+			return ctrl.Result{}, err
+		}
+	}
 
-// exportData exports data from the old cluster using rabbitmqadmin
-func (r *Reconciler) exportData(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
-	Log := r.GetLogger(ctx)
+	// Delete PVCs associated with the RabbitMQ cluster
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	err = helper.GetClient().List(ctx, pvcList, client.InNamespace(instance.Namespace),
+		client.MatchingLabels{"app.kubernetes.io/name": instance.Name})
+	if err != nil {
+		Log.Error(err, "Failed to list PVCs for deletion")
+		return ctrl.Result{}, err
+	}
 
-	if instance.Status.UpgradeStatus.DataExportCompleted {
-		instance.Status.UpgradeStatus.State = "importing"
-		instance.Status.UpgradeStatus.Message = "Data export completed, starting import"
+	for _, pvc := range pvcList.Items {
+		Log.Info("Deleting PVC for re-bootstrap", "pvc", pvc.Name)
+		err := helper.GetClient().Delete(ctx, &pvc)
+		if err != nil && !k8s_errors.IsNotFound(err) {
+			Log.Error(err, "Failed to delete PVC", "pvc", pvc.Name)
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Check if pods and PVCs are deleted
+	if len(podList.Items) > 0 || len(pvcList.Items) > 0 {
+		Log.Info("Waiting for pods and PVCs to be deleted", "pods", len(podList.Items), "pvcs", len(pvcList.Items))
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// Download rabbitmqadmin and export data
-	podName := instance.Name + "-server-0"
-	exportFile := fmt.Sprintf("/tmp/%s.json", instance.Name)
+	// All pods and PVCs deleted, mark upgrade as completed
+	instance.Status.UpgradeStatus.State = "completed"
+	instance.Status.UpgradeStatus.Message = "Pods and PVCs deleted, cluster ready for re-bootstrap"
+	Log.Info("Successfully deleted pods and PVCs for re-bootstrap")
 
-	commands := [][]string{
-		{"/bin/bash", "-c", "curl -s http://127.0.0.1:15672/cli/rabbitmqadmin -o /tmp/rabbitmqadmin && chmod +x /tmp/rabbitmqadmin"},
-		{"/bin/bash", "-c", fmt.Sprintf("/tmp/rabbitmqadmin --host localhost export %s", exportFile)},
-	}
-
-	for _, cmd := range commands {
-		err := r.executeInPod(ctx, helper, podName, instance.Namespace, cmd)
-		if err != nil {
-			Log.Error(err, "Failed to execute command in pod", "pod", podName, "command", cmd)
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
-	}
-
-	instance.Status.UpgradeStatus.DataExportCompleted = true
-	instance.Status.UpgradeStatus.Message = "Data export completed"
-	Log.Info("Data export completed", "file", exportFile)
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-}
-
-// importData imports data to the new cluster using rabbitmqadmin
-func (r *Reconciler) importData(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
-	Log := r.GetLogger(ctx)
-
-	if instance.Status.UpgradeStatus.DataImportCompleted {
-		instance.Status.UpgradeStatus.State = "completed"
-		instance.Status.UpgradeStatus.Message = "Major version upgrade completed"
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-
-	// Copy export file to new cluster and import
-	oldPodName := instance.Name + "-server-0"
-	newPodName := instance.Status.UpgradeStatus.NewClusterName + "-server-0"
-	exportFile := fmt.Sprintf("/tmp/%s.json", instance.Name)
-
-	// Copy file from old pod to new pod
-	err := r.copyFileBetweenPods(ctx, helper, oldPodName, newPodName, instance.Namespace, exportFile, exportFile)
-	if err != nil {
-		Log.Error(err, "Failed to copy export file between pods")
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	// Import data in new cluster
-	commands := [][]string{
-		{"/bin/bash", "-c", "curl -s http://127.0.0.1:15672/cli/rabbitmqadmin -o /tmp/rabbitmqadmin && chmod +x /tmp/rabbitmqadmin"},
-		// new v2 format
-		//{"/bin/bash", "-c", fmt.Sprintf("/tmp/rabbitmqadmin --host localhost definitions import --file %s", exportFile)},
-		{"/bin/bash", "-c", fmt.Sprintf("/tmp/rabbitmqadmin --host localhost import %s", exportFile)},
-	}
-
-	for _, cmd := range commands {
-		err := r.executeInPod(ctx, helper, newPodName, instance.Namespace, cmd)
-		if err != nil {
-			Log.Error(err, "Failed to execute command in new pod", "pod", newPodName, "command", cmd)
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
-	}
-
-	instance.Status.UpgradeStatus.DataImportCompleted = true
-	instance.Status.UpgradeStatus.Message = "Data import completed"
-	Log.Info("Data import completed")
-	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-}
-
-// executeInPod executes a command in a pod
-func (r *Reconciler) executeInPod(ctx context.Context, helper *helper.Helper, podName, namespace string, command []string) error {
-	pod := types.NamespacedName{Name: podName, Namespace: namespace}
-	container := "rabbitmq"
-
-	return rsh.ExecInPod(ctx, helper.GetKClient(), r.config, pod, container, command,
-		func(stdoutBuf *bytes.Buffer, stderrBuf *bytes.Buffer) error {
-			return nil
-		})
-}
-
-// copyFileBetweenPods copies a file from one pod to another
-func (r *Reconciler) copyFileBetweenPods(ctx context.Context, helper *helper.Helper, srcPod, dstPod, namespace, srcFile, dstFile string) error {
-	// Read file from source pod
-	srcPodRef := types.NamespacedName{Name: srcPod, Namespace: namespace}
-	var stdout bytes.Buffer
-	err := rsh.ExecInPod(ctx, helper.GetKClient(), r.config, srcPodRef, "rabbitmq",
-		[]string{"/bin/bash", "-c", fmt.Sprintf("cat %s", srcFile)},
-		func(stdoutBuf *bytes.Buffer, stderrBuf *bytes.Buffer) error {
-			stdout = *stdoutBuf
-			return nil
-		})
-	if err != nil {
-		return err
-	}
-
-	// Write file to destination pod
-	dstPodRef := types.NamespacedName{Name: dstPod, Namespace: namespace}
-	return rsh.ExecInPod(ctx, helper.GetKClient(), r.config, dstPodRef, "rabbitmq",
-		[]string{"/bin/bash", "-c", fmt.Sprintf("cat > %s", dstFile)},
-		func(stdoutBuf *bytes.Buffer, stderrBuf *bytes.Buffer) error {
-			// Write the content to stdin
-			_, err := stdoutBuf.Write(stdout.Bytes())
-			return err
-		})
 }
