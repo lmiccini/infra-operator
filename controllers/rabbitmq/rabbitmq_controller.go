@@ -59,6 +59,7 @@ import (
 
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
@@ -93,6 +94,9 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs/finalizers,verbs=update
 
 // +kubebuilder:rbac:groups=rabbitmq.com,resources=rabbitmqclusters,verbs=get;list;watch;create;update;patch;delete
+
+// Required to patch OpenStackControlPlane for major version upgrades
+// +kubebuilder:rbac:groups=core.openstack.org,resources=openstackcontrolplanes,verbs=get;list;watch;update;patch
 
 // Required to determine IPv6 and FIPS
 // +kubebuilder:rbac:groups=config.openshift.io,resources=networks,verbs=get;list;watch;
@@ -488,21 +492,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 
 			// Check if versions are different (e.g., 3.x vs 4.x)
 			if r.isVersionUpgrade(prodVersion, tempVersion) {
-				Log.Info("Major version upgrade detected, special orchestration required")
-				// TODO: Implement special upgrade orchestration for major version changes
-				// This should include:
-				// 1. Data migration strategy
-				// 2. Rolling upgrade with proper coordination
-				// 3. Backup and rollback procedures
-				// 4. Service downtime coordination
-
-				// For now, mark condition to indicate upgrade orchestration needed
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					condition.DeploymentReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					"Major version upgrade detected - special orchestration required"))
-				return ctrl.Result{}, fmt.Errorf("major version upgrade requires special orchestration")
+				Log.Info("Major version upgrade detected, initiating orchestration")
+				return r.handleMajorVersionUpgrade(ctx, instance, helper, prodVersion, tempVersion)
 			}
 
 			// If versions are compatible, proceed with normal upgrade
@@ -847,4 +838,302 @@ func (r *Reconciler) cleanupTempPod(ctx context.Context, helper *helper.Helper, 
 
 	Log.Info("Successfully cleaned up temporary pod", "tempPod", tempPodName)
 	return nil
+}
+
+// handleMajorVersionUpgrade orchestrates the major version upgrade process
+func (r *Reconciler) handleMajorVersionUpgrade(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper, oldVersion, newVersion string) (ctrl.Result, error) {
+	Log := r.GetLogger(ctx)
+
+	// Initialize upgrade status if not present
+	if instance.Status.UpgradeStatus == nil {
+		instance.Status.UpgradeStatus = &rabbitmqv1beta1.RabbitMqUpgradeStatus{
+			State: "initiated",
+		}
+	}
+
+	upgradeStatus := instance.Status.UpgradeStatus
+
+	switch upgradeStatus.State {
+	case "initiated":
+		return r.initiateUpgrade(ctx, instance, helper, oldVersion, newVersion)
+	case "labeled":
+		return r.createNewCluster(ctx, instance, helper, newVersion)
+	case "exporting":
+		return r.exportData(ctx, instance, helper)
+	case "importing":
+		return r.importData(ctx, instance, helper)
+	case "completed":
+		Log.Info("Major version upgrade completed successfully")
+		instance.Status.LastAppliedImage = instance.Spec.ContainerImage
+		instance.Status.UpgradeStatus = nil
+		return ctrl.Result{}, nil
+	default:
+		return ctrl.Result{}, fmt.Errorf("unknown upgrade state: %s", upgradeStatus.State)
+	}
+}
+
+// initiateUpgrade labels the existing cluster and sets up upgrade tracking
+func (r *Reconciler) initiateUpgrade(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper, oldVersion, newVersion string) (ctrl.Result, error) {
+	Log := r.GetLogger(ctx)
+
+	// Label the existing cluster
+	rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
+	err := helper.GetClient().Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, rabbitmqCluster)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if rabbitmqCluster.Labels == nil {
+		rabbitmqCluster.Labels = make(map[string]string)
+	}
+	rabbitmqCluster.Labels["rabbitmq.openstack.org/major-upgrade"] = "true"
+	rabbitmqCluster.Labels["rabbitmq.openstack.org/old-version"] = r.extractMajorVersion(oldVersion)
+
+	err = helper.GetClient().Update(ctx, rabbitmqCluster)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Generate new cluster name
+	newMajorVersion := r.extractMajorVersion(newVersion)
+	instance.Status.UpgradeStatus.NewClusterName = fmt.Sprintf("%s-v%s", instance.Name, newMajorVersion)
+	instance.Status.UpgradeStatus.OldClusterLabeled = true
+	instance.Status.UpgradeStatus.State = "labeled"
+	instance.Status.UpgradeStatus.Message = "Old cluster labeled, creating new cluster"
+
+	Log.Info("Initiated major version upgrade", "newClusterName", instance.Status.UpgradeStatus.NewClusterName)
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// createNewCluster patches the OpenStackControlPlane to add the new RabbitMQ cluster
+func (r *Reconciler) createNewCluster(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper, newVersion string) (ctrl.Result, error) {
+	Log := r.GetLogger(ctx)
+
+	newClusterName := instance.Status.UpgradeStatus.NewClusterName
+
+	// Find the OpenStackControlPlane that owns this RabbitMQ cluster
+	oscp, err := r.findOpenStackControlPlane(ctx, helper, instance)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to find OpenStackControlPlane: %w", err)
+	}
+
+	// Check if new cluster already exists in the OSCP
+	if r.clusterExistsInOSCP(oscp, newClusterName) {
+		// Wait for the cluster to be ready
+		rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
+		err = helper.GetClient().Get(ctx, types.NamespacedName{Name: newClusterName, Namespace: instance.Namespace}, rabbitmqCluster)
+		if err == nil {
+			clusterReady := false
+			if rabbitmqCluster.Status.ObservedGeneration == rabbitmqCluster.Generation {
+				for _, cond := range rabbitmqCluster.Status.Conditions {
+					if string(cond.Type) == "ClusterAvailable" && cond.Status == corev1.ConditionTrue {
+						clusterReady = true
+						break
+					}
+				}
+			}
+
+			if clusterReady {
+				instance.Status.UpgradeStatus.State = "exporting"
+				instance.Status.UpgradeStatus.Message = "New cluster ready, starting data export"
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+		}
+
+		Log.Info("New cluster not ready yet, waiting", "cluster", newClusterName)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// Patch the OpenStackControlPlane to add the new RabbitMQ cluster
+	err = r.patchOSCPWithNewCluster(ctx, helper, oscp, instance, newClusterName)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to patch OpenStackControlPlane: %w", err)
+	}
+
+	Log.Info("Patched OpenStackControlPlane with new RabbitMQ cluster", "cluster", newClusterName)
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// findOpenStackControlPlane finds the OpenStackControlPlane that owns the RabbitMQ cluster
+func (r *Reconciler) findOpenStackControlPlane(ctx context.Context, helper *helper.Helper, instance *rabbitmqv1beta1.RabbitMq) (*unstructured.Unstructured, error) {
+	// Find the OpenStackControlPlane using owner references
+	for _, ownerRef := range instance.OwnerReferences {
+		if ownerRef.Kind == "OpenStackControlPlane" && ownerRef.APIVersion == "core.openstack.org/v1beta1" {
+			oscp := &unstructured.Unstructured{}
+			oscp.SetAPIVersion("core.openstack.org/v1beta1")
+			oscp.SetKind("OpenStackControlPlane")
+
+			err := helper.GetClient().Get(ctx, types.NamespacedName{
+				Name:      ownerRef.Name,
+				Namespace: instance.Namespace,
+			}, oscp)
+			if err != nil {
+				return nil, err
+			}
+			return oscp, nil
+		}
+	}
+
+	return nil, fmt.Errorf("no OpenStackControlPlane owner reference found for RabbitMQ cluster %s", instance.Name)
+}
+
+// clusterExistsInOSCP checks if the cluster already exists in the OpenStackControlPlane
+func (r *Reconciler) clusterExistsInOSCP(oscp *unstructured.Unstructured, clusterName string) bool {
+	// Check if there's already a cluster with the new name
+	rabbitmqSpec, found, err := unstructured.NestedMap(oscp.Object, "spec", "rabbitmq")
+	if err != nil || !found {
+		return false
+	}
+
+	// Look for existing clusters with the new name in templates map
+	if templates, ok := rabbitmqSpec["templates"].(map[string]interface{}); ok {
+		_, exists := templates[clusterName]
+		return exists
+	}
+
+	return false
+}
+
+// patchOSCPWithNewCluster adds the new RabbitMQ cluster to the OpenStackControlPlane
+func (r *Reconciler) patchOSCPWithNewCluster(ctx context.Context, helper *helper.Helper, oscp *unstructured.Unstructured, instance *rabbitmqv1beta1.RabbitMq, newClusterName string) error {
+	// Get the existing RabbitMQ spec
+	rabbitmqSpec, found, err := unstructured.NestedMap(oscp.Object, "spec", "rabbitmq")
+	if err != nil || !found {
+		return fmt.Errorf("failed to get RabbitMQ spec from OpenStackControlPlane")
+	}
+
+	// Get existing templates (should be a map, not array)
+	templates, ok := rabbitmqSpec["templates"].(map[string]interface{})
+	if !ok {
+		templates = make(map[string]interface{})
+	}
+
+	// Create new cluster template based on existing one
+	newClusterTemplate := map[string]interface{}{
+		"containerImage": instance.Spec.ContainerImage,
+	}
+
+	// Add the new cluster to the templates map
+	templates[newClusterName] = newClusterTemplate
+	rabbitmqSpec["templates"] = templates
+
+	// Update the OSCP
+	err = unstructured.SetNestedMap(oscp.Object, rabbitmqSpec, "spec", "rabbitmq")
+	if err != nil {
+		return err
+	}
+
+	return helper.GetClient().Update(ctx, oscp)
+}
+
+// exportData exports data from the old cluster using rabbitmqadmin
+func (r *Reconciler) exportData(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
+	Log := r.GetLogger(ctx)
+
+	if instance.Status.UpgradeStatus.DataExportCompleted {
+		instance.Status.UpgradeStatus.State = "importing"
+		instance.Status.UpgradeStatus.Message = "Data export completed, starting import"
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// Download rabbitmqadmin and export data
+	podName := instance.Name + "-server-0"
+	exportFile := fmt.Sprintf("/tmp/%s.json", instance.Name)
+
+	commands := [][]string{
+		{"/bin/bash", "-c", "curl -s http://127.0.0.1:15672/cli/rabbitmqadmin -o /tmp/rabbitmqadmin && chmod +x /tmp/rabbitmqadmin"},
+		{"/bin/bash", "-c", fmt.Sprintf("/tmp/rabbitmqadmin --host localhost export %s", exportFile)},
+	}
+
+	for _, cmd := range commands {
+		err := r.executeInPod(ctx, helper, podName, instance.Namespace, cmd)
+		if err != nil {
+			Log.Error(err, "Failed to execute command in pod", "pod", podName, "command", cmd)
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+	}
+
+	instance.Status.UpgradeStatus.DataExportCompleted = true
+	instance.Status.UpgradeStatus.Message = "Data export completed"
+	Log.Info("Data export completed", "file", exportFile)
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// importData imports data to the new cluster using rabbitmqadmin
+func (r *Reconciler) importData(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
+	Log := r.GetLogger(ctx)
+
+	if instance.Status.UpgradeStatus.DataImportCompleted {
+		instance.Status.UpgradeStatus.State = "completed"
+		instance.Status.UpgradeStatus.Message = "Major version upgrade completed"
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// Copy export file to new cluster and import
+	oldPodName := instance.Name + "-server-0"
+	newPodName := instance.Status.UpgradeStatus.NewClusterName + "-server-0"
+	exportFile := fmt.Sprintf("/tmp/%s.json", instance.Name)
+
+	// Copy file from old pod to new pod
+	err := r.copyFileBetweenPods(ctx, helper, oldPodName, newPodName, instance.Namespace, exportFile, exportFile)
+	if err != nil {
+		Log.Error(err, "Failed to copy export file between pods")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// Import data in new cluster
+	commands := [][]string{
+		{"/bin/bash", "-c", "curl -s http://127.0.0.1:15672/cli/rabbitmqadmin -o /tmp/rabbitmqadmin && chmod +x /tmp/rabbitmqadmin"},
+		{"/bin/bash", "-c", fmt.Sprintf("/tmp/rabbitmqadmin --host localhost definitions import --file %s", exportFile)},
+	}
+
+	for _, cmd := range commands {
+		err := r.executeInPod(ctx, helper, newPodName, instance.Namespace, cmd)
+		if err != nil {
+			Log.Error(err, "Failed to execute command in new pod", "pod", newPodName, "command", cmd)
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+	}
+
+	instance.Status.UpgradeStatus.DataImportCompleted = true
+	instance.Status.UpgradeStatus.Message = "Data import completed"
+	Log.Info("Data import completed")
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// executeInPod executes a command in a pod
+func (r *Reconciler) executeInPod(ctx context.Context, helper *helper.Helper, podName, namespace string, command []string) error {
+	pod := types.NamespacedName{Name: podName, Namespace: namespace}
+	container := "rabbitmq"
+
+	return rsh.ExecInPod(ctx, helper.GetKClient(), r.config, pod, container, command,
+		func(stdoutBuf *bytes.Buffer, stderrBuf *bytes.Buffer) error {
+			return nil
+		})
+}
+
+// copyFileBetweenPods copies a file from one pod to another
+func (r *Reconciler) copyFileBetweenPods(ctx context.Context, helper *helper.Helper, srcPod, dstPod, namespace, srcFile, dstFile string) error {
+	// Read file from source pod
+	srcPodRef := types.NamespacedName{Name: srcPod, Namespace: namespace}
+	var stdout bytes.Buffer
+	err := rsh.ExecInPod(ctx, helper.GetKClient(), r.config, srcPodRef, "rabbitmq",
+		[]string{"/bin/bash", "-c", fmt.Sprintf("cat %s", srcFile)},
+		func(stdoutBuf *bytes.Buffer, stderrBuf *bytes.Buffer) error {
+			stdout = *stdoutBuf
+			return nil
+		})
+	if err != nil {
+		return err
+	}
+
+	// Write file to destination pod
+	dstPodRef := types.NamespacedName{Name: dstPod, Namespace: namespace}
+	return rsh.ExecInPod(ctx, helper.GetKClient(), r.config, dstPodRef, "rabbitmq",
+		[]string{"/bin/bash", "-c", fmt.Sprintf("cat > %s", dstFile)},
+		func(stdoutBuf *bytes.Buffer, stderrBuf *bytes.Buffer) error {
+			// Write the content to stdin
+			_, err := stdoutBuf.Write(stdout.Bytes())
+			return err
+		})
 }
