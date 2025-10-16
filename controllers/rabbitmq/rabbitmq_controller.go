@@ -122,6 +122,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, err
 	}
 
+	// Skip reconciliation for upgrade clusters
+	if instance.Labels != nil && instance.Labels["rabbitmq.openstack.org/upgrade-cluster"] == "true" {
+		Log.Info("Skipping reconciliation for upgrade cluster", "name", instance.Name)
+		return ctrl.Result{}, nil
+	}
+
 	helper, err := helper.NewHelper(
 		instance,
 		r.Client,
@@ -599,12 +605,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 func (r *Reconciler) handleRollback(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 
-	// Delete new cluster if it exists
+	// Delete new RabbitMQ CR if it exists
 	if instance.Status.UpgradeStatus.NewClusterName != "" {
-		newCluster := &rabbitmqv2.RabbitmqCluster{}
-		err := helper.GetClient().Get(ctx, types.NamespacedName{Name: instance.Status.UpgradeStatus.NewClusterName, Namespace: instance.Namespace}, newCluster)
+		newRabbitMQ := &rabbitmqv1beta1.RabbitMq{}
+		err := helper.GetClient().Get(ctx, types.NamespacedName{Name: instance.Status.UpgradeStatus.NewClusterName, Namespace: instance.Namespace}, newRabbitMQ)
 		if err == nil {
-			helper.GetClient().Delete(ctx, newCluster)
+			helper.GetClient().Delete(ctx, newRabbitMQ)
 		}
 	}
 
@@ -925,8 +931,7 @@ func (r *Reconciler) initiateUpgrade(ctx context.Context, instance *rabbitmqv1be
 	}
 
 	// Generate new cluster name
-	newMajorVersion := r.extractMajorVersion(newVersion)
-	instance.Status.UpgradeStatus.NewClusterName = fmt.Sprintf("%s-v%s", instance.Name, newMajorVersion)
+	instance.Status.UpgradeStatus.NewClusterName = fmt.Sprintf("%s-upgrade", instance.Name)
 	instance.Status.UpgradeStatus.OldClusterLabeled = true
 	instance.Status.UpgradeStatus.State = "labeled"
 	instance.Status.UpgradeStatus.Message = "Old cluster labeled, creating new cluster"
@@ -968,47 +973,30 @@ func (r *Reconciler) createNewCluster(ctx context.Context, instance *rabbitmqv1b
 		return ctrl.Result{}, fmt.Errorf("failed to check for existing cluster: %w", err)
 	}
 
-	// Get the existing cluster to copy its spec
-	existingCluster := &rabbitmqv2.RabbitmqCluster{}
-	err = helper.GetClient().Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, existingCluster)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to get existing cluster: %w", err)
-	}
-
-	Log.Info("Image comparison",
-		"instanceSpecImage", instance.Spec.ContainerImage,
-		"existingClusterImage", existingCluster.Spec.Image,
-		"newVersion", newVersion)
-
-	// Create new cluster with copied spec and new image
-	newCluster := &rabbitmqv2.RabbitmqCluster{
+	// Create new RabbitMQ CR with copied spec and new image
+	newRabbitMQ := &rabbitmqv1beta1.RabbitMq{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      newClusterName,
 			Namespace: instance.Namespace,
 			Labels: map[string]string{
-				"rabbitmq.openstack.org/major-upgrade": "true",
-				"rabbitmq.openstack.org/new-version":   r.extractMajorVersion(newVersion),
+				"rabbitmq.openstack.org/major-upgrade":   "true",
+				"rabbitmq.openstack.org/upgrade-cluster": "true",
 			},
 		},
-		Spec: existingCluster.Spec,
+		Spec: instance.Spec,
 	}
 
-	// Update the image to the new version - this must be done after copying the spec
-	newCluster.Spec.Image = instance.Spec.ContainerImage
-
-	Log.Info("Creating new RabbitMQ cluster with image",
+	Log.Info("Creating new RabbitMQ CR with image",
 		"cluster", newClusterName,
-		"newImage", newCluster.Spec.Image,
-		"oldImage", existingCluster.Spec.Image,
-		"instanceImage", instance.Spec.ContainerImage)
+		"newImage", newRabbitMQ.Spec.ContainerImage)
 
-	// Create the new cluster
-	err = helper.GetClient().Create(ctx, newCluster)
+	// Create the new RabbitMQ CR
+	err = helper.GetClient().Create(ctx, newRabbitMQ)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to create new cluster: %w", err)
+		return ctrl.Result{}, fmt.Errorf("failed to create new RabbitMQ CR: %w", err)
 	}
 
-	Log.Info("Created new RabbitMQ cluster", "cluster", newClusterName, "image", newCluster.Spec.Image)
+	Log.Info("Created new RabbitMQ CR", "cluster", newClusterName, "image", newRabbitMQ.Spec.ContainerImage)
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
