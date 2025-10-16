@@ -388,85 +388,71 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// Check if image has changed and handle upgrade process
 	// Only proceed if we have a previously applied image and it's different from the current spec
 	if instance.Status.LastAppliedImage != instance.Spec.ContainerImage {
-		Log.Info("RabbitMQ image changed, initiating upgrade process",
+		Log.Info("RabbitMQ image changed, checking if version comparison is needed",
 			"oldImage", instance.Status.LastAppliedImage,
 			"newImage", instance.Spec.ContainerImage)
 
-		// Create temporary pod for version comparison
-		tempPodName := instance.Name + "-temp-version-check"
+		// Generate version check label for current image
+		expectedVersionCheckLabel := fmt.Sprintf("version-checked-%s", instance.Spec.ContainerImage)
 
-		// Check if temporary pod already exists
-		existingPod := &corev1.Pod{}
-		err = helper.GetClient().Get(ctx, types.NamespacedName{Name: tempPodName, Namespace: instance.Namespace}, existingPod)
-		if err == nil {
-			// Pod exists, check if it's being deleted
-			if existingPod.DeletionTimestamp != nil {
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-			}
-			// Pod exists and is not being deleted, check if it's ready
-			if existingPod.Status.Phase != corev1.PodRunning {
+		// Check if we've already verified the version for this image
+		if instance.Status.VersionCheckLabel == expectedVersionCheckLabel {
+			Log.Info("Version already checked for this image, proceeding with upgrade")
+		} else {
+			// Need to check version - create temporary pod
+			tempPodName := instance.Name + "-temp-version-check"
+
+			// Check if temporary pod already exists
+			existingPod := &corev1.Pod{}
+			err = helper.GetClient().Get(ctx, types.NamespacedName{Name: tempPodName, Namespace: instance.Namespace}, existingPod)
+			if err == nil {
+				// Pod exists, check if it's being deleted
+				if existingPod.DeletionTimestamp != nil {
+					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+				}
+				// Pod exists and is not being deleted, check if it's ready
+				if existingPod.Status.Phase != corev1.PodRunning {
+					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+				}
+			} else if !k8s_errors.IsNotFound(err) {
+				return ctrl.Result{}, fmt.Errorf("error checking for existing temporary pod: %w", err)
+			} else {
+				// Pod doesn't exist, create it
+				tempPod := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      tempPodName,
+						Namespace: instance.Namespace,
+						Labels:    map[string]string{"app": "rabbitmq-version-check"},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{
+							{
+								Name:    "rabbitmq",
+								Image:   instance.Spec.ContainerImage,
+								Command: []string{"/bin/bash"},
+								Args:    []string{"-c", "sleep 3600"},
+								Env:     []corev1.EnvVar{{Name: "RABBITMQ_NODE_TYPE", Value: "stats"}},
+							},
+						},
+						RestartPolicy: corev1.RestartPolicyNever,
+					},
+				}
+
+				if instance.Spec.NodeSelector != nil {
+					tempPod.Spec.NodeSelector = *instance.Spec.NodeSelector
+				}
+
+				err = helper.GetClient().Create(ctx, tempPod)
+				if err != nil && !k8s_errors.IsAlreadyExists(err) {
+					return ctrl.Result{}, fmt.Errorf("error creating temporary pod: %w", err)
+				}
 				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 			}
-		} else if !k8s_errors.IsNotFound(err) {
-			return ctrl.Result{}, fmt.Errorf("error checking for existing temporary pod: %w", err)
-		} else {
-			// Pod doesn't exist, create it
-			tempPod := &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      tempPodName,
-					Namespace: instance.Namespace,
-					Labels:    map[string]string{"app": "rabbitmq-version-check"},
-				},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:    "rabbitmq",
-							Image:   instance.Spec.ContainerImage,
-							Command: []string{"/bin/bash"},
-							Args:    []string{"-c", "sleep 3600"},
-							Env:     []corev1.EnvVar{{Name: "RABBITMQ_NODE_TYPE", Value: "stats"}},
-						},
-					},
-					RestartPolicy: corev1.RestartPolicyNever,
-				},
-			}
 
-			if instance.Spec.NodeSelector != nil {
-				tempPod.Spec.NodeSelector = *instance.Spec.NodeSelector
-			}
-
-			err = helper.GetClient().Create(ctx, tempPod)
-			if err != nil && !k8s_errors.IsAlreadyExists(err) {
-				return ctrl.Result{}, fmt.Errorf("error creating temporary pod: %w", err)
-			}
-		}
-
-		// Wait for temporary pod to be ready
-		podReady := existingPod.Status.Phase == corev1.PodRunning
-		if !podReady {
-			for i := 0; i < 30; i++ { // Wait up to 5 minutes (30 * 10s)
-				var currentPod corev1.Pod
-				err = helper.GetClient().Get(ctx, types.NamespacedName{Name: tempPodName, Namespace: instance.Namespace}, &currentPod)
-				if err != nil {
-					r.cleanupTempPod(ctx, helper, tempPodName, instance.Namespace)
-					return ctrl.Result{}, err
-				}
-
-				if currentPod.Status.Phase == corev1.PodRunning {
-					podReady = true
-					break
-				}
-
-				time.Sleep(10 * time.Second)
-			}
-		}
-
-		if podReady {
-			// Compare versions between production and temporary pod
+			// Pod is ready, perform version comparison
 			prodVersion, err := r.getRabbitMQVersion(ctx, helper, instance.Name+"-server-0", instance.Namespace)
 			if err != nil {
 				Log.Error(err, "Failed to get production cluster version")
-				// Clean up temporary pod before returning error
 				r.cleanupTempPod(ctx, helper, tempPodName, instance.Namespace)
 				return ctrl.Result{}, err
 			}
@@ -474,7 +460,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			tempVersion, err := r.getRabbitMQVersion(ctx, helper, tempPodName, instance.Namespace)
 			if err != nil {
 				Log.Error(err, "Failed to get temporary pod version")
-				// Clean up temporary pod before returning error
 				r.cleanupTempPod(ctx, helper, tempPodName, instance.Namespace)
 				return ctrl.Result{}, err
 			}
@@ -487,8 +472,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			err = r.cleanupTempPod(ctx, helper, tempPodName, instance.Namespace)
 			if err != nil {
 				Log.Error(err, "Failed to cleanup temporary pod", "tempPod", tempPodName)
-				// Don't fail the reconcile for cleanup errors, just log them
 			}
+
+			// Update version check label to avoid recreating temp pod
+			instance.Status.VersionCheckLabel = expectedVersionCheckLabel
 
 			// Check if versions are different (e.g., 3.x vs 4.x)
 			if r.isVersionUpgrade(prodVersion, tempVersion) {
@@ -498,9 +485,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 
 			// If versions are compatible, proceed with normal upgrade
 			Log.Info("Versions are compatible, proceeding with normal upgrade")
-		} else {
-			Log.Info("Temporary pod not ready yet, requeuing")
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 	}
 
@@ -592,6 +576,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 
 		// Update the last applied image when cluster is ready
 		instance.Status.LastAppliedImage = instance.Spec.ContainerImage
+		// Clear version check label since we've applied a new image
+		instance.Status.VersionCheckLabel = ""
 	}
 
 	if instance.Status.Conditions.AllSubConditionIsTrue() {
@@ -865,6 +851,7 @@ func (r *Reconciler) handleMajorVersionUpgrade(ctx context.Context, instance *ra
 	case "completed":
 		Log.Info("Major version upgrade completed successfully")
 		instance.Status.LastAppliedImage = instance.Spec.ContainerImage
+		instance.Status.VersionCheckLabel = ""
 		instance.Status.UpgradeStatus = nil
 		return ctrl.Result{}, nil
 	default:

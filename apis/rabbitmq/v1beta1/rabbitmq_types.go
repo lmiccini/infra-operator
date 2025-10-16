@@ -109,6 +109,9 @@ type RabbitMqStatus struct {
 	// LastAppliedImage - the last successfully applied container image
 	LastAppliedImage string `json:"lastAppliedImage,omitempty"`
 
+	// VersionCheckLabel - label indicating version has been checked for current image
+	VersionCheckLabel string `json:"versionCheckLabel,omitempty"`
+
 	// UpgradeStatus - tracks the status of major version upgrades
 	UpgradeStatus *RabbitMqUpgradeStatus `json:"upgradeStatus,omitempty"`
 }
