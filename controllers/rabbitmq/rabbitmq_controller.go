@@ -880,6 +880,24 @@ func (r *Reconciler) cleanupTempPod(ctx context.Context, helper *helper.Helper, 
 func (r *Reconciler) handleMajorVersionUpgrade(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper, oldVersion, newVersion string) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 
+	// Check if image has been rolled back to the previous one
+	if instance.Status.LastAppliedImage != "" && instance.Spec.ContainerImage == instance.Status.LastAppliedImage {
+		Log.Info("Image rolled back to previous version, cleaning up upgrade and marking as completed")
+		// Clean up any existing upgrade cluster
+		if instance.Status.UpgradeStatus != nil && instance.Status.UpgradeStatus.NewClusterName != "" {
+			newRabbitMQ := &rabbitmqv1beta1.RabbitMq{}
+			err := helper.GetClient().Get(ctx, types.NamespacedName{Name: instance.Status.UpgradeStatus.NewClusterName, Namespace: instance.Namespace}, newRabbitMQ)
+			if err == nil {
+				helper.GetClient().Delete(ctx, newRabbitMQ)
+			}
+		}
+		// Clear upgrade status and mark as completed
+		instance.Status.UpgradeStatus = nil
+		instance.Status.VersionCheckLabel = ""
+		Log.Info("Upgrade cleanup completed, cluster considered upgraded")
+		return ctrl.Result{}, nil
+	}
+
 	// Initialize upgrade status if not present
 	if instance.Status.UpgradeStatus == nil {
 		instance.Status.UpgradeStatus = &rabbitmqv1beta1.RabbitMqUpgradeStatus{
@@ -898,6 +916,11 @@ func (r *Reconciler) handleMajorVersionUpgrade(ctx context.Context, instance *ra
 		// If no version info, just continue with current state
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	case "labeled":
+		// Update cluster name to new pattern if it's still using old pattern
+		if !strings.HasSuffix(instance.Status.UpgradeStatus.NewClusterName, "-upgrade") {
+			Log.Info("Updating cluster name to new pattern", "oldName", instance.Status.UpgradeStatus.NewClusterName)
+			instance.Status.UpgradeStatus.NewClusterName = fmt.Sprintf("%s-upgrade", instance.Name)
+		}
 		return r.createNewCluster(ctx, instance, helper, newVersion)
 	case "exporting":
 		return r.exportData(ctx, instance, helper)
