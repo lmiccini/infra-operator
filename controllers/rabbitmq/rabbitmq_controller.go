@@ -59,7 +59,6 @@ import (
 
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
@@ -94,9 +93,6 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs/finalizers,verbs=update
 
 // +kubebuilder:rbac:groups=rabbitmq.com,resources=rabbitmqclusters,verbs=get;list;watch;create;update;patch;delete
-
-// Required to patch OpenStackControlPlane for major version upgrades
-// +kubebuilder:rbac:groups=core.openstack.org,resources=openstackcontrolplanes,verbs=get;list;watch;update;patch
 
 // Required to determine IPv6 and FIPS
 // +kubebuilder:rbac:groups=config.openshift.io,resources=networks,verbs=get;list;watch;
@@ -903,125 +899,70 @@ func (r *Reconciler) initiateUpgrade(ctx context.Context, instance *rabbitmqv1be
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
-// createNewCluster patches the OpenStackControlPlane to add the new RabbitMQ cluster
+// createNewCluster creates a new RabbitMQ cluster directly using the infra-operator controller
 func (r *Reconciler) createNewCluster(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper, newVersion string) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 
 	newClusterName := instance.Status.UpgradeStatus.NewClusterName
 
-	// Find the OpenStackControlPlane that owns this RabbitMQ cluster
-	oscp, err := r.findOpenStackControlPlane(ctx, helper, instance)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to find OpenStackControlPlane: %w", err)
-	}
-
-	// Check if new cluster already exists in the OSCP
-	if r.clusterExistsInOSCP(oscp, newClusterName) {
-		// Wait for the cluster to be ready
-		rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
-		err = helper.GetClient().Get(ctx, types.NamespacedName{Name: newClusterName, Namespace: instance.Namespace}, rabbitmqCluster)
-		if err == nil {
-			clusterReady := false
-			if rabbitmqCluster.Status.ObservedGeneration == rabbitmqCluster.Generation {
-				for _, cond := range rabbitmqCluster.Status.Conditions {
-					if string(cond.Type) == "ClusterAvailable" && cond.Status == corev1.ConditionTrue {
-						clusterReady = true
-						break
-					}
+	// Check if new cluster already exists
+	rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
+	err := helper.GetClient().Get(ctx, types.NamespacedName{Name: newClusterName, Namespace: instance.Namespace}, rabbitmqCluster)
+	if err == nil {
+		// Cluster exists, check if it's ready
+		clusterReady := false
+		if rabbitmqCluster.Status.ObservedGeneration == rabbitmqCluster.Generation {
+			for _, cond := range rabbitmqCluster.Status.Conditions {
+				if string(cond.Type) == "ClusterAvailable" && cond.Status == corev1.ConditionTrue {
+					clusterReady = true
+					break
 				}
 			}
+		}
 
-			if clusterReady {
-				instance.Status.UpgradeStatus.State = "exporting"
-				instance.Status.UpgradeStatus.Message = "New cluster ready, starting data export"
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-			}
+		if clusterReady {
+			instance.Status.UpgradeStatus.State = "exporting"
+			instance.Status.UpgradeStatus.Message = "New cluster ready, starting data export"
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 
 		Log.Info("New cluster not ready yet, waiting", "cluster", newClusterName)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	} else if !k8s_errors.IsNotFound(err) {
+		return ctrl.Result{}, fmt.Errorf("failed to check for existing cluster: %w", err)
 	}
 
-	// Patch the OpenStackControlPlane to add the new RabbitMQ cluster
-	err = r.patchOSCPWithNewCluster(ctx, helper, oscp, instance, newClusterName)
+	// Get the existing cluster to copy its spec
+	existingCluster := &rabbitmqv2.RabbitmqCluster{}
+	err = helper.GetClient().Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, existingCluster)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to patch OpenStackControlPlane: %w", err)
+		return ctrl.Result{}, fmt.Errorf("failed to get existing cluster: %w", err)
 	}
 
-	Log.Info("Patched OpenStackControlPlane with new RabbitMQ cluster", "cluster", newClusterName)
+	// Create new cluster with copied spec and new image
+	newCluster := &rabbitmqv2.RabbitmqCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      newClusterName,
+			Namespace: instance.Namespace,
+			Labels: map[string]string{
+				"rabbitmq.openstack.org/major-upgrade": "true",
+				"rabbitmq.openstack.org/new-version":   r.extractMajorVersion(newVersion),
+			},
+		},
+		Spec: existingCluster.Spec,
+	}
+
+	// Update the image to the new version
+	newCluster.Spec.Image = instance.Spec.ContainerImage
+
+	// Create the new cluster
+	err = helper.GetClient().Create(ctx, newCluster)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to create new cluster: %w", err)
+	}
+
+	Log.Info("Created new RabbitMQ cluster", "cluster", newClusterName, "image", instance.Spec.ContainerImage)
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-}
-
-// findOpenStackControlPlane finds the OpenStackControlPlane that owns the RabbitMQ cluster
-func (r *Reconciler) findOpenStackControlPlane(ctx context.Context, helper *helper.Helper, instance *rabbitmqv1beta1.RabbitMq) (*unstructured.Unstructured, error) {
-	// Find the OpenStackControlPlane using owner references
-	for _, ownerRef := range instance.OwnerReferences {
-		if ownerRef.Kind == "OpenStackControlPlane" && ownerRef.APIVersion == "core.openstack.org/v1beta1" {
-			oscp := &unstructured.Unstructured{}
-			oscp.SetAPIVersion("core.openstack.org/v1beta1")
-			oscp.SetKind("OpenStackControlPlane")
-
-			err := helper.GetClient().Get(ctx, types.NamespacedName{
-				Name:      ownerRef.Name,
-				Namespace: instance.Namespace,
-			}, oscp)
-			if err != nil {
-				return nil, err
-			}
-			return oscp, nil
-		}
-	}
-
-	return nil, fmt.Errorf("no OpenStackControlPlane owner reference found for RabbitMQ cluster %s", instance.Name)
-}
-
-// clusterExistsInOSCP checks if the cluster already exists in the OpenStackControlPlane
-func (r *Reconciler) clusterExistsInOSCP(oscp *unstructured.Unstructured, clusterName string) bool {
-	// Check if there's already a cluster with the new name
-	rabbitmqSpec, found, err := unstructured.NestedMap(oscp.Object, "spec", "rabbitmq")
-	if err != nil || !found {
-		return false
-	}
-
-	// Look for existing clusters with the new name in templates map
-	if templates, ok := rabbitmqSpec["templates"].(map[string]interface{}); ok {
-		_, exists := templates[clusterName]
-		return exists
-	}
-
-	return false
-}
-
-// patchOSCPWithNewCluster adds the new RabbitMQ cluster to the OpenStackControlPlane
-func (r *Reconciler) patchOSCPWithNewCluster(ctx context.Context, helper *helper.Helper, oscp *unstructured.Unstructured, instance *rabbitmqv1beta1.RabbitMq, newClusterName string) error {
-	// Get the existing RabbitMQ spec
-	rabbitmqSpec, found, err := unstructured.NestedMap(oscp.Object, "spec", "rabbitmq")
-	if err != nil || !found {
-		return fmt.Errorf("failed to get RabbitMQ spec from OpenStackControlPlane")
-	}
-
-	// Get existing templates (should be a map, not array)
-	templates, ok := rabbitmqSpec["templates"].(map[string]interface{})
-	if !ok {
-		templates = make(map[string]interface{})
-	}
-
-	// Create new cluster template based on existing one
-	newClusterTemplate := map[string]interface{}{
-		"containerImage": instance.Spec.ContainerImage,
-	}
-
-	// Add the new cluster to the templates map
-	templates[newClusterName] = newClusterTemplate
-	rabbitmqSpec["templates"] = templates
-
-	// Update the OSCP
-	err = unstructured.SetNestedMap(oscp.Object, rabbitmqSpec, "spec", "rabbitmq")
-	if err != nil {
-		return err
-	}
-
-	return helper.GetClient().Update(ctx, oscp)
 }
 
 // exportData exports data from the old cluster using rabbitmqadmin
