@@ -939,6 +939,11 @@ func (r *Reconciler) createNewCluster(ctx context.Context, instance *rabbitmqv1b
 		return ctrl.Result{}, fmt.Errorf("failed to get existing cluster: %w", err)
 	}
 
+	Log.Info("Image comparison",
+		"instanceSpecImage", instance.Spec.ContainerImage,
+		"existingClusterImage", existingCluster.Spec.Image,
+		"newVersion", newVersion)
+
 	// Create new cluster with copied spec and new image
 	newCluster := &rabbitmqv2.RabbitmqCluster{
 		ObjectMeta: metav1.ObjectMeta{
@@ -952,8 +957,14 @@ func (r *Reconciler) createNewCluster(ctx context.Context, instance *rabbitmqv1b
 		Spec: existingCluster.Spec,
 	}
 
-	// Update the image to the new version
+	// Update the image to the new version - this must be done after copying the spec
 	newCluster.Spec.Image = instance.Spec.ContainerImage
+
+	Log.Info("Creating new RabbitMQ cluster with image",
+		"cluster", newClusterName,
+		"newImage", newCluster.Spec.Image,
+		"oldImage", existingCluster.Spec.Image,
+		"instanceImage", instance.Spec.ContainerImage)
 
 	// Create the new cluster
 	err = helper.GetClient().Create(ctx, newCluster)
@@ -961,7 +972,7 @@ func (r *Reconciler) createNewCluster(ctx context.Context, instance *rabbitmqv1b
 		return ctrl.Result{}, fmt.Errorf("failed to create new cluster: %w", err)
 	}
 
-	Log.Info("Created new RabbitMQ cluster", "cluster", newClusterName, "image", instance.Spec.ContainerImage)
+	Log.Info("Created new RabbitMQ cluster", "cluster", newClusterName, "image", newCluster.Spec.Image)
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
