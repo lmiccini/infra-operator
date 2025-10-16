@@ -394,6 +394,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			"oldImage", instance.Status.LastAppliedImage,
 			"newImage", instance.Spec.ContainerImage)
 
+		// Check if we're rolling back to the old image (rollback scenario)
+		if instance.Status.UpgradeStatus != nil && instance.Spec.ContainerImage == instance.Status.LastAppliedImage {
+			Log.Info("Rollback detected - cleaning up upgrade state and new cluster")
+			return r.handleRollback(ctx, instance, helper)
+		}
+
 		// Generate version check label for current image
 		expectedVersionCheckLabel := fmt.Sprintf("version-checked-%s", instance.Spec.ContainerImage)
 
@@ -587,6 +593,36 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			condition.ReadyCondition, condition.ReadyMessage)
 	}
 	return ctrl.Result{}, nil
+}
+
+// handleRollback cleans up upgrade state and new cluster during rollback
+func (r *Reconciler) handleRollback(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
+	Log := r.GetLogger(ctx)
+
+	// Delete new cluster if it exists
+	if instance.Status.UpgradeStatus.NewClusterName != "" {
+		newCluster := &rabbitmqv2.RabbitmqCluster{}
+		err := helper.GetClient().Get(ctx, types.NamespacedName{Name: instance.Status.UpgradeStatus.NewClusterName, Namespace: instance.Namespace}, newCluster)
+		if err == nil {
+			helper.GetClient().Delete(ctx, newCluster)
+		}
+	}
+
+	// Remove upgrade labels from old cluster
+	oldCluster := &rabbitmqv2.RabbitmqCluster{}
+	err := helper.GetClient().Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, oldCluster)
+	if err == nil && oldCluster.Labels != nil {
+		delete(oldCluster.Labels, "rabbitmq.openstack.org/major-upgrade")
+		delete(oldCluster.Labels, "rabbitmq.openstack.org/old-version")
+		helper.GetClient().Update(ctx, oldCluster)
+	}
+
+	// Clear upgrade status
+	instance.Status.UpgradeStatus = nil
+	instance.Status.VersionCheckLabel = ""
+
+	Log.Info("Rollback completed")
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
 func updateMirroredPolicy(ctx context.Context, helper *helper.Helper, instance *rabbitmqv1beta1.RabbitMq, config *rest.Config, apply bool) error {
