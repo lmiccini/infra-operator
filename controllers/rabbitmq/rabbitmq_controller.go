@@ -942,39 +942,69 @@ func (r *Reconciler) initiateUpgrade(ctx context.Context, instance *rabbitmqv1be
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
-// deleteRabbitmqCluster deletes the RabbitmqCluster object to allow re-bootstrap with new image
+// deleteRabbitmqCluster deletes the RabbitmqCluster object and PVCs to allow re-bootstrap with new image
 func (r *Reconciler) deleteRabbitmqCluster(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 
-	// Check if RabbitmqCluster exists
+	// First, delete the RabbitmqCluster if it exists
 	rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
 	err := helper.GetClient().Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, rabbitmqCluster)
-	if err != nil {
-		if k8s_errors.IsNotFound(err) {
-			// RabbitmqCluster already deleted, mark upgrade as completed
-			instance.Status.UpgradeStatus.State = "completed"
-			instance.Status.UpgradeStatus.Message = "RabbitmqCluster deleted, ready for re-bootstrap"
-			Log.Info("RabbitmqCluster already deleted, upgrade completed")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	if err == nil {
+		// RabbitmqCluster exists, delete it
+		if rabbitmqCluster.DeletionTimestamp == nil {
+			Log.Info("Deleting RabbitmqCluster for re-bootstrap", "cluster", instance.Name)
+			err = helper.GetClient().Delete(ctx, rabbitmqCluster)
+			if err != nil && !k8s_errors.IsNotFound(err) {
+				Log.Error(err, "Failed to delete RabbitmqCluster")
+				return ctrl.Result{}, err
+			}
 		}
+		// Wait for RabbitmqCluster to be deleted before proceeding with PVCs
+		Log.Info("RabbitmqCluster is being deleted, waiting before deleting PVCs")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	} else if !k8s_errors.IsNotFound(err) {
 		Log.Error(err, "Failed to get RabbitmqCluster")
 		return ctrl.Result{}, err
 	}
 
-	// Check if RabbitmqCluster is already being deleted
-	if rabbitmqCluster.DeletionTimestamp != nil {
-		Log.Info("RabbitmqCluster is being deleted, waiting for completion")
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	// Delete the RabbitmqCluster
-	Log.Info("Deleting RabbitmqCluster for re-bootstrap", "cluster", instance.Name)
-	err = helper.GetClient().Delete(ctx, rabbitmqCluster)
-	if err != nil && !k8s_errors.IsNotFound(err) {
-		Log.Error(err, "Failed to delete RabbitmqCluster")
+	// RabbitmqCluster is deleted, now delete PVCs
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	err = helper.GetClient().List(ctx, pvcList, client.InNamespace(instance.Namespace),
+		client.MatchingLabels{"app.kubernetes.io/name": instance.Name})
+	if err != nil {
+		Log.Error(err, "Failed to list PVCs for deletion")
 		return ctrl.Result{}, err
 	}
 
-	Log.Info("RabbitmqCluster deletion initiated, waiting for completion")
-	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	// Delete any remaining PVCs
+	for _, pvc := range pvcList.Items {
+		if pvc.DeletionTimestamp == nil {
+			Log.Info("Deleting PVC for re-bootstrap", "pvc", pvc.Name)
+			err := helper.GetClient().Delete(ctx, &pvc)
+			if err != nil && !k8s_errors.IsNotFound(err) {
+				Log.Error(err, "Failed to delete PVC", "pvc", pvc.Name)
+				return ctrl.Result{}, err
+			}
+		}
+	}
+
+	// Check if there are still active PVCs
+	activePVCs := 0
+	for _, pvc := range pvcList.Items {
+		if pvc.DeletionTimestamp == nil {
+			activePVCs++
+		}
+	}
+
+	if activePVCs > 0 {
+		Log.Info("Waiting for PVCs to be deleted", "activePVCs", activePVCs, "totalPVCs", len(pvcList.Items))
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// All PVCs deleted, mark upgrade as completed
+	instance.Status.UpgradeStatus.State = "completed"
+	instance.Status.UpgradeStatus.Message = "RabbitmqCluster and PVCs deleted, ready for re-bootstrap"
+	Log.Info("Successfully deleted RabbitmqCluster and PVCs for re-bootstrap")
+
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
