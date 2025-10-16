@@ -385,6 +385,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		Log.Info("Initializing LastAppliedImage for new instance", "image", instance.Spec.ContainerImage)
 	}
 
+	// Check if we're in the middle of a major version upgrade
+	if instance.Status.UpgradeStatus != nil {
+		Log.Info("Major version upgrade in progress, handling upgrade state", "state", instance.Status.UpgradeStatus.State)
+		return r.handleMajorVersionUpgrade(ctx, instance, helper, "", "")
+	}
+
 	// Check if image has changed and handle upgrade process
 	// Only proceed if we have a previously applied image and it's different from the current spec
 	if instance.Status.LastAppliedImage != instance.Spec.ContainerImage {
@@ -841,7 +847,12 @@ func (r *Reconciler) handleMajorVersionUpgrade(ctx context.Context, instance *ra
 
 	switch upgradeStatus.State {
 	case "initiated":
-		return r.initiateUpgrade(ctx, instance, helper, oldVersion, newVersion)
+		// Only call initiateUpgrade if we have version information
+		if oldVersion != "" && newVersion != "" {
+			return r.initiateUpgrade(ctx, instance, helper, oldVersion, newVersion)
+		}
+		// If no version info, just continue with current state
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	case "labeled":
 		return r.createNewCluster(ctx, instance, helper, newVersion)
 	case "exporting":
