@@ -394,8 +394,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 
 	// Check if image has changed and handle upgrade process
-	// Only proceed if we have a previously applied image and it's different from the current spec
-	if instance.Status.LastAppliedImage != instance.Spec.ContainerImage {
+	// If image matches the applied one, clear any upgrade status
+	if instance.Status.LastAppliedImage == instance.Spec.ContainerImage {
+		if instance.Status.UpgradeStatus != nil {
+			Log.Info("Image matches applied image, clearing upgrade status")
+			instance.Status.UpgradeStatus = nil
+			instance.Status.VersionCheckLabel = ""
+		}
+	} else if instance.Status.LastAppliedImage != "" {
 		Log.Info("RabbitMQ image changed, checking if version comparison is needed",
 			"oldImage", instance.Status.LastAppliedImage,
 			"newImage", instance.Spec.ContainerImage)
@@ -928,6 +934,15 @@ func (r *Reconciler) initiateUpgrade(ctx context.Context, instance *rabbitmqv1be
 	err = helper.GetClient().Update(ctx, rabbitmqCluster)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+
+	// Clean up any existing upgrade clusters with old naming pattern
+	oldUpgradeName := fmt.Sprintf("%s-v%s", instance.Name, r.extractMajorVersion(newVersion))
+	oldUpgradeCluster := &rabbitmqv1beta1.RabbitMq{}
+	err = helper.GetClient().Get(ctx, types.NamespacedName{Name: oldUpgradeName, Namespace: instance.Namespace}, oldUpgradeCluster)
+	if err == nil {
+		Log.Info("Cleaning up old upgrade cluster", "name", oldUpgradeName)
+		helper.GetClient().Delete(ctx, oldUpgradeCluster)
 	}
 
 	// Generate new cluster name
