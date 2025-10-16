@@ -899,7 +899,7 @@ func (r *Reconciler) handleMajorVersionUpgrade(ctx context.Context, instance *ra
 		// If no version info, just continue with current state
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	case "deleting":
-		return r.deletePodsAndPVCs(ctx, instance, helper)
+		return r.deleteRabbitmqCluster(ctx, instance, helper)
 	case "completed":
 		Log.Info("Major version upgrade completed successfully")
 		instance.Status.LastAppliedImage = instance.Spec.ContainerImage
@@ -942,56 +942,39 @@ func (r *Reconciler) initiateUpgrade(ctx context.Context, instance *rabbitmqv1be
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
-// deletePodsAndPVCs deletes existing pods and PVCs to allow cluster re-bootstrap with new image
-func (r *Reconciler) deletePodsAndPVCs(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
+// deleteRabbitmqCluster deletes the RabbitmqCluster object to allow re-bootstrap with new image
+func (r *Reconciler) deleteRabbitmqCluster(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 
-	// Delete pods associated with the RabbitMQ cluster
-	podList := &corev1.PodList{}
-	err := helper.GetClient().List(ctx, podList, client.InNamespace(instance.Namespace),
-		client.MatchingLabels{"app.kubernetes.io/name": instance.Name})
+	// Check if RabbitmqCluster exists
+	rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
+	err := helper.GetClient().Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, rabbitmqCluster)
 	if err != nil {
-		Log.Error(err, "Failed to list pods for deletion")
+		if k8s_errors.IsNotFound(err) {
+			// RabbitmqCluster already deleted, mark upgrade as completed
+			instance.Status.UpgradeStatus.State = "completed"
+			instance.Status.UpgradeStatus.Message = "RabbitmqCluster deleted, ready for re-bootstrap"
+			Log.Info("RabbitmqCluster already deleted, upgrade completed")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		Log.Error(err, "Failed to get RabbitmqCluster")
 		return ctrl.Result{}, err
 	}
 
-	for _, pod := range podList.Items {
-		Log.Info("Deleting pod for re-bootstrap", "pod", pod.Name)
-		err := helper.GetClient().Delete(ctx, &pod)
-		if err != nil && !k8s_errors.IsNotFound(err) {
-			Log.Error(err, "Failed to delete pod", "pod", pod.Name)
-			return ctrl.Result{}, err
-		}
+	// Check if RabbitmqCluster is already being deleted
+	if rabbitmqCluster.DeletionTimestamp != nil {
+		Log.Info("RabbitmqCluster is being deleted, waiting for completion")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	// Delete PVCs associated with the RabbitMQ cluster
-	pvcList := &corev1.PersistentVolumeClaimList{}
-	err = helper.GetClient().List(ctx, pvcList, client.InNamespace(instance.Namespace),
-		client.MatchingLabels{"app.kubernetes.io/name": instance.Name})
-	if err != nil {
-		Log.Error(err, "Failed to list PVCs for deletion")
+	// Delete the RabbitmqCluster
+	Log.Info("Deleting RabbitmqCluster for re-bootstrap", "cluster", instance.Name)
+	err = helper.GetClient().Delete(ctx, rabbitmqCluster)
+	if err != nil && !k8s_errors.IsNotFound(err) {
+		Log.Error(err, "Failed to delete RabbitmqCluster")
 		return ctrl.Result{}, err
 	}
 
-	for _, pvc := range pvcList.Items {
-		Log.Info("Deleting PVC for re-bootstrap", "pvc", pvc.Name)
-		err := helper.GetClient().Delete(ctx, &pvc)
-		if err != nil && !k8s_errors.IsNotFound(err) {
-			Log.Error(err, "Failed to delete PVC", "pvc", pvc.Name)
-			return ctrl.Result{}, err
-		}
-	}
-
-	// Check if pods and PVCs are deleted
-	if len(podList.Items) > 0 || len(pvcList.Items) > 0 {
-		Log.Info("Waiting for pods and PVCs to be deleted", "pods", len(podList.Items), "pvcs", len(pvcList.Items))
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-
-	// All pods and PVCs deleted, mark upgrade as completed
-	instance.Status.UpgradeStatus.State = "completed"
-	instance.Status.UpgradeStatus.Message = "Pods and PVCs deleted, cluster ready for re-bootstrap"
-	Log.Info("Successfully deleted pods and PVCs for re-bootstrap")
-
-	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	Log.Info("RabbitmqCluster deletion initiated, waiting for completion")
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
