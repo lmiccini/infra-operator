@@ -132,6 +132,24 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, err
 	}
 
+	// Add RabbitmqCurrentVersion label to instance if it doesn't exist
+	if instance.Labels == nil {
+		instance.Labels = make(map[string]string)
+	}
+	if _, exists := instance.Labels["rabbitmqcurrentversion"]; !exists {
+		instance.Labels["rabbitmqcurrentversion"] = "3.9"
+	}
+
+	// Check version compatibility to prevent updates with different RabbitMQ versions
+	if currentVersion, hasCurrent := instance.Labels["rabbitmqcurrentversion"]; hasCurrent {
+		if targetVersion, hasTarget := instance.Labels["rabbitmqversion"]; hasTarget {
+			if currentVersion != targetVersion {
+				Log.Info(fmt.Sprintf("RabbitMQ version mismatch: current=%s, target=%s. Skipping reconcile to prevent container image updates.", currentVersion, targetVersion))
+				return ctrl.Result{}, nil
+			}
+		}
+	}
+
 	// initialize status if Conditions is nil, but do not reset if it already
 	// exists
 	isNewInstance := instance.Status.Conditions == nil
