@@ -684,7 +684,7 @@ func (r *Reconciler) pauseAndPatchForVersionUpgrade(ctx context.Context, instanc
 	// Get the StatefulSet created by the RabbitMQ operator
 	statefulSet := &appsv1.StatefulSet{}
 	err = r.Client.Get(ctx, types.NamespacedName{
-		Name:      instance.Name,
+		Name:      instance.Name + "-server",
 		Namespace: instance.Namespace,
 	}, statefulSet)
 	if err != nil {
@@ -693,6 +693,11 @@ func (r *Reconciler) pauseAndPatchForVersionUpgrade(ctx context.Context, instanc
 			return nil
 		}
 		return err
+	}
+
+	Log.Info(fmt.Sprintf("Found StatefulSet with %d init containers", len(statefulSet.Spec.Template.Spec.InitContainers)))
+	for i, initContainer := range statefulSet.Spec.Template.Spec.InitContainers {
+		Log.Info(fmt.Sprintf("Init container %d: %s", i, initContainer.Name))
 	}
 
 	// Create a cleanup init container
@@ -727,7 +732,7 @@ func (r *Reconciler) pauseAndPatchForVersionUpgrade(ctx context.Context, instanc
 	time.Sleep(1 * time.Second)
 	updatedStatefulSet := &appsv1.StatefulSet{}
 	err = r.Client.Get(ctx, types.NamespacedName{
-		Name:      instance.Name,
+		Name:      instance.Name + "-server",
 		Namespace: instance.Namespace,
 	}, updatedStatefulSet)
 	if err != nil {
