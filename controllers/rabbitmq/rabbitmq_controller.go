@@ -57,6 +57,7 @@ import (
 	"github.com/openstack-k8s-operators/infra-operator/pkg/rabbitmq/impl"
 
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
@@ -448,17 +449,51 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		Log.Info(fmt.Sprintf("Version upgrade in progress. RabbitMQ cluster replicas: %d", *rabbitmqClusterInstance.Spec.Replicas))
 
 		if *rabbitmqClusterInstance.Spec.Replicas == 0 {
-			Log.Info("RabbitMQ cluster scaled to zero, proceeding with cleanup and scaling back up")
-			if err := r.handleVersionUpgrade(ctx, instance, helper, targetVersion); err != nil {
-				Log.Error(err, "Failed to handle version upgrade cleanup")
+			// Check if the StatefulSet has been updated with the new image
+			// We need to wait for the RabbitMQ cluster operator to update the StatefulSet
+			// before we clean data and scale back up
+
+			// Get the StatefulSet to check if it has the new image
+			statefulSetList := &appsv1.StatefulSetList{}
+			err := r.List(ctx, statefulSetList, client.InNamespace(instance.Namespace),
+				client.MatchingLabels{
+					"app.kubernetes.io/name": instance.Name,
+				})
+			if err != nil {
+				Log.Error(err, "Failed to list StatefulSets")
 				return ctrl.Result{}, err
 			}
-			// Scale back up to original replica count
-			if instance.Spec.Replicas != nil {
-				Log.Info(fmt.Sprintf("Scaling RabbitMQ cluster back up to %d replicas", *instance.Spec.Replicas))
-				rabbitmqCluster.Spec.Replicas = instance.Spec.Replicas
-				// Requeue to apply the scale-up
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+
+			statefulSetUpdated := false
+			for _, sts := range statefulSetList.Items {
+				if len(sts.Spec.Template.Spec.Containers) > 0 {
+					currentImage := sts.Spec.Template.Spec.Containers[0].Image
+					expectedImage := instance.Spec.ContainerImage
+					Log.Info(fmt.Sprintf("StatefulSet image: %s, Expected image: %s", currentImage, expectedImage))
+					if currentImage == expectedImage {
+						statefulSetUpdated = true
+						break
+					}
+				}
+			}
+
+			if statefulSetUpdated {
+				Log.Info("StatefulSet updated with new image, proceeding with cleanup and scaling back up")
+				if err := r.handleVersionUpgrade(ctx, instance, helper, targetVersion); err != nil {
+					Log.Error(err, "Failed to handle version upgrade cleanup")
+					return ctrl.Result{}, err
+				}
+				// Scale back up to original replica count
+				if instance.Spec.Replicas != nil {
+					Log.Info(fmt.Sprintf("Scaling RabbitMQ cluster back up to %d replicas", *instance.Spec.Replicas))
+					rabbitmqCluster.Spec.Replicas = instance.Spec.Replicas
+					// Requeue to apply the scale-up
+					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+				}
+			} else {
+				// StatefulSet not updated yet, wait for RabbitMQ cluster operator to update it
+				Log.Info("Waiting for StatefulSet to be updated with new image")
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 			}
 		} else {
 			// Still scaling down, requeue to wait for scale to zero
