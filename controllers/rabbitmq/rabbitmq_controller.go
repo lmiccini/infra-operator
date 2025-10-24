@@ -24,6 +24,7 @@ import (
 	"time"
 
 	rabbitmqv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
+	appsv1 "k8s.io/api/apps/v1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -436,71 +437,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, fmt.Errorf("error configuring RabbitmqCluster: %w", err)
 	}
 
-	// Override setup-container command to clean mnesia directory during version upgrade
-	if versionMismatch {
-		Log.Info("Overriding setup-container command to clean mnesia directory for version upgrade")
-
-		// Ensure the StatefulSet override structure exists
-		if rabbitmqCluster.Spec.Override.StatefulSet == nil {
-			rabbitmqCluster.Spec.Override.StatefulSet = &rabbitmqv2.StatefulSet{}
-		}
-		if rabbitmqCluster.Spec.Override.StatefulSet.Spec == nil {
-			rabbitmqCluster.Spec.Override.StatefulSet.Spec = &rabbitmqv2.StatefulSetSpec{}
-		}
-		if rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template == nil {
-			rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template = &rabbitmqv2.PodTemplateSpec{}
-		}
-		if rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec == nil {
-			rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec = &corev1.PodSpec{}
-		}
-
-		// Find and override the setup-container command
-		for i, initContainer := range rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec.InitContainers {
-			if initContainer.Name == "setup-container" {
-				// Get the existing command and args
-				existingCommand := initContainer.Command
-				existingArgs := initContainer.Args
-
-				// Build the new command that prepends mnesia cleanup to the existing setup
-				var newArgs []string
-				if len(existingArgs) > 0 {
-					// If there are existing args, prepend the mnesia cleanup
-					existingCmd := existingArgs[0] // The shell command
-					if len(existingArgs) > 1 {
-						// Combine all existing args into a single command
-						existingScript := existingArgs[1]
-						newArgs = []string{
-							existingCmd,
-							"rm -rf /var/lib/rabbitmq/mnesia/* && " + existingScript,
-						}
-					} else {
-						newArgs = []string{
-							existingCmd,
-							"rm -rf /var/lib/rabbitmq/mnesia/*",
-						}
-					}
-				} else {
-					// Fallback if no existing args
-					newArgs = []string{
-						"sh",
-						"-c",
-						"rm -rf /var/lib/rabbitmq/mnesia/*",
-					}
-				}
-
-				// Override the command to prepend mnesia cleanup
-				rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec.InitContainers[i].Command = existingCommand
-				rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec.InitContainers[i].Args = newArgs
-				Log.Info("Setup-container command overridden to prepend mnesia cleanup")
-				break
-			}
-		}
-	}
-
 	rabbitmqImplCluster := impl.NewRabbitMqCluster(rabbitmqCluster, 5)
 	rmqres, rmqerr := rabbitmqImplCluster.CreateOrPatch(ctx, helper)
 	if rmqerr != nil {
 		return rmqres, rmqerr
+	}
+
+	// Pause RabbitMQ operator reconciliation and patch StatefulSet for version upgrade
+	if versionMismatch {
+		Log.Info("Pausing RabbitMQ operator reconciliation and patching StatefulSet for version upgrade")
+		if err := r.pauseAndPatchForVersionUpgrade(ctx, instance); err != nil {
+			Log.Error(err, "Failed to pause and patch for version upgrade")
+			return ctrl.Result{}, err
+		}
 	}
 
 	rabbitmqClusterInstance := rabbitmqImplCluster.GetRabbitMqCluster()
@@ -526,6 +475,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		if instance.Spec.Replicas != nil {
 			Log.Info(fmt.Sprintf("Scaling RabbitMQ cluster back up to %d replicas", *instance.Spec.Replicas))
 			rabbitmqCluster.Spec.Replicas = instance.Spec.Replicas
+		}
+
+		// Resume RabbitMQ operator reconciliation
+		if err := r.resumeRabbitMQReconciliation(ctx, instance); err != nil {
+			Log.Error(err, "Failed to resume RabbitMQ operator reconciliation")
+			return ctrl.Result{}, err
 		}
 
 		// Update version labels and clear upgrade status
@@ -669,6 +624,111 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1be
 	Log.Info("Reconciled Service delete successfully")
 
 	return ctrl.Result{}, nil
+}
+
+// pauseAndPatchForVersionUpgrade pauses RabbitMQ operator reconciliation and patches StatefulSet
+func (r *Reconciler) pauseAndPatchForVersionUpgrade(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) error {
+	Log := r.GetLogger(ctx)
+
+	// Get the RabbitmqCluster created by our controller
+	rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
+	err := r.Client.Get(ctx, types.NamespacedName{
+		Name:      instance.Name,
+		Namespace: instance.Namespace,
+	}, rabbitmqCluster)
+	if err != nil {
+		if k8s_errors.IsNotFound(err) {
+			Log.Info("RabbitmqCluster not found yet, will retry")
+			return nil
+		}
+		return err
+	}
+
+	// Pause RabbitMQ operator reconciliation
+	if rabbitmqCluster.Labels == nil {
+		rabbitmqCluster.Labels = make(map[string]string)
+	}
+	rabbitmqCluster.Labels["rabbitmq.com/pauseReconciliation"] = "true"
+
+	err = r.Client.Update(ctx, rabbitmqCluster)
+	if err != nil {
+		return err
+	}
+	Log.Info("RabbitMQ operator reconciliation paused")
+
+	// Wait a moment for the operator to stop reconciling
+	time.Sleep(2 * time.Second)
+
+	// Get the StatefulSet created by the RabbitMQ operator
+	statefulSet := &appsv1.StatefulSet{}
+	err = r.Client.Get(ctx, types.NamespacedName{
+		Name:      instance.Name,
+		Namespace: instance.Namespace,
+	}, statefulSet)
+	if err != nil {
+		if k8s_errors.IsNotFound(err) {
+			Log.Info("StatefulSet not found yet, will retry")
+			return nil
+		}
+		return err
+	}
+
+	// Create a cleanup init container
+	cleanupContainer := corev1.Container{
+		Name:    "clean-mnesia",
+		Image:   instance.Spec.ContainerImage,
+		Command: []string{"/bin/bash"},
+		Args:    []string{"-c", "rm -rf /var/lib/rabbitmq/mnesia/*"},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      "persistence",
+				MountPath: "/var/lib/rabbitmq",
+			},
+		},
+	}
+
+	// Add the cleanup container at the beginning of initContainers
+	statefulSet.Spec.Template.Spec.InitContainers = append(
+		[]corev1.Container{cleanupContainer},
+		statefulSet.Spec.Template.Spec.InitContainers...,
+	)
+
+	// Patch the StatefulSet
+	err = r.Client.Update(ctx, statefulSet)
+	if err != nil {
+		return err
+	}
+
+	Log.Info("StatefulSet patched successfully with mnesia cleanup init container")
+	return nil
+}
+
+// resumeRabbitMQReconciliation resumes RabbitMQ operator reconciliation
+func (r *Reconciler) resumeRabbitMQReconciliation(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) error {
+	Log := r.GetLogger(ctx)
+
+	// Get the RabbitmqCluster
+	rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
+	err := r.Client.Get(ctx, types.NamespacedName{
+		Name:      instance.Name,
+		Namespace: instance.Namespace,
+	}, rabbitmqCluster)
+	if err != nil {
+		return err
+	}
+
+	// Remove the pause reconciliation label
+	if rabbitmqCluster.Labels != nil {
+		delete(rabbitmqCluster.Labels, "rabbitmq.com/pauseReconciliation")
+	}
+
+	err = r.Client.Update(ctx, rabbitmqCluster)
+	if err != nil {
+		return err
+	}
+
+	Log.Info("RabbitMQ operator reconciliation resumed")
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
