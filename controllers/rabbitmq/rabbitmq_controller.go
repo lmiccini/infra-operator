@@ -141,6 +141,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 	if currentVersion, exists := instance.Labels["rabbitmqcurrentversion"]; !exists || currentVersion == "" {
 		instance.Labels["rabbitmqcurrentversion"] = "3.9"
+		// Patch the instance to persist the default label
+		if err := helper.PatchInstance(ctx, instance); err != nil {
+			Log.Error(err, "Failed to set default rabbitmqcurrentversion label")
+			return ctrl.Result{}, err
+		}
+		Log.Info("Set default rabbitmqcurrentversion label to 3.9")
 	}
 
 	// Check version compatibility and handle version upgrades
