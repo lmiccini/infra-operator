@@ -456,7 +456,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 
 	clusterReady := false
 	Log.Info(fmt.Sprintf("RabbitMQ cluster status: ObservedGeneration=%d, Generation=%d", rabbitmqClusterInstance.Status.ObservedGeneration, rabbitmqClusterInstance.Generation))
-	if rabbitmqClusterInstance.Status.ObservedGeneration == rabbitmqClusterInstance.Generation {
+
+	// Check if reconciliation is paused - if so, check conditions directly
+	reconciliationPaused := rabbitmqClusterInstance.Labels != nil && rabbitmqClusterInstance.Labels["rabbitmq.com/pauseReconciliation"] == "true"
+
+	if rabbitmqClusterInstance.Status.ObservedGeneration == rabbitmqClusterInstance.Generation || reconciliationPaused {
 		Log.Info(fmt.Sprintf("RabbitMQ cluster conditions: %+v", rabbitmqClusterInstance.Status.Conditions))
 		for _, oldCond := range rabbitmqClusterInstance.Status.Conditions {
 			// Forced to hardcode "ClusterAvailable" here because linter will not allow
