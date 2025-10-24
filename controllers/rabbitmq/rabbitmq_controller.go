@@ -419,12 +419,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		instance.Status.LastAppliedTopology = nil
 	}
 
-	// Add init container to clean mnesia directory during version upgrade
+	// Scale to 1 replica during version upgrade to avoid mixing incompatible versions
 	if versionMismatch {
-		Log.Info("Starting version upgrade: scaling to 1 replica and adding init container")
-
-		// Scale to 1 replica to avoid mixing incompatible versions
+		Log.Info("Starting version upgrade: scaling to 1 replica")
 		rabbitmqCluster.Spec.Replicas = ptr.To(int32(1))
+	}
+
+	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, instance.Spec.Override)
+	if err != nil {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.ServiceConfigReadyCondition,
+			condition.ErrorReason,
+			condition.SeverityWarning,
+			condition.ServiceConfigReadyErrorMessage,
+			err.Error()))
+		return ctrl.Result{}, fmt.Errorf("error configuring RabbitmqCluster: %w", err)
+	}
+
+	// Add init container to clean mnesia directory during version upgrade (after ConfigureCluster)
+	if versionMismatch {
+		Log.Info("Adding init container to clean mnesia directory for version upgrade")
 
 		// Create init container spec to clean mnesia directory
 		initContainer := corev1.Container{
@@ -454,22 +468,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec = &corev1.PodSpec{}
 		}
 
-		// Add the init container
+		// Add the init container at the beginning to ensure it runs first
 		rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec.InitContainers = append(
-			rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec.InitContainers,
-			initContainer,
+			[]corev1.Container{initContainer},
+			rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec.InitContainers...,
 		)
-	}
-
-	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, instance.Spec.Override)
-	if err != nil {
-		instance.Status.Conditions.Set(condition.FalseCondition(
-			condition.ServiceConfigReadyCondition,
-			condition.ErrorReason,
-			condition.SeverityWarning,
-			condition.ServiceConfigReadyErrorMessage,
-			err.Error()))
-		return ctrl.Result{}, fmt.Errorf("error configuring RabbitmqCluster: %w", err)
 	}
 
 	rabbitmqImplCluster := impl.NewRabbitMqCluster(rabbitmqCluster, 5)
