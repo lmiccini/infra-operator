@@ -21,7 +21,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	rabbitmqv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
@@ -570,23 +569,44 @@ func (r *Reconciler) handleVersionUpgrade(ctx context.Context, instance *rabbitm
 	Log := r.GetLogger(ctx)
 	Log.Info("Starting version upgrade cleanup")
 
-	// Delete PVCs associated with this RabbitMQ instance
-	// Use multiple label selectors to catch different PVC naming patterns
-	pvcList := &corev1.PersistentVolumeClaimList{}
-	err := r.List(ctx, pvcList, client.InNamespace(instance.Namespace))
+	// Find and clean RabbitMQ pods before deleting them
+	podList := &corev1.PodList{}
+	err := r.List(ctx, podList, client.InNamespace(instance.Namespace),
+		client.MatchingLabels{
+			"app.kubernetes.io/name": instance.Name,
+		})
 	if err != nil {
-		return fmt.Errorf("failed to list PVCs: %w", err)
+		return fmt.Errorf("failed to list pods: %w", err)
 	}
 
-	Log.Info(fmt.Sprintf("Found %d PVCs in namespace %s", len(pvcList.Items), instance.Namespace))
-	for _, pvc := range pvcList.Items {
-		Log.Info(fmt.Sprintf("PVC: %s", pvc.Name))
-		// Check if PVC belongs to this RabbitMQ instance
-		if strings.Contains(pvc.Name, instance.Name) && strings.Contains(pvc.Name, "persistence") {
-			Log.Info(fmt.Sprintf("Deleting PVC: %s", pvc.Name))
-			if err := r.Delete(ctx, &pvc); err != nil && !k8s_errors.IsNotFound(err) {
-				return fmt.Errorf("failed to delete PVC %s: %w", pvc.Name, err)
-			}
+	Log.Info(fmt.Sprintf("Found %d pods for cleanup", len(podList.Items)))
+	for _, pod := range podList.Items {
+		Log.Info(fmt.Sprintf("Cleaning RabbitMQ data in pod: %s", pod.Name))
+
+		// Clean the mnesia directory inside the pod
+		podName := types.NamespacedName{
+			Name:      pod.Name,
+			Namespace: pod.Namespace,
+		}
+
+		container := "rabbitmq"
+		cleanCmd := []string{"/bin/bash", "-c", "rm -rf /var/lib/rabbitmq/mnesia/*"}
+
+		err := rsh.ExecInPod(ctx, helper.GetKClient(), r.config, podName, container, cleanCmd,
+			func(_ *bytes.Buffer, _ *bytes.Buffer) error {
+				return nil
+			})
+		if err != nil {
+			Log.Error(err, fmt.Sprintf("Failed to clean mnesia directory in pod %s", pod.Name))
+			// Continue with other pods even if one fails
+		} else {
+			Log.Info(fmt.Sprintf("Successfully cleaned mnesia directory in pod %s", pod.Name))
+		}
+
+		// Delete the pod
+		Log.Info(fmt.Sprintf("Deleting pod: %s", pod.Name))
+		if err := r.Delete(ctx, &pod); err != nil && !k8s_errors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete pod %s: %w", pod.Name, err)
 		}
 	}
 
