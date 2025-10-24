@@ -147,6 +147,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			return ctrl.Result{}, err
 		}
 		Log.Info("Set default rabbitmqcurrentversion label to 3.9")
+		// Return to let the reconcile cycle continue with the updated labels
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Check version compatibility and handle version upgrades
@@ -164,6 +166,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 					// Mark upgrade as in progress
 					instance.Status.VersionUpgradeInProgress = targetVersion
 					Log.Info(fmt.Sprintf("RabbitMQ version mismatch: current=%s, target=%s. Starting version upgrade process.", currentVersion, targetVersion))
+					// Persist the upgrade status immediately
+					if err := helper.PatchInstance(ctx, instance); err != nil {
+						Log.Error(err, "Failed to set version upgrade in progress status")
+						return ctrl.Result{}, err
+					}
 				} else {
 					Log.Info("Version upgrade already in progress")
 				}
