@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	rabbitmqv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
@@ -153,7 +154,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 				// Check if upgrade is already in progress
 				if instance.Status.VersionUpgradeInProgress != targetVersion {
 					versionMismatch = true
-					Log.Info(fmt.Sprintf("RabbitMQ version mismatch: current=%s, target=%s. Proceeding with reconcile to update container image.", currentVersion, targetVersion))
+					// Mark upgrade as in progress
+					instance.Status.VersionUpgradeInProgress = targetVersion
+					Log.Info(fmt.Sprintf("RabbitMQ version mismatch: current=%s, target=%s. Starting version upgrade process.", currentVersion, targetVersion))
 				}
 			} else {
 				// Versions match, clear any upgrade in progress status
@@ -396,6 +399,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		instance.Status.LastAppliedTopology = nil
 	}
 
+	// Scale to zero during version upgrade
+	if versionMismatch {
+		Log.Info("Scaling RabbitMQ cluster to zero for version upgrade")
+		rabbitmqCluster.Spec.Replicas = ptr.To(int32(0))
+	}
+
 	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, instance.Spec.Override)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
@@ -422,6 +431,40 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			if string(oldCond.Type) == "ClusterAvailable" && oldCond.Status == corev1.ConditionTrue {
 				clusterReady = true
 			}
+		}
+	}
+
+	// Handle version upgrade phases
+	if versionMismatch {
+		// Check if cluster is scaled to zero
+		scaledToZero := false
+		Log.Info(fmt.Sprintf("Checking RabbitMQ cluster conditions for version upgrade. Total conditions: %d", len(rabbitmqClusterInstance.Status.Conditions)))
+		for _, condition := range rabbitmqClusterInstance.Status.Conditions {
+			Log.Info(fmt.Sprintf("Condition: Type=%s, Reason=%s, Status=%s", condition.Type, condition.Reason, condition.Status))
+			if condition.Type == "AllReplicasReady" && condition.Reason == "ScaledToZero" && condition.Status == "False" {
+				scaledToZero = true
+				Log.Info("Found ScaledToZero condition")
+				break
+			}
+		}
+
+		if scaledToZero {
+			Log.Info("RabbitMQ cluster scaled to zero, proceeding with cleanup and scaling back up")
+			if err := r.handleVersionUpgrade(ctx, instance, helper, targetVersion); err != nil {
+				Log.Error(err, "Failed to handle version upgrade cleanup")
+				return ctrl.Result{}, err
+			}
+			// Scale back up to original replica count
+			if instance.Spec.Replicas != nil {
+				Log.Info(fmt.Sprintf("Scaling RabbitMQ cluster back up to %d replicas", *instance.Spec.Replicas))
+				rabbitmqCluster.Spec.Replicas = instance.Spec.Replicas
+				// Requeue to apply the scale-up
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+		} else {
+			// Still scaling down, requeue to wait for ScaledToZero condition
+			Log.Info("Waiting for RabbitMQ cluster to scale to zero")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 	}
 
@@ -497,21 +540,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	if instance.Status.Conditions.AllSubConditionIsTrue() {
 		instance.Status.Conditions.MarkTrue(
 			condition.ReadyCondition, condition.ReadyMessage)
-
-		// Handle version upgrade cleanup if there was a version mismatch
-		if versionMismatch {
-			Log.Info("Reconcile completed successfully, proceeding with version upgrade cleanup")
-			// Mark upgrade as in progress
-			instance.Status.VersionUpgradeInProgress = targetVersion
-			if err := helper.PatchInstance(ctx, instance); err != nil {
-				return ctrl.Result{}, err
-			}
-
-			if err := r.handleVersionUpgrade(ctx, instance, helper, targetVersion); err != nil {
-				Log.Error(err, "Failed to handle version upgrade cleanup")
-				return ctrl.Result{}, err
-			}
-		}
 	}
 	return ctrl.Result{}, nil
 }
@@ -540,38 +568,25 @@ func updateMirroredPolicy(ctx context.Context, helper *helper.Helper, instance *
 
 func (r *Reconciler) handleVersionUpgrade(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper, targetVersion string) error {
 	Log := r.GetLogger(ctx)
-
-	// Delete pods associated with this RabbitMQ instance
-	podList := &corev1.PodList{}
-	err := r.List(ctx, podList, client.InNamespace(instance.Namespace),
-		client.MatchingLabels{
-			"app.kubernetes.io/name": instance.Name,
-		})
-	if err != nil {
-		return fmt.Errorf("failed to list pods: %w", err)
-	}
-
-	for _, pod := range podList.Items {
-		Log.Info(fmt.Sprintf("Deleting pod: %s", pod.Name))
-		if err := r.Delete(ctx, &pod); err != nil && !k8s_errors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete pod %s: %w", pod.Name, err)
-		}
-	}
+	Log.Info("Starting version upgrade cleanup")
 
 	// Delete PVCs associated with this RabbitMQ instance
+	// Use multiple label selectors to catch different PVC naming patterns
 	pvcList := &corev1.PersistentVolumeClaimList{}
-	err = r.List(ctx, pvcList, client.InNamespace(instance.Namespace),
-		client.MatchingLabels{
-			"app.kubernetes.io/name": instance.Name,
-		})
+	err := r.List(ctx, pvcList, client.InNamespace(instance.Namespace))
 	if err != nil {
 		return fmt.Errorf("failed to list PVCs: %w", err)
 	}
 
+	Log.Info(fmt.Sprintf("Found %d PVCs in namespace %s", len(pvcList.Items), instance.Namespace))
 	for _, pvc := range pvcList.Items {
-		Log.Info(fmt.Sprintf("Deleting PVC: %s", pvc.Name))
-		if err := r.Delete(ctx, &pvc); err != nil && !k8s_errors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete PVC %s: %w", pvc.Name, err)
+		Log.Info(fmt.Sprintf("PVC: %s", pvc.Name))
+		// Check if PVC belongs to this RabbitMQ instance
+		if strings.Contains(pvc.Name, instance.Name) && strings.Contains(pvc.Name, "persistence") {
+			Log.Info(fmt.Sprintf("Deleting PVC: %s", pvc.Name))
+			if err := r.Delete(ctx, &pvc); err != nil && !k8s_errors.IsNotFound(err) {
+				return fmt.Errorf("failed to delete PVC %s: %w", pvc.Name, err)
+			}
 		}
 	}
 
