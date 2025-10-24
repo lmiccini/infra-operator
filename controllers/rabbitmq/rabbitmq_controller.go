@@ -704,8 +704,7 @@ func (r *Reconciler) pauseAndPatchForVersionUpgrade(ctx context.Context, instanc
 	cleanupContainer := corev1.Container{
 		Name:    "clean-mnesia",
 		Image:   instance.Spec.ContainerImage,
-		Command: []string{"/bin/bash"},
-		Args:    []string{"-c", "rm -rf /var/lib/rabbitmq/mnesia/*"},
+		Command: []string{"sh", "-c", "rm -rf /var/lib/rabbitmq/mnesia/*"},
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      "persistence",
