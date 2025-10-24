@@ -456,19 +456,28 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	rabbitmqClusterInstance := rabbitmqImplCluster.GetRabbitMqCluster()
 
 	clusterReady := false
+	Log.Info(fmt.Sprintf("RabbitMQ cluster status: ObservedGeneration=%d, Generation=%d", rabbitmqClusterInstance.Status.ObservedGeneration, rabbitmqClusterInstance.Generation))
 	if rabbitmqClusterInstance.Status.ObservedGeneration == rabbitmqClusterInstance.Generation {
+		Log.Info(fmt.Sprintf("RabbitMQ cluster conditions: %+v", rabbitmqClusterInstance.Status.Conditions))
 		for _, oldCond := range rabbitmqClusterInstance.Status.Conditions {
 			// Forced to hardcode "ClusterAvailable" here because linter will not allow
 			// us to import "github.com/rabbitmq/cluster-operator/internal/status"
-			if string(oldCond.Type) == "ClusterAvailable" && oldCond.Status == corev1.ConditionTrue {
+			if string(oldCond.Type) == "ClusterAvailable" && oldCond.Status == "True" {
 				clusterReady = true
+				Log.Info("RabbitMQ cluster is ready (ClusterAvailable=True)")
 			}
 		}
+	} else {
+		Log.Info("RabbitMQ cluster not ready (ObservedGeneration != Generation)")
 	}
 
 	// Handle version upgrade completion
-	Log.Info(fmt.Sprintf("Version upgrade check: versionMismatch=%t", versionMismatch))
-	if versionMismatch && clusterReady {
+	Log.Info(fmt.Sprintf("Version upgrade check: versionMismatch=%t, clusterReady=%t, upgradeInProgress=%s", versionMismatch, clusterReady, instance.Status.VersionUpgradeInProgress))
+	
+	// Check if we have an upgrade in progress and the cluster is ready
+	if instance.Status.VersionUpgradeInProgress != "" {
+		Log.Info(fmt.Sprintf("Version upgrade in progress: %s, clusterReady=%t", instance.Status.VersionUpgradeInProgress, clusterReady))
+		if clusterReady {
 		// Version upgrade is complete, scale back up to original replica count
 		Log.Info("Version upgrade completed successfully, scaling back up to original replica count")
 
@@ -482,13 +491,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		Log.Info("Version upgrade completed, but keeping reconciliation paused until pods restart")
 
 		// Update version labels and clear upgrade status
-		instance.Labels["rabbitmqcurrentversion"] = targetVersion
+		instance.Labels["rabbitmqcurrentversion"] = instance.Status.VersionUpgradeInProgress
 		instance.Status.VersionUpgradeInProgress = ""
 		if err := helper.PatchInstance(ctx, instance); err != nil {
 			Log.Error(err, "Failed to update version label")
 			return ctrl.Result{}, err
 		}
-		Log.Info(fmt.Sprintf("Version upgrade completed. Updated rabbitmqcurrentversion to %s", targetVersion))
+		Log.Info(fmt.Sprintf("Version upgrade completed. Updated rabbitmqcurrentversion to %s", instance.Labels["rabbitmqcurrentversion"]))
 	}
 
 	// Check if we need to resume reconciliation after version upgrade
@@ -506,37 +515,41 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		}
 	}
 
-	if clusterReady {
-		instance.Status.Conditions.MarkTrue(condition.DeploymentReadyCondition, condition.DeploymentReadyMessage)
+	// Handle PDB for multi-replica deployments (regardless of cluster ready status)
+	if instance.Spec.Replicas != nil && *instance.Spec.Replicas > 1 {
+		// Apply PDB for multi-replica deployments
+		labelMap := map[string]string{
+			labels.K8sAppName:      instance.Name,
+			labels.K8sAppComponent: "rabbitmq",
+			labels.K8sAppPartOf:    "rabbitmq",
+		}
 
-		if instance.Spec.Replicas != nil && *instance.Spec.Replicas > 1 {
-			// Apply PDB for multi-replica deployments
-			labelMap := map[string]string{
-				labels.K8sAppName:      instance.Name,
-				labels.K8sAppComponent: "rabbitmq",
-				labels.K8sAppPartOf:    "rabbitmq",
-			}
+		pdbSpec := pdb.MaxUnavailablePodDisruptionBudget(
+			instance.Name,
+			instance.Namespace,
+			intstr.FromInt(1),
+			labelMap,
+		)
+		pdbInstance := pdb.NewPDB(pdbSpec, 5*time.Second)
 
-			pdbSpec := pdb.MaxUnavailablePodDisruptionBudget(
-				instance.Name,
-				instance.Namespace,
-				intstr.FromInt(1),
-				labelMap,
-			)
-			pdbInstance := pdb.NewPDB(pdbSpec, 5*time.Second)
-
-			_, err := pdbInstance.CreateOrPatch(ctx, helper)
-			if err != nil {
-				Log.Error(err, "Could not apply PDB")
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					condition.PDBReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					condition.PDBReadyErrorMessage, err.Error()))
-				return ctrl.Result{}, err
-			}
+		_, err := pdbInstance.CreateOrPatch(ctx, helper)
+		if err != nil {
+			Log.Error(err, "Could not apply PDB")
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				condition.PDBReadyCondition,
+				condition.ErrorReason,
+				condition.SeverityWarning,
+				condition.PDBReadyErrorMessage, err.Error()))
+			return ctrl.Result{}, err
 		}
 		instance.Status.Conditions.MarkTrue(condition.PDBReadyCondition, condition.PDBReadyMessage)
+	} else {
+		// For single replica deployments, mark PDB as ready (not applicable)
+		instance.Status.Conditions.MarkTrue(condition.PDBReadyCondition, condition.PDBReadyMessage)
+	}
+
+	if clusterReady {
+		instance.Status.Conditions.MarkTrue(condition.DeploymentReadyCondition, condition.DeploymentReadyMessage)
 
 		// Let's wait DeploymentReadyCondition=True to apply the policy
 		if instance.Spec.QueueType == "Mirrored" && *instance.Spec.Replicas > 1 && instance.Status.QueueType != "Mirrored" {
