@@ -450,6 +450,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			Log.Error(err, "Failed to pause and patch for version upgrade")
 			return ctrl.Result{}, err
 		}
+		Log.Info("Successfully completed pause and patch for version upgrade")
 	}
 
 	rabbitmqClusterInstance := rabbitmqImplCluster.GetRabbitMqCluster()
@@ -682,18 +683,24 @@ func (r *Reconciler) pauseAndPatchForVersionUpgrade(ctx context.Context, instanc
 	time.Sleep(2 * time.Second)
 
 	// Get the StatefulSet created by the RabbitMQ operator
+	statefulSetName := instance.Name + "-server"
+	Log.Info(fmt.Sprintf("Looking for StatefulSet: %s in namespace: %s", statefulSetName, instance.Namespace))
+
 	statefulSet := &appsv1.StatefulSet{}
 	err = r.Client.Get(ctx, types.NamespacedName{
-		Name:      instance.Name + "-server",
+		Name:      statefulSetName,
 		Namespace: instance.Namespace,
 	}, statefulSet)
 	if err != nil {
 		if k8s_errors.IsNotFound(err) {
-			Log.Info("StatefulSet not found yet, will retry")
+			Log.Info(fmt.Sprintf("StatefulSet %s not found yet, will retry", statefulSetName))
 			return nil
 		}
+		Log.Error(err, fmt.Sprintf("Failed to get StatefulSet %s", statefulSetName))
 		return err
 	}
+
+	Log.Info(fmt.Sprintf("Successfully found StatefulSet: %s", statefulSetName))
 
 	Log.Info(fmt.Sprintf("Found StatefulSet with %d init containers", len(statefulSet.Spec.Template.Spec.InitContainers)))
 	for i, initContainer := range statefulSet.Spec.Template.Spec.InitContainers {
@@ -714,14 +721,19 @@ func (r *Reconciler) pauseAndPatchForVersionUpgrade(ctx context.Context, instanc
 	}
 
 	// Add the cleanup container at the beginning of initContainers
+	Log.Info("Adding clean-mnesia init container to StatefulSet")
 	statefulSet.Spec.Template.Spec.InitContainers = append(
 		[]corev1.Container{cleanupContainer},
 		statefulSet.Spec.Template.Spec.InitContainers...,
 	)
 
+	Log.Info(fmt.Sprintf("StatefulSet now has %d init containers after adding clean-mnesia", len(statefulSet.Spec.Template.Spec.InitContainers)))
+
 	// Patch the StatefulSet
+	Log.Info("Updating StatefulSet with new init container")
 	err = r.Client.Update(ctx, statefulSet)
 	if err != nil {
+		Log.Error(err, "Failed to update StatefulSet")
 		return err
 	}
 
