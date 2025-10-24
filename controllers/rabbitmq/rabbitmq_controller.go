@@ -719,11 +719,24 @@ func (r *Reconciler) pauseAndPatchForVersionUpgrade(ctx context.Context, instanc
 		Log.Info(fmt.Sprintf("Init container %d: %s", i, initContainer.Name))
 	}
 
+	// Get the user ID from the existing RabbitMQ container
+	var runAsUser *int64
+	for _, container := range statefulSet.Spec.Template.Spec.Containers {
+		if container.Name == "rabbitmq" && container.SecurityContext != nil && container.SecurityContext.RunAsUser != nil {
+			runAsUser = container.SecurityContext.RunAsUser
+			Log.Info(fmt.Sprintf("Found RabbitMQ container user ID: %d", *runAsUser))
+			break
+		}
+	}
+
 	// Create a cleanup init container
 	cleanupContainer := corev1.Container{
 		Name:    "clean-mnesia",
 		Image:   instance.Spec.ContainerImage,
 		Command: []string{"sh", "-c", "rm -rf /var/lib/rabbitmq/mnesia/*"},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser: runAsUser, // Use same user ID as RabbitMQ container
+		},
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      "persistence",
