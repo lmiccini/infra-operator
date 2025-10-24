@@ -100,6 +100,9 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete;
 // +kubebuilder:rbac:groups=core,resources=pods/exec,verbs=create
 
+// Required to manage PersistentVolumeClaims for version upgrades
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;delete
+
 // Required to manage PodDisruptionBudgets for multi-replica deployments
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 
@@ -132,20 +135,32 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, err
 	}
 
-	// Add RabbitmqCurrentVersion label to instance if it doesn't exist
+	// Add RabbitmqCurrentVersion label to instance if it doesn't exist or is empty
 	if instance.Labels == nil {
 		instance.Labels = make(map[string]string)
 	}
-	if _, exists := instance.Labels["rabbitmqcurrentversion"]; !exists {
+	if currentVersion, exists := instance.Labels["rabbitmqcurrentversion"]; !exists || currentVersion == "" {
 		instance.Labels["rabbitmqcurrentversion"] = "3.9"
 	}
 
-	// Check version compatibility to prevent updates with different RabbitMQ versions
+	// Check version compatibility and handle version upgrades
+	var versionMismatch bool
+	var targetVersion string
 	if currentVersion, hasCurrent := instance.Labels["rabbitmqcurrentversion"]; hasCurrent {
-		if targetVersion, hasTarget := instance.Labels["rabbitmqversion"]; hasTarget {
+		if tv, hasTarget := instance.Labels["rabbitmqversion"]; hasTarget {
+			targetVersion = tv
 			if currentVersion != targetVersion {
-				Log.Info(fmt.Sprintf("RabbitMQ version mismatch: current=%s, target=%s. Skipping reconcile to prevent container image updates.", currentVersion, targetVersion))
-				return ctrl.Result{}, nil
+				// Check if upgrade is already in progress
+				if instance.Status.VersionUpgradeInProgress != targetVersion {
+					versionMismatch = true
+					Log.Info(fmt.Sprintf("RabbitMQ version mismatch: current=%s, target=%s. Proceeding with reconcile to update container image.", currentVersion, targetVersion))
+				}
+			} else {
+				// Versions match, clear any upgrade in progress status
+				if instance.Status.VersionUpgradeInProgress != "" {
+					Log.Info("Versions match, clearing upgrade in progress status")
+					instance.Status.VersionUpgradeInProgress = ""
+				}
 			}
 		}
 	}
@@ -482,6 +497,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	if instance.Status.Conditions.AllSubConditionIsTrue() {
 		instance.Status.Conditions.MarkTrue(
 			condition.ReadyCondition, condition.ReadyMessage)
+
+		// Handle version upgrade cleanup if there was a version mismatch
+		if versionMismatch {
+			Log.Info("Reconcile completed successfully, proceeding with version upgrade cleanup")
+			// Mark upgrade as in progress
+			instance.Status.VersionUpgradeInProgress = targetVersion
+			if err := helper.PatchInstance(ctx, instance); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			if err := r.handleVersionUpgrade(ctx, instance, helper, targetVersion); err != nil {
+				Log.Error(err, "Failed to handle version upgrade cleanup")
+				return ctrl.Result{}, err
+			}
+		}
 	}
 	return ctrl.Result{}, nil
 }
@@ -506,6 +536,55 @@ func updateMirroredPolicy(ctx context.Context, helper *helper.Helper, instance *
 			return nil
 		})
 	return err
+}
+
+func (r *Reconciler) handleVersionUpgrade(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper, targetVersion string) error {
+	Log := r.GetLogger(ctx)
+
+	// Delete pods associated with this RabbitMQ instance
+	podList := &corev1.PodList{}
+	err := r.List(ctx, podList, client.InNamespace(instance.Namespace),
+		client.MatchingLabels{
+			"app.kubernetes.io/name": instance.Name,
+		})
+	if err != nil {
+		return fmt.Errorf("failed to list pods: %w", err)
+	}
+
+	for _, pod := range podList.Items {
+		Log.Info(fmt.Sprintf("Deleting pod: %s", pod.Name))
+		if err := r.Delete(ctx, &pod); err != nil && !k8s_errors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete pod %s: %w", pod.Name, err)
+		}
+	}
+
+	// Delete PVCs associated with this RabbitMQ instance
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	err = r.List(ctx, pvcList, client.InNamespace(instance.Namespace),
+		client.MatchingLabels{
+			"app.kubernetes.io/name": instance.Name,
+		})
+	if err != nil {
+		return fmt.Errorf("failed to list PVCs: %w", err)
+	}
+
+	for _, pvc := range pvcList.Items {
+		Log.Info(fmt.Sprintf("Deleting PVC: %s", pvc.Name))
+		if err := r.Delete(ctx, &pvc); err != nil && !k8s_errors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete PVC %s: %w", pvc.Name, err)
+		}
+	}
+
+	// Update the current version label to match target version
+	instance.Labels["rabbitmqcurrentversion"] = targetVersion
+	// Clear the upgrade in progress status
+	instance.Status.VersionUpgradeInProgress = ""
+	if err := helper.PatchInstance(ctx, instance); err != nil {
+		return fmt.Errorf("failed to update version label: %w", err)
+	}
+
+	Log.Info(fmt.Sprintf("Version upgrade cleanup completed. Updated rabbitmqcurrentversion to %s", targetVersion))
+	return nil
 }
 
 func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
