@@ -147,9 +147,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// Check version compatibility and handle version upgrades
 	var versionMismatch bool
 	var targetVersion string
+	Log.Info(fmt.Sprintf("Checking version compatibility. Labels: %v", instance.Labels))
 	if currentVersion, hasCurrent := instance.Labels["rabbitmqcurrentversion"]; hasCurrent {
 		if tv, hasTarget := instance.Labels["rabbitmqversion"]; hasTarget {
 			targetVersion = tv
+			Log.Info(fmt.Sprintf("Version check: current=%s, target=%s, upgradeInProgress=%s", currentVersion, targetVersion, instance.Status.VersionUpgradeInProgress))
 			if currentVersion != targetVersion {
 				// Check if upgrade is already in progress
 				if instance.Status.VersionUpgradeInProgress != targetVersion {
@@ -157,6 +159,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 					// Mark upgrade as in progress
 					instance.Status.VersionUpgradeInProgress = targetVersion
 					Log.Info(fmt.Sprintf("RabbitMQ version mismatch: current=%s, target=%s. Starting version upgrade process.", currentVersion, targetVersion))
+				} else {
+					Log.Info("Version upgrade already in progress")
 				}
 			} else {
 				// Versions match, clear any upgrade in progress status
@@ -165,7 +169,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 					instance.Status.VersionUpgradeInProgress = ""
 				}
 			}
+		} else {
+			Log.Info("No rabbitmqversion label found")
 		}
+	} else {
+		Log.Info("No rabbitmqcurrentversion label found")
 	}
 
 	// initialize status if Conditions is nil, but do not reset if it already
@@ -435,20 +443,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 
 	// Handle version upgrade phases
+	Log.Info(fmt.Sprintf("Version upgrade check: versionMismatch=%t", versionMismatch))
 	if versionMismatch {
-		// Check if cluster is scaled to zero
-		scaledToZero := false
-		Log.Info(fmt.Sprintf("Checking RabbitMQ cluster conditions for version upgrade. Total conditions: %d", len(rabbitmqClusterInstance.Status.Conditions)))
-		for _, condition := range rabbitmqClusterInstance.Status.Conditions {
-			Log.Info(fmt.Sprintf("Condition: Type=%s, Reason=%s, Status=%s", condition.Type, condition.Reason, condition.Status))
-			if condition.Type == "AllReplicasReady" && condition.Reason == "ScaledToZero" && condition.Status == "False" {
-				scaledToZero = true
-				Log.Info("Found ScaledToZero condition")
-				break
-			}
-		}
+		// Check if cluster is scaled to zero by looking at replica count
+		Log.Info(fmt.Sprintf("Version upgrade in progress. RabbitMQ cluster replicas: %d", *rabbitmqClusterInstance.Spec.Replicas))
 
-		if scaledToZero {
+		if *rabbitmqClusterInstance.Spec.Replicas == 0 {
 			Log.Info("RabbitMQ cluster scaled to zero, proceeding with cleanup and scaling back up")
 			if err := r.handleVersionUpgrade(ctx, instance, helper, targetVersion); err != nil {
 				Log.Error(err, "Failed to handle version upgrade cleanup")
@@ -462,7 +462,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
 		} else {
-			// Still scaling down, requeue to wait for ScaledToZero condition
+			// Still scaling down, requeue to wait for scale to zero
 			Log.Info("Waiting for RabbitMQ cluster to scale to zero")
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
