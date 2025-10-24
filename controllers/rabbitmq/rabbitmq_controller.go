@@ -473,31 +473,32 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 
 	// Handle version upgrade completion
 	Log.Info(fmt.Sprintf("Version upgrade check: versionMismatch=%t, clusterReady=%t, upgradeInProgress=%s", versionMismatch, clusterReady, instance.Status.VersionUpgradeInProgress))
-	
+
 	// Check if we have an upgrade in progress and the cluster is ready
 	if instance.Status.VersionUpgradeInProgress != "" {
 		Log.Info(fmt.Sprintf("Version upgrade in progress: %s, clusterReady=%t", instance.Status.VersionUpgradeInProgress, clusterReady))
 		if clusterReady {
-		// Version upgrade is complete, scale back up to original replica count
-		Log.Info("Version upgrade completed successfully, scaling back up to original replica count")
+			// Version upgrade is complete, scale back up to original replica count
+			Log.Info("Version upgrade completed successfully, scaling back up to original replica count")
 
-		// Scale back up to original replica count
-		if instance.Spec.Replicas != nil {
-			Log.Info(fmt.Sprintf("Scaling RabbitMQ cluster back up to %d replicas", *instance.Spec.Replicas))
-			rabbitmqCluster.Spec.Replicas = instance.Spec.Replicas
+			// Scale back up to original replica count
+			if instance.Spec.Replicas != nil {
+				Log.Info(fmt.Sprintf("Scaling RabbitMQ cluster back up to %d replicas", *instance.Spec.Replicas))
+				rabbitmqCluster.Spec.Replicas = instance.Spec.Replicas
+			}
+
+			// Don't resume reconciliation yet - wait for pods to restart with new init container
+			Log.Info("Version upgrade completed, but keeping reconciliation paused until pods restart")
+
+			// Update version labels and clear upgrade status
+			instance.Labels["rabbitmqcurrentversion"] = instance.Status.VersionUpgradeInProgress
+			instance.Status.VersionUpgradeInProgress = ""
+			if err := helper.PatchInstance(ctx, instance); err != nil {
+				Log.Error(err, "Failed to update version label")
+				return ctrl.Result{}, err
+			}
+			Log.Info(fmt.Sprintf("Version upgrade completed. Updated rabbitmqcurrentversion to %s", instance.Labels["rabbitmqcurrentversion"]))
 		}
-
-		// Don't resume reconciliation yet - wait for pods to restart with new init container
-		Log.Info("Version upgrade completed, but keeping reconciliation paused until pods restart")
-
-		// Update version labels and clear upgrade status
-		instance.Labels["rabbitmqcurrentversion"] = instance.Status.VersionUpgradeInProgress
-		instance.Status.VersionUpgradeInProgress = ""
-		if err := helper.PatchInstance(ctx, instance); err != nil {
-			Log.Error(err, "Failed to update version label")
-			return ctrl.Result{}, err
-		}
-		Log.Info(fmt.Sprintf("Version upgrade completed. Updated rabbitmqcurrentversion to %s", instance.Labels["rabbitmqcurrentversion"]))
 	}
 
 	// Check if we need to resume reconciliation after version upgrade
@@ -554,7 +555,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		// Let's wait DeploymentReadyCondition=True to apply the policy
 		if instance.Spec.QueueType == "Mirrored" && *instance.Spec.Replicas > 1 && instance.Status.QueueType != "Mirrored" {
 			Log.Info("ha-all policy not present. Applying.")
-			err := updateMirroredPolicy(ctx, helper, instance, r.config, true)
+			err := r.updateMirroredPolicy(ctx, helper, instance, r.config, true)
 			if err != nil {
 				Log.Error(err, "Could not apply ha-all policy")
 				instance.Status.Conditions.Set(condition.FalseCondition(
@@ -566,7 +567,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			}
 		} else if instance.Spec.QueueType != "Mirrored" && instance.Status.QueueType == "Mirrored" {
 			Log.Info("Removing ha-all policy")
-			err := updateMirroredPolicy(ctx, helper, instance, r.config, false)
+			err := r.updateMirroredPolicy(ctx, helper, instance, r.config, false)
 			if err != nil {
 				Log.Error(err, "Could not remove ha-all policy")
 				instance.Status.Conditions.Set(condition.FalseCondition(
@@ -595,7 +596,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	return ctrl.Result{}, nil
 }
 
-func updateMirroredPolicy(ctx context.Context, helper *helper.Helper, instance *rabbitmqv1beta1.RabbitMq, config *rest.Config, apply bool) error {
+func (r *Reconciler) updateMirroredPolicy(ctx context.Context, helper *helper.Helper, instance *rabbitmqv1beta1.RabbitMq, config *rest.Config, apply bool) error {
 	cli := helper.GetKClient()
 
 	pod := types.NamespacedName{
