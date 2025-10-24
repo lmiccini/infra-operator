@@ -57,7 +57,6 @@ import (
 	"github.com/openstack-k8s-operators/infra-operator/pkg/rabbitmq/impl"
 
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
@@ -407,10 +406,46 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		instance.Status.LastAppliedTopology = nil
 	}
 
-	// Scale to zero during version upgrade
+	// Add init container to clean mnesia directory during version upgrade
 	if versionMismatch {
-		Log.Info("Scaling RabbitMQ cluster to zero for version upgrade")
-		rabbitmqCluster.Spec.Replicas = ptr.To(int32(0))
+		Log.Info("Starting version upgrade: scaling to 1 replica and adding init container")
+
+		// Scale to 1 replica to avoid mixing incompatible versions
+		rabbitmqCluster.Spec.Replicas = ptr.To(int32(1))
+
+		// Create init container spec to clean mnesia directory
+		initContainer := corev1.Container{
+			Name:    "clean-mnesia",
+			Image:   instance.Spec.ContainerImage, // Use the new image
+			Command: []string{"/bin/bash"},
+			Args:    []string{"-c", "rm -rf /var/lib/rabbitmq/mnesia/*"},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "persistence",
+					MountPath: "/var/lib/rabbitmq",
+				},
+			},
+		}
+
+		// Add init container to the StatefulSet override
+		if rabbitmqCluster.Spec.Override.StatefulSet == nil {
+			rabbitmqCluster.Spec.Override.StatefulSet = &rabbitmqv2.StatefulSet{}
+		}
+		if rabbitmqCluster.Spec.Override.StatefulSet.Spec == nil {
+			rabbitmqCluster.Spec.Override.StatefulSet.Spec = &rabbitmqv2.StatefulSetSpec{}
+		}
+		if rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template == nil {
+			rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template = &rabbitmqv2.PodTemplateSpec{}
+		}
+		if rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec == nil {
+			rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec = &corev1.PodSpec{}
+		}
+
+		// Add the init container
+		rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec.InitContainers = append(
+			rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec.InitContainers,
+			initContainer,
+		)
 	}
 
 	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, instance.Spec.Override)
@@ -442,64 +477,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		}
 	}
 
-	// Handle version upgrade phases
+	// Handle version upgrade completion
 	Log.Info(fmt.Sprintf("Version upgrade check: versionMismatch=%t", versionMismatch))
-	if versionMismatch {
-		// Check if cluster is scaled to zero by looking at replica count
-		Log.Info(fmt.Sprintf("Version upgrade in progress. RabbitMQ cluster replicas: %d", *rabbitmqClusterInstance.Spec.Replicas))
+	if versionMismatch && clusterReady {
+		// Version upgrade is complete, scale back up to original replica count
+		Log.Info("Version upgrade completed successfully, scaling back up to original replica count")
 
-		if *rabbitmqClusterInstance.Spec.Replicas == 0 {
-			// Check if the StatefulSet has been updated with the new image
-			// We need to wait for the RabbitMQ cluster operator to update the StatefulSet
-			// before we clean data and scale back up
-
-			// Get the StatefulSet to check if it has the new image
-			statefulSetList := &appsv1.StatefulSetList{}
-			err := r.List(ctx, statefulSetList, client.InNamespace(instance.Namespace),
-				client.MatchingLabels{
-					"app.kubernetes.io/name": instance.Name,
-				})
-			if err != nil {
-				Log.Error(err, "Failed to list StatefulSets")
-				return ctrl.Result{}, err
-			}
-
-			statefulSetUpdated := false
-			for _, sts := range statefulSetList.Items {
-				if len(sts.Spec.Template.Spec.Containers) > 0 {
-					currentImage := sts.Spec.Template.Spec.Containers[0].Image
-					expectedImage := instance.Spec.ContainerImage
-					Log.Info(fmt.Sprintf("StatefulSet image: %s, Expected image: %s", currentImage, expectedImage))
-					if currentImage == expectedImage {
-						statefulSetUpdated = true
-						break
-					}
-				}
-			}
-
-			if statefulSetUpdated {
-				Log.Info("StatefulSet updated with new image, proceeding with cleanup and scaling back up")
-				if err := r.handleVersionUpgrade(ctx, instance, helper, targetVersion); err != nil {
-					Log.Error(err, "Failed to handle version upgrade cleanup")
-					return ctrl.Result{}, err
-				}
-				// Scale back up to original replica count
-				if instance.Spec.Replicas != nil {
-					Log.Info(fmt.Sprintf("Scaling RabbitMQ cluster back up to %d replicas", *instance.Spec.Replicas))
-					rabbitmqCluster.Spec.Replicas = instance.Spec.Replicas
-					// Requeue to apply the scale-up
-					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-				}
-			} else {
-				// StatefulSet not updated yet, wait for RabbitMQ cluster operator to update it
-				Log.Info("Waiting for StatefulSet to be updated with new image")
-				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-			}
-		} else {
-			// Still scaling down, requeue to wait for scale to zero
-			Log.Info("Waiting for RabbitMQ cluster to scale to zero")
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		// Scale back up to original replica count
+		if instance.Spec.Replicas != nil {
+			Log.Info(fmt.Sprintf("Scaling RabbitMQ cluster back up to %d replicas", *instance.Spec.Replicas))
+			rabbitmqCluster.Spec.Replicas = instance.Spec.Replicas
 		}
+
+		// Update version labels and clear upgrade status
+		instance.Labels["rabbitmqcurrentversion"] = targetVersion
+		instance.Status.VersionUpgradeInProgress = ""
+		if err := helper.PatchInstance(ctx, instance); err != nil {
+			Log.Error(err, "Failed to update version label")
+			return ctrl.Result{}, err
+		}
+		Log.Info(fmt.Sprintf("Version upgrade completed. Updated rabbitmqcurrentversion to %s", targetVersion))
 	}
 
 	if clusterReady {
@@ -598,63 +595,6 @@ func updateMirroredPolicy(ctx context.Context, helper *helper.Helper, instance *
 			return nil
 		})
 	return err
-}
-
-func (r *Reconciler) handleVersionUpgrade(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper, targetVersion string) error {
-	Log := r.GetLogger(ctx)
-	Log.Info("Starting version upgrade cleanup")
-
-	// Find and clean RabbitMQ pods before deleting them
-	podList := &corev1.PodList{}
-	err := r.List(ctx, podList, client.InNamespace(instance.Namespace),
-		client.MatchingLabels{
-			"app.kubernetes.io/name": instance.Name,
-		})
-	if err != nil {
-		return fmt.Errorf("failed to list pods: %w", err)
-	}
-
-	Log.Info(fmt.Sprintf("Found %d pods for cleanup", len(podList.Items)))
-	for _, pod := range podList.Items {
-		Log.Info(fmt.Sprintf("Cleaning RabbitMQ data in pod: %s", pod.Name))
-
-		// Clean the mnesia directory inside the pod
-		podName := types.NamespacedName{
-			Name:      pod.Name,
-			Namespace: pod.Namespace,
-		}
-
-		container := "rabbitmq"
-		cleanCmd := []string{"/bin/bash", "-c", "rm -rf /var/lib/rabbitmq/mnesia/*"}
-
-		err := rsh.ExecInPod(ctx, helper.GetKClient(), r.config, podName, container, cleanCmd,
-			func(_ *bytes.Buffer, _ *bytes.Buffer) error {
-				return nil
-			})
-		if err != nil {
-			Log.Error(err, fmt.Sprintf("Failed to clean mnesia directory in pod %s", pod.Name))
-			// Continue with other pods even if one fails
-		} else {
-			Log.Info(fmt.Sprintf("Successfully cleaned mnesia directory in pod %s", pod.Name))
-		}
-
-		// Delete the pod
-		Log.Info(fmt.Sprintf("Deleting pod: %s", pod.Name))
-		if err := r.Delete(ctx, &pod); err != nil && !k8s_errors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete pod %s: %w", pod.Name, err)
-		}
-	}
-
-	// Update the current version label to match target version
-	instance.Labels["rabbitmqcurrentversion"] = targetVersion
-	// Clear the upgrade in progress status
-	instance.Status.VersionUpgradeInProgress = ""
-	if err := helper.PatchInstance(ctx, instance); err != nil {
-		return fmt.Errorf("failed to update version label: %w", err)
-	}
-
-	Log.Info(fmt.Sprintf("Version upgrade cleanup completed. Updated rabbitmqcurrentversion to %s", targetVersion))
-	return nil
 }
 
 func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
