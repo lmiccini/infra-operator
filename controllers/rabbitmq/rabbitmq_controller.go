@@ -719,18 +719,22 @@ func (r *Reconciler) pauseAndPatchForVersionUpgrade(ctx context.Context, instanc
 		Log.Info(fmt.Sprintf("Init container %d: %s", i, initContainer.Name))
 	}
 
-	// Create a cleanup init container running as root
+	// Create a cleanup init container using allowed OpenShift user ID
 	cleanupContainer := corev1.Container{
 		Name:    "clean-mnesia",
 		Image:   instance.Spec.ContainerImage,
 		Command: []string{"sh", "-c", "rm -rf /var/lib/rabbitmq/mnesia/*"},
 		SecurityContext: &corev1.SecurityContext{
-			RunAsUser: ptr.To(int64(0)), // Run as root
+			RunAsUser: ptr.To(int64(1000660000)), // Use allowed OpenShift user ID
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      "persistence",
 				MountPath: "/var/lib/rabbitmq/mnesia",
+			},
+			{
+				Name:      "rabbitmq-erlang-cookie",
+				MountPath: "/var/lib/rabbitmq/",
 			},
 		},
 	}
