@@ -478,11 +478,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			rabbitmqCluster.Spec.Replicas = instance.Spec.Replicas
 		}
 
-		// Resume RabbitMQ operator reconciliation
-		if err := r.resumeRabbitMQReconciliation(ctx, instance); err != nil {
-			Log.Error(err, "Failed to resume RabbitMQ operator reconciliation")
-			return ctrl.Result{}, err
-		}
+		// Don't resume reconciliation yet - wait for pods to restart with new init container
+		Log.Info("Version upgrade completed, but keeping reconciliation paused until pods restart")
 
 		// Update version labels and clear upgrade status
 		instance.Labels["rabbitmqcurrentversion"] = targetVersion
@@ -492,6 +489,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			return ctrl.Result{}, err
 		}
 		Log.Info(fmt.Sprintf("Version upgrade completed. Updated rabbitmqcurrentversion to %s", targetVersion))
+	}
+
+	// Check if we need to resume reconciliation after version upgrade
+	if instance.Status.VersionUpgradeInProgress == "" && r.isReconciliationPaused(ctx, instance) {
+		// Check if pods are ready with the new init container
+		if r.arePodsReadyWithNewInitContainer(ctx, instance) {
+			Log.Info("Pods are ready with new init container, resuming RabbitMQ operator reconciliation")
+			if err := r.resumeRabbitMQReconciliation(ctx, instance); err != nil {
+				Log.Error(err, "Failed to resume RabbitMQ operator reconciliation")
+				return ctrl.Result{}, err
+			}
+		} else {
+			Log.Info("Waiting for pods to restart with new init container before resuming reconciliation")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
 	}
 
 	if clusterReady {
@@ -808,6 +820,55 @@ func (r *Reconciler) resumeRabbitMQReconciliation(ctx context.Context, instance 
 	}
 
 	return fmt.Errorf("failed to resume RabbitMQ operator reconciliation after 3 attempts")
+}
+
+// isReconciliationPaused checks if RabbitMQ operator reconciliation is paused
+func (r *Reconciler) isReconciliationPaused(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) bool {
+	rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
+	err := r.Client.Get(ctx, types.NamespacedName{
+		Name:      instance.Name,
+		Namespace: instance.Namespace,
+	}, rabbitmqCluster)
+	if err != nil {
+		return false
+	}
+
+	return rabbitmqCluster.Labels != nil && rabbitmqCluster.Labels["rabbitmq.com/pauseReconciliation"] == "true"
+}
+
+// arePodsReadyWithNewInitContainer checks if pods are ready and have the expected image
+func (r *Reconciler) arePodsReadyWithNewInitContainer(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) bool {
+	// Get pods for this RabbitMQ instance
+	podList := &corev1.PodList{}
+	err := r.Client.List(ctx, podList, client.InNamespace(instance.Namespace), client.MatchingLabels{
+		"app.kubernetes.io/name": instance.Name,
+	})
+	if err != nil {
+		return false
+	}
+
+	// Check if all pods are ready and have the expected image
+	for _, pod := range podList.Items {
+		if pod.Status.Phase != corev1.PodRunning {
+			return false
+		}
+
+		// Check if pod has all containers ready
+		for _, containerStatus := range pod.Status.ContainerStatuses {
+			if !containerStatus.Ready {
+				return false
+			}
+		}
+
+		// Check if pod has the expected container image
+		for _, container := range pod.Spec.Containers {
+			if container.Name == "rabbitmq" && container.Image != instance.Spec.ContainerImage {
+				return false
+			}
+		}
+	}
+
+	return len(podList.Items) > 0
 }
 
 // SetupWithManager sets up the controller with the Manager.
