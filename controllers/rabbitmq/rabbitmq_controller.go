@@ -727,7 +727,7 @@ func (r *Reconciler) pauseAndPatchForVersionUpgrade(ctx context.Context, instanc
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      "persistence",
-				MountPath: "/var/lib/rabbitmq",
+				MountPath: "/var/lib/rabbitmq/mnesia",
 			},
 		},
 	}
