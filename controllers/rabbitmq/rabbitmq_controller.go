@@ -771,6 +771,13 @@ func (r *Reconciler) pauseAndPatchForVersionUpgrade(ctx context.Context, instanc
 
 	Log.Info("StatefulSet patched successfully with mnesia cleanup init container")
 
+	// Force simultaneous pod updates by deleting all pods
+	Log.Info("Deleting all pods to force simultaneous updates")
+	if err := r.deleteAllPodsForSimultaneousUpdate(ctx, instance); err != nil {
+		Log.Error(err, "Failed to delete pods for simultaneous update")
+		return err
+	}
+
 	// Verify the StatefulSet was updated by checking it again
 	time.Sleep(1 * time.Second)
 	updatedStatefulSet := &appsv1.StatefulSet{}
@@ -840,6 +847,38 @@ func (r *Reconciler) resumeRabbitMQReconciliation(ctx context.Context, instance 
 	}
 
 	return fmt.Errorf("failed to resume RabbitMQ operator reconciliation after 3 attempts")
+}
+
+// deleteAllPodsForSimultaneousUpdate deletes all pods to force simultaneous updates
+func (r *Reconciler) deleteAllPodsForSimultaneousUpdate(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) error {
+	Log := r.GetLogger(ctx)
+
+	// Get all pods for this RabbitMQ instance
+	podList := &corev1.PodList{}
+	err := r.Client.List(ctx, podList, client.InNamespace(instance.Namespace), client.MatchingLabels{
+		"app.kubernetes.io/name": instance.Name,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list pods: %w", err)
+	}
+
+	Log.Info(fmt.Sprintf("Found %d pods to delete for simultaneous update", len(podList.Items)))
+
+	// Delete all pods simultaneously
+	for _, pod := range podList.Items {
+		Log.Info(fmt.Sprintf("Deleting pod: %s", pod.Name))
+		err := r.Client.Delete(ctx, &pod)
+		if err != nil {
+			if k8s_errors.IsNotFound(err) {
+				Log.Info(fmt.Sprintf("Pod %s already deleted", pod.Name))
+				continue
+			}
+			return fmt.Errorf("failed to delete pod %s: %w", pod.Name, err)
+		}
+	}
+
+	Log.Info("Successfully initiated deletion of all pods for simultaneous update")
+	return nil
 }
 
 // isReconciliationPaused checks if RabbitMQ operator reconciliation is paused
