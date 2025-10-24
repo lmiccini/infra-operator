@@ -420,10 +420,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		instance.Status.LastAppliedTopology = nil
 	}
 
-	// Scale to 1 replica during version upgrade to avoid mixing incompatible versions
+	// Configure StatefulSet for simultaneous pod updates during version upgrade
 	if versionMismatch {
-		Log.Info("Starting version upgrade: scaling to 1 replica")
-		rabbitmqCluster.Spec.Replicas = ptr.To(int32(1))
+		Log.Info("Starting version upgrade: configuring for simultaneous pod updates")
 	}
 
 	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, instance.Spec.Override)
@@ -478,14 +477,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	if instance.Status.VersionUpgradeInProgress != "" {
 		Log.Info(fmt.Sprintf("Version upgrade in progress: %s, clusterReady=%t", instance.Status.VersionUpgradeInProgress, clusterReady))
 		if clusterReady {
-			// Version upgrade is complete, scale back up to original replica count
-			Log.Info("Version upgrade completed successfully, scaling back up to original replica count")
-
-			// Scale back up to original replica count
-			if instance.Spec.Replicas != nil {
-				Log.Info(fmt.Sprintf("Scaling RabbitMQ cluster back up to %d replicas", *instance.Spec.Replicas))
-				rabbitmqCluster.Spec.Replicas = instance.Spec.Replicas
-			}
+			// Version upgrade is complete
+			Log.Info("Version upgrade completed successfully")
 
 			// Don't resume reconciliation yet - wait for pods to restart with new init container
 			Log.Info("Version upgrade completed, but keeping reconciliation paused until pods restart")
@@ -760,10 +753,16 @@ func (r *Reconciler) pauseAndPatchForVersionUpgrade(ctx context.Context, instanc
 		statefulSet.Spec.Template.Spec.InitContainers...,
 	)
 
+	// Configure StatefulSet for simultaneous pod updates
+	Log.Info("Configuring StatefulSet for simultaneous pod updates")
+	statefulSet.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{
+		Type: appsv1.OnDeleteStatefulSetStrategyType,
+	}
+
 	Log.Info(fmt.Sprintf("StatefulSet now has %d init containers after adding clean-mnesia", len(statefulSet.Spec.Template.Spec.InitContainers)))
 
 	// Patch the StatefulSet
-	Log.Info("Updating StatefulSet with new init container")
+	Log.Info("Updating StatefulSet with new init container and OnDelete strategy")
 	err = r.Client.Update(ctx, statefulSet)
 	if err != nil {
 		Log.Error(err, "Failed to update StatefulSet")
