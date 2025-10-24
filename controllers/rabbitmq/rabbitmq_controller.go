@@ -436,25 +436,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, fmt.Errorf("error configuring RabbitmqCluster: %w", err)
 	}
 
-	// Add init container to clean mnesia directory during version upgrade (after ConfigureCluster)
+	// Override setup-container command to clean mnesia directory during version upgrade
 	if versionMismatch {
-		Log.Info("Adding init container to clean mnesia directory for version upgrade")
+		Log.Info("Overriding setup-container command to clean mnesia directory for version upgrade")
 
-		// Create init container spec to clean mnesia directory
-		initContainer := corev1.Container{
-			Name:    "clean-mnesia",
-			Image:   instance.Spec.ContainerImage, // Use the new image
-			Command: []string{"/bin/bash"},
-			Args:    []string{"-c", "rm -rf /var/lib/rabbitmq/mnesia/*"},
-			VolumeMounts: []corev1.VolumeMount{
-				{
-					Name:      "persistence",
-					MountPath: "/var/lib/rabbitmq",
-				},
-			},
-		}
-
-		// Add init container to the StatefulSet override
+		// Ensure the StatefulSet override structure exists
 		if rabbitmqCluster.Spec.Override.StatefulSet == nil {
 			rabbitmqCluster.Spec.Override.StatefulSet = &rabbitmqv2.StatefulSet{}
 		}
@@ -468,11 +454,47 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec = &corev1.PodSpec{}
 		}
 
-		// Add the init container at the beginning to ensure it runs first
-		rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec.InitContainers = append(
-			[]corev1.Container{initContainer},
-			rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec.InitContainers...,
-		)
+		// Find and override the setup-container command
+		for i, initContainer := range rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec.InitContainers {
+			if initContainer.Name == "setup-container" {
+				// Get the existing command and args
+				existingCommand := initContainer.Command
+				existingArgs := initContainer.Args
+
+				// Build the new command that prepends mnesia cleanup to the existing setup
+				var newArgs []string
+				if len(existingArgs) > 0 {
+					// If there are existing args, prepend the mnesia cleanup
+					existingCmd := existingArgs[0] // The shell command
+					if len(existingArgs) > 1 {
+						// Combine all existing args into a single command
+						existingScript := existingArgs[1]
+						newArgs = []string{
+							existingCmd,
+							"rm -rf /var/lib/rabbitmq/mnesia/* && " + existingScript,
+						}
+					} else {
+						newArgs = []string{
+							existingCmd,
+							"rm -rf /var/lib/rabbitmq/mnesia/*",
+						}
+					}
+				} else {
+					// Fallback if no existing args
+					newArgs = []string{
+						"sh",
+						"-c",
+						"rm -rf /var/lib/rabbitmq/mnesia/*",
+					}
+				}
+
+				// Override the command to prepend mnesia cleanup
+				rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec.InitContainers[i].Command = existingCommand
+				rabbitmqCluster.Spec.Override.StatefulSet.Spec.Template.Spec.InitContainers[i].Args = newArgs
+				Log.Info("Setup-container command overridden to prepend mnesia cleanup")
+				break
+			}
+		}
 	}
 
 	rabbitmqImplCluster := impl.NewRabbitMqCluster(rabbitmqCluster, 5)
@@ -480,6 +502,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	if rmqerr != nil {
 		return rmqres, rmqerr
 	}
+
 	rabbitmqClusterInstance := rabbitmqImplCluster.GetRabbitMqCluster()
 
 	clusterReady := false
