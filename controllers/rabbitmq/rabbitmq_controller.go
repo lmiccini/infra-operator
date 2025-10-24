@@ -630,31 +630,53 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1be
 func (r *Reconciler) pauseAndPatchForVersionUpgrade(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) error {
 	Log := r.GetLogger(ctx)
 
-	// Get the RabbitmqCluster created by our controller
-	rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
-	err := r.Client.Get(ctx, types.NamespacedName{
-		Name:      instance.Name,
-		Namespace: instance.Namespace,
-	}, rabbitmqCluster)
-	if err != nil {
-		if k8s_errors.IsNotFound(err) {
-			Log.Info("RabbitmqCluster not found yet, will retry")
-			return nil
+	// Retry mechanism for updating RabbitmqCluster (handles race conditions)
+	var rabbitmqCluster *rabbitmqv2.RabbitmqCluster
+	var err error
+
+	for i := 0; i < 3; i++ {
+		// Get the RabbitmqCluster created by our controller
+		rabbitmqCluster = &rabbitmqv2.RabbitmqCluster{}
+		err = r.Client.Get(ctx, types.NamespacedName{
+			Name:      instance.Name,
+			Namespace: instance.Namespace,
+		}, rabbitmqCluster)
+		if err != nil {
+			if k8s_errors.IsNotFound(err) {
+				Log.Info("RabbitmqCluster not found yet, will retry")
+				return nil
+			}
+			return err
 		}
-		return err
+
+		// Check if already paused
+		if rabbitmqCluster.Labels != nil && rabbitmqCluster.Labels["rabbitmq.com/pauseReconciliation"] == "true" {
+			Log.Info("RabbitMQ operator reconciliation already paused")
+			break
+		}
+
+		// Pause RabbitMQ operator reconciliation
+		if rabbitmqCluster.Labels == nil {
+			rabbitmqCluster.Labels = make(map[string]string)
+		}
+		rabbitmqCluster.Labels["rabbitmq.com/pauseReconciliation"] = "true"
+
+		err = r.Client.Update(ctx, rabbitmqCluster)
+		if err != nil {
+			if k8s_errors.IsConflict(err) {
+				Log.Info(fmt.Sprintf("Conflict updating RabbitmqCluster, retrying (attempt %d/3)", i+1))
+				time.Sleep(time.Duration(i+1) * time.Second)
+				continue
+			}
+			return err
+		}
+		Log.Info("RabbitMQ operator reconciliation paused")
+		break
 	}
 
-	// Pause RabbitMQ operator reconciliation
-	if rabbitmqCluster.Labels == nil {
-		rabbitmqCluster.Labels = make(map[string]string)
-	}
-	rabbitmqCluster.Labels["rabbitmq.com/pauseReconciliation"] = "true"
-
-	err = r.Client.Update(ctx, rabbitmqCluster)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to pause RabbitMQ operator reconciliation after 3 attempts: %w", err)
 	}
-	Log.Info("RabbitMQ operator reconciliation paused")
 
 	// Wait a moment for the operator to stop reconciling
 	time.Sleep(2 * time.Second)
@@ -700,6 +722,33 @@ func (r *Reconciler) pauseAndPatchForVersionUpgrade(ctx context.Context, instanc
 	}
 
 	Log.Info("StatefulSet patched successfully with mnesia cleanup init container")
+
+	// Verify the StatefulSet was updated by checking it again
+	time.Sleep(1 * time.Second)
+	updatedStatefulSet := &appsv1.StatefulSet{}
+	err = r.Client.Get(ctx, types.NamespacedName{
+		Name:      instance.Name,
+		Namespace: instance.Namespace,
+	}, updatedStatefulSet)
+	if err != nil {
+		Log.Error(err, "Failed to verify StatefulSet update")
+		return err
+	}
+
+	// Check if our init container is present
+	cleanupContainerFound := false
+	for _, initContainer := range updatedStatefulSet.Spec.Template.Spec.InitContainers {
+		if initContainer.Name == "clean-mnesia" {
+			cleanupContainerFound = true
+			break
+		}
+	}
+
+	if !cleanupContainerFound {
+		return fmt.Errorf("clean-mnesia init container not found in StatefulSet after update")
+	}
+
+	Log.Info("Verified: clean-mnesia init container successfully added to StatefulSet")
 	return nil
 }
 
@@ -707,28 +756,42 @@ func (r *Reconciler) pauseAndPatchForVersionUpgrade(ctx context.Context, instanc
 func (r *Reconciler) resumeRabbitMQReconciliation(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) error {
 	Log := r.GetLogger(ctx)
 
-	// Get the RabbitmqCluster
-	rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
-	err := r.Client.Get(ctx, types.NamespacedName{
-		Name:      instance.Name,
-		Namespace: instance.Namespace,
-	}, rabbitmqCluster)
-	if err != nil {
-		return err
-	}
+	// Retry mechanism for updating RabbitmqCluster (handles race conditions)
+	for i := 0; i < 3; i++ {
+		// Get the RabbitmqCluster
+		rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
+		err := r.Client.Get(ctx, types.NamespacedName{
+			Name:      instance.Name,
+			Namespace: instance.Namespace,
+		}, rabbitmqCluster)
+		if err != nil {
+			return err
+		}
 
-	// Remove the pause reconciliation label
-	if rabbitmqCluster.Labels != nil {
+		// Check if already resumed
+		if rabbitmqCluster.Labels == nil || rabbitmqCluster.Labels["rabbitmq.com/pauseReconciliation"] != "true" {
+			Log.Info("RabbitMQ operator reconciliation already resumed")
+			return nil
+		}
+
+		// Remove the pause reconciliation label
 		delete(rabbitmqCluster.Labels, "rabbitmq.com/pauseReconciliation")
+
+		err = r.Client.Update(ctx, rabbitmqCluster)
+		if err != nil {
+			if k8s_errors.IsConflict(err) {
+				Log.Info(fmt.Sprintf("Conflict updating RabbitmqCluster, retrying (attempt %d/3)", i+1))
+				time.Sleep(time.Duration(i+1) * time.Second)
+				continue
+			}
+			return err
+		}
+
+		Log.Info("RabbitMQ operator reconciliation resumed")
+		return nil
 	}
 
-	err = r.Client.Update(ctx, rabbitmqCluster)
-	if err != nil {
-		return err
-	}
-
-	Log.Info("RabbitMQ operator reconciliation resumed")
-	return nil
+	return fmt.Errorf("failed to resume RabbitMQ operator reconciliation after 3 attempts")
 }
 
 // SetupWithManager sets up the controller with the Manager.
