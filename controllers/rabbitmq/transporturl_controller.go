@@ -47,123 +47,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-// Local definitions for messaging-topology-operator types to avoid import issues
-type UserTag string
-
-type RabbitmqClusterReference struct {
-	Name string `json:"name"`
-}
-
-type UserSpec struct {
-	RabbitmqClusterReference RabbitmqClusterReference     `json:"rabbitmqClusterReference"`
-	Tags                     []UserTag                    `json:"tags"`
-	ImportCredentialsSecret  *corev1.LocalObjectReference `json:"importCredentialsSecret,omitempty"`
-}
-
-type User struct {
-	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:"metadata,omitempty"`
-	Spec              UserSpec `json:"spec"`
-}
-
-// DeepCopyObject implements client.Object
-func (u *User) DeepCopyObject() runtime.Object {
-	return u.DeepCopy()
-}
-
-// DeepCopy creates a deep copy of User
-func (u *User) DeepCopy() *User {
-	if u == nil {
-		return nil
-	}
-	out := new(User)
-	u.DeepCopyInto(out)
-	return out
-}
-
-// DeepCopyInto copies all properties of this object into another object of the same type
-func (u *User) DeepCopyInto(out *User) {
-	*out = *u
-	out.TypeMeta = u.TypeMeta
-	u.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
-	out.Spec = u.Spec
-}
-
-type VhostSpec struct {
-	Name                     string                   `json:"name"`
-	RabbitmqClusterReference RabbitmqClusterReference `json:"rabbitmqClusterReference"`
-}
-
-type Vhost struct {
-	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:"metadata,omitempty"`
-	Spec              VhostSpec `json:"spec"`
-}
-
-// DeepCopyObject implements client.Object
-func (v *Vhost) DeepCopyObject() runtime.Object {
-	return v.DeepCopy()
-}
-
-// DeepCopy creates a deep copy of Vhost
-func (v *Vhost) DeepCopy() *Vhost {
-	if v == nil {
-		return nil
-	}
-	out := new(Vhost)
-	v.DeepCopyInto(out)
-	return out
-}
-
-// DeepCopyInto copies all properties of this object into another object of the same type
-func (v *Vhost) DeepCopyInto(out *Vhost) {
-	*out = *v
-	out.TypeMeta = v.TypeMeta
-	v.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
-	out.Spec = v.Spec
-}
-
-type VhostPermissions struct {
-	Configure string `json:"configure"`
-	Write     string `json:"write"`
-	Read      string `json:"read"`
-}
-
-type PermissionSpec struct {
-	Vhost                    string                   `json:"vhost"`
-	User                     string                   `json:"user"`
-	Permissions              VhostPermissions         `json:"permissions"`
-	RabbitmqClusterReference RabbitmqClusterReference `json:"rabbitmqClusterReference"`
-}
-
-type Permission struct {
-	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:"metadata,omitempty"`
-	Spec              PermissionSpec `json:"spec"`
-}
-
-// DeepCopyObject implements client.Object
-func (p *Permission) DeepCopyObject() runtime.Object {
-	return p.DeepCopy()
-}
-
-// DeepCopy creates a deep copy of Permission
-func (p *Permission) DeepCopy() *Permission {
-	if p == nil {
-		return nil
-	}
-	out := new(Permission)
-	p.DeepCopyInto(out)
-	return out
-}
-
-// DeepCopyInto copies all properties of this object into another object of the same type
-func (p *Permission) DeepCopyInto(out *Permission) {
-	*out = *p
-	out.TypeMeta = p.TypeMeta
-	p.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
-	out.Spec = p.Spec
-}
 
 // GetClient -
 func (r *TransportURLReconciler) GetClient() client.Client {
@@ -308,16 +191,16 @@ func getVhost(instance *rabbitmqv1.TransportURL) string {
 
 // createRabbitMQUser creates a RabbitMQ user using messaging-topology-operator
 func (r *TransportURLReconciler) createRabbitMQUser(ctx context.Context, instance *rabbitmqv1.TransportURL, username, password string) error {
-	user := &User{
+	user := &rabbitmqv1.User{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      username,
 			Namespace: instance.Namespace,
 		},
-		Spec: UserSpec{
-			RabbitmqClusterReference: RabbitmqClusterReference{
+		Spec: rabbitmqv1.UserSpec{
+			RabbitmqClusterReference: rabbitmqv1.RabbitmqClusterReference{
 				Name: instance.Spec.RabbitmqClusterName,
 			},
-			Tags: []UserTag{},
+			Tags: []rabbitmqv1.UserTag{},
 			ImportCredentialsSecret: &corev1.LocalObjectReference{
 				Name: fmt.Sprintf("rabbitmq-user-%s", username),
 			},
@@ -349,7 +232,7 @@ func (r *TransportURLReconciler) createRabbitMQUser(ctx context.Context, instanc
 	// Create or update the user
 	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, user, func() error {
 		user.Spec.RabbitmqClusterReference.Name = instance.Spec.RabbitmqClusterName
-		user.Spec.Tags = []UserTag{}
+		user.Spec.Tags = []rabbitmqv1.UserTag{}
 		user.Spec.ImportCredentialsSecret = &corev1.LocalObjectReference{
 			Name: fmt.Sprintf("rabbitmq-user-%s", username),
 		}
@@ -369,14 +252,14 @@ func (r *TransportURLReconciler) createRabbitMQVhost(ctx context.Context, instan
 		return nil
 	}
 
-	vhost := &Vhost{
+	vhost := &rabbitmqv1.Vhost{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      vhostName,
 			Namespace: instance.Namespace,
 		},
-		Spec: VhostSpec{
+		Spec: rabbitmqv1.VhostSpec{
 			Name: vhostName,
-			RabbitmqClusterReference: RabbitmqClusterReference{
+			RabbitmqClusterReference: rabbitmqv1.RabbitmqClusterReference{
 				Name: instance.Spec.RabbitmqClusterName,
 			},
 		},
@@ -397,20 +280,20 @@ func (r *TransportURLReconciler) createRabbitMQVhost(ctx context.Context, instan
 // createRabbitMQPermission creates RabbitMQ permissions for a user on a vhost
 func (r *TransportURLReconciler) createRabbitMQPermission(ctx context.Context, instance *rabbitmqv1.TransportURL, username, vhostName string) error {
 	permissionName := fmt.Sprintf("%s-%s-permission", username, vhostName)
-	permission := &Permission{
+	permission := &rabbitmqv1.Permission{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      permissionName,
 			Namespace: instance.Namespace,
 		},
-		Spec: PermissionSpec{
+		Spec: rabbitmqv1.PermissionSpec{
 			Vhost: vhostName,
 			User:  username,
-			Permissions: VhostPermissions{
+			Permissions: rabbitmqv1.VhostPermissions{
 				Configure: ".*",
 				Write:     ".*",
 				Read:      ".*",
 			},
-			RabbitmqClusterReference: RabbitmqClusterReference{
+			RabbitmqClusterReference: rabbitmqv1.RabbitmqClusterReference{
 				Name: instance.Spec.RabbitmqClusterName,
 			},
 		},
@@ -419,7 +302,7 @@ func (r *TransportURLReconciler) createRabbitMQPermission(ctx context.Context, i
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, permission, func() error {
 		permission.Spec.Vhost = vhostName
 		permission.Spec.User = username
-		permission.Spec.Permissions = VhostPermissions{
+		permission.Spec.Permissions = rabbitmqv1.VhostPermissions{
 			Configure: ".*",
 			Write:     ".*",
 			Read:      ".*",
@@ -447,7 +330,7 @@ func (r *TransportURLReconciler) cleanupOldUser(ctx context.Context, instance *r
 	Log.Info(fmt.Sprintf("Cleaning up old user: %s", oldUsername))
 
 	// Delete the old user
-	oldUser := &User{
+	oldUser := &rabbitmqv1.User{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      oldUsername,
 			Namespace: instance.Namespace,
@@ -475,7 +358,7 @@ func (r *TransportURLReconciler) cleanupOldUser(ctx context.Context, instance *r
 
 	// Delete old permissions for the old user
 	oldPermissionName := fmt.Sprintf("%s-%s-permission", oldUsername, instance.Status.RabbitmqVhost)
-	oldPermission := &Permission{
+	oldPermission := &rabbitmqv1.Permission{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      oldPermissionName,
 			Namespace: instance.Namespace,
@@ -853,9 +736,9 @@ func (r *TransportURLReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&rabbitmqv1.TransportURL{}).
 		Owns(&corev1.Secret{}).
-		Owns(&User{}).
-		Owns(&Vhost{}).
-		Owns(&Permission{}).
+		Owns(&rabbitmqv1.User{}).
+		Owns(&rabbitmqv1.Vhost{}).
+		Owns(&rabbitmqv1.Permission{}).
 		Watches(
 			&rabbitmqclusterv2.RabbitmqCluster{},
 			handler.EnqueueRequestsFromMapFunc(r.findObjectsForSrc),
