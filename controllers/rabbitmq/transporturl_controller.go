@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -191,18 +192,22 @@ func getVhost(instance *rabbitmqv1.TransportURL) string {
 
 // createRabbitMQUser creates a RabbitMQ user using messaging-topology-operator
 func (r *TransportURLReconciler) createRabbitMQUser(ctx context.Context, instance *rabbitmqv1.TransportURL, username, password string) error {
-	user := &rabbitmqv1.User{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      username,
-			Namespace: instance.Namespace,
-		},
-		Spec: rabbitmqv1.UserSpec{
-			RabbitmqClusterReference: rabbitmqv1.RabbitmqClusterReference{
-				Name: instance.Spec.RabbitmqClusterName,
+	user := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "rabbitmq.com/v1beta1",
+			"kind":       "User",
+			"metadata": map[string]interface{}{
+				"name":      username,
+				"namespace": instance.Namespace,
 			},
-			Tags: []rabbitmqv1.UserTag{},
-			ImportCredentialsSecret: &corev1.LocalObjectReference{
-				Name: fmt.Sprintf("rabbitmq-user-%s", username),
+			"spec": map[string]interface{}{
+				"rabbitmqClusterReference": map[string]interface{}{
+					"name": instance.Spec.RabbitmqClusterName,
+				},
+				"tags": []string{},
+				"importCredentialsSecret": map[string]interface{}{
+					"name": fmt.Sprintf("rabbitmq-user-%s", username),
+				},
 			},
 		},
 	}
@@ -231,10 +236,14 @@ func (r *TransportURLReconciler) createRabbitMQUser(ctx context.Context, instanc
 
 	// Create or update the user
 	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, user, func() error {
-		user.Spec.RabbitmqClusterReference.Name = instance.Spec.RabbitmqClusterName
-		user.Spec.Tags = []rabbitmqv1.UserTag{}
-		user.Spec.ImportCredentialsSecret = &corev1.LocalObjectReference{
-			Name: fmt.Sprintf("rabbitmq-user-%s", username),
+		// Update the spec for unstructured object
+		spec := user.Object["spec"].(map[string]interface{})
+		spec["rabbitmqClusterReference"] = map[string]interface{}{
+			"name": instance.Spec.RabbitmqClusterName,
+		}
+		spec["tags"] = []string{}
+		spec["importCredentialsSecret"] = map[string]interface{}{
+			"name": fmt.Sprintf("rabbitmq-user-%s", username),
 		}
 		return controllerutil.SetControllerReference(instance, user, r.Scheme)
 	})
@@ -252,22 +261,30 @@ func (r *TransportURLReconciler) createRabbitMQVhost(ctx context.Context, instan
 		return nil
 	}
 
-	vhost := &rabbitmqv1.Vhost{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      vhostName,
-			Namespace: instance.Namespace,
-		},
-		Spec: rabbitmqv1.VhostSpec{
-			Name: vhostName,
-			RabbitmqClusterReference: rabbitmqv1.RabbitmqClusterReference{
-				Name: instance.Spec.RabbitmqClusterName,
+	vhost := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "rabbitmq.com/v1beta1",
+			"kind":       "Vhost",
+			"metadata": map[string]interface{}{
+				"name":      vhostName,
+				"namespace": instance.Namespace,
+			},
+			"spec": map[string]interface{}{
+				"name": vhostName,
+				"rabbitmqClusterReference": map[string]interface{}{
+					"name": instance.Spec.RabbitmqClusterName,
+				},
 			},
 		},
 	}
 
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, vhost, func() error {
-		vhost.Spec.Name = vhostName
-		vhost.Spec.RabbitmqClusterReference.Name = instance.Spec.RabbitmqClusterName
+		// Update the spec for unstructured object
+		spec := vhost.Object["spec"].(map[string]interface{})
+		spec["name"] = vhostName
+		spec["rabbitmqClusterReference"] = map[string]interface{}{
+			"name": instance.Spec.RabbitmqClusterName,
+		}
 		return controllerutil.SetControllerReference(instance, vhost, r.Scheme)
 	})
 	if err != nil {
@@ -280,34 +297,42 @@ func (r *TransportURLReconciler) createRabbitMQVhost(ctx context.Context, instan
 // createRabbitMQPermission creates RabbitMQ permissions for a user on a vhost
 func (r *TransportURLReconciler) createRabbitMQPermission(ctx context.Context, instance *rabbitmqv1.TransportURL, username, vhostName string) error {
 	permissionName := fmt.Sprintf("%s-%s-permission", username, vhostName)
-	permission := &rabbitmqv1.Permission{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      permissionName,
-			Namespace: instance.Namespace,
-		},
-		Spec: rabbitmqv1.PermissionSpec{
-			Vhost: vhostName,
-			User:  username,
-			Permissions: rabbitmqv1.VhostPermissions{
-				Configure: ".*",
-				Write:     ".*",
-				Read:      ".*",
+	permission := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "rabbitmq.com/v1beta1",
+			"kind":       "Permission",
+			"metadata": map[string]interface{}{
+				"name":      permissionName,
+				"namespace": instance.Namespace,
 			},
-			RabbitmqClusterReference: rabbitmqv1.RabbitmqClusterReference{
-				Name: instance.Spec.RabbitmqClusterName,
+			"spec": map[string]interface{}{
+				"vhost": vhostName,
+				"user":  username,
+				"permissions": map[string]interface{}{
+					"configure": ".*",
+					"write":     ".*",
+					"read":      ".*",
+				},
+				"rabbitmqClusterReference": map[string]interface{}{
+					"name": instance.Spec.RabbitmqClusterName,
+				},
 			},
 		},
 	}
 
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, permission, func() error {
-		permission.Spec.Vhost = vhostName
-		permission.Spec.User = username
-		permission.Spec.Permissions = rabbitmqv1.VhostPermissions{
-			Configure: ".*",
-			Write:     ".*",
-			Read:      ".*",
+		// Update the spec for unstructured object
+		spec := permission.Object["spec"].(map[string]interface{})
+		spec["vhost"] = vhostName
+		spec["user"] = username
+		spec["permissions"] = map[string]interface{}{
+			"configure": ".*",
+			"write":     ".*",
+			"read":      ".*",
 		}
-		permission.Spec.RabbitmqClusterReference.Name = instance.Spec.RabbitmqClusterName
+		spec["rabbitmqClusterReference"] = map[string]interface{}{
+			"name": instance.Spec.RabbitmqClusterName,
+		}
 		return controllerutil.SetControllerReference(instance, permission, r.Scheme)
 	})
 	if err != nil {
@@ -330,10 +355,14 @@ func (r *TransportURLReconciler) cleanupOldUser(ctx context.Context, instance *r
 	Log.Info(fmt.Sprintf("Cleaning up old user: %s", oldUsername))
 
 	// Delete the old user
-	oldUser := &rabbitmqv1.User{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      oldUsername,
-			Namespace: instance.Namespace,
+	oldUser := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "rabbitmq.com/v1beta1",
+			"kind":       "User",
+			"metadata": map[string]interface{}{
+				"name":      oldUsername,
+				"namespace": instance.Namespace,
+			},
 		},
 	}
 	err := r.Client.Delete(ctx, oldUser)
@@ -358,10 +387,14 @@ func (r *TransportURLReconciler) cleanupOldUser(ctx context.Context, instance *r
 
 	// Delete old permissions for the old user
 	oldPermissionName := fmt.Sprintf("%s-%s-permission", oldUsername, instance.Status.RabbitmqVhost)
-	oldPermission := &rabbitmqv1.Permission{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      oldPermissionName,
-			Namespace: instance.Namespace,
+	oldPermission := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "rabbitmq.com/v1beta1",
+			"kind":       "Permission",
+			"metadata": map[string]interface{}{
+				"name":      oldPermissionName,
+				"namespace": instance.Namespace,
+			},
 		},
 	}
 	err = r.Client.Delete(ctx, oldPermission)
@@ -736,9 +769,6 @@ func (r *TransportURLReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&rabbitmqv1.TransportURL{}).
 		Owns(&corev1.Secret{}).
-		Owns(&rabbitmqv1.User{}).
-		Owns(&rabbitmqv1.Vhost{}).
-		Owns(&rabbitmqv1.Permission{}).
 		Watches(
 			&rabbitmqclusterv2.RabbitmqCluster{},
 			handler.EnqueueRequestsFromMapFunc(r.findObjectsForSrc),

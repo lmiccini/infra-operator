@@ -1,0 +1,81 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: permissions.rabbitmq.openstack.org
+spec:
+  group: rabbitmq.openstack.org
+  names:
+    kind: Permission
+    listKind: PermissionList
+    plural: permissions
+    singular: permission
+  scope: Namespaced
+  versions:
+  - name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: Permission is the Schema for the permissions API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: PermissionSpec defines the desired state of Permission
+            properties:
+              permissions:
+                description: VhostPermissions defines the permissions for a vhost
+                properties:
+                  configure:
+                    type: string
+                  read:
+                    type: string
+                  write:
+                    type: string
+                required:
+                - configure
+                - read
+                - write
+                type: object
+              rabbitmqClusterReference:
+                description: RabbitmqClusterReference represents a reference to a
+                  RabbitMQ cluster
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              user:
+                type: string
+              vhost:
+                type: string
+            required:
+            - permissions
+            - rabbitmqClusterReference
+            - user
+            - vhost
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
