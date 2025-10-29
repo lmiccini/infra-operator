@@ -202,7 +202,10 @@ rules:
 - apiGroups:
   - rabbitmq.com
   resources:
+  - permissions
   - rabbitmqclusters
+  - users
+  - vhosts
   verbs:
   - create
   - delete
