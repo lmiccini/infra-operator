@@ -487,7 +487,6 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		}
 
 		// Generate password if needed
-		var password string
 		if needNewPassword {
 			password, err = generatePassword(32)
 			if err != nil {
