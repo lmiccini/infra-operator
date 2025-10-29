@@ -299,7 +299,12 @@ func (r *TransportURLReconciler) createRabbitMQVhost(ctx context.Context, instan
 
 // createRabbitMQPermission creates RabbitMQ permissions for a user on a vhost
 func (r *TransportURLReconciler) createRabbitMQPermission(ctx context.Context, instance *rabbitmqv1.TransportURL, username, vhostName string) error {
-	permissionName := fmt.Sprintf("%s-%s-permission", username, vhostName)
+	// Replace "/" with "default" for the default vhost to create a valid resource name
+	safeVhostName := vhostName
+	if vhostName == "/" {
+		safeVhostName = "default"
+	}
+	permissionName := fmt.Sprintf("%s-%s-permission", username, safeVhostName)
 	permission := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "rabbitmq.com/v1beta1",
@@ -389,7 +394,12 @@ func (r *TransportURLReconciler) cleanupOldUser(ctx context.Context, instance *r
 	}
 
 	// Delete old permissions for the old user
-	oldPermissionName := fmt.Sprintf("%s-%s-permission", oldUsername, instance.Status.RabbitmqVhost)
+	// Replace "/" with "default" for the default vhost to create a valid resource name
+	safeOldVhostName := instance.Status.RabbitmqVhost
+	if instance.Status.RabbitmqVhost == "/" {
+		safeOldVhostName = "default"
+	}
+	oldPermissionName := fmt.Sprintf("%s-%s-permission", oldUsername, safeOldVhostName)
 	oldPermission := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "rabbitmq.com/v1beta1",
