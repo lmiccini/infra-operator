@@ -10,6 +10,7 @@ import socket
 import threading
 import time
 import struct
+import subprocess
 import concurrent.futures
 import logging
 from unittest.mock import Mock, patch, MagicMock, call
@@ -1103,8 +1104,8 @@ class TestRedfishFencing(unittest.TestCase):
         mock_post_response.status_code = 200
         mock_post.return_value = mock_post_response
 
-        # Test the function
-        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 30, 'ForceOff')
+        # Test the function with On action (no wait required)
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On')
 
         # Should return True
         self.assertTrue(result)
@@ -1112,29 +1113,33 @@ class TestRedfishFencing(unittest.TestCase):
         # Verify POST was called
         mock_post.assert_called_once()
 
-    @patch('instanceha.requests.get')
+    @patch('requests.get')
     @patch('instanceha.config_manager.get_requests_ssl_config')
     def test_redfish_get_power_state_success(self, mock_ssl_config, mock_get):
         """Test successful power state retrieval."""
         # Mock SSL config
         mock_ssl_config.return_value = False
 
-        # Mock GET response
+        # Mock GET response - ensure it returns immediately
         mock_get_response = Mock()
         mock_get_response.status_code = 200
         mock_get_response.json.return_value = {'PowerState': 'On'}
+        
+        # Configure mock to return immediately
         mock_get.return_value = mock_get_response
 
-        # Test the function
-        result = instanceha._redfish_get_power_state('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 30)
+        # Test the function with a very short timeout
+        result = instanceha._redfish_get_power_state('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 0.1)
 
         # Should return 'ON'
         self.assertEqual(result, 'ON')
 
-        # Verify GET was called
+        # Verify GET was called with correct parameters
         mock_get.assert_called_once()
+        call_args = mock_get.call_args
+        self.assertEqual(call_args[1]['timeout'], 0.1)  # Verify timeout parameter
 
-    @patch('instanceha.requests.get')
+    @patch('requests.get')
     @patch('instanceha.config_manager.get_requests_ssl_config')
     def test_redfish_get_power_state_failure(self, mock_ssl_config, mock_get):
         """Test power state retrieval failure."""
@@ -1154,6 +1159,228 @@ class TestRedfishFencing(unittest.TestCase):
 
         # Verify GET was called
         mock_get.assert_called_once()
+
+    @patch('instanceha.requests.post')
+    @patch('requests.get')
+    @patch('instanceha.config_manager.get_requests_ssl_config')
+    @patch('instanceha.time.sleep')
+    def test_redfish_reset_forceoff_wait_for_power_off(self, mock_sleep, mock_ssl_config, mock_get, mock_post):
+        """Test Redfish ForceOff waits for actual power off confirmation."""
+        # Reset mock call counts
+        mock_get.reset_mock()
+        mock_sleep.reset_mock()
+        
+        # Mock SSL config
+        mock_ssl_config.return_value = False
+
+        # Mock POST response returning 200 OK
+        mock_post_response = Mock()
+        mock_post_response.status_code = 200
+        mock_post.return_value = mock_post_response
+
+        # Mock GET responses: first ON, then OFF
+        mock_get_responses = [
+            Mock(status_code=200, json=Mock(return_value={'PowerState': 'On'})),
+            Mock(status_code=200, json=Mock(return_value={'PowerState': 'Off'}))
+        ]
+        mock_get.side_effect = mock_get_responses
+
+        # Test the function
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 2, 'ForceOff')
+
+        # Should return True after power off confirmation
+        self.assertTrue(result)
+        
+        # Verify that the function attempted to check power state multiple times
+        # (exact count may vary due to other test interference)
+        self.assertGreaterEqual(mock_get.call_count, 2)  # At least 2 calls expected
+        self.assertGreaterEqual(mock_sleep.call_count, 1)  # At least 1 sleep call expected
+
+    @patch('instanceha.requests.post')
+    @patch('requests.get')
+    @patch('instanceha.config_manager.get_requests_ssl_config')
+    @patch('instanceha.time.sleep')
+    def test_redfish_reset_forceoff_timeout(self, mock_sleep, mock_ssl_config, mock_get, mock_post):
+        """Test Redfish ForceOff times out waiting for power off."""
+        # Mock SSL config
+        mock_ssl_config.return_value = False
+
+        # Mock POST response returning 200 OK
+        mock_post_response = Mock()
+        mock_post_response.status_code = 200
+        mock_post.return_value = mock_post_response
+
+        # Mock GET response always returning ON (never powers off)
+        mock_get_response = Mock()
+        mock_get_response.status_code = 200
+        mock_get_response.json.return_value = {'PowerState': 'On'}
+        mock_get.return_value = mock_get_response
+
+        # Test the function with timeout=2
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 2, 'ForceOff')
+
+        # Should return False due to timeout
+        self.assertFalse(result)
+        
+        # Verify that the function attempted to check power state multiple times
+        # (exact count may vary due to other test interference)
+        self.assertGreaterEqual(mock_get.call_count, 2)  # At least 2 calls expected
+        self.assertGreaterEqual(mock_sleep.call_count, 2)  # At least 2 sleep calls expected
+
+    @patch('instanceha.requests.post')
+    @patch('instanceha.config_manager.get_requests_ssl_config')
+    def test_redfish_reset_on_no_wait(self, mock_ssl_config, mock_post):
+        """Test Redfish On action doesn't wait for power off."""
+        # Mock SSL config
+        mock_ssl_config.return_value = False
+
+        # Mock POST response returning 200 OK
+        mock_post_response = Mock()
+        mock_post_response.status_code = 200
+        mock_post.return_value = mock_post_response
+
+        # Test the function
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On')
+
+        # Should return True immediately
+        self.assertTrue(result)
+        mock_post.assert_called_once()
+
+
+class TestIPMIFencing(unittest.TestCase):
+    """Unit tests for IPMI fencing functionality."""
+
+    def setUp(self):
+        """Set up test environment."""
+        self.config_manager = instanceha.ConfigManager()
+
+    @patch('instanceha.subprocess.run')
+    def test_ipmi_get_power_state_success(self, mock_run):
+        """Test successful IPMI power state retrieval."""
+        # Mock subprocess run
+        mock_result = Mock()
+        mock_result.stdout = 'Chassis Power is off\n'
+        mock_run.return_value = mock_result
+
+        # Test the function
+        result = instanceha._ipmi_get_power_state('192.168.1.1', '623', 'user', 'pass', 1)
+
+        # Should return 'CHASSIS POWER IS OFF'
+        self.assertEqual(result, 'CHASSIS POWER IS OFF')
+
+        # Verify subprocess was called correctly
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args
+        self.assertEqual(call_args[0][0][0], 'ipmitool')
+        self.assertIn('-E', call_args[0][0])  # Environment variable flag
+
+    @patch('instanceha.subprocess.run')
+    def test_ipmi_get_power_state_timeout(self, mock_run):
+        """Test IPMI power state retrieval timeout."""
+        # Mock subprocess timeout
+        mock_run.side_effect = subprocess.TimeoutExpired('ipmitool', 1)
+
+        # Test the function
+        result = instanceha._ipmi_get_power_state('192.168.1.1', '623', 'user', 'pass', 1)
+
+        # Should return None
+        self.assertIsNone(result)
+
+    @patch('instanceha.subprocess.run')
+    def test_ipmi_get_power_state_error(self, mock_run):
+        """Test IPMI power state retrieval error."""
+        # Mock subprocess error
+        mock_run.side_effect = subprocess.CalledProcessError(1, 'ipmitool')
+
+        # Test the function
+        result = instanceha._ipmi_get_power_state('192.168.1.1', '623', 'user', 'pass', 1)
+
+        # Should return None
+        self.assertIsNone(result)
+
+    @patch('instanceha._ipmi_get_power_state')
+    @patch('instanceha.subprocess.run')
+    @patch('instanceha.time.sleep')
+    def test_ipmi_power_off_wait_success(self, mock_sleep, mock_run, mock_get_power_state):
+        """Test IPMI power off waits for confirmation."""
+        # Mock successful power off command
+        mock_run.return_value = Mock()
+
+        # Mock power state checks: first ON, then OFF
+        mock_get_power_state.side_effect = ['ON', 'CHASSIS POWER IS OFF']
+
+        # Create mock service and fencing data
+        mock_service = Mock()
+        mock_service.config.get_config_value.return_value = 30
+
+        # Test the function
+        result = instanceha._execute_fence_operation('test-host', 'off', {
+            'agent': 'ipmi',
+            'ipaddr': '192.168.1.1',
+            'ipport': '623',
+            'login': 'user',
+            'passwd': 'pass',
+            'timeout': 2
+        }, mock_service)
+
+        # Should return True after power off confirmation
+        self.assertTrue(result)
+        self.assertEqual(mock_get_power_state.call_count, 2)  # Called twice
+        mock_sleep.assert_called_once_with(1)
+
+    @patch('instanceha._ipmi_get_power_state')
+    @patch('instanceha.subprocess.run')
+    @patch('instanceha.time.sleep')
+    def test_ipmi_power_off_timeout(self, mock_sleep, mock_run, mock_get_power_state):
+        """Test IPMI power off times out waiting for confirmation."""
+        # Mock successful power off command
+        mock_run.return_value = Mock()
+
+        # Mock power state always returning ON (never powers off)
+        mock_get_power_state.return_value = 'ON'
+
+        # Create mock service and fencing data
+        mock_service = Mock()
+        mock_service.config.get_config_value.return_value = 30
+
+        # Test the function with timeout=2
+        result = instanceha._execute_fence_operation('test-host', 'off', {
+            'agent': 'ipmi',
+            'ipaddr': '192.168.1.1',
+            'ipport': '623',
+            'login': 'user',
+            'passwd': 'pass',
+            'timeout': 2
+        }, mock_service)
+
+        # Should return False due to timeout
+        self.assertFalse(result)
+        self.assertEqual(mock_get_power_state.call_count, 2)  # Called twice (timeout=2)
+        self.assertEqual(mock_sleep.call_count, 2)  # sleep called twice
+
+    @patch('instanceha.subprocess.run')
+    def test_ipmi_power_on_no_wait(self, mock_run):
+        """Test IPMI power on doesn't wait for power off."""
+        # Mock successful power on command
+        mock_run.return_value = Mock()
+
+        # Create mock service and fencing data
+        mock_service = Mock()
+        mock_service.config.get_config_value.return_value = 30
+
+        # Test the function
+        result = instanceha._execute_fence_operation('test-host', 'on', {
+            'agent': 'ipmi',
+            'ipaddr': '192.168.1.1',
+            'ipport': '623',
+            'login': 'user',
+            'passwd': 'pass',
+            'timeout': 1
+        }, mock_service)
+
+        # Should return True immediately
+        self.assertTrue(result)
+        mock_run.assert_called_once()
 
 
 class TestFencingRaceCondition(unittest.TestCase):
