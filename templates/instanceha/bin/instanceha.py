@@ -1652,6 +1652,20 @@ def _redfish_get_power_state(url, user, passwd, timeout):
         logging.error('Failed to get power state: %s' % str(e))
     return None
 
+def _ipmi_get_power_state(ip, port, user, passwd, timeout):
+    """Get the power state from IPMI"""
+    try:
+        env = os.environ.copy()
+        env['IPMITOOL_PASSWORD'] = passwd
+        cmd = ['ipmitool', '-I', 'lanplus', '-H', ip, '-U', user, '-E', '-p', port, 'power', 'status']
+        cmd_output = subprocess.run(cmd, timeout=timeout, capture_output=True, text=True, check=True, env=env)
+        return cmd_output.stdout.strip().upper()
+    except subprocess.TimeoutExpired:
+        logging.error('Failed to get IPMI power state: timeout expired')
+    except subprocess.CalledProcessError as e:
+        logging.error('Failed to get IPMI power state: command failed with return code %d' % e.returncode)
+    return None
+
 def _redfish_reset(url, user, passwd, timeout, action):
     """Perform a Redfish reset operation on a computer system."""
     if not all([url, user, passwd, action]):
@@ -1683,8 +1697,19 @@ def _redfish_reset(url, user, passwd, timeout, action):
                                    auth=(user, passwd), verify=ssl_config, timeout=timeout)
 
         if response.status_code in [200, 204]:
-            logging.info("Redfish reset successful: %s on %s", action, url)
-            return True
+            if action == "ForceOff":
+                # Wait for server to actually power off
+                for _ in range(timeout):
+                    time.sleep(1)
+                    power_state = _redfish_get_power_state(url, user, passwd, timeout)
+                    if power_state == 'OFF':
+                        logging.info("Redfish reset successful: %s on %s", action, url)
+                        return True
+                logging.error('Power off of %s timed out' % url)
+                return False
+            else:
+                logging.info("Redfish reset successful: %s on %s", action, url)
+                return True
         elif response.status_code == 409:
             # Check if server is already powered off
             power_state = _redfish_get_power_state(url, user, passwd, timeout)
@@ -1868,8 +1893,21 @@ def _execute_fence_operation(host, action, fencing_data, service):
                    "-p", fencing_data["ipport"], "power", action]
             timeout = fencing_data.get("timeout", service.config.get_config_value('FENCING_TIMEOUT'))
             subprocess.run(cmd, timeout=timeout, env=env, capture_output=True, text=True, check=True)
-            logging.info("IPMI %s successful for %s", action, host)
-            return True
+
+            if action == 'off':
+                # Wait for server to actually power off
+                for _ in range(timeout):
+                    time.sleep(1)
+                    power_state = _ipmi_get_power_state(fencing_data["ipaddr"], fencing_data["ipport"],
+                                                      fencing_data["login"], fencing_data["passwd"], timeout)
+                    if power_state == 'CHASSIS POWER IS OFF':
+                        logging.info("IPMI %s successful for %s", action, host)
+                        return True
+                logging.error('Power off of %s timed out' % host)
+                return False
+            else:
+                logging.info("IPMI %s successful for %s", action, host)
+                return True
 
         elif "redfish" in agent:
             if not _validate_params(["ipaddr", "login", "passwd"], "Redfish"):
