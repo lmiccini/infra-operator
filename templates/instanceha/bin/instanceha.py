@@ -498,102 +498,63 @@ class InstanceHAService(CloudConnectionProvider):
         if evac_images is None:
             evac_images = self.get_evacuable_images()
 
-        # Determine evacuation logic based on configuration
         images_enabled = self.config.is_tagged_images_enabled()
         flavors_enabled = self.config.is_tagged_flavors_enabled()
 
-        # If NEITHER tagged images NOR tagged flavors are enabled, evacuate all instances (backward compatibility)
+        # If neither tagging type enabled, evacuate all (backward compatibility)
         if not images_enabled and not flavors_enabled:
             return True
 
-        # If tagging is enabled but no tagged resources exist, evacuate all servers
-        if images_enabled and flavors_enabled:
-            # Both enabled - if neither has tagged resources, evacuate all
-            if not evac_images and not evac_flavors:
-                logging.info("No tagged images or flavors found - evacuating all servers")
-                return True
-        elif images_enabled:
-            # Only image tagging enabled - if no tagged images, evacuate all
-            if not evac_images:
-                logging.info("No tagged images found - evacuating all servers")
-                return True
-        elif flavors_enabled:
-            # Only flavor tagging enabled - if no tagged flavors, evacuate all
-            if not evac_flavors:
-                logging.info("No tagged flavors found - evacuating all servers")
-                return True
+        # If tagging enabled but no tagged resources exist, evacuate all
+        has_tagged_resources = (images_enabled and evac_images) or (flavors_enabled and evac_flavors)
+        if not has_tagged_resources:
+            resource_type = "images or flavors" if (images_enabled and flavors_enabled) else \
+                          ("images" if images_enabled else "flavors")
+            logging.info("No tagged %s found - evacuating all servers", resource_type)
+            return True
 
-        # Tagged resources exist, so we need to check if this server matches
-
-        # Check if server uses evacuable image
+        # Check if server matches evacuable criteria
         image_matches = False
         if images_enabled:
-            if evac_images:
-                # Use pre-cached list if available
-                server_image_id = self._get_server_image_id(server)
-                if server_image_id and server_image_id in evac_images:
-                    image_matches = True
-                else:
-                    # Fall back to per-server checking if image not in cache
-                    if self.is_server_image_evacuable(server):
-                        image_matches = True
-            else:
-                # Cache is empty - check image directly
-                if self.is_server_image_evacuable(server):
-                    image_matches = True
+            server_image_id = self._get_server_image_id(server)
+            if evac_images and server_image_id and server_image_id in evac_images:
+                image_matches = True
+            elif self.is_server_image_evacuable(server):
+                image_matches = True
 
-        # Check if server uses evacuable flavor
         flavor_matches = False
         if flavors_enabled and evac_flavors:
             try:
                 flavor_extra_specs = server.flavor.get('extra_specs', {})
                 evacuable_tag = self.config.get_evacuable_tag()
 
-                # Check if evacuable_tag is an exact key match or part of a key (e.g., trait:CUSTOM_HA)
-                matching_key = None
-                if evacuable_tag in flavor_extra_specs:
-                    matching_key = evacuable_tag
-                else:
-                    # Look for the tag in composite keys like "trait:CUSTOM_HA"
-                    for key in flavor_extra_specs:
-                        if evacuable_tag in key:
-                            matching_key = key
-                            break
+                # Check for exact key match or substring match in composite keys
+                matching_key = next(
+                    (k for k in flavor_extra_specs 
+                     if k == evacuable_tag or evacuable_tag in k),
+                    None
+                )
 
-                if matching_key:
-                    value = flavor_extra_specs[matching_key]
-                    if str(value).lower() == 'true':
-                        flavor_matches = True
+                if matching_key and str(flavor_extra_specs[matching_key]).lower() == 'true':
+                    flavor_matches = True
             except (AttributeError, KeyError, TypeError):
                 logging.debug("Could not check flavor extra specs for server %s", server.id)
 
-        # Determine if server should be evacuated based on enabled tagging
-        should_evacuate = False
-
-        if images_enabled and flavors_enabled:
-            # Both enabled: evacuate if server matches EITHER criteria (OR logic)
-            should_evacuate = image_matches or flavor_matches
-        elif images_enabled:
-            # Only image tagging enabled: evacuate only if image matches
-            should_evacuate = image_matches
-        elif flavors_enabled:
-            # Only flavor tagging enabled: evacuate only if flavor matches
-            should_evacuate = flavor_matches
+        # Evacuate if matches enabled criteria (OR logic when both enabled)
+        should_evacuate = (image_matches or flavor_matches) if (images_enabled and flavors_enabled) else \
+                         (image_matches if images_enabled else flavor_matches)
 
         if should_evacuate:
             return True
 
-        # Server doesn't match evacuable criteria - provide specific feedback
-        criteria = []
-        if images_enabled and evac_images:
-            criteria.append("evacuable images")
-        if flavors_enabled and evac_flavors:
-            criteria.append("evacuable flavors")
-
+        # Provide feedback on why server is not evacuable
+        criteria = [c for c, enabled in [
+            ("evacuable images", images_enabled and evac_images),
+            ("evacuable flavors", flavors_enabled and evac_flavors)
+        ] if enabled]
         if criteria:
-            criteria_str = " or ".join(criteria)
             logging.warning("Instance %s is not evacuable: not using any of the defined %s tagged with '%s'",
-                           server.id, criteria_str, self.config.get_evacuable_tag())
+                           server.id, " or ".join(criteria), self.config.get_evacuable_tag())
         return False
 
     def get_evacuable_flavors(self, connection: Optional[OpenStackClient] = None):
@@ -616,11 +577,9 @@ class InstanceHAService(CloudConnectionProvider):
             logging.error("No Nova connection available for flavor caching")
             return []
 
+        # Check cache with lock
         with self._cache_lock:
-            if self._evacuable_flavors_cache is None:
-                # Release lock during API call to avoid blocking other operations
-                pass
-            else:
+            if self._evacuable_flavors_cache is not None:
                 return self._evacuable_flavors_cache
 
         # Perform expensive API call outside lock
@@ -672,11 +631,9 @@ class InstanceHAService(CloudConnectionProvider):
             logging.error("No Nova connection available for image caching")
             return []
 
+        # Check cache with lock
         with self._cache_lock:
-            if self._evacuable_images_cache is None:
-                # Release lock during API call to avoid blocking other operations
-                pass
-            else:
+            if self._evacuable_images_cache is not None:
                 return self._evacuable_images_cache
 
         # Perform expensive API call outside lock
@@ -1417,7 +1374,6 @@ def _server_evacuate_future(connection, server):
         logging.debug('Exception traceback:', exc_info=True)
         return False
 
-    # This should not be reached, but return False as fallback
     return False
 
 
@@ -1451,6 +1407,21 @@ def nova_login(username, password, projectname, auth_url, user_domain_name, proj
     return nova
 
 
+def _handle_nova_exception(operation: str, service_info: str, e: Exception, is_critical: bool = True) -> bool:
+    """Handle Nova API exceptions with consistent logging."""
+    if isinstance(e, NotFound):
+        logging.error("Failed to %s for %s. Resource not found: %s", operation, service_info, e)
+    elif isinstance(e, Conflict):
+        logging.error("Failed to %s for %s. Conflicting operation: %s", operation, service_info, e)
+    else:
+        logging.error("Failed to %s for %s. Unexpected error: %s", operation, service_info, e)
+    logging.debug("Exception traceback:", exc_info=True)
+    
+    if not is_critical:
+        logging.warning("Service %s operation partially failed. Manual cleanup may be needed.", service_info)
+    return False
+
+
 def _host_disable(connection, service):
     """
     Disable a compute service by forcing it down and logging the reason.
@@ -1467,48 +1438,25 @@ def _host_disable(connection, service):
         bool: True if both operations succeeded, False otherwise
     """
     # Input validation
-    if not connection:
-        logging.error("Cannot disable service - no connection provided")
+    if not connection or not service:
+        logging.error("Cannot disable service - missing connection or service object")
         return False
 
-    if not service:
-        logging.error("Cannot disable service - no service object provided")
-        return False
-
-    if not hasattr(service, 'id'):
-        logging.error("Cannot disable service - service object missing ID: %s",
-                     getattr(service, 'to_dict', lambda: str(service))())
-        return False
-
-    if not hasattr(service, 'host'):
-        logging.error("Cannot disable service - service object missing host: %s",
-                     getattr(service, 'to_dict', lambda: str(service))())
+    if not hasattr(service, 'id') or not hasattr(service, 'host'):
+        missing = 'id' if not hasattr(service, 'id') else 'host'
+        logging.error("Cannot disable service - service object missing %s: %s",
+                     missing, getattr(service, 'to_dict', lambda: str(service))())
         return False
 
     service_info = f"service {getattr(service, 'binary', 'unknown')} on host {service.host}"
 
     # Step 1: Force the service down
     logging.info("Forcing %s down before evacuation", service.host)
-
     try:
         connection.services.force_down(service.id, True)
         logging.debug("Successfully forced down %s", service_info)
-        force_down_success = True
-
-    except NotFound as e:
-        logging.error("Failed to force-down %s. Resource not found: %s", service_info, e)
-        logging.debug("Exception traceback:", exc_info=True)
-        return False
-
-    except Conflict as e:
-        logging.error("Failed to force-down %s. Conflicting operation: %s", service_info, e)
-        logging.debug("Exception traceback:", exc_info=True)
-        return False
-
     except Exception as e:
-        logging.error("Failed to force-down %s. Unexpected error: %s", service_info, e)
-        logging.debug("Exception traceback:", exc_info=True)
-        return False
+        return _handle_nova_exception("force-down", service_info, e, is_critical=True)
 
     # Step 2: Log the reason for disabling (only if force_down succeeded)
     try:
@@ -1516,27 +1464,8 @@ def _host_disable(connection, service):
         connection.services.disable_log_reason(service.id, disable_reason)
         logging.info("Successfully disabled %s with reason: %s", service_info, disable_reason)
         return True
-
-    except NotFound as e:
-        logging.error("Failed to log disable reason for %s. Resource not found: %s", service_info, e)
-        logging.debug("Exception traceback:", exc_info=True)
-        # Service is forced down but reason logging failed - this is not critical
-        logging.warning("Service %s is forced down but reason logging failed. Manual cleanup may be needed.", service_info)
-        return False
-
-    except Conflict as e:
-        logging.error("Failed to log disable reason for %s. Conflicting operation: %s", service_info, e)
-        logging.debug("Exception traceback:", exc_info=True)
-        # Service is forced down but reason logging failed
-        logging.warning("Service %s is forced down but reason logging failed. Manual cleanup may be needed.", service_info)
-        return False
-
     except Exception as e:
-        logging.error("Failed to log disable reason for %s. Unexpected error: %s", service_info, e)
-        logging.debug("Exception traceback:", exc_info=True)
-        # Service is forced down but reason logging failed
-        logging.warning("Service %s is forced down but reason logging failed. Manual cleanup may be needed.", service_info)
-        return False
+        return _handle_nova_exception("log disable reason", service_info, e, is_critical=False)
 
 
 def _check_kdump(stale_services: List[Any], service: InstanceHAService) -> List[Any]:
@@ -1587,8 +1516,8 @@ def _check_kdump(stale_services: List[Any], service: InstanceHAService) -> List[
                         if future.result():
                             kdumping_hosts.append(futures[future].host)
                             logging.info('Host %s started kdumping, skipping evacuation' % futures[future].host)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logging.debug("Exception checking kdump for host: %s", e)
             except concurrent.futures.TimeoutError:
                 # Some futures didn't complete within timeout - that's OK, just log it
                 pending = [futures[f] for f in futures if not f.done()]
@@ -1610,33 +1539,33 @@ def _check_kdump(stale_services: List[Any], service: InstanceHAService) -> List[
 
 
 def _host_enable(connection, service, reenable=False):
+    """Enable a host service, optionally unsetting force-down."""
     if reenable:
         try:
             logging.info('Unsetting force-down on host %s after evacuation', service.host)
             connection.services.force_down(service.id, False)
             logging.info('Successfully unset force-down on host %s', service.host)
+            return True
         except Exception as e:
             logging.error('Could not unset force-down for %s. Please check the host status and perform manual cleanup if necessary: %s', service.host, e)
             return False
 
-    else:
-        last_error = None
-        for _ in range(3):
-            try:
-                logging.info('Trying to enable %s', service.host)
-                connection.services.enable(service.id)
-                logging.info('Host %s is now enabled', service.host)
-                break
-            except Exception as e:
-                last_error = e
+    # Retry logic for enabling service
+    MAX_RETRIES = 3
+    for attempt in range(MAX_RETRIES):
+        try:
+            logging.info('Trying to enable %s (attempt %d/%d)', service.host, attempt + 1, MAX_RETRIES)
+            connection.services.enable(service.id)
+            logging.info('Host %s is now enabled', service.host)
+            return True
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
                 logging.warning('Failed to enable %s, retrying: %s', service.host, e)
-                continue
-        else:
-            # All retries failed
-            logging.error('Failed to enable %s after 3 attempts. Last error: %s', service.host, last_error)
-            return False
+            else:
+                logging.error('Failed to enable %s after %d attempts. Last error: %s', service.host, MAX_RETRIES, e)
+            continue
 
-    return True
+    return False
 
 
 def _redfish_get_power_state(url, user, passwd, timeout):
@@ -2368,10 +2297,13 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
     if service.config.is_tagged_aggregates_enabled() and compute_nodes:
         compute_nodes = _filter_by_aggregates(conn, service, compute_nodes, services)
 
-    # Check evacuation threshold
-    if services and (len(compute_nodes) / len(services) * 100) > service.config.get_threshold():
-        logging.error('Number of impacted computes exceeds threshold. Not evacuating.')
-        return
+    # Check evacuation threshold (prevent division by zero)
+    if services and compute_nodes:
+        threshold_percent = (len(compute_nodes) / len(services)) * 100
+        if threshold_percent > service.config.get_threshold():
+            logging.error('Number of impacted computes (%.1f%%) exceeds threshold (%d%%). Not evacuating.',
+                         threshold_percent, service.config.get_threshold())
+            return
 
     # Process evacuations
     if not service.config.is_disabled():
@@ -2397,14 +2329,10 @@ def _filter_by_aggregates(conn, service, compute_nodes, services):
         evacuable_hosts = set()
 
         for agg in aggregates:
-            is_evacuable = (evacuable_tag in agg.metadata and
-                          str(agg.metadata[evacuable_tag]).lower() == 'true') or \
-                         any(evacuable_tag in key and str(agg.metadata[key]).lower() == 'true'
-                             for key in agg.metadata)
-            if is_evacuable:
+            if service._is_resource_evacuable(agg, evacuable_tag, ['metadata']):
                 evacuable_hosts.update(agg.hosts)
 
-        compute_nodes_down = compute_nodes
+        compute_nodes_down = list(compute_nodes)
         compute_nodes = [svc for svc in compute_nodes if svc.host in evacuable_hosts]
 
         down_not_tagged = [svc.host for svc in compute_nodes_down if svc not in compute_nodes]
@@ -2464,14 +2392,12 @@ def main():
 
             # Convert generator to list for logging and processing
             compute_nodes_list = list(compute_nodes)
-            logging.info('Found %d compute nodes needing evacuation: %s',
-                        len(compute_nodes_list), [svc.host for svc in compute_nodes_list])
+            if compute_nodes_list:
+                logging.info('Found %d compute nodes needing evacuation: %s',
+                            len(compute_nodes_list), [svc.host for svc in compute_nodes_list])
 
-            # Convert back to generator for the processing function
-            compute_nodes = (svc for svc in compute_nodes_list)
-
-            # Process stale services for evacuation
-            _process_stale_services(conn, service, services, compute_nodes, to_resume)
+            # Process stale services for evacuation (convert back to generator for processing)
+            _process_stale_services(conn, service, services, (svc for svc in compute_nodes_list), to_resume)
 
             # Process services that can be re-enabled
             _process_reenabling(conn, service, to_reenable)
