@@ -1679,7 +1679,7 @@ def _redfish_reset(url, user, passwd, timeout, action):
                 response = requests.post(reset_url, json=payload, headers=headers,
                                        auth=(user, passwd), verify=ssl_config, timeout=timeout)
 
-            if response.status_code in [200, 204]:
+            if response.status_code in [200, 202, 204]:
                 if action == "ForceOff":
                     # Wait for server to actually power off
                     for _ in range(timeout):
