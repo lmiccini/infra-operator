@@ -49,15 +49,224 @@ It loads configuration from multiple YAML files:
 - **Secure config**: `secure.yaml` - Credentials (passwords, tokens)
 - **Fencing config**: `/secrets/fencing.yaml` - BareMetal Host fencing configuration
 
-Configuration values include:
-- `DELTA`: Time threshold for stale service detection (default: 30 seconds)
-- `POLL`: Polling interval (default: 45 seconds)
-- `THRESHOLD`: Maximum percentage of hosts that can be evacuated (default: 50%)
-- `WORKERS`: Number of worker threads for parallel operations (default: 4)
-- `CHECK_KDUMP`: Enable kdump detection (default: False)
-- `SMART_EVACUATION`: Use smart evacuation with status polling (default: False)
-- `RESERVED_HOSTS`: Enable reserved host management (default: False)
-- `TAGGED_IMAGES`, `TAGGED_FLAVORS`, `TAGGED_AGGREGATES`: Filter evacuations by tags
+### Configuration Options
+
+InstanceHA supports extensive configuration through the main configuration file. All configuration values are validated with type checking and range constraints. Below is a comprehensive list of all available configuration options:
+
+#### Core Service Configuration
+
+##### `DELTA` (Integer, Default: 30, Range: 10-300 seconds)
+Time threshold in seconds for detecting stale compute services. A service is considered stale (and eligible for evacuation) if its `updated_at` timestamp is older than `DELTA` seconds from the current time. Setting this too low may cause false positives during normal API latency, while setting it too high delays response to actual failures.
+
+##### `POLL` (Integer, Default: 45, Range: 15-600 seconds)
+Polling interval in seconds for querying the Nova API to check compute service status. The main loop sleeps for this duration between each polling cycle. Lower values provide faster detection but increase API load, while higher values reduce load but increase detection time.
+
+**Note**: If `CHECK_KDUMP` is enabled with `KDUMP_TIMEOUT=30` and `POLL=30`, this may result in unexpected failures. Consider increasing `POLL` to 45 seconds or greater when using kdump detection.
+
+##### `THRESHOLD` (Integer, Default: 50, Range: 0-100)
+Maximum percentage of compute nodes that can be evacuated simultaneously. If the percentage of failed hosts exceeds this threshold, evacuation is aborted to prevent overwhelming the cluster.
+
+**Important**: The threshold check uses a "greater than" comparison, so:
+- Setting to **100** allows evacuating all hosts (since no percentage can exceed 100%)
+- Setting to **0** blocks all evacuations (any percentage > 0 exceeds the threshold)
+- Threshold checking cannot be disabled - it's always enforced, but can be set to 100 to effectively allow all hosts
+
+##### `WORKERS` (Integer, Default: 4, Range: 1-50)
+Number of worker threads for parallel operations such as:
+- Concurrent evacuation status polling (when `SMART_EVACUATION` is enabled)
+- Parallel kdump checks
+- Concurrent host processing
+
+Increasing this value can speed up operations but also increases resource usage and API load.
+
+##### `DELAY` (Integer, Default: 0, Range: 0-300 seconds)
+Delay in seconds to wait before starting evacuation after determining which instances to evacuate from a failed host. This delay occurs after server enumeration and filtering but before evacuation requests are submitted. This can be useful to allow for transient network issues or brief service interruptions to self-resolve before initiating evacuation.
+
+##### `LOGLEVEL` (String, Default: "INFO")
+Logging verbosity level. Valid values: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Setting to `DEBUG` provides detailed diagnostic information including API calls and internal state, while `ERROR` only logs error conditions.
+
+#### Evacuation Behavior Configuration
+
+##### `SMART_EVACUATION` (Boolean, Default: False)
+Enables smart evacuation mode. When enabled, the service polls evacuation status for each server to ensure completion before proceeding. This provides better reliability and error detection but increases evacuation time. When disabled, uses a "fire-and-forget" approach where evacuation requests are submitted without waiting for completion.
+
+##### `RESERVED_HOSTS` (Boolean, Default: False)
+Enables reserved host management. When enabled, the service will automatically enable reserved hosts to replace failed hosts during evacuation. Reserved hosts are compute nodes that are disabled with the string "reserved" appearing anywhere in their `disabled_reason` field. The service matches reserved hosts to failed hosts based on aggregate membership (if `TAGGED_AGGREGATES` is enabled) or availability zone. If no matching reserved host is found, evacuation proceeds without replacement capacity - this is not considered a failure. Reserved hosts are typically pre-configured and ready to accept evacuated instances.
+
+##### `LEAVE_DISABLED` (Boolean, Default: False)
+Controls whether to leave hosts disabled after evacuation. When `False` (default), hosts are re-enabled after successful evacuation. When `True`, hosts remain disabled and must be manually re-enabled, useful for investigation or maintenance scenarios.
+
+##### `FORCE_ENABLE` (Boolean, Default: False)
+Forces host re-enabling even when migrations are still running. Normally, the service waits for all migrations to complete before re-enabling a host. Enabling this bypasses that check (use with caution).
+
+##### `DISABLED` (Boolean, Default: False)
+Global service disable flag. When set to `True`, the service will continue polling and monitoring but will not perform any evacuations. Useful for temporarily suspending evacuation operations during maintenance or testing.
+
+#### Tag-Based Filtering Configuration
+
+##### `EVACUABLE_TAG` (String, Default: "evacuable")
+Tag name used to identify evacuable resources (flavors, images, aggregates). Resources tagged with this tag (set to "true") are eligible for evacuation. The tag can match exact keys or be part of composite keys (e.g., "evacuable" matches both "evacuable" and "trait:evacuable").
+
+##### `TAGGED_IMAGES` (Boolean, Default: True)
+Enables image-based evacuation filtering. When enabled, only instances using images tagged with `EVACUABLE_TAG` are evacuated. When disabled, image tags are not considered (all instances may be evacuated, subject to flavor/aggregate filtering).
+
+##### `TAGGED_FLAVORS` (Boolean, Default: True)
+Enables flavor-based evacuation filtering. When enabled, only instances using flavors with `EVACUABLE_TAG` in their extra specs are evacuated. When disabled, flavor tags are not considered.
+
+##### `TAGGED_AGGREGATES` (Boolean, Default: True)
+Enables aggregate-based evacuation filtering. When enabled, only hosts that are members of aggregates tagged with `EVACUABLE_TAG` in their metadata are considered for evacuation. When disabled, aggregate membership is not checked.
+
+**Tag Filtering Logic**:
+- If all tagging options are disabled, all instances are evacuated (backward compatibility).
+- If any tagging option is enabled but no tagged resources exist, all instances are evacuated (fallback behavior).
+- When multiple tagging options are enabled, instances matching **any** enabled criteria are evacuated (OR logic).
+
+#### Kdump Detection Configuration
+
+##### `CHECK_KDUMP` (Boolean, Default: False)
+Enables kdump detection before evacuation. When enabled, the service listens for kdump UDP messages from hosts before evacuating. If a host is kdumping (has sent a kdump message within `KDUMP_TIMEOUT`), evacuation is delayed to allow crash dump completion.
+
+##### `KDUMP_TIMEOUT` (Integer, Default: 30, Range: 5-300 seconds)
+Timeout in seconds for waiting for kdump messages. If a host has sent a kdump message within this time window, evacuation is skipped. The service also waits up to this duration for delayed kdump starts before proceeding with evacuation.
+
+**Important**: Ensure `POLL` is at least 45 seconds when using `CHECK_KDUMP` with `KDUMP_TIMEOUT=30` to avoid timing conflicts.
+
+#### SSL/TLS Configuration
+
+##### `SSL_VERIFY` (Boolean, Default: True)
+Enables SSL certificate verification for HTTPS requests (Redfish API, etc.). Set to `False` to disable verification (not recommended for production). When disabled, a warning is logged.
+
+##### `SSL_CA_BUNDLE` (String, Optional)
+Path to a CA certificate bundle file for SSL verification. Used when custom CA certificates are required (e.g., self-signed certificates). If not provided or file doesn't exist, system default CA bundle is used.
+
+##### `SSL_CERT_PATH` (String, Optional)
+Path to SSL client certificate file for mutual TLS authentication. Must be provided together with `SSL_KEY_PATH`. Used for client certificate authentication with Redfish APIs.
+
+##### `SSL_KEY_PATH` (String, Optional)
+Path to SSL client private key file for mutual TLS authentication. Must be provided together with `SSL_CERT_PATH`. Used for client certificate authentication with Redfish APIs.
+
+#### Fencing Configuration
+
+The fencing configuration is loaded from `/secrets/fencing.yaml` (or the path specified by `FENCING_CONFIG_PATH`). The configuration file uses a `FencingConfig` key at the top level, with hostnames as keys mapping to their fencing agent configurations.
+
+##### `FENCING_TIMEOUT` (Integer, Default: 30, Range: 5-120 seconds)
+Timeout in seconds for fencing operations (power off/on via Redfish, IPMI, or BareMetal Host). Operations that exceed this timeout are considered failed. This timeout is used for:
+- Redfish power state queries and reset operations
+- BareMetal Host fencing via Kubernetes API
+- Overall fencing operation timeout
+
+##### Fencing Configuration File Format
+
+The fencing configuration file supports three fencing agents: **IPMI**, **Redfish**, and **BareMetal Host (BMH)**. Each host can be configured with one of these agents:
+
+```yaml
+FencingConfig:
+  # IPMI fencing example
+  compute-node-01.example.com:
+    agent: ipmi
+    ipaddr: "192.168.1.100"
+    ipport: "623"
+    login: "admin"
+    passwd: "ipmi-password"
+    timeout: 30  # Optional, overrides FENCING_TIMEOUT config
+
+  # Redfish fencing example
+  compute-node-02.example.com:
+    agent: redfish
+    ipaddr: "192.168.1.101"
+    login: "root"
+    passwd: "redfish-password"
+    ipport: "443"              # Optional, default: 443
+    uuid: "System.Embedded.1"   # Optional, default: System.Embedded.1
+    tls: "true"                # Optional, default: false (use https vs http)
+    timeout: 45                # Optional, overrides FENCING_TIMEOUT config
+
+  # BareMetal Host (BMH) fencing example
+  compute-node-03.example.com:
+    agent: bmh
+    token: "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Q..."  # Kubernetes service account token
+    host: "compute-node-03"    # BareMetalHost resource name
+    namespace: "metal3"        # Kubernetes namespace where BMH exists
+
+  # No-op fencing (for testing, NOT recommended for production)
+  compute-node-04.example.com:
+    agent: noop
+```
+
+**Fencing Agent Requirements**:
+
+- **IPMI**: Requires `ipaddr`, `ipport`, `login`, `passwd`. Uses `ipmitool` for power control.
+- **Redfish**: Requires `ipaddr`, `login`, `passwd`. Optional: `ipport` (default: 443), `uuid` (default: System.Embedded.1), `tls` (default: false for http, set to "true" for https).
+- **BMH**: Requires `token` (Kubernetes service account token), `host` (BareMetalHost resource name), `namespace` (Kubernetes namespace). Uses Kubernetes API to annotate the BareMetalHost resource for power control.
+
+**Important Notes**:
+- Hostnames in the fencing configuration are matched by short hostname (hostname without domain). For example, `compute-node-01.example.com` matches both `compute-node-01` and `compute-node-01.example.com`.
+- All passwords and tokens should be kept secure and never exposed in logs (the service uses safe logging to prevent credential leaks).
+- The `noop` agent is for testing only and will log warnings - it does not actually fence hosts, which can lead to VM corruption in production environments.
+
+#### Monitoring and Health Configuration
+
+##### `HASH_INTERVAL` (Integer, Default: 60, Range: 30-300 seconds)
+Interval in seconds for updating the health monitoring hash. The service generates a new SHA256 hash periodically to indicate it's alive and functioning. External monitoring can check this hash to verify service health.
+
+##### `METRICS_LOG_INTERVAL` (Integer, Default: 3600, Range: 300-86400 seconds)
+Interval in seconds for logging metrics summaries. The service logs operation counters, durations, and performance metrics at this interval. Set to a lower value for more frequent metrics or higher value to reduce log volume.
+
+#### Environment Variables
+
+In addition to the configuration file, the following environment variables can be used:
+
+##### `INSTANCEHA_CONFIG_PATH`
+Overrides the default configuration file path (`/var/lib/instanceha/config.yaml`).
+
+##### `CLOUDS_CONFIG_PATH`
+Overrides the default clouds configuration file path (`/home/cloud-admin/.config/openstack/clouds.yaml`).
+
+##### `SECURE_CONFIG_PATH`
+Overrides the default secure configuration file path (`/home/cloud-admin/.config/openstack/secure.yaml`).
+
+##### `FENCING_CONFIG_PATH`
+Overrides the default fencing configuration file path (`/secrets/fencing.yaml`).
+
+##### `OS_CLOUD`
+OpenStack cloud name to use from clouds.yaml (default: "overcloud").
+
+##### `UDP_PORT`
+UDP port for kdump listener (default: 7410).
+
+#### Configuration File Format
+
+The configuration file should be in YAML format:
+
+```yaml
+config:
+  EVACUABLE_TAG: "evacuable"
+  DELTA: "30"
+  POLL: "45"
+  THRESHOLD: "50"
+  WORKERS: "4"
+  DELAY: "0"
+  LOGLEVEL: "INFO"
+  SMART_EVACUATION: "false"
+  RESERVED_HOSTS: "false"
+  TAGGED_IMAGES: "true"
+  TAGGED_FLAVORS: "true"
+  TAGGED_AGGREGATES: "true"
+  LEAVE_DISABLED: "false"
+  FORCE_ENABLE: "false"
+  CHECK_KDUMP: "false"
+  KDUMP_TIMEOUT: "30"
+  DISABLED: "false"
+  SSL_VERIFY: "true"
+  FENCING_TIMEOUT: "30"
+  HASH_INTERVAL: "60"
+  METRICS_LOG_INTERVAL: "3600"
+  SSL_CA_BUNDLE: "/path/to/ca-bundle.pem"  # Optional
+  SSL_CERT_PATH: "/path/to/client.crt"      # Optional
+  SSL_KEY_PATH: "/path/to/client.key"      # Optional
+```
+
+All configuration values are validated at startup. Invalid values (out of range, wrong type, invalid enum values) will cause the service to fail with a descriptive error message.
 
 ### 2. InstanceHAService
 
