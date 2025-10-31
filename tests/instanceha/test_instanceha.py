@@ -965,8 +965,65 @@ class TestEvacuationFunctions(unittest.TestCase):
 
         # The result should be False because the evacuation failed
         self.assertFalse(result, "Smart evacuation should return False when any evacuation fails")
-        # Verify update_reason was called
-        mock_update_reason.assert_called_once()
+        # Verify update_reason was called with correct arguments
+        mock_update_reason.assert_called_once_with(
+            self.mock_connection, 'test-host', 'service-123'
+        )
+
+    @patch('instanceha._update_service_disable_reason')
+    @patch('instanceha._server_evacuate_future')
+    @patch('time.sleep')
+    def test_smart_evacuation_exception(self, mock_sleep, mock_evacuate_future, mock_update_reason):
+        """Test smart evacuation handles exceptions and marks host appropriately."""
+        # Mock failed service
+        mock_failed_service = Mock()
+        mock_failed_service.host = 'test-host'
+        mock_failed_service.id = 'service-123'
+
+        # Mock service configuration
+        mock_service = Mock()
+        mock_service.config.get_evacuable_images.return_value = []
+        mock_service.config.get_evacuable_flavors.return_value = []
+        mock_service.config.is_smart_evacuation_enabled.return_value = True
+        mock_service.config.get_workers.return_value = 4
+        mock_service.config.get_delay.return_value = 0
+        mock_service.is_server_evacuable.return_value = True
+
+        # Mock servers
+        mock_server1 = Mock()
+        mock_server1.id = 'server-1'
+        mock_server1.status = 'ACTIVE'
+
+        self.mock_connection.servers.list.return_value = [mock_server1]
+
+        # Create a future that will raise an exception when result() is called
+        mock_future = MagicMock()
+        mock_future.result.side_effect = Exception('Evacuation exception')
+
+        # Mock ThreadPoolExecutor
+        with patch('instanceha.concurrent.futures.ThreadPoolExecutor') as mock_executor_class:
+            mock_executor = MagicMock()
+            mock_executor.submit.return_value = mock_future
+
+            context_manager = MagicMock()
+            context_manager.__enter__ = Mock(return_value=mock_executor)
+            context_manager.__exit__ = Mock(return_value=None)
+            mock_executor_class.return_value = context_manager
+
+            def mock_as_completed_side_effect(future_to_server):
+                return iter(future_to_server.keys())
+
+            with patch('instanceha.concurrent.futures.as_completed', side_effect=mock_as_completed_side_effect):
+                result = instanceha._host_evacuate(
+                    self.mock_connection, mock_failed_service, mock_service
+                )
+
+        # The result should be False because the evacuation raised an exception
+        self.assertFalse(result, "Smart evacuation should return False when exception occurs")
+        # Verify update_reason was called with correct arguments
+        mock_update_reason.assert_called_once_with(
+            self.mock_connection, 'test-host', 'service-123'
+        )
 
 
 class TestKdumpFunctionality(unittest.TestCase):

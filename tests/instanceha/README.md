@@ -7,16 +7,19 @@ This directory contains a comprehensive test suite for the InstanceHA service th
 The test suite is organized into three main categories:
 
 ### 1. Unit Tests (`test_instanceha.py`)
-- **48 tests** validating individual components
+- **122 tests** validating individual components
 - Configuration management and validation
 - Metrics collection and timing
 - Service initialization and caching
 - Evacuation logic and tag checking
+- Smart evacuation with success, failure, and exception path testing
 - Kdump detection and UDP message processing
+- Redfish and IPMI fencing operations
 - Thread safety and memory management
+- Security and secret sanitization
 
 ### 2. Functional Tests (`functional_test.py`)
-- **56 tests** validating end-to-end scenarios
+- **60 tests** validating end-to-end scenarios
 - Basic evacuation workflows
 - Large-scale evacuation scenarios (100+ hosts)
 - Host state classification and filtering
@@ -56,7 +59,7 @@ python3 integration_test.py
 
 ## Test Coverage
 
-The comprehensive test suite provides coverage for:
+The test suite provides coverage for:
 
 ### Core Functionality
 - Service initialization and configuration loading
@@ -71,7 +74,10 @@ The comprehensive test suite provides coverage for:
 - Image-based tagging and filtering
 - Aggregate-based filtering
 - Reserved host management
-- Smart evacuation with threading
+- Smart evacuation with threading and comprehensive error handling:
+  - Successful evacuation scenarios
+  - Partial failure scenarios with host marking
+  - Exception handling during evacuation with proper host marking
 - Kdump detection and filtering
 - Threshold protection against mass failures
 
@@ -85,7 +91,8 @@ The comprehensive test suite provides coverage for:
 ### Error Handling
 - Nova API failures and timeouts
 - Configuration errors and validation
-- Partial evacuation failures and recovery
+- Partial evacuation failures and recovery with proper host marking
+- Exception handling in smart evacuation (ensures failed hosts are marked appropriately)
 - Network errors and permission issues
 - Malformed data handling
 
@@ -94,57 +101,3 @@ The comprehensive test suite provides coverage for:
 - Password security in command execution
 - Thread safety for concurrent operations
 - Resource cleanup and leak prevention
-
-## Test Results
-
-Recent test run results:
-
-```
-========================================
-            Test Summary
-========================================
-[PASS] Unit Tests: PASSED (48/48 tests)
-[PASS] Functional Tests: PASSED (56/56 tests)
-[PASS] Integration Tests: PASSED (19/19 tests)
-
-Total: 3/3 test suites passed
-[PASS] All tests completed successfully!
-```
-
-## Test Environment
-
-The tests use comprehensive mocking to simulate:
-- OpenStack Nova API responses
-- Service states and server configurations
-- Network conditions and timeouts
-- Configuration file loading
-- Threading and concurrency scenarios
-
-This approach ensures tests are:
-- Fast and reliable (no external dependencies)
-- Deterministic and repeatable
-- Isolated from system configuration
-- Safe to run in CI/CD environments
-
-## Code Quality Validation
-
-The test suite validates the recent code quality improvements:
-
-### Security Fixes
-- Password protection in IPMI commands (environment variables)
-- Input validation for IP addresses, ports, and usernames
-- Protection against command injection attacks
-
-### Architecture Improvements
-- Function complexity reduction (main() refactored into 6 focused functions)
-- Improved testability through dependency injection
-- Better separation of concerns
-- Enhanced error handling patterns
-
-### Performance Optimizations
-- Caching mechanisms for repeated API calls
-- Efficient batch processing of services
-- Memory management for large deployments
-- Concurrent processing capabilities
-
-The comprehensive test suite ensures that all improvements maintain backward compatibility while enhancing the service's reliability, security, and maintainability.

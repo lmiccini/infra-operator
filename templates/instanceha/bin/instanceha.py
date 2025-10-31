@@ -1225,7 +1225,7 @@ def _host_evacuate(connection, failed_service, service):
                     logging.error('Evacuation generated an exception: %s', exc)
                     logging.debug('Exception traceback:', exc_info=True)
                     all_succeeded = False
-                    _update_service_disable_reason(connection, host)
+                    _update_service_disable_reason(connection, host, failed_service.id)
                     return False
 
         return all_succeeded
@@ -1586,7 +1586,7 @@ def _host_enable(connection, service, reenable=False):
             logging.info('Successfully unset force-down on host %s', service.host)
             return True
         except Exception as e:
-            logging.error('Could not unset force-down for %s. Please check the host status and perform manual cleanup if necessary: %s', service.host, e)
+            logging.warning('Could not unset force-down for %s. Please check the host status and perform manual cleanup if necessary: %s. Will try again the next poll cycle.', service.host, e)
             return False
 
     # Retry logic for enabling service
