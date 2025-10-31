@@ -527,13 +527,18 @@ class InstanceHAService(CloudConnectionProvider):
 
         # Check if server uses evacuable image
         image_matches = False
-        if images_enabled and evac_images:
-            # Use pre-cached list if available
-            server_image_id = self._get_server_image_id(server)
-            if server_image_id and server_image_id in evac_images:
-                image_matches = True
+        if images_enabled:
+            if evac_images:
+                # Use pre-cached list if available
+                server_image_id = self._get_server_image_id(server)
+                if server_image_id and server_image_id in evac_images:
+                    image_matches = True
+                else:
+                    # Fall back to per-server checking if image not in cache
+                    if self.is_server_image_evacuable(server):
+                        image_matches = True
             else:
-                # Fall back to per-server checking if cache is empty
+                # Cache is empty - check image directly
                 if self.is_server_image_evacuable(server):
                     image_matches = True
 
@@ -2325,6 +2330,10 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
 
     logging.warning('The following computes are down: %s', [svc.host for svc in compute_nodes])
 
+    # Force refresh cache when compute nodes go down to ensure fresh data
+    if compute_nodes:
+        service.refresh_evacuable_cache(conn, force=True)
+
     # Filter compute nodes with servers
     host_servers_cache = None
     if compute_nodes:
@@ -2343,8 +2352,7 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
     reserved_hosts = ([svc for svc in services if 'disabled' in svc.status and 'reserved' in svc.disabled_reason]
                      if service.config.is_reserved_hosts_enabled() and compute_nodes else [])
 
-    # Refresh cache and get evacuable resources
-    service.refresh_evacuable_cache(conn)
+    # Get evacuable resources (cache already refreshed above if compute nodes are down)
     images_enabled = service.config.is_tagged_images_enabled()
     flavors_enabled = service.config.is_tagged_flavors_enabled()
     images = service.get_evacuable_images(conn) if images_enabled else []
