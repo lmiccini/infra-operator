@@ -2406,6 +2406,103 @@ class TestFencingRaceCondition(unittest.TestCase):
         max_processing_time = max(self.service.config.get_config_value('FENCING_TIMEOUT'), 300)
         self.assertGreaterEqual(max_processing_time, fencing_timeout)
 
+    def test_cleanup_filtered_hosts_no_servers(self):
+        """Test that hosts filtered out due to no servers are cleaned up."""
+        # Create mock services
+        mock_svc1 = type('MockService', (), {'host': 'host-1.example.com'})()
+        mock_svc2 = type('MockService', (), {'host': 'host-2.example.com'})()
+
+        # Mock connection and services
+        mock_conn = Mock()
+        mock_services = [Mock() for _ in range(10)]  # Total services for threshold check
+
+        # Simulate filtering: hosts get filtered out (no servers)
+        # The cleanup should happen in _process_stale_services after filtering
+        with unittest.mock.patch.object(self.service, 'get_hosts_with_servers_cached', return_value={}), \
+             unittest.mock.patch.object(self.service, 'get_evacuable_images', return_value=[]), \
+             unittest.mock.patch.object(self.service, 'get_evacuable_flavors', return_value=[]), \
+             unittest.mock.patch.object(self.service, 'refresh_evacuable_cache'):
+            instanceha._process_stale_services(mock_conn, self.service, mock_services, [mock_svc1, mock_svc2], [])
+
+        # Verify filtered hosts are cleaned up (were marked but filtered out)
+        with self.service.processing_lock:
+            self.assertNotIn('host-1', self.service.hosts_processing)
+            self.assertNotIn('host-2', self.service.hosts_processing)
+
+    def test_cleanup_filtered_hosts_threshold_exceeded(self):
+        """Test that hosts filtered out due to threshold are cleaned up."""
+        # Create mock services
+        mock_svc = type('MockService', (), {'host': 'host-1.example.com'})()
+
+        # Mock connection with services that exceed threshold
+        mock_conn = Mock()
+        mock_services = [Mock() for _ in range(2)]  # Only 2 services total
+
+        # Set threshold to 40% - with 1 compute down out of 2 total, that's 50%, exceeds threshold
+        with unittest.mock.patch.object(self.service.config, 'get_threshold', return_value=40), \
+             unittest.mock.patch.object(self.service, 'get_hosts_with_servers_cached', return_value={'host-1.example.com': [Mock()]}), \
+             unittest.mock.patch.object(self.service, 'filter_hosts_with_servers', return_value=[mock_svc]), \
+             unittest.mock.patch.object(self.service, 'get_evacuable_images', return_value=[]), \
+             unittest.mock.patch.object(self.service, 'get_evacuable_flavors', return_value=[]), \
+             unittest.mock.patch.object(self.service, 'refresh_evacuable_cache'):
+            instanceha._process_stale_services(mock_conn, self.service, mock_services, [mock_svc], [])
+
+        # Verify host is cleaned up (threshold exceeded, no evacuation)
+        with self.service.processing_lock:
+            self.assertNotIn('host-1', self.service.hosts_processing)
+
+    def test_cleanup_filtered_hosts_empty_list(self):
+        """Test cleanup when hosts are marked but list becomes empty after filtering."""
+        # Create mock service
+        mock_svc = type('MockService', (), {'host': 'host-1.example.com'})()
+
+        # Mock services to simulate filtering that results in empty list
+        mock_conn = Mock()
+        mock_services = [Mock() for _ in range(10)]
+
+        # Simulate: host is marked, but then filtered out (e.g., no servers)
+        # The cleanup should happen when compute_nodes becomes empty
+        with unittest.mock.patch.object(self.service, 'get_hosts_with_servers_cached', return_value={}), \
+             unittest.mock.patch.object(self.service, 'get_evacuable_images', return_value=[]), \
+             unittest.mock.patch.object(self.service, 'get_evacuable_flavors', return_value=[]), \
+             unittest.mock.patch.object(self.service, 'refresh_evacuable_cache'):
+            # Pass host that will be filtered out
+            instanceha._process_stale_services(mock_conn, self.service, mock_services, [mock_svc], [])
+
+        # Verify host is cleaned up (was marked but filtered out)
+        with self.service.processing_lock:
+            self.assertNotIn('host-1', self.service.hosts_processing)
+
+    def test_cleanup_filtered_hosts_timestamp_matching(self):
+        """Test that cleanup only removes hosts with matching timestamp."""
+        # Create mock service
+        mock_svc = type('MockService', (), {'host': 'host-1.example.com'})()
+
+        # Mark host as processing with old timestamp
+        import time
+        old_time = time.time() - 100
+        current_time = time.time()
+        with self.service.processing_lock:
+            self.service.hosts_processing['host-1'] = old_time  # Old timestamp
+
+        # Simulate cleanup - should NOT remove host with old timestamp
+        marked_hostnames = {'host-1'}
+        final_hostnames = set()
+        instanceha._cleanup_filtered_hosts(self.service, marked_hostnames, final_hostnames, current_time)
+
+        # Verify host with old timestamp is NOT cleaned up (different poll cycle)
+        with self.service.processing_lock:
+            self.assertIn('host-1', self.service.hosts_processing)
+
+        # Now test with matching timestamp - should be cleaned up
+        with self.service.processing_lock:
+            self.service.hosts_processing['host-1'] = current_time
+        instanceha._cleanup_filtered_hosts(self.service, marked_hostnames, final_hostnames, current_time)
+
+        # Verify host with matching timestamp IS cleaned up
+        with self.service.processing_lock:
+            self.assertNotIn('host-1', self.service.hosts_processing)
+
 
 if __name__ == '__main__':
     # Create test suite

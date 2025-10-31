@@ -1708,7 +1708,7 @@ def _redfish_reset(url, user, passwd, timeout, action):
                 return False
             elif response.status_code in [500, 502, 503, 504] and attempt < MAX_RETRIES - 1:
                 # Transient server errors - retry
-                logging.warning("Redfish reset failed: server error %d (attempt %d/%d), retrying...", 
+                logging.warning("Redfish reset failed: server error %d (attempt %d/%d), retrying...",
                               response.status_code, attempt + 1, MAX_RETRIES)
                 time.sleep(retry_delay * (attempt + 1))
                 continue
@@ -2320,6 +2320,15 @@ def _get_reenable_candidates(services, target_date):
         if 'enabled' in svc.status and svc.forced_down:
             yield svc
 
+def _cleanup_filtered_hosts(service, marked_hostnames, final_hostnames, current_time):
+    """Clean up hosts from processing tracking that were filtered out."""
+    with service.processing_lock:
+        for hostname in marked_hostnames:
+            if hostname not in final_hostnames and hostname in service.hosts_processing:
+                if service.hosts_processing[hostname] == current_time:
+                    del service.hosts_processing[hostname]
+                    logging.debug('Cleaned up filtered host %s from processing tracking', hostname)
+
 def _process_stale_services(conn, service, services, compute_nodes, to_resume):
     """Process stale compute services for evacuation."""
     # Convert generators to lists only when needed for processing
@@ -2332,6 +2341,7 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
     # Filter out hosts already being processed to prevent race conditions
     current_time = time.time()
     max_processing_time = max(service.config.get_config_value('FENCING_TIMEOUT'), 300)  # Use max of fencing timeout or 5 minutes
+    marked_hostnames = set()  # Track hosts marked as processing in this cycle
 
     with service.processing_lock:
         # Clean up expired processing entries
@@ -2355,8 +2365,10 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
         for svc in compute_nodes + to_resume:
             hostname = _extract_hostname(svc.host)
             service.hosts_processing[hostname] = current_time
+            marked_hostnames.add(hostname)
 
     if not (compute_nodes or to_resume):
+        _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
         return
 
     logging.warning('The following computes are down: %s', [svc.host for svc in compute_nodes])
@@ -2405,6 +2417,8 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
         if threshold_percent > service.config.get_threshold():
             logging.error('Number of impacted computes (%.1f%%) exceeds threshold (%d%%). Not evacuating.',
                          threshold_percent, service.config.get_threshold())
+            # Clean up all marked hosts since threshold prevents evacuation (none will be processed)
+            _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
             return
 
     # Process evacuations
@@ -2432,8 +2446,14 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
             results = list(executor.map(lambda svc: process_service(svc, reserved_hosts, True, service), to_resume))
             if not all(results):
                 logging.warning('Some services failed to evacuate. Retrying in %s seconds.', service.config.get_poll_interval())
+
+        # Clean up any hosts that were marked but filtered out before processing
+        # (process_service cleans up hosts it processes, so we only need to clean up filtered ones)
+        final_hostnames = {_extract_hostname(svc.host) for svc in to_evacuate + to_resume}
+        _cleanup_filtered_hosts(service, marked_hostnames, final_hostnames, current_time)
     else:
         logging.info('InstanceHA DISABLED is true, not evacuating')
+        _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
 
 def _filter_by_aggregates(conn, service, compute_nodes, services):
     """Filter compute nodes by aggregate evacuability."""
