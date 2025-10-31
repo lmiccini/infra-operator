@@ -13,6 +13,7 @@ import struct
 import subprocess
 import concurrent.futures
 import logging
+import requests
 from unittest.mock import Mock, patch, MagicMock, call
 from datetime import datetime, timedelta
 from io import StringIO
@@ -843,7 +844,7 @@ class TestEvacuationFunctions(unittest.TestCase):
         from datetime import datetime, timedelta as real_timedelta
         mock_datetime.now = Mock(return_value=datetime(2024, 1, 1, 0, 0, 0))
         mock_timedelta.return_value = real_timedelta(minutes=5)
-        
+
         mock_migration = Mock()
         mock_migration.status = 'completed'
         mock_connection = Mock()
@@ -882,7 +883,7 @@ class TestEvacuationFunctions(unittest.TestCase):
         mock_server2 = Mock()
         mock_server2.id = 'server-2'
         mock_server2.status = 'ACTIVE'
-        
+
         self.mock_connection.servers.list.return_value = [mock_server1, mock_server2]
 
         # Mock ThreadPoolExecutor
@@ -896,12 +897,12 @@ class TestEvacuationFunctions(unittest.TestCase):
         mock_future1.result.return_value = True
         mock_future2 = Mock()
         mock_future2.result.return_value = True
-        
+
         mock_executor.submit.side_effect = [mock_future1, mock_future2]
 
         with patch('instanceha.concurrent.futures.as_completed') as mock_as_completed:
             mock_as_completed.return_value = [mock_future1, mock_future2]
-            
+
             result = instanceha._host_evacuate(
                 self.mock_connection, mock_failed_service, mock_service
             )
@@ -932,31 +933,31 @@ class TestEvacuationFunctions(unittest.TestCase):
         mock_server1 = Mock()
         mock_server1.id = 'server-1'
         mock_server1.status = 'ACTIVE'
-        
+
         self.mock_connection.servers.list.return_value = [mock_server1]
 
         # Create a future that will return False when result() is called
         mock_future = MagicMock()
         mock_future.result.return_value = False
-        
+
         # Mock ThreadPoolExecutor
         with patch('instanceha.concurrent.futures.ThreadPoolExecutor') as mock_executor_class:
             mock_executor = MagicMock()
             # Make submit return our mock future
             mock_executor.submit.return_value = mock_future
-            
+
             # Set up context manager properly
             context_manager = MagicMock()
             context_manager.__enter__ = Mock(return_value=mock_executor)
             context_manager.__exit__ = Mock(return_value=None)
             mock_executor_class.return_value = context_manager
-            
+
             # Mock as_completed - it needs to receive the future_to_server dict
             # and return an iterable of futures from that dict
             def mock_as_completed_side_effect(future_to_server):
                 # Return the futures from the dict
                 return iter(future_to_server.keys())
-            
+
             with patch('instanceha.concurrent.futures.as_completed', side_effect=mock_as_completed_side_effect):
                 result = instanceha._host_evacuate(
                     self.mock_connection, mock_failed_service, mock_service
@@ -1417,7 +1418,7 @@ class TestRedfishFencing(unittest.TestCase):
         mock_get_response = Mock()
         mock_get_response.status_code = 200
         mock_get_response.json.return_value = {'PowerState': 'On'}
-        
+
         # Configure mock to return immediately
         mock_get.return_value = mock_get_response
 
@@ -1462,7 +1463,7 @@ class TestRedfishFencing(unittest.TestCase):
         # Reset mock call counts
         mock_get.reset_mock()
         mock_sleep.reset_mock()
-        
+
         # Mock SSL config
         mock_ssl_config.return_value = False
 
@@ -1483,7 +1484,7 @@ class TestRedfishFencing(unittest.TestCase):
 
         # Should return True after power off confirmation
         self.assertTrue(result)
-        
+
         # Verify that the function attempted to check power state multiple times
         # (exact count may vary due to other test interference)
         self.assertGreaterEqual(mock_get.call_count, 2)  # At least 2 calls expected
@@ -1514,7 +1515,7 @@ class TestRedfishFencing(unittest.TestCase):
 
         # Should return False due to timeout
         self.assertFalse(result)
-        
+
         # Verify that the function attempted to check power state multiple times
         # (exact count may vary due to other test interference)
         self.assertGreaterEqual(mock_get.call_count, 2)  # At least 2 calls expected
@@ -1538,6 +1539,132 @@ class TestRedfishFencing(unittest.TestCase):
         # Should return True immediately
         self.assertTrue(result)
         mock_post.assert_called_once()
+
+    @patch('instanceha.requests.post')
+    @patch('instanceha.config_manager.get_requests_ssl_config')
+    @patch('instanceha.time.sleep')
+    def test_redfish_reset_retry_on_server_error(self, mock_sleep, mock_ssl_config, mock_post):
+        """Test Redfish reset retries on 5xx server errors."""
+        mock_ssl_config.return_value = False
+
+        # Mock POST responses: first two 503 errors, then 200 success
+        mock_post_responses = [
+            Mock(status_code=503),
+            Mock(status_code=503),
+            Mock(status_code=200)
+        ]
+        mock_post.side_effect = mock_post_responses
+
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On')
+
+        # Should succeed after retries
+        self.assertTrue(result)
+        self.assertEqual(mock_post.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)  # Sleep between retries
+
+    @patch('instanceha.requests.post')
+    @patch('instanceha.config_manager.get_requests_ssl_config')
+    @patch('instanceha.time.sleep')
+    def test_redfish_reset_retry_exhausted(self, mock_sleep, mock_ssl_config, mock_post):
+        """Test Redfish reset fails after max retries on server errors."""
+        mock_ssl_config.return_value = False
+
+        # Mock POST always returning 503
+        mock_post_response = Mock(status_code=503)
+        mock_post.return_value = mock_post_response
+
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On')
+
+        # Should fail after 3 attempts
+        self.assertFalse(result)
+        self.assertEqual(mock_post.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)
+
+    @patch('instanceha.requests.post')
+    @patch('instanceha.config_manager.get_requests_ssl_config')
+    @patch('instanceha.time.sleep')
+    def test_redfish_reset_retry_on_network_error(self, mock_sleep, mock_ssl_config, mock_post):
+        """Test Redfish reset retries on network errors."""
+        mock_ssl_config.return_value = False
+
+        # Mock network errors then success
+        import requests.exceptions
+        mock_post.side_effect = [
+            requests.exceptions.ConnectionError("Connection failed"),
+            requests.exceptions.Timeout("Request timeout"),
+            Mock(status_code=200)
+        ]
+
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On')
+
+        # Should succeed after retries
+        self.assertTrue(result)
+        self.assertEqual(mock_post.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)
+
+    @patch('instanceha.requests.post')
+    @patch('instanceha.config_manager.get_requests_ssl_config')
+    def test_redfish_reset_no_retry_on_auth_error(self, mock_ssl_config, mock_post):
+        """Test Redfish reset doesn't retry on 401/403 auth errors."""
+        mock_ssl_config.return_value = False
+
+        # Mock POST response returning 401
+        mock_post_response = Mock(status_code=401)
+        mock_post.return_value = mock_post_response
+
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On')
+
+        # Should fail immediately without retry
+        self.assertFalse(result)
+        mock_post.assert_called_once()  # Only called once, no retry
+
+    @patch('instanceha.requests.post')
+    @patch('instanceha.config_manager.get_requests_ssl_config')
+    @patch('instanceha.logging.error')
+    def test_redfish_reset_url_sanitization(self, mock_log, mock_ssl_config, mock_post):
+        """Test that URLs with embedded credentials are sanitized in logs."""
+        mock_ssl_config.return_value = False
+
+        # URL with embedded credentials
+        url_with_creds = 'http://admin:secret123@test-server/redfish/v1/Systems/1'
+        mock_post_response = Mock(status_code=401)
+        mock_post.return_value = mock_post_response
+
+        instanceha._redfish_reset(url_with_creds, 'user', 'pass', 1, 'On')
+
+        # Verify URL was sanitized in logs (extract all log message arguments)
+        log_messages = []
+        for call_args in mock_log.call_args_list:
+            if call_args[0]:  # Positional arguments
+                log_messages.append(' '.join(str(arg) for arg in call_args[0]))
+            if call_args[1]:  # Keyword arguments
+                log_messages.append(' '.join(str(v) for v in call_args[1].values()))
+
+        log_output = ' '.join(log_messages)
+
+        # Should not contain the password
+        self.assertNotIn('secret123', log_output)
+        self.assertNotIn('admin', log_output)
+        # Should contain sanitized version
+        self.assertIn('***@', log_output)
+
+    def test_sanitize_url_function(self):
+        """Test _sanitize_url function directly."""
+        # Test URL with credentials
+        url_with_creds = 'http://admin:secret123@test-server/path'
+        sanitized = instanceha._sanitize_url(url_with_creds)
+        self.assertEqual(sanitized, 'http://***@test-server/path')
+        self.assertNotIn('secret123', sanitized)
+        self.assertNotIn('admin', sanitized)
+
+        # Test HTTPS URL with credentials
+        https_url = 'https://user:pass@example.com/api'
+        sanitized = instanceha._sanitize_url(https_url)
+        self.assertEqual(sanitized, 'https://***@example.com/api')
+
+        # Test URL without credentials (should remain unchanged)
+        normal_url = 'http://test-server/path'
+        self.assertEqual(instanceha._sanitize_url(normal_url), normal_url)
 
 
 class TestIPMIFencing(unittest.TestCase):
@@ -1675,6 +1802,534 @@ class TestIPMIFencing(unittest.TestCase):
         self.assertTrue(result)
         mock_run.assert_called_once()
 
+    @patch('instanceha.subprocess.run')
+    @patch('instanceha.time.sleep')
+    def test_ipmi_retry_on_timeout(self, mock_sleep, mock_run):
+        """Test IPMI retries on TimeoutExpired."""
+        # Mock timeout then success
+        mock_run.side_effect = [
+            subprocess.TimeoutExpired('ipmitool', 1),
+            subprocess.TimeoutExpired('ipmitool', 1),
+            Mock()  # Success on third attempt
+        ]
+
+        mock_service = Mock()
+        mock_service.config.get_config_value.return_value = 30
+
+        result = instanceha._execute_fence_operation('test-host', 'on', {
+            'agent': 'ipmi',
+            'ipaddr': '192.168.1.1',
+            'ipport': '623',
+            'login': 'user',
+            'passwd': 'pass',
+            'timeout': 1
+        }, mock_service)
+
+        # Should succeed after retries
+        self.assertTrue(result)
+        self.assertEqual(mock_run.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)  # Sleep between retries
+
+    @patch('instanceha.subprocess.run')
+    @patch('instanceha.time.sleep')
+    def test_ipmi_retry_exhausted_timeout(self, mock_sleep, mock_run):
+        """Test IPMI fails after max retries on TimeoutExpired."""
+        # Mock always timing out
+        mock_run.side_effect = subprocess.TimeoutExpired('ipmitool', 1)
+
+        mock_service = Mock()
+        mock_service.config.get_config_value.return_value = 30
+
+        result = instanceha._execute_fence_operation('test-host', 'on', {
+            'agent': 'ipmi',
+            'ipaddr': '192.168.1.1',
+            'ipport': '623',
+            'login': 'user',
+            'passwd': 'pass',
+            'timeout': 1
+        }, mock_service)
+
+        # Should fail after 3 attempts
+        self.assertFalse(result)
+        self.assertEqual(mock_run.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)
+
+    @patch('instanceha.subprocess.run')
+    @patch('instanceha.time.sleep')
+    def test_ipmi_retry_on_called_process_error(self, mock_sleep, mock_run):
+        """Test IPMI retries on CalledProcessError."""
+        # Mock error then success
+        mock_run.side_effect = [
+            subprocess.CalledProcessError(1, 'ipmitool'),
+            subprocess.CalledProcessError(1, 'ipmitool'),
+            Mock()  # Success on third attempt
+        ]
+
+        mock_service = Mock()
+        mock_service.config.get_config_value.return_value = 30
+
+        result = instanceha._execute_fence_operation('test-host', 'on', {
+            'agent': 'ipmi',
+            'ipaddr': '192.168.1.1',
+            'ipport': '623',
+            'login': 'user',
+            'passwd': 'pass',
+            'timeout': 1
+        }, mock_service)
+
+        # Should succeed after retries
+        self.assertTrue(result)
+        self.assertEqual(mock_run.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)
+
+    @patch('instanceha.subprocess.run')
+    @patch('instanceha.time.sleep')
+    def test_ipmi_retry_exhausted_process_error(self, mock_sleep, mock_run):
+        """Test IPMI fails after max retries on CalledProcessError."""
+        # Mock always failing
+        mock_run.side_effect = subprocess.CalledProcessError(1, 'ipmitool')
+
+        mock_service = Mock()
+        mock_service.config.get_config_value.return_value = 30
+
+        result = instanceha._execute_fence_operation('test-host', 'on', {
+            'agent': 'ipmi',
+            'ipaddr': '192.168.1.1',
+            'ipport': '623',
+            'login': 'user',
+            'passwd': 'pass',
+            'timeout': 1
+        }, mock_service)
+
+        # Should fail after 3 attempts
+        self.assertFalse(result)
+        self.assertEqual(mock_run.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)
+
+    @patch('instanceha._safe_log_exception')
+    @patch('instanceha.subprocess.run')
+    def test_ipmi_safe_logging_on_final_failure(self, mock_run, mock_safe_log):
+        """Test that IPMI uses safe logging on final failure."""
+        # Mock TimeoutExpired that will fail after retries
+        mock_run.side_effect = subprocess.TimeoutExpired('ipmitool', 1)
+
+        mock_service = Mock()
+        mock_service.config.get_config_value.return_value = 30
+
+        result = instanceha._execute_fence_operation('test-host', 'on', {
+            'agent': 'ipmi',
+            'ipaddr': '192.168.1.1',
+            'ipport': '623',
+            'login': 'user',
+            'passwd': 'pass',
+            'timeout': 1
+        }, mock_service)
+
+        # Should fail and use safe logging
+        self.assertFalse(result)
+        mock_safe_log.assert_called_once()
+        # Verify the message contains the expected text
+        call_args = mock_safe_log.call_args
+        self.assertIn('IPMI', call_args[0][0])
+        self.assertIn('test-host', call_args[0][0])
+
+
+class TestSecretExposure(unittest.TestCase):
+    """Test that credentials are never exposed in logs or debug outputs."""
+
+    def setUp(self):
+        """Set up test fixtures."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.config_path = os.path.join(self.temp_dir, 'config.yaml')
+        self.clouds_path = os.path.join(self.temp_dir, 'clouds.yaml')
+        self.secure_path = os.path.join(self.temp_dir, 'secure.yaml')
+        self.fencing_path = os.path.join(self.temp_dir, 'fencing.yaml')
+
+        # Create sample configuration files with test secrets
+        self._create_test_configs()
+
+        # Set up log capture
+        self.log_capture = StringIO()
+        self.log_handler = logging.StreamHandler(self.log_capture)
+        self.log_handler.setLevel(logging.DEBUG)
+        logging.getLogger().addHandler(self.log_handler)
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    def tearDown(self):
+        """Clean up test fixtures."""
+        import shutil
+        logging.getLogger().removeHandler(self.log_handler)
+        shutil.rmtree(self.temp_dir)
+
+    def _create_test_configs(self):
+        """Create test configuration files with secrets."""
+        # Main config
+        config_data = {
+            'config': {
+                'EVACUABLE_TAG': 'test_tag',
+                'DELTA': 60,
+                'POLL': 30,
+                'THRESHOLD': 75,
+                'WORKERS': 8,
+                'LOGLEVEL': 'DEBUG'
+            }
+        }
+        with open(self.config_path, 'w') as f:
+            yaml.dump(config_data, f)
+
+        # Clouds config
+        clouds_data = {
+            'clouds': {
+                'testcloud': {
+                    'auth': {
+                        'username': 'test_os_user',
+                        'project_name': 'test_project',
+                        'auth_url': 'http://keystone:5000/v3',
+                        'user_domain_name': 'Default',
+                        'project_domain_name': 'Default'
+                    }
+                }
+            }
+        }
+        with open(self.clouds_path, 'w') as f:
+            yaml.dump(clouds_data, f)
+
+        # Secure config with password
+        secure_data = {
+            'clouds': {
+                'testcloud': {
+                    'auth': {
+                        'password': 'super_secret_openstack_password_123'
+                    }
+                }
+            }
+        }
+        with open(self.secure_path, 'w') as f:
+            yaml.dump(secure_data, f)
+
+        # Fencing config with various credentials
+        fencing_data = {
+            'FencingConfig': {
+                'compute-0': {
+                    'agent': 'ipmi',
+                    'ipaddr': '192.168.1.100',
+                    'ipport': '623',
+                    'login': 'admin',
+                    'passwd': 'secret_ipmi_password_456'
+                },
+                'compute-1': {
+                    'agent': 'redfish',
+                    'ipaddr': '192.168.1.101',
+                    'ipport': '443',
+                    'login': 'root',
+                    'passwd': 'secret_redfish_password_789'
+                },
+                'compute-2': {
+                    'agent': 'bmh',
+                    'token': 'bearer_token_abc123xyz789',
+                    'namespace': 'metal3',
+                    'host': 'compute-2'
+                }
+            }
+        }
+        with open(self.fencing_path, 'w') as f:
+            yaml.dump(fencing_data, f)
+
+    def _assert_no_secrets_in_logs(self):
+        """Assert that no test secrets appear in captured logs."""
+        log_output = self.log_capture.getvalue()
+        secrets = [
+            'super_secret_openstack_password_123',
+            'secret_ipmi_password_456',
+            'secret_redfish_password_789',
+            'bearer_token_abc123xyz789',
+        ]
+        for secret in secrets:
+            self.assertNotIn(secret, log_output,
+                f"Secret '{secret}' was found in log output!")
+
+    def test_nova_login_exception_no_secret_exposure(self):
+        """Test that Nova login exceptions don't expose passwords."""
+        # Clear log capture
+        self.log_capture.seek(0)
+        self.log_capture.truncate(0)
+
+        test_password = 'super_secret_openstack_password_123'
+        test_username = 'test_os_user'
+
+        # Mock keystoneauth1 to raise an exception
+        with patch('instanceha.loading.get_plugin_loader') as mock_loader:
+            mock_loader.side_effect = Exception("Connection failed: password=invalid")
+
+            # Try to login - should not expose password
+            result = instanceha.nova_login(
+                test_username, test_password, 'project',
+                'http://keystone:5000/v3', 'Default', 'Default'
+            )
+
+            self.assertIsNone(result)
+            self._assert_no_secrets_in_logs()
+
+    def test_create_connection_exception_no_secret_exposure(self):
+        """Test that create_connection exceptions don't expose passwords."""
+        # Clear log capture
+        self.log_capture.seek(0)
+        self.log_capture.truncate(0)
+
+        config_manager = instanceha.ConfigManager(self.config_path)
+        config_manager.clouds_path = self.clouds_path
+        config_manager.secure_path = self.secure_path
+        config_manager.clouds = config_manager._load_clouds_config()
+        config_manager.secure = config_manager._load_secure_config()
+
+        service = instanceha.InstanceHAService(config_manager)
+
+        # Mock nova_login to raise exception
+        with patch('instanceha.nova_login') as mock_login:
+            mock_login.side_effect = Exception("Auth failed: password=wrong")
+
+            # This should not expose password
+            try:
+                service.create_connection()
+            except instanceha.NovaConnectionError:
+                pass
+
+            self._assert_no_secrets_in_logs()
+
+    def test_redfish_get_power_state_exception_no_secret_exposure(self):
+        """Test that Redfish power state exceptions don't expose passwords."""
+        # Clear log capture
+        self.log_capture.seek(0)
+        self.log_capture.truncate(0)
+
+        test_password = 'secret_redfish_password_789'
+        test_user = 'root'
+
+        with patch('requests.get') as mock_get:
+            mock_get.side_effect = Exception(f"Connection failed: auth password={test_password}")
+
+            instanceha._redfish_get_power_state(
+                'http://192.168.1.101/redfish/v1/Systems/1',
+                test_user, test_password, 30
+            )
+
+            self._assert_no_secrets_in_logs()
+
+    def test_redfish_reset_exception_no_secret_exposure(self):
+        """Test that Redfish reset exceptions don't expose passwords."""
+        # Clear log capture
+        self.log_capture.seek(0)
+        self.log_capture.truncate(0)
+
+        test_password = 'secret_redfish_password_789'
+        test_user = 'root'
+
+        with patch('requests.post') as mock_post:
+            mock_post.side_effect = Exception(f"POST failed: password={test_password}")
+
+            instanceha._redfish_reset(
+                'http://192.168.1.101/redfish/v1/Systems/1',
+                test_user, test_password, 30, 'ForceOff'
+            )
+
+            self._assert_no_secrets_in_logs()
+
+    def test_bmh_fence_exception_no_secret_exposure(self):
+        """Test that BMH fence exceptions don't expose tokens."""
+        # Clear log capture
+        self.log_capture.seek(0)
+        self.log_capture.truncate(0)
+
+        test_token = 'bearer_token_abc123xyz789'
+        mock_service = Mock()
+        mock_service.config = Mock()
+        mock_service.config.get_config_value = Mock(return_value=30)
+
+        with patch('requests.patch') as mock_patch:
+            mock_patch.side_effect = Exception(f"Request failed: token={test_token}")
+
+            instanceha._bmh_fence(
+                test_token, 'metal3', 'compute-2', 'off', mock_service
+            )
+
+            self._assert_no_secrets_in_logs()
+
+    def test_ipmi_fence_exception_no_secret_exposure(self):
+        """Test that IPMI fence operations don't expose passwords in process list."""
+        # Clear log capture
+        self.log_capture.seek(0)
+        self.log_capture.truncate(0)
+
+        test_password = 'secret_ipmi_password_456'
+        fencing_data = {
+            'agent': 'ipmi',
+            'ipaddr': '192.168.1.100',
+            'ipport': '623',
+            'login': 'admin',
+            'passwd': test_password
+        }
+        mock_service = Mock()
+        mock_service.config = Mock()
+        mock_service.config.get_config_value = Mock(return_value=30)
+
+        # Verify password is passed via environment variable, not command line
+        with patch('subprocess.run') as mock_run:
+            mock_run.side_effect = subprocess.CalledProcessError(1, 'ipmitool')
+
+            try:
+                instanceha._execute_fence_operation('compute-0', 'off', fencing_data, mock_service)
+            except:
+                pass
+
+            # Check that password is not in command arguments
+            if mock_run.called:
+                cmd = mock_run.call_args[0][0]
+                cmd_str = ' '.join(cmd)
+                self.assertNotIn(test_password, cmd_str,
+                    "IPMI password found in command line arguments!")
+
+            self._assert_no_secrets_in_logs()
+
+    def test_handle_nova_exception_no_secret_exposure(self):
+        """Test that _handle_nova_exception doesn't expose secrets."""
+        # Clear log capture
+        self.log_capture.seek(0)
+        self.log_capture.truncate(0)
+
+        # Create exception that might contain sensitive info
+        test_exception = Exception("Auth failed: password=secret123")
+
+        instanceha._handle_nova_exception("test_operation", "test_service", test_exception)
+
+        self._assert_no_secrets_in_logs()
+
+    def test_get_nova_connection_exception_no_secret_exposure(self):
+        """Test that _get_nova_connection exceptions don't expose passwords."""
+        # Clear log capture
+        self.log_capture.seek(0)
+        self.log_capture.truncate(0)
+
+        config_manager = instanceha.ConfigManager(self.config_path)
+        config_manager.clouds_path = self.clouds_path
+        config_manager.secure_path = self.secure_path
+        config_manager.clouds = config_manager._load_clouds_config()
+        config_manager.secure = config_manager._load_secure_config()
+
+        service = instanceha.InstanceHAService(config_manager)
+
+        with patch('instanceha.nova_login') as mock_login:
+            mock_login.side_effect = Exception("Connection error: password=wrong")
+
+            instanceha._get_nova_connection(service)
+
+            self._assert_no_secrets_in_logs()
+
+    def test_establish_nova_connection_exception_no_secret_exposure(self):
+        """Test that _establish_nova_connection exceptions don't expose passwords."""
+        # Clear log capture
+        self.log_capture.seek(0)
+        self.log_capture.truncate(0)
+
+        config_manager = instanceha.ConfigManager(self.config_path)
+        config_manager.clouds_path = self.clouds_path
+        config_manager.secure_path = self.secure_path
+        config_manager.clouds = config_manager._load_clouds_config()
+        config_manager.secure = config_manager._load_secure_config()
+
+        service = instanceha.InstanceHAService(config_manager)
+
+        with patch('instanceha.nova_login') as mock_login:
+            mock_login.side_effect = Exception("Auth error: password=invalid")
+
+            try:
+                instanceha._establish_nova_connection(service)
+            except SystemExit:
+                pass
+
+            self._assert_no_secrets_in_logs()
+
+    def test_bmh_wait_for_power_off_exception_no_secret_exposure(self):
+        """Test that BMH wait exceptions don't expose tokens in headers."""
+        # Clear log capture
+        self.log_capture.seek(0)
+        self.log_capture.truncate(0)
+
+        test_token = 'bearer_token_abc123xyz789'
+        headers = {'Authorization': f'Bearer {test_token}'}
+        mock_service = Mock()
+        mock_service.config = Mock()
+        mock_service.config.get_config_value = Mock(return_value=30)
+
+        with patch('instanceha.requests.Session') as mock_session_class:
+            mock_session = Mock()
+            mock_context = Mock()
+            mock_context.__enter__ = Mock(return_value=mock_session)
+            mock_context.__exit__ = Mock(return_value=None)
+            mock_session_class.return_value = mock_context
+            mock_session.get.side_effect = requests.exceptions.HTTPError("Request failed")
+
+            instanceha._bmh_wait_for_power_off(
+                'https://kubernetes/api/v1/name', headers,
+                '/path/to/ca.crt', 'compute-2', 1, 0.1, mock_service
+            )
+
+            # Verify token not in logs
+            self._assert_no_secrets_in_logs()
+
+    def test_safe_log_exception_sanitizes_secrets(self):
+        """Test that _safe_log_exception properly sanitizes secret patterns."""
+        # Clear log capture
+        self.log_capture.seek(0)
+        self.log_capture.truncate(0)
+
+        test_exceptions = [
+            Exception("Connection failed: password=secret123"),
+            Exception("Auth error: token=abc123xyz"),
+            Exception("Failed: secret=mysecret"),
+            Exception("Error: credential=pass123"),
+            Exception("Auth failed with password=test"),
+        ]
+
+        for exc in test_exceptions:
+            instanceha._safe_log_exception("Test error", exc)
+
+        log_output = self.log_capture.getvalue()
+
+        # Verify secrets are redacted
+        self.assertNotIn('secret123', log_output)
+        self.assertNotIn('abc123xyz', log_output)
+        self.assertNotIn('mysecret', log_output)
+        self.assertNotIn('pass123', log_output)
+        self.assertNotIn('=test', log_output)
+
+        # But should contain redacted versions
+        self.assertIn('password=***', log_output.lower())
+        self.assertIn('token=***', log_output.lower())
+
+    def test_username_validation_no_exposure(self):
+        """Test that invalid username validation doesn't log the username."""
+        # Clear log capture
+        self.log_capture.seek(0)
+        self.log_capture.truncate(0)
+
+        fencing_data = {
+            'agent': 'ipmi',
+            'ipaddr': '192.168.1.100',
+            'ipport': '623',
+            'login': 'invalid user@name',  # Invalid username with special chars
+            'passwd': 'secret_password'
+        }
+        mock_service = Mock()
+        mock_service.config = Mock()
+        mock_service.config.get_config_value = Mock(return_value=30)
+
+        instanceha._execute_fence_operation('compute-0', 'off', fencing_data, mock_service)
+
+        log_output = self.log_capture.getvalue()
+        # Should not expose the invalid username
+        self.assertNotIn('invalid user@name', log_output)
+        self.assertNotIn('secret_password', log_output)
+
 
 class TestFencingRaceCondition(unittest.TestCase):
     """Unit tests for fencing race condition prevention."""
@@ -1756,6 +2411,7 @@ if __name__ == '__main__':
         TestKdumpFunctionality,
         TestKdumpIntegration,
         TestRedfishFencing,
+        TestSecretExposure,
         TestFencingRaceCondition,
     ]
 

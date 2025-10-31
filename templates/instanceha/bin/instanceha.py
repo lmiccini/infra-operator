@@ -43,6 +43,17 @@ class NovaConnectionError(Exception):
     pass
 
 
+def _safe_log_exception(msg: str, e: Exception, include_traceback: bool = False) -> None:
+    """Log exception without exposing secrets in messages or tracebacks."""
+    import re
+    safe_msg = str(e)
+    for secret_word in ['password', 'token', 'secret', 'credential', 'auth']:
+        safe_msg = re.sub(rf'\b{secret_word}=[^\s)\'"]+', f'{secret_word}=***', safe_msg, flags=re.IGNORECASE)
+    logging.error("%s: %s", msg, safe_msg)
+    if include_traceback:
+        logging.debug("Exception traceback (sanitized): %s", type(e).__name__)
+
+
 # Migration status constants
 MIGRATION_STATUS_COMPLETED = ['completed', 'done']
 MIGRATION_STATUS_ERROR = ['error', 'failed', 'cancelled']
@@ -51,6 +62,13 @@ MIGRATION_STATUS_ERROR = ['error', 'failed', 'cancelled']
 def _extract_hostname(host: str) -> str:
     """Extract short hostname from FQDN or hostname."""
     return host.split('.', 1)[0]
+
+
+def _sanitize_url(url: str) -> str:
+    """Remove credentials from URL if present (e.g., http://user:pass@host -> http://***@host)."""
+    import re
+    # Remove user:password from URLs to prevent credential leaks in logs
+    return re.sub(r'://([^/:]+):([^@]+)@', r'://***@', url)
 
 
 class OpenStackClient(Protocol):
@@ -487,9 +505,8 @@ class InstanceHAService(CloudConnectionProvider):
 
             return nova_login(username, password, projectname, auth_url, user_domain_name, project_domain_name)
         except Exception as e:
-            logging.error("Failed to create Nova connection: %s", e)
-            logging.debug('Exception traceback:', exc_info=True)
-            raise NovaConnectionError(f"Nova connection failed: {e}")
+            _safe_log_exception("Failed to create Nova connection", e, include_traceback=True)
+            raise NovaConnectionError("Nova connection failed")
 
     def is_server_evacuable(self, server, evac_flavors=None, evac_images=None):
         """
@@ -1414,14 +1431,13 @@ def nova_login(username, password, projectname, auth_url, user_domain_name, proj
         nova = client.Client("2.59", session=session)
         nova.versions.get_current()
     except DiscoveryFailure as e:
-        logging.error("Nova login failed: Discovery Failure: %s" % e)
+        _safe_log_exception("Nova login failed: Discovery Failure", e)
         return None
     except Unauthorized as e:
-        logging.error("Nova login failed: Unauthorized: %s" % e)
+        _safe_log_exception("Nova login failed: Unauthorized", e)
         return None
     except Exception as e:
-        logging.error("Nova login failed: %s" % e)
-        logging.debug('Exception traceback:', exc_info=True)
+        _safe_log_exception("Nova login failed", e, include_traceback=True)
         return None
 
     logging.info("Nova login successful")
@@ -1431,12 +1447,11 @@ def nova_login(username, password, projectname, auth_url, user_domain_name, proj
 def _handle_nova_exception(operation: str, service_info: str, e: Exception, is_critical: bool = True) -> bool:
     """Handle Nova API exceptions with consistent logging."""
     if isinstance(e, NotFound):
-        logging.error("Failed to %s for %s. Resource not found: %s", operation, service_info, e)
+        logging.error("Failed to %s for %s. Resource not found: %s", operation, service_info, type(e).__name__)
     elif isinstance(e, Conflict):
-        logging.error("Failed to %s for %s. Conflicting operation: %s", operation, service_info, e)
+        logging.error("Failed to %s for %s. Conflicting operation: %s", operation, service_info, type(e).__name__)
     else:
-        logging.error("Failed to %s for %s. Unexpected error: %s", operation, service_info, e)
-    logging.debug("Exception traceback:", exc_info=True)
+        _safe_log_exception("Failed to %s for %s. Unexpected error" % (operation, service_info), e, include_traceback=True)
 
     if not is_critical:
         logging.warning("Service %s operation partially failed. Manual cleanup may be needed.", service_info)
@@ -1603,8 +1618,12 @@ def _redfish_get_power_state(url, user, passwd, timeout):
         if response.status_code == 200:
             data = response.json()
             return data.get('PowerState', '').upper()
+        # Don't log 4xx/5xx errors for power state checks - they're handled by caller
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        # Network errors are expected during power transitions
+        logging.debug('Power state check network error: %s', type(e).__name__)
     except Exception as e:
-        logging.error('Failed to get power state: %s' % str(e))
+        _safe_log_exception('Failed to get power state', e)
     return None
 
 def _ipmi_get_power_state(ip, port, user, passwd, timeout):
@@ -1635,52 +1654,79 @@ def _redfish_reset(url, user, passwd, timeout, action):
     timeout = max(5, min(300, int(timeout or 30)))  # Clamp between 5-300 seconds
     url = url.rstrip('/')
     reset_url = f"{url}/Actions/ComputerSystem.Reset"
+    safe_url = _sanitize_url(url)  # Sanitize for logging
 
     payload = {"ResetType": action}
     headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
 
-    try:
-        # Handle SSL config type issue - convert tuple to cert parameter
-        ssl_config = config_manager.get_requests_ssl_config()
-        if isinstance(ssl_config, tuple):
-            # Client cert authentication
-            response = requests.post(reset_url, json=payload, headers=headers,
-                                   auth=(user, passwd), cert=ssl_config, timeout=timeout)
-        else:
-            # Standard SSL verification
-            response = requests.post(reset_url, json=payload, headers=headers,
-                                   auth=(user, passwd), verify=ssl_config, timeout=timeout)
+    # Retry logic for transient failures
+    MAX_RETRIES = 3
+    retry_delay = 1
 
-        if response.status_code in [200, 204]:
-            if action == "ForceOff":
-                # Wait for server to actually power off
-                for _ in range(timeout):
-                    time.sleep(1)
-                    power_state = _redfish_get_power_state(url, user, passwd, timeout)
-                    if power_state == 'OFF':
-                        logging.info("Redfish reset successful: %s on %s", action, url)
-                        return True
-                logging.error('Power off of %s timed out' % url)
-                return False
+    for attempt in range(MAX_RETRIES):
+        try:
+            # Handle SSL config type issue - convert tuple to cert parameter
+            ssl_config = config_manager.get_requests_ssl_config()
+            if isinstance(ssl_config, tuple):
+                # Client cert authentication
+                response = requests.post(reset_url, json=payload, headers=headers,
+                                       auth=(user, passwd), cert=ssl_config, timeout=timeout)
             else:
-                logging.info("Redfish reset successful: %s on %s", action, url)
-                return True
-        elif response.status_code == 409:
-            # Check if server is already powered off
-            power_state = _redfish_get_power_state(url, user, passwd, timeout)
-            if power_state == 'OFF':
-                logging.info("Redfish reset successful: %s on %s (already off)", action, url)
-                return True
-            else:
-                logging.error("Redfish reset failed: 409 conflict but not OFF (status: %s) for %s", power_state, url)
+                # Standard SSL verification
+                response = requests.post(reset_url, json=payload, headers=headers,
+                                       auth=(user, passwd), verify=ssl_config, timeout=timeout)
+
+            if response.status_code in [200, 204]:
+                if action == "ForceOff":
+                    # Wait for server to actually power off
+                    for _ in range(timeout):
+                        time.sleep(1)
+                        power_state = _redfish_get_power_state(url, user, passwd, timeout)
+                        if power_state == 'OFF':
+                            logging.info("Redfish reset successful: %s on %s", action, safe_url)
+                            return True
+                    logging.error('Power off of %s timed out' % safe_url)
+                    return False
+                else:
+                    logging.info("Redfish reset successful: %s on %s", action, safe_url)
+                    return True
+            elif response.status_code == 409:
+                # Check if server is already powered off
+                power_state = _redfish_get_power_state(url, user, passwd, timeout)
+                if power_state == 'OFF':
+                    logging.info("Redfish reset successful: %s on %s (already off)", action, safe_url)
+                    return True
+                else:
+                    logging.error("Redfish reset failed: 409 conflict but not OFF (status: %s) for %s", power_state, safe_url)
+                    return False
+            elif response.status_code in [401, 403]:
+                # Authentication/authorization errors - don't retry
+                logging.error("Redfish reset failed: authentication error (status %d) for %s", response.status_code, safe_url)
                 return False
-        else:
-            logging.error("Redfish reset failed: status %d for %s", response.status_code, url)
+            elif response.status_code in [500, 502, 503, 504] and attempt < MAX_RETRIES - 1:
+                # Transient server errors - retry
+                logging.warning("Redfish reset failed: server error %d (attempt %d/%d), retrying...", 
+                              response.status_code, attempt + 1, MAX_RETRIES)
+                time.sleep(retry_delay * (attempt + 1))
+                continue
+            else:
+                logging.error("Redfish reset failed: status %d for %s", response.status_code, safe_url)
+                return False
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            # Network errors - retry
+            if attempt < MAX_RETRIES - 1:
+                logging.warning("Redfish reset network error (attempt %d/%d), retrying...", attempt + 1, MAX_RETRIES)
+                time.sleep(retry_delay * (attempt + 1))
+                continue
+            else:
+                _safe_log_exception("Redfish reset failed for %s" % safe_url, e)
+                return False
+        except Exception as e:
+            _safe_log_exception("Redfish reset failed for %s" % safe_url, e)
             return False
 
-    except Exception as e:
-        logging.error("Redfish reset failed for %s: %s", url, e)
-        return False
+    return False
 
 def _bmh_fence(token, namespace, host, action, service):
     """Fence a BareMetal Host using Kubernetes API."""
@@ -1717,7 +1763,7 @@ def _bmh_fence(token, namespace, host, action, service):
             return True
 
     except Exception as e:
-        logging.error("BMH fencing failed for %s: %s", host, e)
+        _safe_log_exception("BMH fencing failed for %s" % host, e)
         return False
 
 
@@ -1754,10 +1800,10 @@ def _bmh_wait_for_power_off(get_url, headers, cacert, host, timeout, poll_interv
                 logging.warning("Timeout checking power status for %s, continuing to wait", host)
                 continue
             except requests.exceptions.HTTPError as e:
-                logging.warning("HTTP error checking power status for %s: %s, continuing to wait", host, e)
+                logging.warning("HTTP error checking power status for %s, continuing to wait", host)
                 continue
             except requests.exceptions.RequestException as e:
-                logging.warning("Request error checking power status for %s: %s, continuing to wait", host, e)
+                logging.warning("Request error checking power status for %s, continuing to wait", host)
                 continue
 
             # Parse JSON response
@@ -1825,7 +1871,7 @@ def _execute_fence_operation(host, action, fencing_data, service):
         if "login" in fencing_data:
             username = fencing_data["login"]
             if not re.match(r'^[a-zA-Z0-9_-]{1,64}$', username):
-                logging.error("Invalid username for %s: %s", agent_name, username)
+                logging.error("Invalid username format for %s", agent_name)
                 return False
 
         return True
@@ -1847,7 +1893,39 @@ def _execute_fence_operation(host, action, fencing_data, service):
                    "-U", fencing_data["login"], "-E",  # Use environment variable
                    "-p", fencing_data["ipport"], "power", action]
             timeout = fencing_data.get("timeout", service.config.get_config_value('FENCING_TIMEOUT'))
-            subprocess.run(cmd, timeout=timeout, env=env, capture_output=True, text=True, check=True)
+
+            # Retry logic for transient failures
+            MAX_RETRIES = 3
+            retry_delay = 1
+
+            for attempt in range(MAX_RETRIES):
+                try:
+                    subprocess.run(cmd, timeout=timeout, env=env, capture_output=True, text=True, check=True)
+                    # Success - break out of retry loop
+                    break
+                except subprocess.TimeoutExpired as e:
+                    # Network timeout - retry
+                    if attempt < MAX_RETRIES - 1:
+                        logging.warning("IPMI %s timeout for %s (attempt %d/%d), retrying...", action, host, attempt + 1, MAX_RETRIES)
+                        time.sleep(retry_delay * (attempt + 1))
+                        continue
+                    else:
+                        # Use safe logging to avoid exposing any command details
+                        _safe_log_exception("IPMI %s failed for %s: timeout after %d attempts" % (action, host, MAX_RETRIES), e)
+                        return False
+                except subprocess.CalledProcessError as e:
+                    # Command failed - retry on transient errors
+                    # Note: Some errors (like auth failures) aren't retryable, but we retry for consistency
+                    if attempt < MAX_RETRIES - 1:
+                        logging.warning("IPMI %s failed for %s with return code %d (attempt %d/%d), retrying...",
+                                      action, host, e.returncode, attempt + 1, MAX_RETRIES)
+                        time.sleep(retry_delay * (attempt + 1))
+                        continue
+                    else:
+                        # Use safe logging - exception may contain stderr/stdout with sensitive info
+                        _safe_log_exception("IPMI %s failed for %s: command failed with return code %d after %d attempts" %
+                                          (action, host, e.returncode, MAX_RETRIES), e)
+                        return False
 
             if action == 'off':
                 # Wait for server to actually power off
@@ -1948,7 +2026,7 @@ def _get_nova_connection(service):
         return conn
 
     except Exception as e:
-        logging.error("Failed to establish Nova connection: %s", e)
+        _safe_log_exception("Failed to establish Nova connection", e)
         return None
 
 
@@ -2196,7 +2274,7 @@ def _establish_nova_connection(service):
         logging.error("Could not find valid data for Cloud: %s", cloud)
         sys.exit(1)
     except Exception as e:
-        logging.error("Failed: Unable to connect to Nova: %s", e)
+        _safe_log_exception("Failed: Unable to connect to Nova", e)
         sys.exit(1)
 
 def _categorize_services(services: List[Any], target_date: datetime) -> tuple:
