@@ -250,6 +250,30 @@ class TestMetrics(unittest.TestCase):
         self.assertEqual(summary['total_durations']['test_duration'], 2.0)
 
 
+class TestHelperFunctions(unittest.TestCase):
+    """Test utility helper functions."""
+
+    def test_extract_hostname_fqdn(self):
+        """Test extracting hostname from FQDN."""
+        result = instanceha._extract_hostname('compute-01.example.com')
+        self.assertEqual(result, 'compute-01')
+
+    def test_extract_hostname_short(self):
+        """Test extracting hostname from short hostname."""
+        result = instanceha._extract_hostname('compute-01')
+        self.assertEqual(result, 'compute-01')
+
+    def test_extract_hostname_multiple_dots(self):
+        """Test extracting hostname with multiple dots."""
+        result = instanceha._extract_hostname('host.subdomain.example.com')
+        self.assertEqual(result, 'host')
+
+    def test_extract_hostname_no_dot(self):
+        """Test extracting hostname with no dots."""
+        result = instanceha._extract_hostname('localhost')
+        self.assertEqual(result, 'localhost')
+
+
 class TestInstanceHAService(unittest.TestCase):
     """Test the InstanceHAService class functionality."""
 
@@ -673,6 +697,275 @@ class TestEvacuationFunctions(unittest.TestCase):
         data = ['trait:CUSTOM_EVACUABLE']
         result = service._check_evacuable_tag(data, 'EVACUABLE')
         self.assertTrue(result)
+
+    def test_server_evacuate_none_response(self):
+        """Test _server_evacuate when response is None."""
+        self.mock_connection.servers.evacuate.return_value = (None, {})
+
+        result = instanceha._server_evacuate(self.mock_connection, 'server-123')
+
+        self.assertFalse(result['accepted'])
+        self.assertEqual(result['reason'], 'No response received while evacuating instance')
+
+    def test_server_evacuate_none_reason(self):
+        """Test _server_evacuate when response.reason is None (uses fallback)."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.reason = None
+        self.mock_connection.servers.evacuate.return_value = (mock_response, {})
+
+        result = instanceha._server_evacuate(self.mock_connection, 'server-123')
+
+        self.assertTrue(result['accepted'])
+        self.assertEqual(result['reason'], 'Evacuation initiated successfully')
+
+    def test_server_evacuate_error_status_no_reason(self):
+        """Test _server_evacuate when status code is error but reason is None."""
+        mock_response = Mock()
+        mock_response.status_code = 500
+        mock_response.reason = None
+        self.mock_connection.servers.evacuate.return_value = (mock_response, {})
+
+        result = instanceha._server_evacuate(self.mock_connection, 'server-123')
+
+        self.assertFalse(result['accepted'])
+        self.assertIn('status 500', result['reason'])
+
+    def test_host_disable_log_reason_fails_non_critical(self):
+        """Test that disable_log_reason failure is handled gracefully."""
+        # disable_log_reason fails
+        self.mock_connection.services.disable_log_reason.side_effect = Exception("Logging failed")
+
+        result = instanceha._host_disable(self.mock_connection, self.mock_service)
+
+        # Should return False but service is still forced down
+        self.assertFalse(result)
+        self.mock_connection.services.force_down.assert_called_once()
+        self.mock_connection.services.disable_log_reason.assert_called_once()
+
+    def test_handle_nova_exception_notfound(self):
+        """Test handling NotFound exception."""
+        class MockNotFound(Exception):
+            pass
+
+        with patch('instanceha.NotFound', MockNotFound):
+            result = instanceha._handle_nova_exception(
+                "test operation", "test-service", MockNotFound("Not found"), is_critical=True
+            )
+            self.assertFalse(result)
+
+    def test_handle_nova_exception_conflict(self):
+        """Test handling Conflict exception."""
+        class MockConflict(Exception):
+            pass
+
+        with patch('instanceha.Conflict', MockConflict):
+            result = instanceha._handle_nova_exception(
+                "test operation", "test-service", MockConflict("Conflict"), is_critical=True
+            )
+            self.assertFalse(result)
+
+    def test_handle_nova_exception_generic(self):
+        """Test handling generic exception."""
+        result = instanceha._handle_nova_exception(
+            "test operation", "test-service", Exception("Generic error"), is_critical=True
+        )
+        self.assertFalse(result)
+
+    def test_handle_nova_exception_non_critical(self):
+        """Test handling non-critical exception (should log warning)."""
+        result = instanceha._handle_nova_exception(
+            "test operation", "test-service", Exception("Error"), is_critical=False
+        )
+        self.assertFalse(result)
+
+    def test_update_service_disable_reason_with_id(self):
+        """Test updating disable reason with provided service ID."""
+        result = instanceha._update_service_disable_reason(
+            self.mock_connection, 'test-host', service_id='service-123'
+        )
+        self.assertTrue(result)
+        self.mock_connection.services.disable_log_reason.assert_called_once()
+        self.mock_connection.services.list.assert_not_called()
+
+    def test_update_service_disable_reason_without_id(self):
+        """Test updating disable reason without service ID (fetch service)."""
+        mock_service = Mock()
+        mock_service.host = 'test-host'
+        mock_service.binary = 'nova-compute'
+        mock_service.id = 'service-123'
+        self.mock_connection.services.list.return_value = [mock_service]
+
+        result = instanceha._update_service_disable_reason(
+            self.mock_connection, 'test-host', service_id=None
+        )
+        self.assertTrue(result)
+        self.mock_connection.services.disable_log_reason.assert_called_once()
+
+    def test_update_service_disable_reason_service_not_found(self):
+        """Test updating disable reason when service not found."""
+        self.mock_connection.services.list.return_value = []
+        result = instanceha._update_service_disable_reason(
+            self.mock_connection, 'test-host', service_id=None
+        )
+        self.assertFalse(result)
+
+    def test_update_service_disable_reason_exception_handling(self):
+        """Test exception handling in update disable reason."""
+        self.mock_connection.services.disable_log_reason.side_effect = Exception("API error")
+        result = instanceha._update_service_disable_reason(
+            self.mock_connection, 'test-host', service_id='service-123'
+        )
+        self.assertFalse(result)
+
+    def test_migration_status_constants_defined(self):
+        """Test that migration status constants are defined."""
+        self.assertTrue(hasattr(instanceha, 'MIGRATION_STATUS_COMPLETED'))
+        self.assertTrue(hasattr(instanceha, 'MIGRATION_STATUS_ERROR'))
+        self.assertIsInstance(instanceha.MIGRATION_STATUS_COMPLETED, list)
+        self.assertIsInstance(instanceha.MIGRATION_STATUS_ERROR, list)
+
+    def test_migration_status_completed_values(self):
+        """Test that completed status includes expected values."""
+        self.assertIn('completed', instanceha.MIGRATION_STATUS_COMPLETED)
+        self.assertIn('done', instanceha.MIGRATION_STATUS_COMPLETED)
+
+    def test_migration_status_error_values(self):
+        """Test that error status includes expected values."""
+        self.assertIn('error', instanceha.MIGRATION_STATUS_ERROR)
+        self.assertIn('failed', instanceha.MIGRATION_STATUS_ERROR)
+        self.assertIn('cancelled', instanceha.MIGRATION_STATUS_ERROR)
+
+    @patch('instanceha.datetime')
+    @patch('instanceha.timedelta')
+    def test_server_evacuation_status_uses_constants(self, mock_timedelta, mock_datetime):
+        """Test that _server_evacuation_status uses constants."""
+        from datetime import datetime, timedelta as real_timedelta
+        mock_datetime.now = Mock(return_value=datetime(2024, 1, 1, 0, 0, 0))
+        mock_timedelta.return_value = real_timedelta(minutes=5)
+        
+        mock_migration = Mock()
+        mock_migration.status = 'completed'
+        mock_connection = Mock()
+        mock_connection.migrations.list.return_value = [mock_migration]
+
+        result = instanceha._server_evacuation_status(mock_connection, 'server-123')
+        self.assertTrue(result['completed'])
+        self.assertFalse(result['error'])
+
+        # Verify constants are used (indirectly - status 'completed' is in constant)
+        self.assertIn(mock_migration.status, instanceha.MIGRATION_STATUS_COMPLETED)
+
+    @patch('instanceha._server_evacuate_future')
+    @patch('time.sleep')
+    @patch('concurrent.futures.ThreadPoolExecutor')
+    def test_smart_evacuation_all_success(self, mock_executor_class, mock_sleep, mock_evacuate_future):
+        """Test smart evacuation returns True when all evacuations succeed."""
+        # Mock failed service
+        mock_failed_service = Mock()
+        mock_failed_service.host = 'test-host'
+        mock_failed_service.id = 'service-123'
+
+        # Mock service configuration
+        mock_service = Mock()
+        mock_service.config.get_evacuable_images.return_value = []
+        mock_service.config.get_evacuable_flavors.return_value = []
+        mock_service.config.is_smart_evacuation_enabled.return_value = True
+        mock_service.config.get_workers.return_value = 4
+        mock_service.config.get_delay.return_value = 0
+        mock_service.is_server_evacuable.return_value = True
+
+        # Mock servers
+        mock_server1 = Mock()
+        mock_server1.id = 'server-1'
+        mock_server1.status = 'ACTIVE'
+        mock_server2 = Mock()
+        mock_server2.id = 'server-2'
+        mock_server2.status = 'ACTIVE'
+        
+        self.mock_connection.servers.list.return_value = [mock_server1, mock_server2]
+
+        # Mock ThreadPoolExecutor
+        mock_executor = Mock()
+        mock_executor.__enter__ = Mock(return_value=mock_executor)
+        mock_executor.__exit__ = Mock(return_value=None)
+        mock_executor_class.return_value = mock_executor
+
+        # Mock futures to return True (success)
+        mock_future1 = Mock()
+        mock_future1.result.return_value = True
+        mock_future2 = Mock()
+        mock_future2.result.return_value = True
+        
+        mock_executor.submit.side_effect = [mock_future1, mock_future2]
+
+        with patch('instanceha.concurrent.futures.as_completed') as mock_as_completed:
+            mock_as_completed.return_value = [mock_future1, mock_future2]
+            
+            result = instanceha._host_evacuate(
+                self.mock_connection, mock_failed_service, mock_service
+            )
+
+        # The fix ensures this returns True when all succeed
+        self.assertTrue(result, "Smart evacuation should return True when all evacuations succeed")
+
+    @patch('instanceha._update_service_disable_reason')
+    @patch('instanceha._server_evacuate_future')
+    @patch('time.sleep')
+    def test_smart_evacuation_partial_failure(self, mock_sleep, mock_evacuate_future, mock_update_reason):
+        """Test smart evacuation returns False when any evacuation fails."""
+        # Mock failed service
+        mock_failed_service = Mock()
+        mock_failed_service.host = 'test-host'
+        mock_failed_service.id = 'service-123'
+
+        # Mock service configuration
+        mock_service = Mock()
+        mock_service.config.get_evacuable_images.return_value = []
+        mock_service.config.get_evacuable_flavors.return_value = []
+        mock_service.config.is_smart_evacuation_enabled.return_value = True
+        mock_service.config.get_workers.return_value = 4
+        mock_service.config.get_delay.return_value = 0
+        mock_service.is_server_evacuable.return_value = True
+
+        # Mock servers
+        mock_server1 = Mock()
+        mock_server1.id = 'server-1'
+        mock_server1.status = 'ACTIVE'
+        
+        self.mock_connection.servers.list.return_value = [mock_server1]
+
+        # Create a future that will return False when result() is called
+        mock_future = MagicMock()
+        mock_future.result.return_value = False
+        
+        # Mock ThreadPoolExecutor
+        with patch('instanceha.concurrent.futures.ThreadPoolExecutor') as mock_executor_class:
+            mock_executor = MagicMock()
+            # Make submit return our mock future
+            mock_executor.submit.return_value = mock_future
+            
+            # Set up context manager properly
+            context_manager = MagicMock()
+            context_manager.__enter__ = Mock(return_value=mock_executor)
+            context_manager.__exit__ = Mock(return_value=None)
+            mock_executor_class.return_value = context_manager
+            
+            # Mock as_completed - it needs to receive the future_to_server dict
+            # and return an iterable of futures from that dict
+            def mock_as_completed_side_effect(future_to_server):
+                # Return the futures from the dict
+                return iter(future_to_server.keys())
+            
+            with patch('instanceha.concurrent.futures.as_completed', side_effect=mock_as_completed_side_effect):
+                result = instanceha._host_evacuate(
+                    self.mock_connection, mock_failed_service, mock_service
+                )
+
+        # The result should be False because the evacuation failed
+        self.assertFalse(result, "Smart evacuation should return False when any evacuation fails")
+        # Verify update_reason was called
+        mock_update_reason.assert_called_once()
 
 
 class TestKdumpFunctionality(unittest.TestCase):
@@ -1457,6 +1750,7 @@ if __name__ == '__main__':
     test_classes = [
         TestConfigManager,
         TestMetrics,
+        TestHelperFunctions,
         TestInstanceHAService,
         TestEvacuationFunctions,
         TestKdumpFunctionality,
