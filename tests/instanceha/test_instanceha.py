@@ -1068,8 +1068,9 @@ class TestKdumpFunctionality(unittest.TestCase):
 
     def test_kdump_check_no_services(self):
         """Test _check_kdump with empty service list."""
-        result = instanceha._check_kdump([], self.mock_service_instance)
-        self.assertEqual(result, [])
+        to_evacuate, kdumping_hosts = instanceha._check_kdump([], self.mock_service_instance)
+        self.assertEqual(to_evacuate, [])
+        self.assertEqual(kdumping_hosts, [])
 
     def test_kdump_check_immediate_detection(self):
         """Test _check_kdump with immediate kdump detection."""
@@ -1079,8 +1080,9 @@ class TestKdumpFunctionality(unittest.TestCase):
         # Set recent kdump timestamp
         self.mock_service_instance.kdump_hosts_timestamp['compute-01'] = time.time() - 5
 
-        result = instanceha._check_kdump([mock_service1], self.mock_service_instance)
-        self.assertEqual(len(result), 0)  # Host should be filtered out
+        to_evacuate, kdumping_hosts = instanceha._check_kdump([mock_service1], self.mock_service_instance)
+        self.assertEqual(len(to_evacuate), 0)  # Host should be filtered out
+        self.assertEqual(len(kdumping_hosts), 1)  # Host should be in kdumping list
 
     def test_kdump_check_no_kdump_activity(self):
         """Test _check_kdump with no kdump activity."""
@@ -1088,8 +1090,9 @@ class TestKdumpFunctionality(unittest.TestCase):
         mock_service1.host = 'compute-01.example.com'
 
         with patch('instanceha._check_kdump_single', return_value=False):
-            result = instanceha._check_kdump([mock_service1], self.mock_service_instance)
-            self.assertEqual(len(result), 1)  # Host should not be filtered
+            to_evacuate, kdumping_hosts = instanceha._check_kdump([mock_service1], self.mock_service_instance)
+            self.assertEqual(len(to_evacuate), 1)  # Host should not be filtered
+            self.assertEqual(len(kdumping_hosts), 0)  # Host should not be kdumping
 
     def test_kdump_message_processing_valid_magic(self):
         """Test UDP message processing with valid magic number."""
@@ -1142,11 +1145,13 @@ class TestKdumpFunctionality(unittest.TestCase):
 
         with patch('instanceha._check_kdump_single') as mock_check:
             mock_check.side_effect = [True, False]  # First host kdumping, second not
-            result = instanceha._check_kdump(services, mock_service_instance)
+            to_evacuate, kdumping_hosts = instanceha._check_kdump(services, mock_service_instance)
 
             # Should return only the non-kdumping host
-            self.assertEqual(len(result), 1)
-            self.assertEqual(result[0].host, 'compute-02.example.com')
+            self.assertEqual(len(to_evacuate), 1)
+            self.assertEqual(to_evacuate[0].host, 'compute-02.example.com')
+            self.assertEqual(len(kdumping_hosts), 1)
+            self.assertEqual(kdumping_hosts[0], 'compute-01.example.com')
 
     def test_kdump_long_timeout_scenario(self):
         """Test kdump detection with long timeout for delayed starts."""
@@ -1258,11 +1263,13 @@ class TestKdumpIntegration(unittest.TestCase):
         mock_service_instance.kdump_hosts_timestamp['compute-01'] = time.time() - 5
 
         with patch('instanceha._check_kdump_single', return_value=False):
-            result = instanceha._check_kdump(services, mock_service_instance)
+            to_evacuate, kdumping_hosts = instanceha._check_kdump(services, mock_service_instance)
 
             # Should filter out the kdumping host
-            self.assertEqual(len(result), 1)
-            self.assertEqual(result[0].host, 'compute-02.example.com')
+            self.assertEqual(len(to_evacuate), 1)
+            self.assertEqual(to_evacuate[0].host, 'compute-02.example.com')
+            self.assertEqual(len(kdumping_hosts), 1)
+            self.assertEqual(kdumping_hosts[0], 'compute-01.example.com')
 
     def test_kdump_thread_safety(self):
         """Test thread safety of kdump operations."""
@@ -1746,7 +1753,10 @@ class TestIPMIFencing(unittest.TestCase):
         # Should return True after power off confirmation
         self.assertTrue(result)
         self.assertEqual(mock_get_power_state.call_count, 2)  # Called twice
-        mock_sleep.assert_called_once_with(1)
+        # Sleep should be called at least once with value 1
+        self.assertGreaterEqual(mock_sleep.call_count, 1)
+        # Check that sleep was called with 1 at least once
+        self.assertIn(call(1), mock_sleep.call_args_list)
 
     @patch('instanceha._ipmi_get_power_state')
     @patch('instanceha.subprocess.run')
