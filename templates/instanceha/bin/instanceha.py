@@ -20,7 +20,7 @@ import threading
 import hashlib
 from http import server
 import json
-from typing import Dict, Any, Optional, Union, List, Protocol
+from typing import Dict, Any, Optional, Union, List, Protocol, Tuple
 from collections import defaultdict
 from abc import ABC, abstractmethod
 
@@ -1504,11 +1504,11 @@ def _host_disable(connection, service):
         return _handle_nova_exception("log disable reason", service_info, e, is_critical=False)
 
 
-def _check_kdump(stale_services: List[Any], service: InstanceHAService) -> List[Any]:
+def _check_kdump(stale_services: List[Any], service: InstanceHAService) -> Tuple[List[Any], List[str]]:
     """Check for kdump messages using background UDP listener and filter hosts individually."""
     if not stale_services:
         logging.debug("No stale services to check for kdump")
-        return []
+        return [], []
 
     logging.info("Checking %d hosts for kdump activity", len(stale_services))
     kdumping_hosts = []
@@ -1560,10 +1560,13 @@ def _check_kdump(stale_services: List[Any], service: InstanceHAService) -> List[
                 if pending:
                     logging.debug('Kdump check timed out for %d hosts: %s' % (len(pending), [s.host for s in pending]))
 
-    # Clean up completed checks for hosts that completed
-    for svc in stale_services:
-        hostname = _extract_hostname(svc.host)
-        if svc.host not in [s.host for s in uncertain_hosts] and hostname in service.kdump_hosts_checking:
+    # Clean up completed checks for hosts that were checked
+    # Remove entries for hosts that were checked in this iteration (were in uncertain_hosts)
+    # Once a check completes (successfully or with timeout), the entry should be removed
+    # so that future polls can properly detect kdump status based on kdump_hosts_timestamp
+    uncertain_hostnames = {_extract_hostname(s.host) for s in uncertain_hosts}
+    for hostname in uncertain_hostnames:
+        if hostname in service.kdump_hosts_checking:
             del service.kdump_hosts_checking[hostname]
 
     # Remove kdumping hosts from evacuation
@@ -1571,7 +1574,7 @@ def _check_kdump(stale_services: List[Any], service: InstanceHAService) -> List[
     if kdumping_hosts:
         logging.info('Total hosts skipped due to kdumping: %d' % len(kdumping_hosts))
 
-    return to_evacuate
+    return to_evacuate, kdumping_hosts
 
 
 def _host_enable(connection, service, reenable=False):
@@ -2406,7 +2409,19 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
 
     # Process evacuations
     if not service.config.is_disabled():
-        to_evacuate = _check_kdump(compute_nodes, service) if service.config.is_kdump_check_enabled() else compute_nodes
+        if service.config.is_kdump_check_enabled():
+            to_evacuate, kdumping_hosts = _check_kdump(compute_nodes, service)
+            # Remove kdumping hosts from hosts_processing so they can be re-checked in next poll
+            # This allows us to continuously monitor kdump status - evacuation will proceed
+            # automatically once kdump messages stop being received (beyond timeout period)
+            with service.processing_lock:
+                for kdumping_host_str in kdumping_hosts:
+                    hostname = _extract_hostname(kdumping_host_str)
+                    if hostname in service.hosts_processing:
+                        del service.hosts_processing[hostname]
+                        logging.debug('Removed kdumping host %s from processing tracking - will re-check kdump status in next poll', hostname)
+        else:
+            to_evacuate = compute_nodes
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             # Process new evacuations
