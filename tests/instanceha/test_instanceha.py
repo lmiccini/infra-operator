@@ -2001,6 +2001,242 @@ class TestIPMIFencing(unittest.TestCase):
         self.assertIn('test-host', call_args[0][0])
 
 
+class TestBMHFencing(unittest.TestCase):
+    """Unit tests for BareMetal Host (BMH) fencing functionality."""
+
+    def setUp(self):
+        """Set up test environment."""
+        self.config_manager = instanceha.ConfigManager()
+        self.token = 'test-bearer-token'
+        self.namespace = 'metal3'
+        self.host = 'compute-node-1'
+        self.base_url = f"https://kubernetes.default.svc/apis/metal3.io/v1alpha1/namespaces/{self.namespace}/baremetalhosts/{self.host}"
+        self.mock_service = Mock()
+        self.mock_service.config = Mock()
+        self.mock_service.config.get_config_value = Mock(return_value=30)
+
+    @patch('instanceha.os.path.exists')
+    @patch('instanceha.requests.patch')
+    @patch('instanceha._bmh_wait_for_power_off')
+    def test_bmh_power_off_success(self, mock_wait, mock_patch, mock_exists):
+        """Test successful BMH power off with correct API payload."""
+        # Mock CA cert exists
+        mock_exists.return_value = True
+
+        # Mock successful patch response
+        mock_response = Mock()
+        mock_response.raise_for_status = Mock()
+        mock_patch.return_value = mock_response
+
+        # Mock wait for power off success
+        mock_wait.return_value = True
+
+        # Test power off
+        result = instanceha._bmh_fence(
+            self.token, self.namespace, self.host, 'off', self.mock_service
+        )
+
+        # Should return True
+        self.assertTrue(result)
+
+        # Verify patch was called with correct URL
+        mock_patch.assert_called_once()
+        call_args = mock_patch.call_args
+        self.assertIn(f"{self.base_url}?fieldManager=kubectl-patch", call_args[0][0])
+
+        # Verify correct payload: spec.online=false + reboot annotation
+        payload = call_args[1]['json']
+        self.assertIn('spec', payload)
+        self.assertFalse(payload['spec']['online'])
+        self.assertIn('metadata', payload)
+        self.assertIn('annotations', payload['metadata'])
+        self.assertEqual(payload['metadata']['annotations']['reboot.metal3.io/iha'], '{"mode": "hard"}')
+
+        # Verify wait for power off was called
+        mock_wait.assert_called_once()
+        wait_call_args = mock_wait.call_args[0]
+        self.assertEqual(wait_call_args[0], self.base_url)  # get_url
+
+    @patch('instanceha.os.path.exists')
+    @patch('instanceha.requests.patch')
+    def test_bmh_power_on_success(self, mock_patch, mock_exists):
+        """Test successful BMH power on with correct API payload."""
+        # Mock CA cert exists
+        mock_exists.return_value = True
+
+        # Mock successful patch response
+        mock_response = Mock()
+        mock_response.raise_for_status = Mock()
+        mock_patch.return_value = mock_response
+
+        # Test power on
+        result = instanceha._bmh_fence(
+            self.token, self.namespace, self.host, 'on', self.mock_service
+        )
+
+        # Should return True
+        self.assertTrue(result)
+
+        # Verify patch was called with correct payload
+        mock_patch.assert_called_once()
+        payload = mock_patch.call_args[1]['json']
+        self.assertIn('spec', payload)
+        self.assertTrue(payload['spec']['online'])
+        # Power on should remove reboot annotation by setting it to None
+        self.assertIn('metadata', payload)
+        self.assertIn('annotations', payload['metadata'])
+        self.assertIsNone(payload['metadata']['annotations'].get('reboot.metal3.io/iha'))
+
+    @patch('instanceha.os.path.exists')
+    @patch('instanceha.requests.Session')
+    @patch('instanceha.requests.patch')
+    @patch('instanceha.time.sleep')
+    def test_bmh_wait_for_power_off_success(self, mock_sleep, mock_patch, mock_session_class, mock_exists):
+        """Test BMH wait for power off successfully detects power off."""
+        # Mock CA cert exists
+        mock_exists.return_value = True
+
+        # Mock successful patch response
+        mock_patch_response = Mock()
+        mock_patch_response.raise_for_status = Mock()
+        mock_patch.return_value = mock_patch_response
+
+        # Mock session for status polling
+        mock_session = Mock()
+        mock_context = Mock()
+        mock_context.__enter__ = Mock(return_value=mock_session)
+        mock_context.__exit__ = Mock(return_value=None)
+        mock_session_class.return_value = mock_context
+
+        # Simulate power status: first ON, then OFF
+        mock_get_response1 = Mock()
+        mock_get_response1.json.return_value = {
+            'status': {'poweredOn': True}
+        }
+        mock_get_response1.raise_for_status = Mock()
+
+        mock_get_response2 = Mock()
+        mock_get_response2.json.return_value = {
+            'status': {'poweredOn': False}
+        }
+        mock_get_response2.raise_for_status = Mock()
+
+        mock_session.get.side_effect = [mock_get_response1, mock_get_response2]
+
+        # Test power off with wait
+        result = instanceha._bmh_fence(
+            self.token, self.namespace, self.host, 'off', self.mock_service
+        )
+
+        # Should return True after detecting power off
+        self.assertTrue(result)
+        # Should have polled at least twice
+        self.assertGreaterEqual(mock_session.get.call_count, 2)
+        # Verify it checked for poweredOn status
+        calls = mock_session.get.call_args_list
+        for call_args in calls:
+            self.assertEqual(call_args[0][0], self.base_url)
+
+    @patch('instanceha.os.path.exists')
+    @patch('instanceha.requests.Session')
+    @patch('instanceha.requests.patch')
+    @patch('instanceha.time.sleep')
+    def test_bmh_wait_for_power_off_timeout(self, mock_sleep, mock_patch, mock_session_class, mock_exists):
+        """Test BMH wait for power off times out when host never powers off."""
+        # Mock CA cert exists
+        mock_exists.return_value = True
+
+        # Mock successful patch response
+        mock_patch_response = Mock()
+        mock_patch_response.raise_for_status = Mock()
+        mock_patch.return_value = mock_patch_response
+
+        # Mock session for status polling - always returns poweredOn=True
+        mock_session = Mock()
+        mock_context = Mock()
+        mock_context.__enter__ = Mock(return_value=mock_session)
+        mock_context.__exit__ = Mock(return_value=None)
+        mock_session_class.return_value = mock_context
+
+        mock_get_response = Mock()
+        mock_get_response.json.return_value = {
+            'status': {'poweredOn': True}
+        }
+        mock_get_response.raise_for_status = Mock()
+        mock_session.get.return_value = mock_get_response
+
+        # Set a short timeout for testing
+        self.mock_service.config.get_config_value = Mock(return_value=2)
+
+        # Test power off with wait - should timeout
+        result = instanceha._bmh_fence(
+            self.token, self.namespace, self.host, 'off', self.mock_service
+        )
+
+        # Should return False due to timeout
+        self.assertFalse(result)
+
+    @patch('instanceha.os.path.exists')
+    @patch('instanceha.requests.patch')
+    def test_bmh_fence_no_ca_cert(self, mock_patch, mock_exists):
+        """Test BMH fence fails when CA cert is missing."""
+        # Mock CA cert doesn't exist
+        mock_exists.return_value = False
+
+        # Test power off
+        result = instanceha._bmh_fence(
+            self.token, self.namespace, self.host, 'off', self.mock_service
+        )
+
+        # Should return False
+        self.assertFalse(result)
+        # Patch should not be called
+        mock_patch.assert_not_called()
+
+    @patch('instanceha.os.path.exists')
+    @patch('instanceha.requests.patch')
+    def test_bmh_fence_invalid_params(self, mock_patch, mock_exists):
+        """Test BMH fence fails with invalid parameters."""
+        mock_exists.return_value = True
+
+        # Test with missing token
+        result = instanceha._bmh_fence(
+            None, self.namespace, self.host, 'off', self.mock_service
+        )
+        self.assertFalse(result)
+
+        # Test with invalid action
+        result = instanceha._bmh_fence(
+            self.token, self.namespace, self.host, 'invalid', self.mock_service
+        )
+        self.assertFalse(result)
+
+        # Patch should not be called
+        mock_patch.assert_not_called()
+
+    @patch('instanceha.os.path.exists')
+    @patch('instanceha.requests.patch')
+    @patch('instanceha._safe_log_exception')
+    def test_bmh_fence_api_error(self, mock_safe_log, mock_patch, mock_exists):
+        """Test BMH fence handles API errors gracefully."""
+        mock_exists.return_value = True
+
+        # Mock API error
+        mock_response = Mock()
+        mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError("API error")
+        mock_patch.return_value = mock_response
+
+        # Test power off
+        result = instanceha._bmh_fence(
+            self.token, self.namespace, self.host, 'off', self.mock_service
+        )
+
+        # Should return False
+        self.assertFalse(result)
+        # Should log error safely
+        mock_safe_log.assert_called_once()
+
+
 class TestSecretExposure(unittest.TestCase):
     """Test that credentials are never exposed in logs or debug outputs."""
 

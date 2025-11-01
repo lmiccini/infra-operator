@@ -1747,11 +1747,18 @@ def _bmh_fence(token, namespace, host, action, service):
 
     try:
         if action == 'off':
-            annotation_value = '{"mode": "hard"}'
+            # Use reboot annotation with hard mode for immediate hard power-off
+            # Combined with spec.online=false to ensure it stays off
+            data = {
+                "spec": {"online": False},
+                "metadata": {"annotations": {"reboot.metal3.io/iha": '{"mode": "hard"}'}}
+            }
         else:
-            annotation_value = None
-
-        data = {"metadata": {"annotations": {"reboot.metal3.io/iha": annotation_value}}}
+            # Power on: set online=True and remove reboot annotation if present
+            data = {
+                "spec": {"online": True},
+                "metadata": {"annotations": {"reboot.metal3.io/iha": None}}
+            }
 
         fencing_timeout = service.config.get_config_value('FENCING_TIMEOUT')
         response = requests.patch(f"{base_url}?fieldManager=kubectl-patch",
