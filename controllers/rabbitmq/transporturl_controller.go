@@ -19,6 +19,7 @@ package rabbitmq
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -237,20 +238,6 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		return ctrl.Result{}, err
 	}
 
-	var host string
-	if h, ok := rabbitSecret.Data["host"]; ok {
-		host = string(h)
-	} else {
-		err := fmt.Errorf("host does not exist in rabbitmq secret %s", rabbitSecret.Name)
-		instance.Status.Conditions.Set(condition.FalseCondition(
-			rabbitmqv1.TransportURLReadyCondition,
-			condition.ErrorReason,
-			condition.SeverityWarning,
-			rabbitmqv1.TransportURLReadyErrorMessage,
-			err.Error()))
-		return ctrl.Result{}, err
-	}
-
 	var port string
 	if p, ok := rabbitSecret.Data["port"]; ok {
 		port = string(p)
@@ -265,15 +252,72 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		return ctrl.Result{}, err
 	}
 
+	// Get RabbitMq CR to check original IP configuration
+	rabbitmqCR := &rabbitmqv1.RabbitMq{}
+	err = r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbitmqCR)
+
+	// Build list of hosts from StatefulSet pods
+	var hosts []string
+	usePerPodServices := false
+	useMainService := false
+
+	// Check if per-pod LoadBalancer services are configured using RabbitMq CR annotations
+	// but replica count from RabbitmqCluster
+	if err == nil && rabbit.Spec.Replicas != nil && *rabbit.Spec.Replicas > 0 &&
+		rabbitmqCR.Spec.Override != nil && rabbitmqCR.Spec.Override.Service != nil &&
+		rabbitmqCR.Spec.Override.Service.Spec != nil &&
+		rabbitmqCR.Spec.Override.Service.Spec.Type == corev1.ServiceTypeLoadBalancer &&
+		rabbitmqCR.Spec.Override.Service.Annotations != nil {
+		if ipsStr, ok := rabbitmqCR.Spec.Override.Service.Annotations["metallb.universe.tf/loadBalancerIPs"]; ok {
+			ips := strings.Split(ipsStr, ",")
+			for i := range ips {
+				ips[i] = strings.TrimSpace(ips[i])
+			}
+			// replicas+1 IPs means per-pod services, 1 IP means main service
+			if len(ips) == int(*rabbit.Spec.Replicas)+1 {
+				usePerPodServices = true
+			} else if len(ips) == 1 {
+				useMainService = true
+			}
+		}
+	}
+
+	if usePerPodServices {
+		// Use per-pod service names
+		for i := 0; i < int(*rabbit.Spec.Replicas); i++ {
+			podHost := fmt.Sprintf("%s-server-%d.%s.svc", rabbit.Name, i, instance.Namespace)
+			hosts = append(hosts, podHost)
+		}
+	} else if useMainService {
+		// Use main service
+		hosts = []string{fmt.Sprintf("%s.%s.svc", rabbit.Name, instance.Namespace)}
+	} else if rabbit.Spec.Replicas != nil && *rabbit.Spec.Replicas > 1 {
+		// Use headless service for StatefulSet pods
+		for i := 0; i < int(*rabbit.Spec.Replicas); i++ {
+			podHost := fmt.Sprintf("%s-server-%d.%s-nodes.%s.svc", rabbit.Name, i, rabbit.Name, instance.Namespace)
+			hosts = append(hosts, podHost)
+		}
+	} else {
+		// Fallback to single host from secret
+		if h, ok := rabbitSecret.Data["host"]; ok {
+			hosts = []string{string(h)}
+		} else {
+			err := fmt.Errorf("host does not exist in rabbitmq secret %s", rabbitSecret.Name)
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				rabbitmqv1.TransportURLReadyCondition,
+				condition.ErrorReason,
+				condition.SeverityWarning,
+				rabbitmqv1.TransportURLReadyErrorMessage,
+				err.Error()))
+			return ctrl.Result{}, err
+		}
+	}
+
 	tlsEnabled := rabbit.Spec.TLS.SecretName != ""
 
 	Log.Info(fmt.Sprintf("rabbitmq cluster %s has TLS enabled: %t", rabbit.Name, tlsEnabled))
 
-	// Get RabbitMq CR for both secret generation and status update
-	rabbitmqCR := &rabbitmqv1.RabbitMq{}
-	err = r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbitmqCR)
-
-	// Determine quorum setting for secret generation
+	// Determine quorum setting for secret generation (rabbitmqCR already fetched above)
 	quorum := false
 	if err != nil {
 		Log.Info(fmt.Sprintf("Could not fetch RabbitMQ CR: %v", err))
@@ -298,7 +342,7 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 	}
 
 	// Create a new secret with the transport URL for this CR
-	secret := r.createTransportURLSecret(instance, string(username), string(password), string(host), string(port), tlsEnabled, quorum)
+	secret := r.createTransportURLSecret(instance, string(username), string(password), hosts, string(port), tlsEnabled, quorum)
 	_, op, err := oko_secret.CreateOrPatchSecret(ctx, helper, instance, secret)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
@@ -338,7 +382,7 @@ func (r *TransportURLReconciler) createTransportURLSecret(
 	instance *rabbitmqv1.TransportURL,
 	username string,
 	password string,
-	host string,
+	hosts []string,
 	port string,
 	tlsEnabled bool,
 	quorum bool,
@@ -350,9 +394,16 @@ func (r *TransportURLReconciler) createTransportURLSecret(
 		query += "?ssl=0"
 	}
 
+	// Build transport URL with all hosts
+	var hostParts []string
+	for _, host := range hosts {
+		hostParts = append(hostParts, fmt.Sprintf("%s:%s@%s:%s", username, password, host, port))
+	}
+	transportURL := fmt.Sprintf("rabbit://%s/%s", strings.Join(hostParts, ","), query)
+
 	// Create a new secret with the transport URL for this CR
 	data := map[string][]byte{
-		"transport_url": fmt.Appendf(nil, "rabbit://%s:%s@%s:%s/%s", username, password, host, port, query),
+		"transport_url": []byte(transportURL),
 	}
 	if quorum {
 		data["quorumqueues"] = []byte("true")

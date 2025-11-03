@@ -30,6 +30,7 @@ import (
 
 	//. "github.com/openstack-k8s-operators/lib-common/modules/common/test/helpers"
 	corev1 "k8s.io/api/core/v1"
+	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -395,6 +396,133 @@ var _ = Describe("RabbitMQ Controller", func() {
 				g.Expect(cluster.Spec.Override.Service.Annotations["metallb.universe.tf/loadBalancerIPs"]).To(Equal("192.0.2.1"))
 				g.Expect(cluster.Spec.Override.Service.Annotations["dnsmasq.network.openstack.org/hostname"]).To(Equal(fmt.Sprintf("%s.%s.svc", rabbitmqDefaultName, namespace)))
 				g.Expect(cluster.Spec.Override.Service.Spec.Type).To(Equal(corev1.ServiceTypeLoadBalancer))
+			}, timeout, interval).Should(Succeed())
+		})
+	})
+
+	When("RabbitMQ per-pod services with 1 IP specified", func() {
+		BeforeEach(func() {
+			spec := GetDefaultRabbitMQSpec()
+			spec["replicas"] = 3
+			spec["override"] = map[string]any{
+				"service": map[string]any{
+					"metadata": map[string]any{
+						"annotations": map[string]any{
+							"metallb.universe.tf/address-pool":    "internalapi",
+							"metallb.universe.tf/loadBalancerIPs": "192.0.2.10",
+						},
+					},
+					"spec": map[string]any{
+						"type": "LoadBalancer",
+					},
+				},
+			}
+			rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+			DeferCleanup(th.DeleteInstance, rabbitmq)
+		})
+
+		It("should use IP for main service only, no per-pod services", func() {
+			SimulateRabbitMQClusterReady(rabbitmqName)
+			Eventually(func(g Gomega) {
+				// Check main service has the specified IP
+				cluster := GetRabbitMQCluster(rabbitmqName)
+				g.Expect(cluster.Spec.Override.Service.Annotations["metallb.universe.tf/loadBalancerIPs"]).To(Equal("192.0.2.10"))
+
+				// Check per-pod services are NOT created
+				for i := 0; i < 3; i++ {
+					svcName := types.NamespacedName{
+						Name:      fmt.Sprintf("%s-server-%d", rabbitmqDefaultName, i),
+						Namespace: namespace,
+					}
+					svc := &corev1.Service{}
+					err := k8sClient.Get(ctx, svcName, svc)
+					g.Expect(err).To(HaveOccurred())
+					g.Expect(k8s_errors.IsNotFound(err)).To(BeTrue())
+				}
+			}, timeout, interval).Should(Succeed())
+		})
+	})
+
+	When("RabbitMQ per-pod services with replicas+1 IPs specified", func() {
+		BeforeEach(func() {
+			spec := GetDefaultRabbitMQSpec()
+			spec["replicas"] = 3
+			spec["override"] = map[string]any{
+				"service": map[string]any{
+					"metadata": map[string]any{
+						"annotations": map[string]any{
+							"metallb.universe.tf/address-pool":    "internalapi",
+							"metallb.universe.tf/loadBalancerIPs": "192.0.2.10,192.0.2.11,192.0.2.12,192.0.2.13",
+						},
+					},
+					"spec": map[string]any{
+						"type": "LoadBalancer",
+					},
+				},
+			}
+			rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+			DeferCleanup(th.DeleteInstance, rabbitmq)
+		})
+
+		It("should use first IP for main service and remaining IPs for per-pod services", func() {
+			SimulateRabbitMQClusterReady(rabbitmqName)
+			Eventually(func(g Gomega) {
+				// Check main service has only the first IP
+				cluster := GetRabbitMQCluster(rabbitmqName)
+				g.Expect(cluster.Spec.Override.Service.Annotations["metallb.universe.tf/loadBalancerIPs"]).To(Equal("192.0.2.10"))
+
+				// Check per-pod services have the remaining IPs
+				expectedIPs := []string{"192.0.2.11", "192.0.2.12", "192.0.2.13"}
+				for i := 0; i < 3; i++ {
+					svcName := types.NamespacedName{
+						Name:      fmt.Sprintf("%s-server-%d", rabbitmqDefaultName, i),
+						Namespace: namespace,
+					}
+					svc := &corev1.Service{}
+					g.Expect(k8sClient.Get(ctx, svcName, svc)).Should(Succeed())
+					g.Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeLoadBalancer))
+					g.Expect(svc.Annotations["metallb.universe.tf/loadBalancerIPs"]).To(Equal(expectedIPs[i]))
+					g.Expect(svc.Spec.Selector).To(HaveKeyWithValue("statefulset.kubernetes.io/pod-name", fmt.Sprintf("%s-server-%d", rabbitmqDefaultName, i)))
+				}
+			}, timeout, interval).Should(Succeed())
+		})
+	})
+
+	When("RabbitMQ per-pod services with wrong number of IPs", func() {
+		BeforeEach(func() {
+			spec := GetDefaultRabbitMQSpec()
+			spec["replicas"] = 3
+			spec["override"] = map[string]any{
+				"service": map[string]any{
+					"metadata": map[string]any{
+						"annotations": map[string]any{
+							"metallb.universe.tf/address-pool":    "internalapi",
+							"metallb.universe.tf/loadBalancerIPs": "192.0.2.10,192.0.2.11",
+						},
+					},
+					"spec": map[string]any{
+						"type": "LoadBalancer",
+					},
+				},
+			}
+			rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+			DeferCleanup(th.DeleteInstance, rabbitmq)
+		})
+
+		It("should skip per-pod service creation", func() {
+			SimulateRabbitMQClusterReady(rabbitmqName)
+			Eventually(func(g Gomega) {
+				// Check per-pod services are NOT created
+				for i := 0; i < 3; i++ {
+					svcName := types.NamespacedName{
+						Name:      fmt.Sprintf("%s-server-%d", rabbitmqDefaultName, i),
+						Namespace: namespace,
+					}
+					svc := &corev1.Service{}
+					err := k8sClient.Get(ctx, svcName, svc)
+					g.Expect(err).To(HaveOccurred())
+					g.Expect(k8s_errors.IsNotFound(err)).To(BeTrue())
+				}
 			}, timeout, interval).Should(Succeed())
 		})
 	})

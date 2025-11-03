@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	rabbitmqv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
@@ -52,11 +53,11 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
 
 	"github.com/go-logr/logr"
+	networkv1 "github.com/openstack-k8s-operators/infra-operator/apis/network/v1beta1"
 	rabbitmqv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
+	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	"github.com/openstack-k8s-operators/infra-operator/pkg/rabbitmq"
 	"github.com/openstack-k8s-operators/infra-operator/pkg/rabbitmq/impl"
-
-	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
@@ -102,6 +103,9 @@ type Reconciler struct {
 
 // Required to manage PodDisruptionBudgets for multi-replica deployments
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+
+// Required to create per-pod LoadBalancer services
+// +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile - RabbitMq
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, _err error) {
@@ -363,7 +367,35 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		instance.Status.LastAppliedTopology = nil
 	}
 
-	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, instance.Spec.Override)
+	// Handle IP allocation: if multiple IPs provided, split first IP for main service
+	overrideSpec := instance.Spec.Override
+	if instance.Spec.Replicas != nil && *instance.Spec.Replicas > 0 &&
+		instance.Spec.Override != nil && instance.Spec.Override.Service != nil &&
+		instance.Spec.Override.Service.Annotations != nil {
+		if ipsStr, ok := instance.Spec.Override.Service.Annotations["metallb.universe.tf/loadBalancerIPs"]; ok {
+			loadBalancerIPs := strings.Split(ipsStr, ",")
+			for i := range loadBalancerIPs {
+				loadBalancerIPs[i] = strings.TrimSpace(loadBalancerIPs[i])
+			}
+			replicas := int(*instance.Spec.Replicas)
+			// If we have replicas+1 IPs, use first for main service, rest for per-pod
+			if len(loadBalancerIPs) == replicas+1 {
+				// Clone Override to avoid modifying the original
+				overrideSpec = instance.Spec.Override.DeepCopy()
+				// Create a new annotations map with all existing annotations
+				newAnnotations := make(map[string]string)
+				for k, v := range instance.Spec.Override.Service.Annotations {
+					newAnnotations[k] = v
+				}
+				// Override the IPs annotation with only the first IP
+				newAnnotations["metallb.universe.tf/loadBalancerIPs"] = loadBalancerIPs[0]
+				overrideSpec.Service.Annotations = newAnnotations
+				Log.Info(fmt.Sprintf("Splitting IPs: main service gets %s, per-pod services will get %v", loadBalancerIPs[0], loadBalancerIPs[1:]))
+			}
+		}
+	}
+
+	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, overrideSpec)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -461,11 +493,124 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		instance.Status.QueueType = instance.Spec.QueueType
 	}
 
+	// Create per-pod services for LoadBalancer type
+	if instance.Spec.Replicas != nil && *instance.Spec.Replicas > 0 &&
+		instance.Spec.Override != nil && instance.Spec.Override.Service != nil &&
+		instance.Spec.Override.Service.Spec != nil &&
+		instance.Spec.Override.Service.Spec.Type == corev1.ServiceTypeLoadBalancer {
+		err := r.reconcilePerPodServices(ctx, instance, helper)
+		if err != nil {
+			Log.Error(err, "Failed to create per-pod services")
+			return ctrl.Result{}, err
+		}
+	}
+
 	if instance.Status.Conditions.AllSubConditionIsTrue() {
 		instance.Status.Conditions.MarkTrue(
 			condition.ReadyCondition, condition.ReadyMessage)
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *Reconciler) reconcilePerPodServices(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) error {
+	Log := r.GetLogger(ctx)
+
+	// Parse loadBalancerIPs from annotations
+	var loadBalancerIPs []string
+	if instance.Spec.Override.Service.Annotations != nil {
+		if ipsStr, ok := instance.Spec.Override.Service.Annotations["metallb.universe.tf/loadBalancerIPs"]; ok {
+			loadBalancerIPs = strings.Split(ipsStr, ",")
+			for i := range loadBalancerIPs {
+				loadBalancerIPs[i] = strings.TrimSpace(loadBalancerIPs[i])
+			}
+		}
+	}
+
+	replicas := int(*instance.Spec.Replicas)
+
+	// Only create per-pod services if exactly replicas+1 IPs are specified
+	if len(loadBalancerIPs) != replicas+1 {
+		Log.Info(fmt.Sprintf("Skipping per-pod service creation. Expected %d IPs (replicas+1) but got %d. Specify 1 IP for main service only, or %d IPs for main + per-pod services.", replicas+1, len(loadBalancerIPs), replicas+1))
+		return nil
+	}
+
+	// Use IPs starting from index 1 (skip first IP which is for main service)
+	perPodIPs := loadBalancerIPs[1:]
+	Log.Info(fmt.Sprintf("Creating per-pod services with specific IPs"))
+
+	// Create a service for each pod
+	for i := 0; i < replicas; i++ {
+		podName := fmt.Sprintf("%s-server-%d", instance.Name, i)
+		svcName := podName
+
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      svcName,
+				Namespace: instance.Namespace,
+			},
+		}
+
+		// Create or update the service
+		op, err := controllerutil.CreateOrUpdate(ctx, helper.GetClient(), svc, func() error {
+			// Set labels
+			if svc.Labels == nil {
+				svc.Labels = make(map[string]string)
+			}
+			svc.Labels[labels.K8sAppName] = instance.Name
+			svc.Labels[labels.K8sAppComponent] = "rabbitmq"
+
+			// Set annotations
+			if svc.Annotations == nil {
+				svc.Annotations = make(map[string]string)
+			}
+
+			// Copy annotations from override service
+			if instance.Spec.Override.Service.Annotations != nil {
+				for k, v := range instance.Spec.Override.Service.Annotations {
+					// Skip the comma-separated IPs annotation - handle individually below
+					if k != "metallb.universe.tf/loadBalancerIPs" {
+						svc.Annotations[k] = v
+					}
+				}
+			}
+
+			// Set individual IP for this pod
+			svc.Annotations["metallb.universe.tf/loadBalancerIPs"] = perPodIPs[i]
+
+			// Add DNS hostname annotation to register in dnsmasq
+			hostname := fmt.Sprintf("%s.%s.svc", svcName, instance.Namespace)
+			svc.Annotations[networkv1.AnnotationHostnameKey] = hostname
+
+			// Set service spec
+			svc.Spec.Type = corev1.ServiceTypeLoadBalancer
+			svc.Spec.Selector = map[string]string{
+				"statefulset.kubernetes.io/pod-name": podName,
+			}
+			svc.Spec.Ports = []corev1.ServicePort{
+				{
+					Name:       "amqp",
+					Port:       5672,
+					TargetPort: intstr.FromInt(5672),
+				},
+				{
+					Name:       "amqps",
+					Port:       5671,
+					TargetPort: intstr.FromInt(5671),
+				},
+			}
+
+			// Set owner reference
+			return ctrl.SetControllerReference(instance, svc, r.Scheme)
+		})
+		if err != nil {
+			return err
+		}
+		if op != controllerutil.OperationResultNone {
+			Log.Info(fmt.Sprintf("Service %s %s", svcName, op))
+		}
+	}
+
+	return nil
 }
 
 func updateMirroredPolicy(ctx context.Context, helper *helper.Helper, instance *rabbitmqv1beta1.RabbitMq, config *rest.Config, apply bool) error {
