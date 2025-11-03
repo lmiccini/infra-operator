@@ -25,11 +25,27 @@ from unittest.mock import Mock, patch, MagicMock, call
 from datetime import datetime, timedelta
 import concurrent.futures
 
+# Mock OpenStack dependencies before importing instanceha
+# This allows tests to run without novaclient, keystoneauth1, etc.
+if 'novaclient' not in sys.modules:
+    sys.modules['novaclient'] = MagicMock()
+    sys.modules['novaclient.client'] = MagicMock()
+    sys.modules['novaclient.exceptions'] = MagicMock()
+
+if 'keystoneauth1' not in sys.modules:
+    sys.modules['keystoneauth1'] = MagicMock()
+    sys.modules['keystoneauth1.loading'] = MagicMock()
+    sys.modules['keystoneauth1.session'] = MagicMock()
+    sys.modules['keystoneauth1.exceptions'] = MagicMock()
+    sys.modules['keystoneauth1.exceptions.discovery'] = MagicMock()
+
 # Suppress warnings during testing
 logging.getLogger().setLevel(logging.CRITICAL)
 
 # Add the module path for testing
-sys.path.append('../../templates/instanceha/bin/')
+test_dir = os.path.dirname(os.path.abspath(__file__))
+instanceha_path = os.path.join(test_dir, '../../templates/instanceha/bin/')
+sys.path.insert(0, os.path.abspath(instanceha_path))
 
 import instanceha
 
@@ -266,6 +282,8 @@ class TestServiceInitialization(unittest.TestCase):
                 }
             }
         }
+        # Mock get_cloud_name to return 'testcloud'
+        mock_config.get_cloud_name.return_value = 'testcloud'
 
         service = instanceha.InstanceHAService(mock_config)
 
