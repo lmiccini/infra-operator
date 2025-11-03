@@ -459,6 +459,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		}
 
 		instance.Status.QueueType = instance.Spec.QueueType
+
+		// Check for unresponsive pods and delete them to trigger StatefulSet recreation
+		if err := r.checkAndCleanupUnresponsivePods(ctx, helper, instance); err != nil {
+			Log.Error(err, "Failed to check and cleanup unresponsive pods")
+			// Don't fail the reconciliation, just log the error
+		}
 	}
 
 	if instance.Status.Conditions.AllSubConditionIsTrue() {
@@ -488,6 +494,54 @@ func updateMirroredPolicy(ctx context.Context, helper *helper.Helper, instance *
 			return nil
 		})
 	return err
+}
+
+// checkAndCleanupUnresponsivePods checks RabbitMQ pods for responsiveness and deletes unresponsive ones
+func (r *Reconciler) checkAndCleanupUnresponsivePods(ctx context.Context, helper *helper.Helper, instance *rabbitmqv1beta1.RabbitMq) error {
+	Log := r.GetLogger(ctx)
+
+	// List all RabbitMQ pods for this instance
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(instance.Namespace), client.MatchingLabels{
+		"app.kubernetes.io/name": instance.Name,
+	}); err != nil {
+		return fmt.Errorf("failed to list RabbitMQ pods: %w", err)
+	}
+
+	for _, pod := range podList.Items {
+		// Only check pods that are in Running phase
+		if pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+
+		// Create a context with 5-second timeout for the health check
+		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		// Try to execute rabbitmqctl ping
+		podName := types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}
+		cmd := []string{"/bin/bash", "-c", "rabbitmqctl ping"}
+
+		err := rsh.ExecInPod(checkCtx, helper.GetKClient(), r.config, podName, "rabbitmq", cmd,
+			func(_ *bytes.Buffer, _ *bytes.Buffer) error {
+				return nil
+			})
+
+		if err != nil {
+			Log.Info("Pod is unresponsive, deleting to trigger recreation", "pod", pod.Name, "error", err.Error())
+			// Force immediate deletion with zero grace period since the node is likely down
+			deleteOpts := &client.DeleteOptions{
+				GracePeriodSeconds: ptr.To(int64(0)),
+			}
+			if deleteErr := r.Delete(ctx, &pod, deleteOpts); deleteErr != nil {
+				Log.Error(deleteErr, "Failed to delete unresponsive pod", "pod", pod.Name)
+				return fmt.Errorf("failed to delete unresponsive pod %s: %w", pod.Name, deleteErr)
+			}
+			Log.Info("Successfully deleted unresponsive pod", "pod", pod.Name)
+		}
+	}
+
+	return nil
 }
 
 func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
