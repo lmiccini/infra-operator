@@ -443,20 +443,35 @@ var _ = Describe("RabbitMQ Controller", func() {
 		})
 	})
 
-	When("RabbitMQ per-pod services with replicas+1 IPs specified", func() {
+	When("RabbitMQ per-pod services with podOverride", func() {
 		BeforeEach(func() {
 			spec := GetDefaultRabbitMQSpec()
 			spec["replicas"] = 3
-			spec["override"] = map[string]any{
-				"service": map[string]any{
-					"metadata": map[string]any{
-						"annotations": map[string]any{
-							"metallb.universe.tf/address-pool":    "internalapi",
-							"metallb.universe.tf/loadBalancerIPs": "192.0.2.10,192.0.2.11,192.0.2.12,192.0.2.13",
+			spec["podOverride"] = map[string]any{
+				"services": []map[string]any{
+					{
+						"metadata": map[string]any{
+							"annotations": map[string]any{
+								"metallb.universe.tf/address-pool":    "internalapi",
+								"metallb.universe.tf/loadBalancerIPs": "192.0.2.11",
+							},
 						},
 					},
-					"spec": map[string]any{
-						"type": "LoadBalancer",
+					{
+						"metadata": map[string]any{
+							"annotations": map[string]any{
+								"metallb.universe.tf/address-pool":    "internalapi",
+								"metallb.universe.tf/loadBalancerIPs": "192.0.2.12",
+							},
+						},
+					},
+					{
+						"metadata": map[string]any{
+							"annotations": map[string]any{
+								"metallb.universe.tf/address-pool":    "internalapi",
+								"metallb.universe.tf/loadBalancerIPs": "192.0.2.13",
+							},
+						},
 					},
 				},
 			}
@@ -464,14 +479,10 @@ var _ = Describe("RabbitMQ Controller", func() {
 			DeferCleanup(th.DeleteInstance, rabbitmq)
 		})
 
-		It("should use first IP for main service and remaining IPs for per-pod services", func() {
+		It("should create per-pod services with specified IPs", func() {
 			SimulateRabbitMQClusterReady(rabbitmqName)
 			Eventually(func(g Gomega) {
-				// Check main service has only the first IP
-				cluster := GetRabbitMQCluster(rabbitmqName)
-				g.Expect(cluster.Spec.Override.Service.Annotations["metallb.universe.tf/loadBalancerIPs"]).To(Equal("192.0.2.10"))
-
-				// Check per-pod services have the remaining IPs
+				// Check per-pod services have the specified IPs
 				expectedIPs := []string{"192.0.2.11", "192.0.2.12", "192.0.2.13"}
 				for i := 0; i < 3; i++ {
 					svcName := types.NamespacedName{
@@ -482,26 +493,34 @@ var _ = Describe("RabbitMQ Controller", func() {
 					g.Expect(k8sClient.Get(ctx, svcName, svc)).Should(Succeed())
 					g.Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeLoadBalancer))
 					g.Expect(svc.Annotations["metallb.universe.tf/loadBalancerIPs"]).To(Equal(expectedIPs[i]))
+					g.Expect(svc.Annotations["metallb.universe.tf/address-pool"]).To(Equal("internalapi"))
 					g.Expect(svc.Spec.Selector).To(HaveKeyWithValue("statefulset.kubernetes.io/pod-name", fmt.Sprintf("%s-server-%d", rabbitmqDefaultName, i)))
 				}
 			}, timeout, interval).Should(Succeed())
 		})
 	})
 
-	When("RabbitMQ per-pod services with wrong number of IPs", func() {
+	When("RabbitMQ per-pod services with wrong number of service overrides", func() {
 		BeforeEach(func() {
 			spec := GetDefaultRabbitMQSpec()
 			spec["replicas"] = 3
-			spec["override"] = map[string]any{
-				"service": map[string]any{
-					"metadata": map[string]any{
-						"annotations": map[string]any{
-							"metallb.universe.tf/address-pool":    "internalapi",
-							"metallb.universe.tf/loadBalancerIPs": "192.0.2.10,192.0.2.11",
+			spec["podOverride"] = map[string]any{
+				"services": []map[string]any{
+					{
+						"metadata": map[string]any{
+							"annotations": map[string]any{
+								"metallb.universe.tf/address-pool":    "internalapi",
+								"metallb.universe.tf/loadBalancerIPs": "192.0.2.11",
+							},
 						},
 					},
-					"spec": map[string]any{
-						"type": "LoadBalancer",
+					{
+						"metadata": map[string]any{
+							"annotations": map[string]any{
+								"metallb.universe.tf/address-pool":    "internalapi",
+								"metallb.universe.tf/loadBalancerIPs": "192.0.2.12",
+							},
+						},
 					},
 				},
 			}
@@ -509,10 +528,10 @@ var _ = Describe("RabbitMQ Controller", func() {
 			DeferCleanup(th.DeleteInstance, rabbitmq)
 		})
 
-		It("should skip per-pod service creation", func() {
+		It("should skip per-pod service creation due to mismatch", func() {
 			SimulateRabbitMQClusterReady(rabbitmqName)
 			Eventually(func(g Gomega) {
-				// Check per-pod services are NOT created
+				// Check per-pod services are NOT created (only 2 services for 3 replicas)
 				for i := 0; i < 3; i++ {
 					svcName := types.NamespacedName{
 						Name:      fmt.Sprintf("%s-server-%d", rabbitmqDefaultName, i),
