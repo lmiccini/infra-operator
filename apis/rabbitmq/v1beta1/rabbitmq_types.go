@@ -23,6 +23,7 @@ import (
 
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/service"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
 	rabbitmqv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -43,6 +44,14 @@ const (
 	errInvalidOverride      = "invalid spec override (%s)"
 	warnOverrideStatefulSet = "%s: is deprecated and will be removed in a future API version"
 )
+
+// PodOverride defines per-pod service configurations
+type PodOverride struct {
+	// +kubebuilder:validation:Optional
+	// +listType=atomic
+	// Services - list of per-pod service overrides
+	Services []service.OverrideSpec `json:"services,omitempty"`
+}
 
 // RabbitMqSpec defines the desired state of RabbitMq
 type RabbitMqSpec struct {
@@ -70,6 +79,12 @@ type RabbitMqSpecCore struct {
 	// +kubebuilder:default=Mirrored
 	// QueueType to eventually apply the ha-all policy or configure default queue type for the cluster
 	QueueType string `json:"queueType"`
+	// +kubebuilder:validation:Optional
+	// +operator-sdk:csv:customresourcedefinitions:type=spec
+	// PodOverride - Override configuration for per-pod services. When specified, individual LoadBalancer
+	// services will be created for each pod with the provided configuration, and the transport URL will be
+	// configured to use these per-pod services.
+	PodOverride *PodOverride `json:"podOverride,omitempty"`
 }
 
 // Method to convert RabbitMqSpec to RabbitmqClusterSpec

@@ -21,7 +21,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	rabbitmqv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
@@ -367,33 +366,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		instance.Status.LastAppliedTopology = nil
 	}
 
-	// Handle IP allocation: if multiple IPs provided, split first IP for main service
+	// Use the override spec as-is (no IP splitting needed when using podOverride)
 	overrideSpec := instance.Spec.Override
-	if instance.Spec.Replicas != nil && *instance.Spec.Replicas > 0 &&
-		instance.Spec.Override != nil && instance.Spec.Override.Service != nil &&
-		instance.Spec.Override.Service.Annotations != nil {
-		if ipsStr, ok := instance.Spec.Override.Service.Annotations["metallb.universe.tf/loadBalancerIPs"]; ok {
-			loadBalancerIPs := strings.Split(ipsStr, ",")
-			for i := range loadBalancerIPs {
-				loadBalancerIPs[i] = strings.TrimSpace(loadBalancerIPs[i])
-			}
-			replicas := int(*instance.Spec.Replicas)
-			// If we have replicas+1 IPs, use first for main service, rest for per-pod
-			if len(loadBalancerIPs) == replicas+1 {
-				// Clone Override to avoid modifying the original
-				overrideSpec = instance.Spec.Override.DeepCopy()
-				// Create a new annotations map with all existing annotations
-				newAnnotations := make(map[string]string)
-				for k, v := range instance.Spec.Override.Service.Annotations {
-					newAnnotations[k] = v
-				}
-				// Override the IPs annotation with only the first IP
-				newAnnotations["metallb.universe.tf/loadBalancerIPs"] = loadBalancerIPs[0]
-				overrideSpec.Service.Annotations = newAnnotations
-				Log.Info(fmt.Sprintf("Splitting IPs: main service gets %s, per-pod services will get %v", loadBalancerIPs[0], loadBalancerIPs[1:]))
-			}
-		}
-	}
 
 	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, overrideSpec)
 	if err != nil {
@@ -515,33 +489,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 func (r *Reconciler) reconcilePerPodServices(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) error {
 	Log := r.GetLogger(ctx)
 
-	// Parse loadBalancerIPs from annotations
-	var loadBalancerIPs []string
-	if instance.Spec.Override.Service.Annotations != nil {
-		if ipsStr, ok := instance.Spec.Override.Service.Annotations["metallb.universe.tf/loadBalancerIPs"]; ok {
-			loadBalancerIPs = strings.Split(ipsStr, ",")
-			for i := range loadBalancerIPs {
-				loadBalancerIPs[i] = strings.TrimSpace(loadBalancerIPs[i])
-			}
-		}
+	// Check if PodOverride is configured
+	if instance.Spec.PodOverride == nil || len(instance.Spec.PodOverride.Services) == 0 {
+		Log.Info("PodOverride not configured, skipping per-pod service creation")
+		return nil
 	}
 
 	replicas := int(*instance.Spec.Replicas)
 
-	// Only create per-pod services if exactly replicas+1 IPs are specified
-	if len(loadBalancerIPs) != replicas+1 {
-		Log.Info(fmt.Sprintf("Skipping per-pod service creation. Expected %d IPs (replicas+1) but got %d. Specify 1 IP for main service only, or %d IPs for main + per-pod services.", replicas+1, len(loadBalancerIPs), replicas+1))
-		return nil
+	// Validate that the number of service overrides matches the number of replicas
+	if len(instance.Spec.PodOverride.Services) != replicas {
+		return fmt.Errorf("number of services in podOverride (%d) must match number of replicas (%d)", len(instance.Spec.PodOverride.Services), replicas)
 	}
 
-	// Use IPs starting from index 1 (skip first IP which is for main service)
-	perPodIPs := loadBalancerIPs[1:]
-	Log.Info(fmt.Sprintf("Creating per-pod services with specific IPs"))
+	Log.Info(fmt.Sprintf("Creating per-pod services using podOverride configuration"))
 
 	// Create a service for each pod
 	for i := 0; i < replicas; i++ {
 		podName := fmt.Sprintf("%s-server-%d", instance.Name, i)
 		svcName := podName
+		serviceOverride := instance.Spec.PodOverride.Services[i]
 
 		svc := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
@@ -559,23 +526,24 @@ func (r *Reconciler) reconcilePerPodServices(ctx context.Context, instance *rabb
 			svc.Labels[labels.K8sAppName] = instance.Name
 			svc.Labels[labels.K8sAppComponent] = "rabbitmq"
 
+			// Apply labels from podOverride if present
+			if serviceOverride.EmbeddedLabelsAnnotations != nil && serviceOverride.EmbeddedLabelsAnnotations.Labels != nil {
+				for k, v := range serviceOverride.EmbeddedLabelsAnnotations.Labels {
+					svc.Labels[k] = v
+				}
+			}
+
 			// Set annotations
 			if svc.Annotations == nil {
 				svc.Annotations = make(map[string]string)
 			}
 
-			// Copy annotations from override service
-			if instance.Spec.Override.Service.Annotations != nil {
-				for k, v := range instance.Spec.Override.Service.Annotations {
-					// Skip the comma-separated IPs annotation - handle individually below
-					if k != "metallb.universe.tf/loadBalancerIPs" {
-						svc.Annotations[k] = v
-					}
+			// Apply annotations from podOverride if present
+			if serviceOverride.EmbeddedLabelsAnnotations != nil && serviceOverride.EmbeddedLabelsAnnotations.Annotations != nil {
+				for k, v := range serviceOverride.EmbeddedLabelsAnnotations.Annotations {
+					svc.Annotations[k] = v
 				}
 			}
-
-			// Set individual IP for this pod
-			svc.Annotations["metallb.universe.tf/loadBalancerIPs"] = perPodIPs[i]
 
 			// Add DNS hostname annotation to register in dnsmasq
 			hostname := fmt.Sprintf("%s.%s.svc", svcName, instance.Namespace)
@@ -597,6 +565,11 @@ func (r *Reconciler) reconcilePerPodServices(ctx context.Context, instance *rabb
 					Port:       5671,
 					TargetPort: intstr.FromInt(5671),
 				},
+			}
+
+			// Apply service spec overrides if present
+			if serviceOverride.Spec != nil && serviceOverride.Spec.Type != "" {
+				svc.Spec.Type = serviceOverride.Spec.Type
 			}
 
 			// Set owner reference

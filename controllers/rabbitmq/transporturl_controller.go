@@ -261,25 +261,17 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 	usePerPodServices := false
 	useMainService := false
 
-	// Check if per-pod LoadBalancer services are configured using RabbitMq CR annotations
-	// but replica count from RabbitmqCluster
+	// Check if per-pod LoadBalancer services are configured using PodOverride
 	if err == nil && rabbit.Spec.Replicas != nil && *rabbit.Spec.Replicas > 0 &&
+		rabbitmqCR.Spec.PodOverride != nil && len(rabbitmqCR.Spec.PodOverride.Services) > 0 {
+		// PodOverride is configured, use per-pod services
+		usePerPodServices = true
+	} else if err == nil && rabbit.Spec.Replicas != nil && *rabbit.Spec.Replicas > 0 &&
 		rabbitmqCR.Spec.Override != nil && rabbitmqCR.Spec.Override.Service != nil &&
 		rabbitmqCR.Spec.Override.Service.Spec != nil &&
-		rabbitmqCR.Spec.Override.Service.Spec.Type == corev1.ServiceTypeLoadBalancer &&
-		rabbitmqCR.Spec.Override.Service.Annotations != nil {
-		if ipsStr, ok := rabbitmqCR.Spec.Override.Service.Annotations["metallb.universe.tf/loadBalancerIPs"]; ok {
-			ips := strings.Split(ipsStr, ",")
-			for i := range ips {
-				ips[i] = strings.TrimSpace(ips[i])
-			}
-			// replicas+1 IPs means per-pod services, 1 IP means main service
-			if len(ips) == int(*rabbit.Spec.Replicas)+1 {
-				usePerPodServices = true
-			} else if len(ips) == 1 {
-				useMainService = true
-			}
-		}
+		rabbitmqCR.Spec.Override.Service.Spec.Type == corev1.ServiceTypeLoadBalancer {
+		// Main service LoadBalancer is configured
+		useMainService = true
 	}
 
 	if usePerPodServices {
