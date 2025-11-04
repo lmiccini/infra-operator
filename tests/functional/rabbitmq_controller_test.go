@@ -447,6 +447,7 @@ var _ = Describe("RabbitMQ Controller", func() {
 		BeforeEach(func() {
 			spec := GetDefaultRabbitMQSpec()
 			spec["replicas"] = 3
+			spec["queueType"] = "None" // Avoid ha-all policy which requires actual pods
 			spec["podOverride"] = map[string]any{
 				"services": []map[string]any{
 					{
@@ -504,6 +505,7 @@ var _ = Describe("RabbitMQ Controller", func() {
 		BeforeEach(func() {
 			spec := GetDefaultRabbitMQSpec()
 			spec["replicas"] = 3
+			spec["queueType"] = "None" // Avoid ha-all policy which requires actual pods
 			spec["podOverride"] = map[string]any{
 				"services": []map[string]any{
 					{

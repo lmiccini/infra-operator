@@ -430,6 +430,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		}
 		instance.Status.Conditions.MarkTrue(condition.PDBReadyCondition, condition.PDBReadyMessage)
 
+		// Create per-pod services when podOverride is configured
+		if instance.Spec.Replicas != nil && *instance.Spec.Replicas > 0 &&
+			instance.Spec.PodOverride != nil && len(instance.Spec.PodOverride.Services) > 0 {
+			err := r.reconcilePerPodServices(ctx, instance, helper)
+			if err != nil {
+				Log.Error(err, "Failed to create per-pod services")
+				return ctrl.Result{}, err
+			}
+		}
+
 		// Let's wait DeploymentReadyCondition=True to apply the policy
 		if instance.Spec.QueueType == "Mirrored" && *instance.Spec.Replicas > 1 && instance.Status.QueueType != "Mirrored" {
 			Log.Info("ha-all policy not present. Applying.")
@@ -465,18 +475,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		}
 
 		instance.Status.QueueType = instance.Spec.QueueType
-	}
-
-	// Create per-pod services for LoadBalancer type
-	if instance.Spec.Replicas != nil && *instance.Spec.Replicas > 0 &&
-		instance.Spec.Override != nil && instance.Spec.Override.Service != nil &&
-		instance.Spec.Override.Service.Spec != nil &&
-		instance.Spec.Override.Service.Spec.Type == corev1.ServiceTypeLoadBalancer {
-		err := r.reconcilePerPodServices(ctx, instance, helper)
-		if err != nil {
-			Log.Error(err, "Failed to create per-pod services")
-			return ctrl.Result{}, err
-		}
 	}
 
 	if instance.Status.Conditions.AllSubConditionIsTrue() {
