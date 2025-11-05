@@ -29,7 +29,9 @@ import (
 	//revive:disable-next-line:dot-imports
 
 	//. "github.com/openstack-k8s-operators/lib-common/modules/common/test/helpers"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -396,6 +398,305 @@ var _ = Describe("RabbitMQ Controller", func() {
 				g.Expect(cluster.Spec.Override.Service.Annotations["dnsmasq.network.openstack.org/hostname"]).To(Equal(fmt.Sprintf("%s.%s.svc", rabbitmqDefaultName, namespace)))
 				g.Expect(cluster.Spec.Override.Service.Spec.Type).To(Equal(corev1.ServiceTypeLoadBalancer))
 			}, timeout, interval).Should(Succeed())
+		})
+	})
+
+	When("RabbitMQ version upgrade", func() {
+		When("RabbitMQ is created without version labels", func() {
+			BeforeEach(func() {
+				rabbitmq := CreateRabbitMQ(rabbitmqName, GetDefaultRabbitMQSpec())
+				DeferCleanup(th.DeleteInstance, rabbitmq)
+			})
+
+			It("should default rabbitmqcurrentversion to 3.9", func() {
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Labels).NotTo(BeNil())
+					g.Expect(instance.Labels["rabbitmqcurrentversion"]).To(Equal("3.9"))
+				}, timeout, interval).Should(Succeed())
+			})
+		})
+
+		When("RabbitMQ version label changes from 3.9 to 3.13", func() {
+			BeforeEach(func() {
+				spec := GetDefaultRabbitMQSpec()
+				spec["queueType"] = "Quorum" // Avoid policy application that requires real pods
+				rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+				DeferCleanup(th.DeleteInstance, rabbitmq)
+
+				// Wait for default version to be set
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Labels["rabbitmqcurrentversion"]).To(Equal("3.9"))
+				}, timeout, interval).Should(Succeed())
+			})
+
+			It("should detect version mismatch and start upgrade", func() {
+				// Update rabbitmqversion label to trigger upgrade
+				instance := GetRabbitMQ(rabbitmqName)
+				if instance.Labels == nil {
+					instance.Labels = make(map[string]string)
+				}
+				instance.Labels["rabbitmqversion"] = "3.13"
+				Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
+
+				// Verify upgrade in progress status is set
+				Eventually(func(g Gomega) {
+					updatedInstance := GetRabbitMQ(rabbitmqName)
+					g.Expect(updatedInstance.Status.VersionUpgradeInProgress).To(Equal("3.13"))
+					g.Expect(updatedInstance.Labels["rabbitmqcurrentversion"]).To(Equal("3.9"))
+					g.Expect(updatedInstance.Labels["rabbitmqversion"]).To(Equal("3.13"))
+				}, timeout, interval).Should(Succeed())
+			})
+		})
+
+		When("Version upgrade patches StatefulSet", func() {
+			BeforeEach(func() {
+				spec := GetDefaultRabbitMQSpec()
+				spec["containerImage"] = "quay.io/rabbitmq/rabbitmq:3.13"
+				spec["queueType"] = "Quorum" // Avoid policy application that requires real pods
+				rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+				DeferCleanup(th.DeleteInstance, rabbitmq)
+
+				// Wait for cluster to be created
+				SimulateRabbitMQClusterReady(rabbitmqName)
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Labels["rabbitmqcurrentversion"]).To(Equal("3.9"))
+				}, timeout, interval).Should(Succeed())
+
+				// Create a mock StatefulSet to simulate the one created by RabbitMQ operator
+				statefulSet := &appsv1.StatefulSet{}
+				statefulSet.Name = rabbitmqName.Name + "-server"
+				statefulSet.Namespace = rabbitmqName.Namespace
+				statefulSet.Spec.Selector = &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app.kubernetes.io/name": rabbitmqName.Name,
+					},
+				}
+				statefulSet.Spec.Template.ObjectMeta.Labels = map[string]string{
+					"app.kubernetes.io/name": rabbitmqName.Name,
+				}
+				statefulSet.Spec.Template.Spec.Containers = []corev1.Container{
+					{
+						Name:  "rabbitmq",
+						Image: "quay.io/rabbitmq/rabbitmq:3.13",
+					},
+				}
+				statefulSet.Spec.UpdateStrategy.Type = appsv1.RollingUpdateStatefulSetStrategyType
+				Expect(k8sClient.Create(ctx, statefulSet)).Should(Succeed())
+				DeferCleanup(k8sClient.Delete, statefulSet)
+			})
+
+			It("should patch StatefulSet with cleanup container and OnDelete strategy", func() {
+				// Trigger version upgrade
+				instance := GetRabbitMQ(rabbitmqName)
+				if instance.Labels == nil {
+					instance.Labels = make(map[string]string)
+				}
+				instance.Labels["rabbitmqversion"] = "3.13"
+				Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
+
+				// Verify StatefulSet is patched
+				Eventually(func(g Gomega) {
+					statefulSet := &appsv1.StatefulSet{}
+					g.Expect(k8sClient.Get(ctx, types.NamespacedName{
+						Name:      rabbitmqName.Name + "-server",
+						Namespace: rabbitmqName.Namespace,
+					}, statefulSet)).Should(Succeed())
+
+					// Check for clean-mnesia init container
+					g.Expect(len(statefulSet.Spec.Template.Spec.InitContainers)).To(BeNumerically(">", 0))
+					g.Expect(statefulSet.Spec.Template.Spec.InitContainers[0].Name).To(Equal("clean-mnesia"))
+					g.Expect(statefulSet.Spec.Template.Spec.InitContainers[0].Image).To(Equal("quay.io/rabbitmq/rabbitmq:3.13"))
+					g.Expect(statefulSet.Spec.Template.Spec.InitContainers[0].Command).To(Equal([]string{"sh", "-c", "rm -rf /var/lib/rabbitmq/mnesia/*"}))
+
+					// Check update strategy
+					g.Expect(statefulSet.Spec.UpdateStrategy.Type).To(Equal(appsv1.OnDeleteStatefulSetStrategyType))
+				}, timeout, interval).Should(Succeed())
+			})
+		})
+
+		When("Version upgrade completes and reconciliation is paused", func() {
+			BeforeEach(func() {
+				spec := GetDefaultRabbitMQSpec()
+				spec["containerImage"] = "quay.io/rabbitmq/rabbitmq:3.13"
+				spec["queueType"] = "Quorum" // Avoid policy application that requires real pods
+				rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+				DeferCleanup(th.DeleteInstance, rabbitmq)
+
+				SimulateRabbitMQClusterReady(rabbitmqName)
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Labels["rabbitmqcurrentversion"]).To(Equal("3.9"))
+				}, timeout, interval).Should(Succeed())
+
+				// Create mock StatefulSet
+				statefulSet := &appsv1.StatefulSet{}
+				statefulSet.Name = rabbitmqName.Name + "-server"
+				statefulSet.Namespace = rabbitmqName.Namespace
+				statefulSet.Spec.Selector = &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app.kubernetes.io/name": rabbitmqName.Name,
+					},
+				}
+				statefulSet.Spec.Template.ObjectMeta.Labels = map[string]string{
+					"app.kubernetes.io/name": rabbitmqName.Name,
+				}
+				statefulSet.Spec.Template.Spec.Containers = []corev1.Container{
+					{Name: "rabbitmq", Image: "quay.io/rabbitmq/rabbitmq:3.13"},
+				}
+				statefulSet.Spec.UpdateStrategy.Type = appsv1.RollingUpdateStatefulSetStrategyType
+				Expect(k8sClient.Create(ctx, statefulSet)).Should(Succeed())
+				DeferCleanup(k8sClient.Delete, statefulSet)
+
+				// Trigger upgrade
+				instance := GetRabbitMQ(rabbitmqName)
+				instance.Labels["rabbitmqversion"] = "3.13"
+				Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
+
+				// Wait for StatefulSet to be patched
+				Eventually(func(g Gomega) {
+					ss := &appsv1.StatefulSet{}
+					g.Expect(k8sClient.Get(ctx, types.NamespacedName{
+						Name:      rabbitmqName.Name + "-server",
+						Namespace: rabbitmqName.Namespace,
+					}, ss)).Should(Succeed())
+					g.Expect(ss.Spec.UpdateStrategy.Type).To(Equal(appsv1.OnDeleteStatefulSetStrategyType))
+				}, timeout, interval).Should(Succeed())
+			})
+
+			It("should update version labels when cluster is ready", func() {
+				// Simulate cluster ready
+				SimulateRabbitMQClusterReady(rabbitmqName)
+
+				// Verify version labels are updated
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Labels["rabbitmqcurrentversion"]).To(Equal("3.13"))
+					g.Expect(instance.Status.VersionUpgradeInProgress).To(BeEmpty())
+				}, timeout, interval).Should(Succeed())
+			})
+
+			It("should verify reconciliation is paused during upgrade", func() {
+				// Verify RabbitmqCluster has pause label
+				Eventually(func(g Gomega) {
+					cluster := GetRabbitMQCluster(rabbitmqName)
+					g.Expect(cluster.Labels).NotTo(BeNil())
+					g.Expect(cluster.Labels["rabbitmq.com/pauseReconciliation"]).To(Equal("true"))
+				}, timeout, interval).Should(Succeed())
+			})
+		})
+
+		When("RabbitMQ upgrades from 3.9 to 3.13 (end-to-end)", func() {
+			BeforeEach(func() {
+				spec := GetDefaultRabbitMQSpec()
+				spec["containerImage"] = "quay.io/rabbitmq/rabbitmq:3.9"
+				spec["queueType"] = "Quorum" // Avoid policy application that requires real pods
+				rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+				DeferCleanup(th.DeleteInstance, rabbitmq)
+
+				SimulateRabbitMQClusterReady(rabbitmqName)
+			})
+
+			It("should complete full upgrade cycle with pause and resume", func() {
+				// 1. Verify initial version is 3.9
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Labels["rabbitmqcurrentversion"]).To(Equal("3.9"))
+					g.Expect(instance.Status.VersionUpgradeInProgress).To(BeEmpty())
+				}, timeout, interval).Should(Succeed())
+
+				// Create mock StatefulSet
+				statefulSet := &appsv1.StatefulSet{}
+				statefulSet.Name = rabbitmqName.Name + "-server"
+				statefulSet.Namespace = rabbitmqName.Namespace
+				statefulSet.Spec.Selector = &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app.kubernetes.io/name": rabbitmqName.Name,
+					},
+				}
+				statefulSet.Spec.Template.ObjectMeta.Labels = map[string]string{
+					"app.kubernetes.io/name": rabbitmqName.Name,
+				}
+				statefulSet.Spec.Template.Spec.Containers = []corev1.Container{
+					{Name: "rabbitmq", Image: "quay.io/rabbitmq/rabbitmq:3.9"},
+				}
+				statefulSet.Spec.UpdateStrategy.Type = appsv1.RollingUpdateStatefulSetStrategyType
+				Expect(k8sClient.Create(ctx, statefulSet)).Should(Succeed())
+				DeferCleanup(k8sClient.Delete, statefulSet)
+
+				// 2. Update to version 3.13
+				instance := GetRabbitMQ(rabbitmqName)
+				instance.Labels["rabbitmqversion"] = "3.13"
+				instance.Spec.ContainerImage = "quay.io/rabbitmq/rabbitmq:3.13"
+				Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
+
+				// 3. Verify upgrade in progress
+				Eventually(func(g Gomega) {
+					updatedInstance := GetRabbitMQ(rabbitmqName)
+					g.Expect(updatedInstance.Status.VersionUpgradeInProgress).To(Equal("3.13"))
+				}, timeout, interval).Should(Succeed())
+
+				// 4. Verify RabbitmqCluster reconciliation is paused
+				Eventually(func(g Gomega) {
+					cluster := GetRabbitMQCluster(rabbitmqName)
+					g.Expect(cluster.Labels).NotTo(BeNil())
+					g.Expect(cluster.Labels["rabbitmq.com/pauseReconciliation"]).To(Equal("true"))
+				}, timeout, interval).Should(Succeed())
+
+				// 5. Verify StatefulSet is patched with cleanup container and OnDelete
+				Eventually(func(g Gomega) {
+					ss := &appsv1.StatefulSet{}
+					g.Expect(k8sClient.Get(ctx, types.NamespacedName{
+						Name:      rabbitmqName.Name + "-server",
+						Namespace: rabbitmqName.Namespace,
+					}, ss)).Should(Succeed())
+
+					g.Expect(len(ss.Spec.Template.Spec.InitContainers)).To(BeNumerically(">", 0))
+					g.Expect(ss.Spec.Template.Spec.InitContainers[0].Name).To(Equal("clean-mnesia"))
+					g.Expect(ss.Spec.UpdateStrategy.Type).To(Equal(appsv1.OnDeleteStatefulSetStrategyType))
+				}, timeout, interval).Should(Succeed())
+
+				// 6. Simulate cluster ready (with pods restarted)
+				SimulateRabbitMQClusterReady(rabbitmqName)
+
+				// Create mock pods to simulate ready state
+				for i := 0; i < 3; i++ {
+					pod := &corev1.Pod{}
+					pod.Name = fmt.Sprintf("%s-server-%d", rabbitmqName.Name, i)
+					pod.Namespace = rabbitmqName.Namespace
+					pod.Labels = map[string]string{
+						"app.kubernetes.io/name": rabbitmqName.Name,
+					}
+					pod.Spec.Containers = []corev1.Container{
+						{Name: "rabbitmq", Image: "quay.io/rabbitmq/rabbitmq:3.13"},
+					}
+					pod.Status.Phase = corev1.PodRunning
+					pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+						{Name: "rabbitmq", Ready: true},
+					}
+					Expect(k8sClient.Create(ctx, pod)).Should(Succeed())
+					DeferCleanup(k8sClient.Delete, pod)
+				}
+
+				// 7. Verify version labels are updated
+				Eventually(func(g Gomega) {
+					finalInstance := GetRabbitMQ(rabbitmqName)
+					g.Expect(finalInstance.Labels["rabbitmqcurrentversion"]).To(Equal("3.13"))
+					g.Expect(finalInstance.Status.VersionUpgradeInProgress).To(BeEmpty())
+				}, timeout, interval).Should(Succeed())
+
+				// 8. Verify reconciliation is eventually resumed
+				// (In a real scenario, this happens after pods are ready with new version)
+				Eventually(func(g Gomega) {
+					cluster := GetRabbitMQCluster(rabbitmqName)
+					// Reconciliation should be resumed (pause label removed)
+					if cluster.Labels != nil {
+						g.Expect(cluster.Labels["rabbitmq.com/pauseReconciliation"]).To(Or(BeEmpty(), Equal("false")))
+					}
+				}, timeout*3, interval).Should(Succeed())
+			})
 		})
 	})
 })
