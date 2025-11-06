@@ -672,11 +672,21 @@ var _ = Describe("RabbitMQ Controller", func() {
 					pod.Spec.Containers = []corev1.Container{
 						{Name: "rabbitmq", Image: "quay.io/rabbitmq/rabbitmq:3.13"},
 					}
-					pod.Status.Phase = corev1.PodRunning
-					pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+					Expect(k8sClient.Create(ctx, pod)).Should(Succeed())
+
+					// Get the pod again to ensure we have the latest resource version
+					createdPod := &corev1.Pod{}
+					Expect(k8sClient.Get(ctx, types.NamespacedName{
+						Name:      pod.Name,
+						Namespace: pod.Namespace,
+					}, createdPod)).Should(Succeed())
+
+					// Update status on the retrieved pod
+					createdPod.Status.Phase = corev1.PodRunning
+					createdPod.Status.ContainerStatuses = []corev1.ContainerStatus{
 						{Name: "rabbitmq", Ready: true},
 					}
-					Expect(k8sClient.Create(ctx, pod)).Should(Succeed())
+					Expect(k8sClient.Status().Update(ctx, createdPod)).Should(Succeed())
 					DeferCleanup(k8sClient.Delete, pod)
 				}
 
