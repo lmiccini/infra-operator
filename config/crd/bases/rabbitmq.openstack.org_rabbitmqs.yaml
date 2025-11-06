@@ -1813,6 +1813,14 @@ spec:
                 description: QueueType - store whether default ha-all policy is present
                   or not
                 type: string
+              upgradeExternalSecretConfigured:
+                description: UpgradeExternalSecretConfigured - tracks if we've configured
+                  externalSecret for upgrade
+                type: boolean
+              upgradeManagedSecretCreated:
+                description: UpgradeManagedSecretCreated - tracks if we created a
+                  managed secret for upgrade
+                type: boolean
               versionUpgradeInProgress:
                 description: VersionUpgradeInProgress - tracks the target version
                   during upgrade to avoid deletion loops

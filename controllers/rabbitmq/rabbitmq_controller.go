@@ -24,7 +24,6 @@ import (
 	"time"
 
 	rabbitmqv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
-	appsv1 "k8s.io/api/apps/v1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -211,14 +210,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			instance.Status.Conditions.Set(
 				instance.Status.Conditions.Mirror(condition.ReadyCondition))
 		}
-		Log.Info(fmt.Sprintf("Defer: Patching instance with VersionUpgradeInProgress=%s", instance.Status.VersionUpgradeInProgress))
+		// Patch instance to persist changes
 		err := helper.PatchInstance(ctx, instance)
 		if err != nil {
 			Log.Error(err, "Failed to patch instance in defer")
 			_err = err
 			return
 		}
-		Log.Info("Defer: Successfully patched instance")
 	}()
 
 	//
@@ -378,6 +376,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, fmt.Errorf("error creating RabbitmqCluster Spec: %w", err)
 	}
 
+	// Don't configure externalSecret here during upgrade - it will be configured
+	// in handleVersionUpgradeScaleToZero after the old cluster is deleted and secret is restored
+
 	instance.Status.Conditions.MarkTrue(condition.ServiceConfigReadyCondition, condition.ServiceConfigReadyMessage)
 
 	//
@@ -436,19 +437,48 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, fmt.Errorf("error configuring RabbitmqCluster: %w", err)
 	}
 
+	// Handle version upgrade BEFORE CreateOrPatch
+	var shouldConfigureExternalSecret bool
+	var externalSecretName string
+	if versionMismatch {
+		Log.Info("Version upgrade in progress")
+		result, shouldConfigure, secretName, err := r.handleVersionUpgrade(ctx, instance, rabbitmqCluster, helper)
+		if err != nil {
+			Log.Error(err, "Failed to handle version upgrade")
+			return ctrl.Result{}, err
+		}
+		shouldConfigureExternalSecret = shouldConfigure
+		externalSecretName = secretName
+		// If result indicates we should requeue, return early (before CreateOrPatch)
+		if result.Requeue || result.RequeueAfter > 0 {
+			return result, nil
+		}
+	}
+
+	// Configure externalSecret right before CreateOrPatch to prevent it being overwritten
+	if shouldConfigureExternalSecret {
+		rabbitmqCluster.Spec.SecretBackend.ExternalSecret = corev1.LocalObjectReference{
+			Name: externalSecretName,
+		}
+		Log.Info(fmt.Sprintf("Configured externalSecret=%s right before CreateOrPatch", externalSecretName))
+
+		// Set flag immediately to prevent concurrent reconciles from deleting the cluster
+		// Fetch fresh copy to avoid conflicts
+		fresh := &rabbitmqv1beta1.RabbitMq{}
+		if err := r.Client.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, fresh); err == nil {
+			fresh.Status.UpgradeExternalSecretConfigured = true
+			fresh.Status.VersionUpgradeInProgress = instance.Status.VersionUpgradeInProgress
+			fresh.Status.UpgradeManagedSecretCreated = instance.Status.UpgradeManagedSecretCreated
+			if err := r.Client.Status().Update(ctx, fresh); err != nil {
+				Log.Error(err, "Failed to set UpgradeExternalSecretConfigured flag")
+			}
+		}
+	}
+
 	rabbitmqImplCluster := impl.NewRabbitMqCluster(rabbitmqCluster, 5)
 	rmqres, rmqerr := rabbitmqImplCluster.CreateOrPatch(ctx, helper)
 	if rmqerr != nil {
 		return rmqres, rmqerr
-	}
-
-	// Pause RabbitMQ operator reconciliation and patch StatefulSet for version upgrade
-	if versionMismatch {
-		Log.Info("Version upgrade in progress: pausing RabbitMQ operator and patching StatefulSet")
-		if err := r.pauseAndPatchForVersionUpgrade(ctx, instance); err != nil {
-			Log.Error(err, "Failed to pause and patch for version upgrade")
-			return ctrl.Result{}, err
-		}
 	}
 
 	rabbitmqClusterInstance := rabbitmqImplCluster.GetRabbitMqCluster()
@@ -456,10 +486,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	clusterReady := false
 	Log.Info(fmt.Sprintf("RabbitMQ cluster status: ObservedGeneration=%d, Generation=%d", rabbitmqClusterInstance.Status.ObservedGeneration, rabbitmqClusterInstance.Generation))
 
-	// Check if reconciliation is paused - if so, check conditions directly
-	reconciliationPaused := rabbitmqClusterInstance.Labels != nil && rabbitmqClusterInstance.Labels["rabbitmq.com/pauseReconciliation"] == "true"
-
-	if rabbitmqClusterInstance.Status.ObservedGeneration == rabbitmqClusterInstance.Generation || reconciliationPaused {
+	if rabbitmqClusterInstance.Status.ObservedGeneration == rabbitmqClusterInstance.Generation {
 		Log.Info(fmt.Sprintf("RabbitMQ cluster conditions: %+v", rabbitmqClusterInstance.Status.Conditions))
 		for _, oldCond := range rabbitmqClusterInstance.Status.Conditions {
 			// Forced to hardcode "ClusterAvailable" here because linter will not allow
@@ -483,23 +510,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		// Update the version label and clear upgrade status
 		instance.Labels["rabbitmqcurrentversion"] = instance.Status.VersionUpgradeInProgress
 		instance.Status.VersionUpgradeInProgress = ""
+		instance.Status.UpgradeManagedSecretCreated = false
+		instance.Status.UpgradeExternalSecretConfigured = false
 
 		Log.Info(fmt.Sprintf("Updated rabbitmqcurrentversion to %s", instance.Labels["rabbitmqcurrentversion"]))
-	}
-
-	// Check if we need to resume reconciliation after version upgrade
-	if instance.Status.VersionUpgradeInProgress == "" && r.isReconciliationPaused(ctx, instance) {
-		// Check if pods are ready with the new init container
-		if r.arePodsReadyWithNewInitContainer(ctx, instance) {
-			Log.Info("Pods are ready with new init container, resuming RabbitMQ operator reconciliation")
-			if err := r.resumeRabbitMQReconciliation(ctx, instance); err != nil {
-				Log.Error(err, "Failed to resume RabbitMQ operator reconciliation")
-				return ctrl.Result{}, err
-			}
-		} else {
-			Log.Info("Waiting for pods to restart with new init container before resuming reconciliation")
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
 	}
 
 	// Handle PDB for multi-replica deployments (regardless of cluster ready status)
@@ -639,272 +653,167 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1be
 	return ctrl.Result{}, nil
 }
 
-// pauseAndPatchForVersionUpgrade pauses RabbitMQ operator reconciliation and patches StatefulSet
-func (r *Reconciler) pauseAndPatchForVersionUpgrade(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) error {
+// handleVersionUpgrade handles version upgrades by preserving credentials via backup/restore
+// Returns: (result, shouldConfigureExternalSecret, externalSecretName, error)
+func (r *Reconciler) handleVersionUpgrade(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, rabbitmqCluster *rabbitmqv2.RabbitmqCluster, helper *helper.Helper) (ctrl.Result, bool, string, error) {
 	Log := r.GetLogger(ctx)
 
-	// Retry mechanism for updating RabbitmqCluster (handles race conditions)
-	var rabbitmqCluster *rabbitmqv2.RabbitmqCluster
-	var err error
+	secretName := instance.Name + "-default-user"
+	backupSecretName := instance.Name + "-default-user-backup"
 
-	for i := 0; i < 3; i++ {
-		// Get the RabbitmqCluster created by our controller
-		rabbitmqCluster = &rabbitmqv2.RabbitmqCluster{}
-		err = r.Client.Get(ctx, types.NamespacedName{
-			Name:      instance.Name,
-			Namespace: instance.Namespace,
-		}, rabbitmqCluster)
-		if err != nil {
-			if k8s_errors.IsNotFound(err) {
-				Log.Info("RabbitmqCluster not found yet, will retry")
-				return nil
+	// Step 1: Create backup of default-user secret
+	// Only create backup if we haven't already AND the backup doesn't exist yet
+	if !instance.Status.UpgradeManagedSecretCreated {
+		// Check if backup already exists (in case flag was cleared prematurely)
+		checkBackup := &corev1.Secret{}
+		if backupErr := r.Client.Get(ctx, types.NamespacedName{Name: backupSecretName, Namespace: instance.Namespace}, checkBackup); backupErr == nil {
+			// Backup exists, just set the flag and continue
+			Log.Info("Step 1: Backup already exists, setting flag")
+			// Fetch fresh copy before status update to avoid conflicts
+			fresh := &rabbitmqv1beta1.RabbitMq{}
+			if err := r.Client.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, fresh); err != nil {
+				return ctrl.Result{}, false, "", fmt.Errorf("failed to fetch fresh instance: %w", err)
 			}
-			return err
-		}
-
-		// Check if already paused
-		if rabbitmqCluster.Labels != nil && rabbitmqCluster.Labels["rabbitmq.com/pauseReconciliation"] == "true" {
-			Log.Info("RabbitMQ operator reconciliation already paused")
-			break
-		}
-
-		// Pause RabbitMQ operator reconciliation
-		if rabbitmqCluster.Labels == nil {
-			rabbitmqCluster.Labels = make(map[string]string)
-		}
-		rabbitmqCluster.Labels["rabbitmq.com/pauseReconciliation"] = "true"
-
-		err = r.Client.Update(ctx, rabbitmqCluster)
-		if err != nil {
-			if k8s_errors.IsConflict(err) {
-				Log.Info(fmt.Sprintf("Conflict updating RabbitmqCluster, retrying (attempt %d/3)", i+1))
-				time.Sleep(time.Duration(i+1) * time.Second)
-				continue
+			fresh.Status.UpgradeManagedSecretCreated = true
+			fresh.Status.VersionUpgradeInProgress = instance.Status.VersionUpgradeInProgress
+			if err := r.Client.Status().Update(ctx, fresh); err != nil {
+				return ctrl.Result{}, false, "", fmt.Errorf("failed to update status: %w", err)
 			}
-			return err
-		}
-		Log.Info("RabbitMQ operator reconciliation paused")
-		break
-	}
-
-	if err != nil {
-		return fmt.Errorf("failed to pause RabbitMQ operator reconciliation after 3 attempts: %w", err)
-	}
-
-	// Wait a moment for the operator to stop reconciling
-	time.Sleep(2 * time.Second)
-
-	// Get the StatefulSet created by the RabbitMQ operator
-	statefulSetName := instance.Name + "-server"
-	Log.Info(fmt.Sprintf("Looking for StatefulSet: %s in namespace: %s", statefulSetName, instance.Namespace))
-
-	statefulSet := &appsv1.StatefulSet{}
-	err = r.Client.Get(ctx, types.NamespacedName{
-		Name:      statefulSetName,
-		Namespace: instance.Namespace,
-	}, statefulSet)
-	if err != nil {
-		if k8s_errors.IsNotFound(err) {
-			Log.Info(fmt.Sprintf("StatefulSet %s not found yet, will retry", statefulSetName))
-			return nil
-		}
-		Log.Error(err, fmt.Sprintf("Failed to get StatefulSet %s", statefulSetName))
-		return err
-	}
-
-	Log.Info(fmt.Sprintf("Successfully found StatefulSet: %s", statefulSetName))
-
-	// Check if already patched (prevents repeated deletion of pods on every reconcile)
-	for _, initContainer := range statefulSet.Spec.Template.Spec.InitContainers {
-		if initContainer.Name == "clean-mnesia" {
-			Log.Info("StatefulSet already patched with clean-mnesia init container, skipping")
-			return nil
-		}
-	}
-
-	// Create a cleanup init container
-	// Note: We don't set RunAsUser - let OpenShift assign it based on the namespace's SCC range
-	cleanupContainer := corev1.Container{
-		Name:    "clean-mnesia",
-		Image:   instance.Spec.ContainerImage,
-		Command: []string{"sh", "-c", "rm -rf /var/lib/rabbitmq/mnesia/*"},
-		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      "persistence",
-				MountPath: "/var/lib/rabbitmq/mnesia",
-			},
-			{
-				Name:      "rabbitmq-erlang-cookie",
-				MountPath: "/var/lib/rabbitmq/",
-			},
-		},
-	}
-
-	// Add the cleanup container at the beginning of initContainers
-	statefulSet.Spec.Template.Spec.InitContainers = append(
-		[]corev1.Container{cleanupContainer},
-		statefulSet.Spec.Template.Spec.InitContainers...,
-	)
-
-	// Configure StatefulSet for simultaneous pod updates
-	statefulSet.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{
-		Type: appsv1.OnDeleteStatefulSetStrategyType,
-	}
-
-	// Update the StatefulSet
-	err = r.Client.Update(ctx, statefulSet)
-	if err != nil {
-		Log.Error(err, "Failed to update StatefulSet")
-		return err
-	}
-	Log.Info("StatefulSet patched successfully with clean-mnesia init container")
-
-	// Delete all pods to force simultaneous updates
-	return r.deleteAllPodsForSimultaneousUpdate(ctx, instance)
-}
-
-// resumeRabbitMQReconciliation resumes RabbitMQ operator reconciliation
-func (r *Reconciler) resumeRabbitMQReconciliation(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) error {
-	Log := r.GetLogger(ctx)
-
-	// Retry mechanism for updating RabbitmqCluster (handles race conditions)
-	for i := 0; i < 3; i++ {
-		// Get the RabbitmqCluster
-		rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
-		err := r.Client.Get(ctx, types.NamespacedName{
-			Name:      instance.Name,
-			Namespace: instance.Namespace,
-		}, rabbitmqCluster)
-		if err != nil {
-			return err
+			return ctrl.Result{Requeue: true}, false, "", nil
 		}
 
-		// Check if already resumed
-		if rabbitmqCluster.Labels == nil || rabbitmqCluster.Labels["rabbitmq.com/pauseReconciliation"] != "true" {
-			Log.Info("RabbitMQ operator reconciliation already resumed")
-			return nil
-		}
-
-		// Remove the pause reconciliation label
-		delete(rabbitmqCluster.Labels, "rabbitmq.com/pauseReconciliation")
-
-		err = r.Client.Update(ctx, rabbitmqCluster)
-		if err != nil {
-			if k8s_errors.IsConflict(err) {
-				Log.Info(fmt.Sprintf("Conflict updating RabbitmqCluster, retrying (attempt %d/3)", i+1))
-				time.Sleep(time.Duration(i+1) * time.Second)
-				continue
+		existingSecret := &corev1.Secret{}
+		err := r.Client.Get(ctx, types.NamespacedName{Name: secretName, Namespace: instance.Namespace}, existingSecret)
+		if err == nil {
+			backupSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      backupSecretName,
+					Namespace: instance.Namespace,
+				},
+				Type: existingSecret.Type,
+				Data: existingSecret.Data,
 			}
-			return err
-		}
-
-		Log.Info("RabbitMQ operator reconciliation resumed")
-		return nil
-	}
-
-	return fmt.Errorf("failed to resume RabbitMQ operator reconciliation after 3 attempts")
-}
-
-// deleteAllPodsForSimultaneousUpdate deletes all pods to force simultaneous updates
-func (r *Reconciler) deleteAllPodsForSimultaneousUpdate(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) error {
-	Log := r.GetLogger(ctx)
-
-	// Get the StatefulSet to determine the correct pod selector
-	statefulSetName := instance.Name + "-server"
-	statefulSet := &appsv1.StatefulSet{}
-	err := r.Client.Get(ctx, types.NamespacedName{
-		Name:      statefulSetName,
-		Namespace: instance.Namespace,
-	}, statefulSet)
-	if err != nil {
-		return fmt.Errorf("failed to get StatefulSet %s: %w", statefulSetName, err)
-	}
-
-	// Use the StatefulSet's selector to find pods
-	podList := &corev1.PodList{}
-	err = r.Client.List(ctx, podList, client.InNamespace(instance.Namespace), client.MatchingLabels(statefulSet.Spec.Selector.MatchLabels))
-	if err != nil {
-		return fmt.Errorf("failed to list pods: %w", err)
-	}
-
-	Log.Info(fmt.Sprintf("Found %d pods to delete for simultaneous update", len(podList.Items)))
-
-	// Delete all pods simultaneously
-	for _, pod := range podList.Items {
-		Log.Info(fmt.Sprintf("Deleting pod: %s", pod.Name))
-		err := r.Client.Delete(ctx, &pod)
-		if err != nil {
-			if k8s_errors.IsNotFound(err) {
-				Log.Info(fmt.Sprintf("Pod %s already deleted", pod.Name))
-				continue
+			if err := r.Client.Create(ctx, backupSecret); err != nil && !k8s_errors.IsAlreadyExists(err) {
+				return ctrl.Result{}, false, "", fmt.Errorf("failed to create backup secret: %w", err)
 			}
-			return fmt.Errorf("failed to delete pod %s: %w", pod.Name, err)
+			// Fetch fresh copy before status update to avoid conflicts
+			fresh := &rabbitmqv1beta1.RabbitMq{}
+			if err := r.Client.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, fresh); err != nil {
+				return ctrl.Result{}, false, "", fmt.Errorf("failed to fetch fresh instance: %w", err)
+			}
+			fresh.Status.UpgradeManagedSecretCreated = true
+			fresh.Status.VersionUpgradeInProgress = instance.Status.VersionUpgradeInProgress
+			if err := r.Client.Status().Update(ctx, fresh); err != nil {
+				return ctrl.Result{}, false, "", fmt.Errorf("failed to update status: %w", err)
+			}
+			Log.Info(fmt.Sprintf("Created backup secret: %s", backupSecretName))
+			// Return to let the change propagate before proceeding to deletion
+			return ctrl.Result{Requeue: true}, false, "", nil
+		} else if !k8s_errors.IsNotFound(err) {
+			return ctrl.Result{}, false, "", fmt.Errorf("failed to get default user secret: %w", err)
 		}
+		// If secret not found, we can't back it up, but we should continue to other steps
+		Log.Info("Step 1: Default-user secret not found, skipping backup")
 	}
 
-	Log.Info("Successfully initiated deletion of all pods for simultaneous update")
-	return nil
-}
-
-// isReconciliationPaused checks if RabbitMQ operator reconciliation is paused
-func (r *Reconciler) isReconciliationPaused(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) bool {
-	rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
-	err := r.Client.Get(ctx, types.NamespacedName{
-		Name:      instance.Name,
-		Namespace: instance.Namespace,
-	}, rabbitmqCluster)
-	if err != nil {
-		return false
+	// Step 2: Delete RabbitMQCluster and its default-user secret
+	// Skip if we've already configured externalSecret (prevents race with cluster-operator)
+	if instance.Status.UpgradeExternalSecretConfigured {
+		Log.Info("Step 2: ExternalSecret already configured, skipping deletion")
+		return ctrl.Result{}, false, "", nil
 	}
 
-	return rabbitmqCluster.Labels != nil && rabbitmqCluster.Labels["rabbitmq.com/pauseReconciliation"] == "true"
-}
-
-// arePodsReadyWithNewInitContainer checks if pods are ready and have the expected image
-func (r *Reconciler) arePodsReadyWithNewInitContainer(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) bool {
-	Log := r.GetLogger(ctx)
-
-	// Get the StatefulSet to determine the correct pod selector
-	statefulSetName := instance.Name + "-server"
-	statefulSet := &appsv1.StatefulSet{}
-	err := r.Client.Get(ctx, types.NamespacedName{
-		Name:      statefulSetName,
-		Namespace: instance.Namespace,
-	}, statefulSet)
-	if err != nil {
-		return false
-	}
-
-	// Use the StatefulSet's selector to find pods
-	podList := &corev1.PodList{}
-	err = r.Client.List(ctx, podList, client.InNamespace(instance.Namespace), client.MatchingLabels(statefulSet.Spec.Selector.MatchLabels))
-	if err != nil || len(podList.Items) == 0 {
-		return false
-	}
-
-	// Check if all pods are ready and have the expected image
-	for _, pod := range podList.Items {
-		if pod.Status.Phase != corev1.PodRunning {
-			return false
+	existingCluster := &rabbitmqv2.RabbitmqCluster{}
+	err := r.Client.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, existingCluster)
+	if err == nil {
+		// Cluster exists, delete it for upgrade
+		Log.Info("Step 2: Found existing cluster, deleting for upgrade")
+		if err := r.Client.Delete(ctx, existingCluster); err != nil {
+			return ctrl.Result{}, false, "", fmt.Errorf("failed to delete RabbitMQCluster: %w", err)
 		}
+		Log.Info("Step 2: Deleted RabbitMQCluster for upgrade")
 
-		// Check if pod has all containers ready
-		for _, containerStatus := range pod.Status.ContainerStatuses {
-			if !containerStatus.Ready {
-				return false
+		// Also explicitly delete the default-user secret to avoid race with garbage collection
+		defaultSecret := &corev1.Secret{}
+		if secretErr := r.Client.Get(ctx, types.NamespacedName{Name: secretName, Namespace: instance.Namespace}, defaultSecret); secretErr == nil {
+			if deleteErr := r.Client.Delete(ctx, defaultSecret); deleteErr != nil {
+				Log.Error(deleteErr, "Step 2: Failed to delete default-user secret")
+			} else {
+				Log.Info("Step 2: Deleted default-user secret")
 			}
 		}
 
-		// Check if pod has the expected container image
-		for _, container := range pod.Spec.Containers {
-			if container.Name == "rabbitmq" && container.Image != instance.Spec.ContainerImage {
-				return false
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, false, "", nil
+	} else if !k8s_errors.IsNotFound(err) {
+		return ctrl.Result{}, false, "", fmt.Errorf("failed to get RabbitMQCluster: %w", err)
+	}
+
+	// Step 3: Restore default-user secret from backup if cluster is deleted and secret doesn't exist
+	if err != nil && k8s_errors.IsNotFound(err) {
+		Log.Info("Step 3: Cluster not found, checking if secret needs restoration")
+		// Cluster is deleted, check if we need to restore the secret
+		defaultSecret := &corev1.Secret{}
+		secretErr := r.Client.Get(ctx, types.NamespacedName{Name: secretName, Namespace: instance.Namespace}, defaultSecret)
+		Log.Info(fmt.Sprintf("Step 3: Secret check result: %v", secretErr))
+		if k8s_errors.IsNotFound(secretErr) {
+			Log.Info("Step 3: Secret not found, attempting to restore from backup")
+			// Secret doesn't exist, restore from backup
+			backupSecret := &corev1.Secret{}
+			if err := r.Client.Get(ctx, types.NamespacedName{Name: backupSecretName, Namespace: instance.Namespace}, backupSecret); err == nil {
+				restoredSecret := &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      secretName,
+						Namespace: instance.Namespace,
+					},
+					Type: backupSecret.Type,
+					Data: backupSecret.Data,
+				}
+				if err := r.Client.Create(ctx, restoredSecret); err != nil {
+					return ctrl.Result{}, false, "", fmt.Errorf("failed to restore default-user secret: %w", err)
+				}
+				Log.Info("Restored default-user secret from backup")
+				// Don't clear the flag yet - wait for Step 4 to delete backup and clear flag
+				// This prevents Step 1 from creating a new backup in the next reconcile
+				// Don't delete backup yet, wait for next reconcile to verify cluster is using it
+				return ctrl.Result{Requeue: true}, false, "", nil
 			}
 		}
 	}
 
-	Log.Info("All pods ready with new version")
-	return true
+	// Step 4: Clean up backup secret only if cluster has externalSecret configured
+	if err == nil && existingCluster.Spec.SecretBackend.ExternalSecret.Name == secretName {
+		// Cluster exists and is using externalSecret, safe to delete backup
+		backupSecret := &corev1.Secret{}
+		if err := r.Client.Get(ctx, types.NamespacedName{Name: backupSecretName, Namespace: instance.Namespace}, backupSecret); err == nil {
+			if err := r.Client.Delete(ctx, backupSecret); err != nil {
+				Log.Error(err, "Failed to delete backup secret")
+			} else {
+				Log.Info("Deleted backup secret after successful upgrade")
+				// Don't clear the flag here - it will be cleared when the upgrade completes
+			}
+		}
+	}
+
+	// Step 5: Configure externalSecret now that cluster is deleted and secret is restored
+	// Only proceed if cluster doesn't exist AND secret has been restored
+	checkCluster := &rabbitmqv2.RabbitmqCluster{}
+	if checkErr := r.Client.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, checkCluster); checkErr != nil && k8s_errors.IsNotFound(checkErr) {
+		// Verify secret exists before configuring externalSecret
+		checkSecret := &corev1.Secret{}
+		if secretErr := r.Client.Get(ctx, types.NamespacedName{Name: secretName, Namespace: instance.Namespace}, checkSecret); secretErr == nil {
+			// Cluster doesn't exist and secret is restored, signal to configure externalSecret
+			Log.Info(fmt.Sprintf("Step 5: Secret %s is ready, signaling to configure externalSecret before CreateOrPatch", secretName))
+			// Return with shouldConfigure=true to signal main Reconcile to configure externalSecret
+			return ctrl.Result{}, true, secretName, nil
+		} else {
+			Log.Info("Step 5: Cluster deleted but secret not yet restored, waiting")
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, false, "", nil
+		}
+	}
+
+	// Cluster still exists, keep waiting
+	Log.Info("Step 5: Cluster still exists, waiting for deletion")
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, false, "", nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

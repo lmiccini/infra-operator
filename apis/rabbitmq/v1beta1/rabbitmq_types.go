@@ -108,6 +108,12 @@ type RabbitMqStatus struct {
 
 	// VersionUpgradeInProgress - tracks the target version during upgrade to avoid deletion loops
 	VersionUpgradeInProgress string `json:"versionUpgradeInProgress,omitempty"`
+
+	// UpgradeManagedSecretCreated - tracks if we created a managed secret for upgrade
+	UpgradeManagedSecretCreated bool `json:"upgradeManagedSecretCreated,omitempty"`
+
+	// UpgradeExternalSecretConfigured - tracks if we've configured externalSecret for upgrade
+	UpgradeExternalSecretConfigured bool `json:"upgradeExternalSecretConfigured,omitempty"`
 }
 
 //+kubebuilder:object:root=true

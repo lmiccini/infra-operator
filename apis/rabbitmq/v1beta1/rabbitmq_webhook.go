@@ -113,12 +113,29 @@ func (r *RabbitMq) ValidateCreate() (admission.Warnings, error) {
 }
 
 // ValidateUpdate implements webhook.Validator so a webhook will be registered for the type
-func (r *RabbitMq) ValidateUpdate(_ runtime.Object) (admission.Warnings, error) {
+func (r *RabbitMq) ValidateUpdate(old runtime.Object) (admission.Warnings, error) {
 	rabbitmqlog.Info("validate update", "name", r.Name)
 
 	var allErrs field.ErrorList
 	var allWarn []string
 	basePath := field.NewPath("spec")
+
+	// Block replica changes during version upgrade
+	oldRabbitMq, ok := old.(*RabbitMq)
+	if ok && oldRabbitMq.Status.VersionUpgradeInProgress != "" {
+		if oldRabbitMq.Spec.Replicas != nil && r.Spec.Replicas != nil {
+			oldReplicas := *oldRabbitMq.Spec.Replicas
+			newReplicas := *r.Spec.Replicas
+
+			// Don't allow replica changes during upgrade
+			if newReplicas != oldReplicas {
+				allErrs = append(allErrs, field.Forbidden(
+					basePath.Child("replicas"),
+					"cannot change replicas during version upgrade",
+				))
+			}
+		}
+	}
 
 	// When a TopologyRef CR is referenced, fail if a different Namespace is
 	// referenced because is not supported
