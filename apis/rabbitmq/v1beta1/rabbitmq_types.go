@@ -108,6 +108,9 @@ type RabbitMqStatus struct {
 
 	// VersionUpgradeInProgress - tracks the target version during upgrade to avoid deletion loops
 	VersionUpgradeInProgress string `json:"versionUpgradeInProgress,omitempty"`
+
+	// UpgradeDesiredReplicas - saves the desired replica count during scale-to-zero upgrade
+	UpgradeDesiredReplicas *int32 `json:"upgradeDesiredReplicas,omitempty"`
 }
 
 //+kubebuilder:object:root=true

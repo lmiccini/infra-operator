@@ -24,7 +24,6 @@ import (
 	"time"
 
 	rabbitmqv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
-	appsv1 "k8s.io/api/apps/v1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -178,6 +177,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 					Log.Info("Versions match, clearing upgrade in progress status")
 					instance.Status.VersionUpgradeInProgress = ""
 				}
+				// Also clear UpgradeDesiredReplicas if it's set
+				if instance.Status.UpgradeDesiredReplicas != nil {
+					Log.Info("Versions match, clearing UpgradeDesiredReplicas")
+					instance.Status.UpgradeDesiredReplicas = nil
+				}
 			}
 		} else {
 			Log.Info("No rabbitmqversion label found")
@@ -211,14 +215,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			instance.Status.Conditions.Set(
 				instance.Status.Conditions.Mirror(condition.ReadyCondition))
 		}
-		Log.Info(fmt.Sprintf("Defer: Patching instance with VersionUpgradeInProgress=%s", instance.Status.VersionUpgradeInProgress))
+		// Patch instance to persist changes
 		err := helper.PatchInstance(ctx, instance)
 		if err != nil {
 			Log.Error(err, "Failed to patch instance in defer")
 			_err = err
 			return
 		}
-		Log.Info("Defer: Successfully patched instance")
 	}()
 
 	//
@@ -436,19 +439,24 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, fmt.Errorf("error configuring RabbitmqCluster: %w", err)
 	}
 
+	// Handle version upgrade using scale-to-zero approach BEFORE CreateOrPatch
+	if versionMismatch {
+		Log.Info("Version upgrade in progress: using scale-to-zero approach")
+		result, err := r.handleVersionUpgradeScaleToZero(ctx, instance, rabbitmqCluster, helper)
+		if err != nil {
+			Log.Error(err, "Failed to handle version upgrade")
+			return ctrl.Result{}, err
+		}
+		// If result indicates we should requeue, return early (before CreateOrPatch)
+		if result.Requeue || result.RequeueAfter > 0 {
+			return result, nil
+		}
+	}
+
 	rabbitmqImplCluster := impl.NewRabbitMqCluster(rabbitmqCluster, 5)
 	rmqres, rmqerr := rabbitmqImplCluster.CreateOrPatch(ctx, helper)
 	if rmqerr != nil {
 		return rmqres, rmqerr
-	}
-
-	// Pause RabbitMQ operator reconciliation and patch StatefulSet for version upgrade
-	if versionMismatch {
-		Log.Info("Version upgrade in progress: pausing RabbitMQ operator and patching StatefulSet")
-		if err := r.pauseAndPatchForVersionUpgrade(ctx, instance); err != nil {
-			Log.Error(err, "Failed to pause and patch for version upgrade")
-			return ctrl.Result{}, err
-		}
 	}
 
 	rabbitmqClusterInstance := rabbitmqImplCluster.GetRabbitMqCluster()
@@ -456,10 +464,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	clusterReady := false
 	Log.Info(fmt.Sprintf("RabbitMQ cluster status: ObservedGeneration=%d, Generation=%d", rabbitmqClusterInstance.Status.ObservedGeneration, rabbitmqClusterInstance.Generation))
 
-	// Check if reconciliation is paused - if so, check conditions directly
-	reconciliationPaused := rabbitmqClusterInstance.Labels != nil && rabbitmqClusterInstance.Labels["rabbitmq.com/pauseReconciliation"] == "true"
-
-	if rabbitmqClusterInstance.Status.ObservedGeneration == rabbitmqClusterInstance.Generation || reconciliationPaused {
+	if rabbitmqClusterInstance.Status.ObservedGeneration == rabbitmqClusterInstance.Generation {
 		Log.Info(fmt.Sprintf("RabbitMQ cluster conditions: %+v", rabbitmqClusterInstance.Status.Conditions))
 		for _, oldCond := range rabbitmqClusterInstance.Status.Conditions {
 			// Forced to hardcode "ClusterAvailable" here because linter will not allow
@@ -474,10 +479,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 
 	// Handle version upgrade completion
-	Log.Info(fmt.Sprintf("Version upgrade check: versionMismatch=%t, clusterReady=%t, upgradeInProgress=%s", versionMismatch, clusterReady, instance.Status.VersionUpgradeInProgress))
+	Log.Info(fmt.Sprintf("Version upgrade check: versionMismatch=%t, clusterReady=%t, upgradeInProgress=%s, upgradeDesiredReplicas=%v", versionMismatch, clusterReady, instance.Status.VersionUpgradeInProgress, instance.Status.UpgradeDesiredReplicas))
 
 	// Check if we have an upgrade in progress and the cluster is ready
-	if instance.Status.VersionUpgradeInProgress != "" && clusterReady {
+	// Only mark as complete if UpgradeDesiredReplicas is nil (meaning Step 5 completed and cleared it)
+	if instance.Status.VersionUpgradeInProgress != "" && clusterReady && instance.Status.UpgradeDesiredReplicas == nil {
 		Log.Info("Version upgrade completed - updating rabbitmqcurrentversion label")
 
 		// Update the version label and clear upgrade status
@@ -485,21 +491,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		instance.Status.VersionUpgradeInProgress = ""
 
 		Log.Info(fmt.Sprintf("Updated rabbitmqcurrentversion to %s", instance.Labels["rabbitmqcurrentversion"]))
-	}
-
-	// Check if we need to resume reconciliation after version upgrade
-	if instance.Status.VersionUpgradeInProgress == "" && r.isReconciliationPaused(ctx, instance) {
-		// Check if pods are ready with the new init container
-		if r.arePodsReadyWithNewInitContainer(ctx, instance) {
-			Log.Info("Pods are ready with new init container, resuming RabbitMQ operator reconciliation")
-			if err := r.resumeRabbitMQReconciliation(ctx, instance); err != nil {
-				Log.Error(err, "Failed to resume RabbitMQ operator reconciliation")
-				return ctrl.Result{}, err
-			}
-		} else {
-			Log.Info("Waiting for pods to restart with new init container before resuming reconciliation")
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
 	}
 
 	// Handle PDB for multi-replica deployments (regardless of cluster ready status)
@@ -639,272 +630,100 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1be
 	return ctrl.Result{}, nil
 }
 
-// pauseAndPatchForVersionUpgrade pauses RabbitMQ operator reconciliation and patches StatefulSet
-func (r *Reconciler) pauseAndPatchForVersionUpgrade(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) error {
+// handleVersionUpgradeScaleToZero handles version upgrades using scale-to-zero approach
+func (r *Reconciler) handleVersionUpgradeScaleToZero(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, rabbitmqCluster *rabbitmqv2.RabbitmqCluster, helper *helper.Helper) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 
-	// Retry mechanism for updating RabbitmqCluster (handles race conditions)
-	var rabbitmqCluster *rabbitmqv2.RabbitmqCluster
-	var err error
-
-	for i := 0; i < 3; i++ {
-		// Get the RabbitmqCluster created by our controller
-		rabbitmqCluster = &rabbitmqv2.RabbitmqCluster{}
-		err = r.Client.Get(ctx, types.NamespacedName{
-			Name:      instance.Name,
-			Namespace: instance.Namespace,
-		}, rabbitmqCluster)
-		if err != nil {
-			if k8s_errors.IsNotFound(err) {
-				Log.Info("RabbitmqCluster not found yet, will retry")
-				return nil
-			}
-			return err
-		}
-
-		// Check if already paused
-		if rabbitmqCluster.Labels != nil && rabbitmqCluster.Labels["rabbitmq.com/pauseReconciliation"] == "true" {
-			Log.Info("RabbitMQ operator reconciliation already paused")
-			break
-		}
-
-		// Pause RabbitMQ operator reconciliation
-		if rabbitmqCluster.Labels == nil {
-			rabbitmqCluster.Labels = make(map[string]string)
-		}
-		rabbitmqCluster.Labels["rabbitmq.com/pauseReconciliation"] = "true"
-
-		err = r.Client.Update(ctx, rabbitmqCluster)
-		if err != nil {
-			if k8s_errors.IsConflict(err) {
-				Log.Info(fmt.Sprintf("Conflict updating RabbitmqCluster, retrying (attempt %d/3)", i+1))
-				time.Sleep(time.Duration(i+1) * time.Second)
-				continue
-			}
-			return err
-		}
-		Log.Info("RabbitMQ operator reconciliation paused")
-		break
+	// Get a fresh copy to check current state
+	freshInstance := &rabbitmqv1beta1.RabbitMq{}
+	if err := r.Client.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, freshInstance); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get fresh RabbitMq instance: %w", err)
 	}
 
-	if err != nil {
-		return fmt.Errorf("failed to pause RabbitMQ operator reconciliation after 3 attempts: %w", err)
-	}
-
-	// Wait a moment for the operator to stop reconciling
-	time.Sleep(2 * time.Second)
-
-	// Get the StatefulSet created by the RabbitMQ operator
-	statefulSetName := instance.Name + "-server"
-	Log.Info(fmt.Sprintf("Looking for StatefulSet: %s in namespace: %s", statefulSetName, instance.Namespace))
-
-	statefulSet := &appsv1.StatefulSet{}
-	err = r.Client.Get(ctx, types.NamespacedName{
-		Name:      statefulSetName,
-		Namespace: instance.Namespace,
-	}, statefulSet)
-	if err != nil {
-		if k8s_errors.IsNotFound(err) {
-			Log.Info(fmt.Sprintf("StatefulSet %s not found yet, will retry", statefulSetName))
-			return nil
+	// Step 1: Save desired replicas
+	if freshInstance.Status.UpgradeDesiredReplicas == nil {
+		desiredReplicas := int32(1)
+		if freshInstance.Spec.Replicas != nil {
+			desiredReplicas = *freshInstance.Spec.Replicas
 		}
-		Log.Error(err, fmt.Sprintf("Failed to get StatefulSet %s", statefulSetName))
-		return err
-	}
-
-	Log.Info(fmt.Sprintf("Successfully found StatefulSet: %s", statefulSetName))
-
-	// Check if already patched (prevents repeated deletion of pods on every reconcile)
-	for _, initContainer := range statefulSet.Spec.Template.Spec.InitContainers {
-		if initContainer.Name == "clean-mnesia" {
-			Log.Info("StatefulSet already patched with clean-mnesia init container, skipping")
-			return nil
+		freshInstance.Status.UpgradeDesiredReplicas = &desiredReplicas
+		// Update instance first so defer can see it
+		instance.Status.UpgradeDesiredReplicas = &desiredReplicas
+		if err := r.Client.Status().Update(ctx, freshInstance); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to save UpgradeDesiredReplicas: %w", err)
 		}
+		Log.Info(fmt.Sprintf("Saved desired replicas: %d", desiredReplicas))
+		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Create a cleanup init container
-	// Note: We don't set RunAsUser - let OpenShift assign it based on the namespace's SCC range
-	cleanupContainer := corev1.Container{
-		Name:    "clean-mnesia",
-		Image:   instance.Spec.ContainerImage,
-		Command: []string{"sh", "-c", "rm -rf /var/lib/rabbitmq/mnesia/*"},
-		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      "persistence",
-				MountPath: "/var/lib/rabbitmq/mnesia",
-			},
-			{
-				Name:      "rabbitmq-erlang-cookie",
-				MountPath: "/var/lib/rabbitmq/",
-			},
-		},
-	}
-
-	// Add the cleanup container at the beginning of initContainers
-	statefulSet.Spec.Template.Spec.InitContainers = append(
-		[]corev1.Container{cleanupContainer},
-		statefulSet.Spec.Template.Spec.InitContainers...,
-	)
-
-	// Configure StatefulSet for simultaneous pod updates
-	statefulSet.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{
-		Type: appsv1.OnDeleteStatefulSetStrategyType,
-	}
-
-	// Update the StatefulSet
-	err = r.Client.Update(ctx, statefulSet)
-	if err != nil {
-		Log.Error(err, "Failed to update StatefulSet")
-		return err
-	}
-	Log.Info("StatefulSet patched successfully with clean-mnesia init container")
-
-	// Delete all pods to force simultaneous updates
-	return r.deleteAllPodsForSimultaneousUpdate(ctx, instance)
-}
-
-// resumeRabbitMQReconciliation resumes RabbitMQ operator reconciliation
-func (r *Reconciler) resumeRabbitMQReconciliation(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) error {
-	Log := r.GetLogger(ctx)
-
-	// Retry mechanism for updating RabbitmqCluster (handles race conditions)
-	for i := 0; i < 3; i++ {
-		// Get the RabbitmqCluster
-		rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
-		err := r.Client.Get(ctx, types.NamespacedName{
-			Name:      instance.Name,
-			Namespace: instance.Namespace,
-		}, rabbitmqCluster)
-		if err != nil {
-			return err
+	// Step 2: Scale to 0 if needed
+	if freshInstance.Spec.Replicas == nil || *freshInstance.Spec.Replicas > 0 {
+		freshInstance.Spec.Replicas = ptr.To(int32(0))
+		if err := r.Client.Update(ctx, freshInstance); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to scale to 0: %w", err)
 		}
-
-		// Check if already resumed
-		if rabbitmqCluster.Labels == nil || rabbitmqCluster.Labels["rabbitmq.com/pauseReconciliation"] != "true" {
-			Log.Info("RabbitMQ operator reconciliation already resumed")
-			return nil
-		}
-
-		// Remove the pause reconciliation label
-		delete(rabbitmqCluster.Labels, "rabbitmq.com/pauseReconciliation")
-
-		err = r.Client.Update(ctx, rabbitmqCluster)
-		if err != nil {
-			if k8s_errors.IsConflict(err) {
-				Log.Info(fmt.Sprintf("Conflict updating RabbitmqCluster, retrying (attempt %d/3)", i+1))
-				time.Sleep(time.Duration(i+1) * time.Second)
-				continue
-			}
-			return err
-		}
-
-		Log.Info("RabbitMQ operator reconciliation resumed")
-		return nil
+		Log.Info("Scaled to 0, requeuing to apply")
+		return ctrl.Result{Requeue: true}, nil
 	}
 
-	return fmt.Errorf("failed to resume RabbitMQ operator reconciliation after 3 attempts")
-}
-
-// deleteAllPodsForSimultaneousUpdate deletes all pods to force simultaneous updates
-func (r *Reconciler) deleteAllPodsForSimultaneousUpdate(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) error {
-	Log := r.GetLogger(ctx)
-
-	// Get the StatefulSet to determine the correct pod selector
-	statefulSetName := instance.Name + "-server"
-	statefulSet := &appsv1.StatefulSet{}
-	err := r.Client.Get(ctx, types.NamespacedName{
-		Name:      statefulSetName,
-		Namespace: instance.Namespace,
-	}, statefulSet)
-	if err != nil {
-		return fmt.Errorf("failed to get StatefulSet %s: %w", statefulSetName, err)
-	}
-
-	// Use the StatefulSet's selector to find pods
+	// Step 3: Wait for pods to terminate
 	podList := &corev1.PodList{}
-	err = r.Client.List(ctx, podList, client.InNamespace(instance.Namespace), client.MatchingLabels(statefulSet.Spec.Selector.MatchLabels))
+	err := r.Client.List(ctx, podList, client.InNamespace(instance.Namespace), client.MatchingLabels{
+		"app.kubernetes.io/name": instance.Name,
+	})
 	if err != nil {
-		return fmt.Errorf("failed to list pods: %w", err)
+		return ctrl.Result{}, fmt.Errorf("failed to list pods: %w", err)
 	}
 
-	Log.Info(fmt.Sprintf("Found %d pods to delete for simultaneous update", len(podList.Items)))
-
-	// Delete all pods simultaneously
-	for _, pod := range podList.Items {
-		Log.Info(fmt.Sprintf("Deleting pod: %s", pod.Name))
-		err := r.Client.Delete(ctx, &pod)
-		if err != nil {
-			if k8s_errors.IsNotFound(err) {
-				Log.Info(fmt.Sprintf("Pod %s already deleted", pod.Name))
-				continue
-			}
-			return fmt.Errorf("failed to delete pod %s: %w", pod.Name, err)
-		}
+	if len(podList.Items) > 0 {
+		Log.Info(fmt.Sprintf("%d pods still terminating, allowing CreateOrPatch to proceed", len(podList.Items)))
+		return ctrl.Result{}, nil
 	}
 
-	Log.Info("Successfully initiated deletion of all pods for simultaneous update")
-	return nil
-}
-
-// isReconciliationPaused checks if RabbitMQ operator reconciliation is paused
-func (r *Reconciler) isReconciliationPaused(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) bool {
-	rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
-	err := r.Client.Get(ctx, types.NamespacedName{
-		Name:      instance.Name,
-		Namespace: instance.Namespace,
-	}, rabbitmqCluster)
+	// Step 4: Delete PVCs
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	err = r.Client.List(ctx, pvcList, client.InNamespace(instance.Namespace), client.MatchingLabels{
+		"app.kubernetes.io/name": instance.Name,
+	})
 	if err != nil {
-		return false
+		return ctrl.Result{}, fmt.Errorf("failed to list PVCs: %w", err)
 	}
 
-	return rabbitmqCluster.Labels != nil && rabbitmqCluster.Labels["rabbitmq.com/pauseReconciliation"] == "true"
-}
-
-// arePodsReadyWithNewInitContainer checks if pods are ready and have the expected image
-func (r *Reconciler) arePodsReadyWithNewInitContainer(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) bool {
-	Log := r.GetLogger(ctx)
-
-	// Get the StatefulSet to determine the correct pod selector
-	statefulSetName := instance.Name + "-server"
-	statefulSet := &appsv1.StatefulSet{}
-	err := r.Client.Get(ctx, types.NamespacedName{
-		Name:      statefulSetName,
-		Namespace: instance.Namespace,
-	}, statefulSet)
-	if err != nil {
-		return false
-	}
-
-	// Use the StatefulSet's selector to find pods
-	podList := &corev1.PodList{}
-	err = r.Client.List(ctx, podList, client.InNamespace(instance.Namespace), client.MatchingLabels(statefulSet.Spec.Selector.MatchLabels))
-	if err != nil || len(podList.Items) == 0 {
-		return false
-	}
-
-	// Check if all pods are ready and have the expected image
-	for _, pod := range podList.Items {
-		if pod.Status.Phase != corev1.PodRunning {
-			return false
-		}
-
-		// Check if pod has all containers ready
-		for _, containerStatus := range pod.Status.ContainerStatuses {
-			if !containerStatus.Ready {
-				return false
+	if len(pvcList.Items) > 0 {
+		for _, pvc := range pvcList.Items {
+			if err := r.Client.Delete(ctx, &pvc); err != nil && !k8s_errors.IsNotFound(err) {
+				return ctrl.Result{}, fmt.Errorf("failed to delete PVC %s: %w", pvc.Name, err)
 			}
 		}
-
-		// Check if pod has the expected container image
-		for _, container := range pod.Spec.Containers {
-			if container.Name == "rabbitmq" && container.Image != instance.Spec.ContainerImage {
-				return false
-			}
-		}
+		Log.Info(fmt.Sprintf("Deleted %d PVCs", len(pvcList.Items)))
 	}
 
-	Log.Info("All pods ready with new version")
-	return true
+	// Step 5: Scale back to desired replicas
+	savedReplicas := freshInstance.Status.UpgradeDesiredReplicas
+	if savedReplicas != nil && (freshInstance.Spec.Replicas == nil || *freshInstance.Spec.Replicas != *savedReplicas) {
+		freshInstance.Spec.Replicas = savedReplicas
+		if err := r.Client.Update(ctx, freshInstance); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to scale back: %w", err)
+		}
+		Log.Info(fmt.Sprintf("Scaled back to %d replicas", *savedReplicas))
+		// UpgradeDesiredReplicas will be cleared when versions match (lines 181-184)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// Version upgrade complete - clear UpgradeDesiredReplicas
+	if freshInstance.Status.UpgradeDesiredReplicas != nil {
+		freshInstance.Status.UpgradeDesiredReplicas = nil
+		// Update instance first so defer can see it
+		instance.Status.UpgradeDesiredReplicas = nil
+		if err := r.Client.Status().Update(ctx, freshInstance); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to clear UpgradeDesiredReplicas: %w", err)
+		}
+		Log.Info("Cleared UpgradeDesiredReplicas after upgrade complete")
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	Log.Info("Version upgrade complete")
+	return ctrl.Result{}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
