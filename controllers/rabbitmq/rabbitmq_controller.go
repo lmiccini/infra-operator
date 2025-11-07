@@ -153,41 +153,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 
 	// Check version compatibility and handle version upgrades
 	var versionMismatch bool
-	var targetVersion string
 	Log.Info(fmt.Sprintf("Checking version compatibility. Labels: %v", instance.Labels))
 	if currentVersion, hasCurrent := instance.Labels["rabbitmqcurrentversion"]; hasCurrent {
-		if tv, hasTarget := instance.Labels["rabbitmqversion"]; hasTarget {
-			targetVersion = tv
-			Log.Info(fmt.Sprintf("Version check: current=%s, target=%s, upgradeInProgress=%s", currentVersion, targetVersion, instance.Status.VersionUpgradeInProgress))
+		if targetVersion, hasTarget := instance.Labels["rabbitmqversion"]; hasTarget {
 			if currentVersion != targetVersion {
-				// Check if upgrade is already in progress
-				if instance.Status.VersionUpgradeInProgress != targetVersion {
-					// Mark upgrade as in progress (will be persisted by defer)
-					instance.Status.VersionUpgradeInProgress = targetVersion
-					Log.Info(fmt.Sprintf("RabbitMQ version mismatch: current=%s, target=%s. Starting version upgrade process.", currentVersion, targetVersion))
-					// Set versionMismatch to trigger upgrade logic
-					versionMismatch = true
-				} else {
-					Log.Info("Version upgrade already in progress")
-					versionMismatch = true
-				}
-			} else {
-				// Versions match, clear any upgrade in progress status
-				if instance.Status.VersionUpgradeInProgress != "" {
-					Log.Info("Versions match, clearing upgrade in progress status")
-					instance.Status.VersionUpgradeInProgress = ""
-				}
-				// Also clear UpgradeDesiredReplicas if it's set
-				if instance.Status.UpgradeDesiredReplicas != nil {
-					Log.Info("Versions match, clearing UpgradeDesiredReplicas")
-					instance.Status.UpgradeDesiredReplicas = nil
-				}
+				versionMismatch = true
+				Log.Info(fmt.Sprintf("RabbitMQ version mismatch: current=%s, target=%s. Will delete and recreate cluster.", currentVersion, targetVersion))
 			}
-		} else {
-			Log.Info("No rabbitmqversion label found")
 		}
-	} else {
-		Log.Info("No rabbitmqcurrentversion label found")
 	}
 
 	// initialize status if Conditions is nil, but do not reset if it already
@@ -423,9 +396,80 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		instance.Status.LastAppliedTopology = nil
 	}
 
-	// Configure StatefulSet for simultaneous pod updates during version upgrade
+	// Handle version upgrade by deleting RabbitMQCluster, waiting for pods to terminate, then deleting PVCs
 	if versionMismatch {
-		Log.Info("Starting version upgrade: configuring for simultaneous pod updates")
+		Log.Info("Version upgrade detected: deleting RabbitMQCluster and cleaning storage")
+
+		// Step 1: Delete the RabbitMQCluster (this triggers pod deletion)
+		rmqCluster := impl.NewRabbitMqCluster(rabbitmqCluster, 5)
+		if err := rmqCluster.Delete(ctx, helper); err != nil && !k8s_errors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("failed to delete RabbitMQCluster: %w", err)
+		}
+
+		// Step 2: Wait for all pods to be gone before deleting PVCs
+		podList := &corev1.PodList{}
+		if err := r.Client.List(ctx, podList, client.InNamespace(instance.Namespace), client.MatchingLabels{
+			"app.kubernetes.io/name": instance.Name,
+		}); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to list pods: %w", err)
+		}
+
+		if len(podList.Items) > 0 {
+			Log.Info(fmt.Sprintf("Waiting for %d pods to terminate before deleting PVCs", len(podList.Items)))
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+
+		// Step 3: Delete PVCs only after pods are gone
+		pvcList := &corev1.PersistentVolumeClaimList{}
+		if err := r.Client.List(ctx, pvcList, client.InNamespace(instance.Namespace), client.MatchingLabels{
+			"app.kubernetes.io/name": instance.Name,
+		}); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to list PVCs: %w", err)
+		}
+
+		if len(pvcList.Items) > 0 {
+			for i := range pvcList.Items {
+				pvc := &pvcList.Items[i]
+
+				// Get the bound PV name before deleting PVC
+				pvName := pvc.Spec.VolumeName
+
+				// Remove finalizers to force immediate deletion
+				if len(pvc.Finalizers) > 0 {
+					pvc.Finalizers = []string{}
+					if err := r.Client.Update(ctx, pvc); err != nil && !k8s_errors.IsNotFound(err) {
+						Log.Info(fmt.Sprintf("Failed to remove finalizers from PVC %s: %v", pvc.Name, err))
+					}
+				}
+
+				// Delete the PVC
+				if err := r.Client.Delete(ctx, pvc); err != nil && !k8s_errors.IsNotFound(err) {
+					return ctrl.Result{}, fmt.Errorf("failed to delete PVC %s: %w", pvc.Name, err)
+				}
+
+				// Remove claimRef from the underlying PV to unbind it and trigger reclaim policy
+				if pvName != "" {
+					pv := &corev1.PersistentVolume{}
+					if err := r.Client.Get(ctx, types.NamespacedName{Name: pvName}, pv); err == nil {
+						if pv.Spec.ClaimRef != nil {
+							pv.Spec.ClaimRef = nil
+							if err := r.Client.Update(ctx, pv); err != nil && !k8s_errors.IsNotFound(err) {
+								Log.Info(fmt.Sprintf("Failed to remove claimRef from PV %s: %v", pvName, err))
+							} else {
+								Log.Info(fmt.Sprintf("Removed claimRef from PV %s to trigger reclaim policy", pvName))
+							}
+						}
+					}
+				}
+			}
+			Log.Info(fmt.Sprintf("Deleted %d PVCs and unbound their PVs, waiting for cleanup", len(pvcList.Items)))
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+
+		// Step 4: Storage is clean, now we can proceed to recreate the cluster
+		// Don't update version label yet - wait for cluster to be ready
+		Log.Info("Storage cleaned, proceeding to recreate cluster with new version")
+		// Fall through to CreateOrPatch below
 	}
 
 	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, instance.Spec.Override)
@@ -437,20 +481,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			condition.ServiceConfigReadyErrorMessage,
 			err.Error()))
 		return ctrl.Result{}, fmt.Errorf("error configuring RabbitmqCluster: %w", err)
-	}
-
-	// Handle version upgrade using scale-to-zero approach BEFORE CreateOrPatch
-	if versionMismatch {
-		Log.Info("Version upgrade in progress: using scale-to-zero approach")
-		result, err := r.handleVersionUpgradeScaleToZero(ctx, instance, rabbitmqCluster, helper)
-		if err != nil {
-			Log.Error(err, "Failed to handle version upgrade")
-			return ctrl.Result{}, err
-		}
-		// If result indicates we should requeue, return early (before CreateOrPatch)
-		if result.Requeue || result.RequeueAfter > 0 {
-			return result, nil
-		}
 	}
 
 	rabbitmqImplCluster := impl.NewRabbitMqCluster(rabbitmqCluster, 5)
@@ -478,19 +508,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		Log.Info("RabbitMQ cluster not ready (ObservedGeneration != Generation)")
 	}
 
-	// Handle version upgrade completion
-	Log.Info(fmt.Sprintf("Version upgrade check: versionMismatch=%t, clusterReady=%t, upgradeInProgress=%s, upgradeDesiredReplicas=%v", versionMismatch, clusterReady, instance.Status.VersionUpgradeInProgress, instance.Status.UpgradeDesiredReplicas))
-
-	// Check if we have an upgrade in progress and the cluster is ready
-	// Only mark as complete if UpgradeDesiredReplicas is nil (meaning Step 5 completed and cleared it)
-	if instance.Status.VersionUpgradeInProgress != "" && clusterReady && instance.Status.UpgradeDesiredReplicas == nil {
-		Log.Info("Version upgrade completed - updating rabbitmqcurrentversion label")
-
-		// Update the version label and clear upgrade status
-		instance.Labels["rabbitmqcurrentversion"] = instance.Status.VersionUpgradeInProgress
-		instance.Status.VersionUpgradeInProgress = ""
-
-		Log.Info(fmt.Sprintf("Updated rabbitmqcurrentversion to %s", instance.Labels["rabbitmqcurrentversion"]))
+	// Update version label after successful upgrade (cluster ready with new version)
+	if versionMismatch && clusterReady {
+		instance.Labels["rabbitmqcurrentversion"] = instance.Labels["rabbitmqversion"]
+		Log.Info(fmt.Sprintf("Upgrade complete - updated rabbitmqcurrentversion to %s", instance.Labels["rabbitmqcurrentversion"]))
 	}
 
 	// Handle PDB for multi-replica deployments (regardless of cluster ready status)
@@ -627,102 +648,6 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1be
 	controllerutil.RemoveFinalizer(instance, helper.GetFinalizer())
 	Log.Info("Reconciled Service delete successfully")
 
-	return ctrl.Result{}, nil
-}
-
-// handleVersionUpgradeScaleToZero handles version upgrades using scale-to-zero approach
-func (r *Reconciler) handleVersionUpgradeScaleToZero(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, rabbitmqCluster *rabbitmqv2.RabbitmqCluster, helper *helper.Helper) (ctrl.Result, error) {
-	Log := r.GetLogger(ctx)
-
-	// Get a fresh copy to check current state
-	freshInstance := &rabbitmqv1beta1.RabbitMq{}
-	if err := r.Client.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, freshInstance); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to get fresh RabbitMq instance: %w", err)
-	}
-
-	// Step 1: Save desired replicas
-	if freshInstance.Status.UpgradeDesiredReplicas == nil {
-		desiredReplicas := int32(1)
-		if freshInstance.Spec.Replicas != nil {
-			desiredReplicas = *freshInstance.Spec.Replicas
-		}
-		freshInstance.Status.UpgradeDesiredReplicas = &desiredReplicas
-		// Update instance first so defer can see it
-		instance.Status.UpgradeDesiredReplicas = &desiredReplicas
-		if err := r.Client.Status().Update(ctx, freshInstance); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to save UpgradeDesiredReplicas: %w", err)
-		}
-		Log.Info(fmt.Sprintf("Saved desired replicas: %d", desiredReplicas))
-		return ctrl.Result{Requeue: true}, nil
-	}
-
-	// Step 2: Scale to 0 if needed
-	if freshInstance.Spec.Replicas == nil || *freshInstance.Spec.Replicas > 0 {
-		freshInstance.Spec.Replicas = ptr.To(int32(0))
-		if err := r.Client.Update(ctx, freshInstance); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to scale to 0: %w", err)
-		}
-		Log.Info("Scaled to 0, requeuing to apply")
-		return ctrl.Result{Requeue: true}, nil
-	}
-
-	// Step 3: Wait for pods to terminate
-	podList := &corev1.PodList{}
-	err := r.Client.List(ctx, podList, client.InNamespace(instance.Namespace), client.MatchingLabels{
-		"app.kubernetes.io/name": instance.Name,
-	})
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to list pods: %w", err)
-	}
-
-	if len(podList.Items) > 0 {
-		Log.Info(fmt.Sprintf("%d pods still terminating, allowing CreateOrPatch to proceed", len(podList.Items)))
-		return ctrl.Result{}, nil
-	}
-
-	// Step 4: Delete PVCs
-	pvcList := &corev1.PersistentVolumeClaimList{}
-	err = r.Client.List(ctx, pvcList, client.InNamespace(instance.Namespace), client.MatchingLabels{
-		"app.kubernetes.io/name": instance.Name,
-	})
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to list PVCs: %w", err)
-	}
-
-	if len(pvcList.Items) > 0 {
-		for _, pvc := range pvcList.Items {
-			if err := r.Client.Delete(ctx, &pvc); err != nil && !k8s_errors.IsNotFound(err) {
-				return ctrl.Result{}, fmt.Errorf("failed to delete PVC %s: %w", pvc.Name, err)
-			}
-		}
-		Log.Info(fmt.Sprintf("Deleted %d PVCs", len(pvcList.Items)))
-	}
-
-	// Step 5: Scale back to desired replicas
-	savedReplicas := freshInstance.Status.UpgradeDesiredReplicas
-	if savedReplicas != nil && (freshInstance.Spec.Replicas == nil || *freshInstance.Spec.Replicas != *savedReplicas) {
-		freshInstance.Spec.Replicas = savedReplicas
-		if err := r.Client.Update(ctx, freshInstance); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to scale back: %w", err)
-		}
-		Log.Info(fmt.Sprintf("Scaled back to %d replicas", *savedReplicas))
-		// UpgradeDesiredReplicas will be cleared when versions match (lines 181-184)
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-
-	// Version upgrade complete - clear UpgradeDesiredReplicas
-	if freshInstance.Status.UpgradeDesiredReplicas != nil {
-		freshInstance.Status.UpgradeDesiredReplicas = nil
-		// Update instance first so defer can see it
-		instance.Status.UpgradeDesiredReplicas = nil
-		if err := r.Client.Status().Update(ctx, freshInstance); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to clear UpgradeDesiredReplicas: %w", err)
-		}
-		Log.Info("Cleared UpgradeDesiredReplicas after upgrade complete")
-		return ctrl.Result{Requeue: true}, nil
-	}
-
-	Log.Info("Version upgrade complete")
 	return ctrl.Result{}, nil
 }
 

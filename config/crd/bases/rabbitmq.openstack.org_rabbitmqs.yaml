@@ -1813,15 +1813,6 @@ spec:
                 description: QueueType - store whether default ha-all policy is present
                   or not
                 type: string
-              upgradeDesiredReplicas:
-                description: UpgradeDesiredReplicas - saves the desired replica count
-                  during scale-to-zero upgrade
-                format: int32
-                type: integer
-              versionUpgradeInProgress:
-                description: VersionUpgradeInProgress - tracks the target version
-                  during upgrade to avoid deletion loops
-                type: string
             type: object
         type: object
     served: true

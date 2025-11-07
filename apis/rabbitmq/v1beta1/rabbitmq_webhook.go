@@ -120,25 +120,6 @@ func (r *RabbitMq) ValidateUpdate(old runtime.Object) (admission.Warnings, error
 	var allWarn []string
 	basePath := field.NewPath("spec")
 
-	// Block replica changes during version upgrade
-	oldRabbitMq, ok := old.(*RabbitMq)
-	if ok && oldRabbitMq.Status.VersionUpgradeInProgress != "" {
-		if oldRabbitMq.Spec.Replicas != nil && r.Spec.Replicas != nil {
-			oldReplicas := *oldRabbitMq.Spec.Replicas
-			newReplicas := *r.Spec.Replicas
-
-			// Allow scaling to 0 or restoring to saved value during upgrade
-			if newReplicas != oldReplicas && newReplicas != 0 {
-				if oldRabbitMq.Status.UpgradeDesiredReplicas == nil || newReplicas != *oldRabbitMq.Status.UpgradeDesiredReplicas {
-					allErrs = append(allErrs, field.Forbidden(
-						basePath.Child("replicas"),
-						"cannot change replicas during version upgrade",
-					))
-				}
-			}
-		}
-	}
-
 	// When a TopologyRef CR is referenced, fail if a different Namespace is
 	// referenced because is not supported
 	allErrs = append(allErrs, r.Spec.ValidateTopology(basePath, r.Namespace)...)
