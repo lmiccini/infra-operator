@@ -144,12 +144,10 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 	// Get or create user secret (use CR name to avoid conflicts when multiple CRs have same username)
 	secretName := fmt.Sprintf("rabbitmq-user-%s", instance.Name)
 	userSecret, _, err := oko_secret.GetSecret(ctx, h, secretName, instance.Namespace)
-	needsCreation := false
 	var password string
 
 	if err != nil {
 		if k8s_errors.IsNotFound(err) {
-			needsCreation = true
 			password, _ = generatePassword(32)
 		} else {
 			instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.UserReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.UserReadyErrorMessage, err.Error()))
@@ -159,7 +157,7 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 		password = string(userSecret.Data["password"])
 	}
 
-	// Create user secret
+	// Create or update user secret
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      secretName,
@@ -171,7 +169,7 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 		},
 	}
 
-	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
 		secret.Data["username"] = []byte(username)
 		secret.Data["password"] = []byte(password)
 		return controllerutil.SetControllerReference(instance, secret, r.Scheme)
@@ -181,8 +179,8 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 		return ctrl.Result{}, err
 	}
 
-	// Create user in RabbitMQ if needed
-	if needsCreation {
+	// Only create/update user in RabbitMQ if secret was just created
+	if op == controllerutil.OperationResultCreated {
 		// Get admin credentials
 		rabbitSecret, _, err := oko_secret.GetSecret(ctx, h, rabbit.Status.DefaultUser.SecretReference.Name, instance.Namespace)
 		if err != nil {
