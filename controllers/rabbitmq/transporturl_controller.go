@@ -327,42 +327,101 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 	// Check if we should use dedicated user or default RabbitMQ user
 	useDedicatedUser := instance.Spec.RabbitmqUsername != "" || instance.Spec.RabbitmqVhost != ""
 
+	// Get RabbitMQ cluster admin secret for both connection details and API access
+	rabbitSecret, _, err := oko_secret.GetSecret(ctx, helper, rabbit.Status.DefaultUser.SecretReference.Name, instance.Namespace)
+	if err != nil {
+		if k8s_errors.IsNotFound(err) {
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				rabbitmqv1.TransportURLReadyCondition,
+				condition.ErrorReason,
+				condition.SeverityWarning,
+				rabbitmqv1.TransportURLInProgressMessage))
+			return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+		}
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			rabbitmqv1.TransportURLReadyCondition,
+			condition.ErrorReason,
+			condition.SeverityWarning,
+			rabbitmqv1.TransportURLReadyErrorMessage,
+			err.Error()))
+		return ctrl.Result{}, err
+	}
+
+	// Extract connection details from secret
+	host, ok := rabbitSecret.Data["host"]
+	if !ok {
+		err := fmt.Errorf("host does not exist in rabbitmq secret %s", rabbitSecret.Name)
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			rabbitmqv1.TransportURLReadyCondition,
+			condition.ErrorReason,
+			condition.SeverityWarning,
+			rabbitmqv1.TransportURLReadyErrorMessage,
+			err.Error()))
+		return ctrl.Result{}, err
+	}
+
+	port, ok := rabbitSecret.Data["port"]
+	if !ok {
+		err := fmt.Errorf("port does not exist in rabbitmq secret %s", rabbitSecret.Name)
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			rabbitmqv1.TransportURLReadyCondition,
+			condition.ErrorReason,
+			condition.SeverityWarning,
+			rabbitmqv1.TransportURLReadyErrorMessage,
+			err.Error()))
+		return ctrl.Result{}, err
+	}
+
+	adminUsername, ok := rabbitSecret.Data["username"]
+	if !ok {
+		err := fmt.Errorf("username does not exist in rabbitmq secret %s", rabbitSecret.Name)
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			rabbitmqv1.TransportURLReadyCondition,
+			condition.ErrorReason,
+			condition.SeverityWarning,
+			rabbitmqv1.TransportURLReadyErrorMessage,
+			err.Error()))
+		return ctrl.Result{}, err
+	}
+
+	adminPassword, ok := rabbitSecret.Data["password"]
+	if !ok {
+		err := fmt.Errorf("password does not exist in rabbitmq secret %s", rabbitSecret.Name)
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			rabbitmqv1.TransportURLReadyCondition,
+			condition.ErrorReason,
+			condition.SeverityWarning,
+			rabbitmqv1.TransportURLReadyErrorMessage,
+			err.Error()))
+		return ctrl.Result{}, err
+	}
+
 	var username, password string
 	if useDedicatedUser {
 		username = dedicatedUsername
 		// Check if username has changed (for gradual migration)
-		// When username changes, we create a new user but keep the old one active
-		// to prevent breaking existing services. Old user cleanup is manual only.
 		if instance.Status.RabbitmqUsername != "" && instance.Status.RabbitmqUsername != username {
 			Log.Info(fmt.Sprintf("Username changed from %s to %s, creating new user while keeping old one", instance.Status.RabbitmqUsername, username))
-			// Store the previous username for potential manual cleanup later
 			instance.Status.PreviousRabbitmqUsername = instance.Status.RabbitmqUsername
 		}
 
-		// Check if we need to create a new user or if credentials have changed
+		// Check if we need to create a new user or if credentials exist
 		userSecretName := fmt.Sprintf("rabbitmq-user-%s", username)
 		userSecret, _, err := oko_secret.GetSecret(ctx, helper, userSecretName, instance.Namespace)
-		needNewPassword := false
-
 		if err != nil {
 			if k8s_errors.IsNotFound(err) {
-				// User doesn't exist, we need to create it
-				needNewPassword = true
+				// Generate new password for new user
+				password, err = generatePassword(32)
+				if err != nil {
+					instance.Status.Conditions.Set(condition.FalseCondition(
+						rabbitmqv1.TransportURLReadyCondition,
+						condition.ErrorReason,
+						condition.SeverityWarning,
+						rabbitmqv1.TransportURLReadyErrorMessage,
+						err.Error()))
+					return ctrl.Result{}, err
+				}
 			} else {
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					rabbitmqv1.TransportURLReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					rabbitmqv1.TransportURLReadyErrorMessage,
-					err.Error()))
-				return ctrl.Result{}, err
-			}
-		}
-
-		// Generate password if needed
-		if needNewPassword {
-			password, err = generatePassword(32)
-			if err != nil {
 				instance.Status.Conditions.Set(condition.FalseCondition(
 					rabbitmqv1.TransportURLReadyCondition,
 					condition.ErrorReason,
@@ -375,77 +434,16 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 			password = string(userSecret.Data["password"])
 		}
 
-		// Get admin credentials and create API client early for user management
-		rabbitSecret, _, err := oko_secret.GetSecret(ctx, helper, rabbit.Status.DefaultUser.SecretReference.Name, instance.Namespace)
-		if err != nil {
-			if k8s_errors.IsNotFound(err) {
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					rabbitmqv1.TransportURLReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					rabbitmqv1.TransportURLInProgressMessage))
-				return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
-			}
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				rabbitmqv1.TransportURLReadyErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
-		}
-
-		var host string
-		if h, ok := rabbitSecret.Data["host"]; ok {
-			host = string(h)
-		} else {
-			err := fmt.Errorf("host does not exist in rabbitmq secret %s", rabbitSecret.Name)
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				rabbitmqv1.TransportURLReadyErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
-		}
-
-		var adminUsername, adminPassword string
-		if u, ok := rabbitSecret.Data["username"]; ok {
-			adminUsername = string(u)
-		} else {
-			err := fmt.Errorf("username does not exist in rabbitmq secret %s", rabbitSecret.Name)
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				rabbitmqv1.TransportURLReadyErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
-		}
-
-		if p, ok := rabbitSecret.Data["password"]; ok {
-			adminPassword = string(p)
-		} else {
-			err := fmt.Errorf("password does not exist in rabbitmq secret %s", rabbitSecret.Name)
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				rabbitmqv1.TransportURLReadyErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
-		}
-
 		// Create RabbitMQ Management API client
 		tlsEnabled := rabbit.Spec.TLS.SecretName != ""
 		protocol := "http"
 		managementPort := "15672"
 		if tlsEnabled {
 			protocol = "https"
-			managementPort = "15671" // TLS management port
+			managementPort = "15671"
 		}
-		baseURL := fmt.Sprintf("%s://%s:%s", protocol, host, managementPort)
-		apiClient := rabbitmqapi.NewClient(baseURL, adminUsername, adminPassword, tlsEnabled)
+		baseURL := fmt.Sprintf("%s://%s:%s", protocol, string(host), managementPort)
+		apiClient := rabbitmqapi.NewClient(baseURL, string(adminUsername), string(adminPassword), tlsEnabled)
 
 		// Create RabbitMQ user
 		err = r.createRabbitMQUser(ctx, instance, username, password, apiClient)
@@ -485,123 +483,19 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 	} else {
 		// Use default RabbitMQ user behavior (backward compatibility)
 		Log.Info("Using default RabbitMQ user behavior (no dedicated user specified)")
-		username = ""   // Will be set from default user secret below
-		vhostName = "/" // Default vhost
+		username = string(adminUsername)
+		vhostName = "/"
 	}
 
-	// Get connection details from the RabbitMQ secret (already fetched in useDedicatedUser block or fetch here)
-	var rabbitSecret *corev1.Secret
-	var host, port string
+	// Determine final credentials for transport URL
+	finalUsername := username
+	finalPassword := password
 	if !useDedicatedUser {
-		rabbitSecret, _, err = oko_secret.GetSecret(ctx, helper, rabbit.Status.DefaultUser.SecretReference.Name, instance.Namespace)
-		if err != nil {
-			if k8s_errors.IsNotFound(err) {
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					rabbitmqv1.TransportURLReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					rabbitmqv1.TransportURLInProgressMessage))
-				return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
-			}
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				rabbitmqv1.TransportURLReadyErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
-		}
-
-		if h, ok := rabbitSecret.Data["host"]; ok {
-			host = string(h)
-		} else {
-			err := fmt.Errorf("host does not exist in rabbitmq secret %s", rabbitSecret.Name)
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				rabbitmqv1.TransportURLReadyErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
-		}
-
-		if p, ok := rabbitSecret.Data["port"]; ok {
-			port = string(p)
-		} else {
-			err := fmt.Errorf("port does not exist in rabbitmq secret %s", rabbitSecret.Name)
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				rabbitmqv1.TransportURLReadyErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
-		}
-	} else {
-		// Extract from the already fetched secret
-		if h, ok := rabbitSecret.Data["host"]; ok {
-			host = string(h)
-		} else {
-			err := fmt.Errorf("host does not exist in rabbitmq secret %s", rabbitSecret.Name)
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				rabbitmqv1.TransportURLReadyErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
-		}
-
-		if p, ok := rabbitSecret.Data["port"]; ok {
-			port = string(p)
-		} else {
-			err := fmt.Errorf("port does not exist in rabbitmq secret %s", rabbitSecret.Name)
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				rabbitmqv1.TransportURLReadyErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
-		}
-	}
-
-	// Set username and password based on whether we're using dedicated user or default
-	var finalUsername, finalPassword string
-	if useDedicatedUser {
-		finalUsername = username
-		finalPassword = password
-	} else {
-		// Use default RabbitMQ user credentials
-		if u, ok := rabbitSecret.Data["username"]; ok {
-			finalUsername = string(u)
-		} else {
-			err := fmt.Errorf("username does not exist in rabbitmq secret %s", rabbitSecret.Name)
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				rabbitmqv1.TransportURLReadyErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
-		}
-
-		if p, ok := rabbitSecret.Data["password"]; ok {
-			finalPassword = string(p)
-		} else {
-			err := fmt.Errorf("password does not exist in rabbitmq secret %s", rabbitSecret.Name)
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				rabbitmqv1.TransportURLReadyErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
-		}
+		finalUsername = string(adminUsername)
+		finalPassword = string(adminPassword)
 	}
 
 	tlsEnabled := rabbit.Spec.TLS.SecretName != ""
-
 	Log.Info(fmt.Sprintf("rabbitmq cluster %s has TLS enabled: %t", rabbit.Name, tlsEnabled))
 
 	// Get RabbitMq CR for both secret generation and status update
@@ -633,7 +527,7 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 	}
 
 	// Create a new secret with the transport URL for this CR
-	secret := r.createTransportURLSecret(instance, finalUsername, finalPassword, host, port, vhostName, tlsEnabled, quorum)
+	secret := r.createTransportURLSecret(instance, finalUsername, finalPassword, string(host), string(port), vhostName, tlsEnabled, quorum)
 	_, op, err := oko_secret.CreateOrPatchSecret(ctx, helper, instance, secret)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
@@ -665,23 +559,14 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 			Log.Info(fmt.Sprintf("Manual cleanup requested for old user: %s", instance.Status.PreviousRabbitmqUsername))
 
 			// Create API client for cleanup operations
-			var adminUsername, adminPassword string
-			if u, ok := rabbitSecret.Data["username"]; ok {
-				adminUsername = string(u)
-			}
-			if p, ok := rabbitSecret.Data["password"]; ok {
-				adminPassword = string(p)
-			}
-
-			tlsEnabled := rabbit.Spec.TLS.SecretName != ""
 			protocol := "http"
 			managementPort := "15672"
 			if tlsEnabled {
 				protocol = "https"
-				managementPort = "15671" // TLS management port
+				managementPort = "15671"
 			}
-			baseURL := fmt.Sprintf("%s://%s:%s", protocol, host, managementPort)
-			apiClient := rabbitmqapi.NewClient(baseURL, adminUsername, adminPassword, tlsEnabled)
+			baseURL := fmt.Sprintf("%s://%s:%s", protocol, string(host), managementPort)
+			apiClient := rabbitmqapi.NewClient(baseURL, string(adminUsername), string(adminPassword), tlsEnabled)
 
 			err = r.cleanupOldUser(ctx, instance, instance.Status.PreviousRabbitmqUsername, apiClient)
 			if err != nil {

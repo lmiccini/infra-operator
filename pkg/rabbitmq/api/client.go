@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -125,7 +126,8 @@ func (c *Client) CreateOrUpdateUser(name, password string, tags []string) error 
 		Tags:     tags,
 	}
 
-	resp, err := c.doRequest("PUT", fmt.Sprintf("/api/users/%s", name), user)
+	encodedName := url.PathEscape(name)
+	resp, err := c.doRequest("PUT", fmt.Sprintf("/api/users/%s", encodedName), user)
 	if err != nil {
 		return err
 	}
@@ -141,7 +143,8 @@ func (c *Client) CreateOrUpdateUser(name, password string, tags []string) error 
 
 // DeleteUser deletes a RabbitMQ user
 func (c *Client) DeleteUser(name string) error {
-	resp, err := c.doRequest("DELETE", fmt.Sprintf("/api/users/%s", name), nil)
+	encodedName := url.PathEscape(name)
+	resp, err := c.doRequest("DELETE", fmt.Sprintf("/api/users/%s", encodedName), nil)
 	if err != nil {
 		return err
 	}
@@ -161,7 +164,8 @@ func (c *Client) CreateOrUpdateVhost(name string) error {
 		Name: name,
 	}
 
-	resp, err := c.doRequest("PUT", fmt.Sprintf("/api/vhosts/%s", name), vhost)
+	encodedName := url.PathEscape(name)
+	resp, err := c.doRequest("PUT", fmt.Sprintf("/api/vhosts/%s", encodedName), vhost)
 	if err != nil {
 		return err
 	}
@@ -177,7 +181,8 @@ func (c *Client) CreateOrUpdateVhost(name string) error {
 
 // DeleteVhost deletes a RabbitMQ vhost
 func (c *Client) DeleteVhost(name string) error {
-	resp, err := c.doRequest("DELETE", fmt.Sprintf("/api/vhosts/%s", name), nil)
+	encodedName := url.PathEscape(name)
+	resp, err := c.doRequest("DELETE", fmt.Sprintf("/api/vhosts/%s", encodedName), nil)
 	if err != nil {
 		return err
 	}
@@ -200,7 +205,11 @@ func (c *Client) SetPermissions(vhost, user, configure, write, read string) erro
 		"read":      read,
 	}
 
-	resp, err := c.doRequest("PUT", fmt.Sprintf("/api/permissions/%s/%s", vhost, user), perm)
+	// URL encode vhost and user (vhost "/" becomes "%2F")
+	encodedVhost := url.PathEscape(vhost)
+	encodedUser := url.PathEscape(user)
+
+	resp, err := c.doRequest("PUT", fmt.Sprintf("/api/permissions/%s/%s", encodedVhost, encodedUser), perm)
 	if err != nil {
 		return err
 	}
@@ -216,7 +225,9 @@ func (c *Client) SetPermissions(vhost, user, configure, write, read string) erro
 
 // DeletePermissions deletes permissions for a user on a vhost
 func (c *Client) DeletePermissions(vhost, user string) error {
-	resp, err := c.doRequest("DELETE", fmt.Sprintf("/api/permissions/%s/%s", vhost, user), nil)
+	encodedVhost := url.PathEscape(vhost)
+	encodedUser := url.PathEscape(user)
+	resp, err := c.doRequest("DELETE", fmt.Sprintf("/api/permissions/%s/%s", encodedVhost, encodedUser), nil)
 	if err != nil {
 		return err
 	}
@@ -243,7 +254,9 @@ func (c *Client) CreateOrUpdatePolicy(vhost, name, pattern string, definition ma
 		ApplyTo:    applyTo,
 	}
 
-	resp, err := c.doRequest("PUT", fmt.Sprintf("/api/policies/%s/%s", vhost, name), policy)
+	encodedVhost := url.PathEscape(vhost)
+	encodedName := url.PathEscape(name)
+	resp, err := c.doRequest("PUT", fmt.Sprintf("/api/policies/%s/%s", encodedVhost, encodedName), policy)
 	if err != nil {
 		return err
 	}
@@ -259,7 +272,9 @@ func (c *Client) CreateOrUpdatePolicy(vhost, name, pattern string, definition ma
 
 // DeletePolicy deletes a RabbitMQ policy
 func (c *Client) DeletePolicy(vhost, name string) error {
-	resp, err := c.doRequest("DELETE", fmt.Sprintf("/api/policies/%s/%s", vhost, name), nil)
+	encodedVhost := url.PathEscape(vhost)
+	encodedName := url.PathEscape(name)
+	resp, err := c.doRequest("DELETE", fmt.Sprintf("/api/policies/%s/%s", encodedVhost, encodedName), nil)
 	if err != nil {
 		return err
 	}
