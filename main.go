@@ -303,6 +303,10 @@ func main() {
 			setupLog.Error(err, "unable to create webhook", "webhook", "RabbitMq")
 			os.Exit(1)
 		}
+		if err = (&rabbitmqv1beta1.RabbitMQUser{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "RabbitMQUser")
+			os.Exit(1)
+		}
 		checker = mgr.GetWebhookServer().StartedChecker()
 	}
 

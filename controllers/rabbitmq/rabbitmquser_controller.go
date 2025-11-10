@@ -141,8 +141,8 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 		return ctrl.Result{}, err
 	}
 
-	// Get or create user secret
-	secretName := fmt.Sprintf("rabbitmq-user-%s", username)
+	// Get or create user secret (use CR name to avoid conflicts when multiple CRs have same username)
+	secretName := fmt.Sprintf("rabbitmq-user-%s", instance.Name)
 	userSecret, _, err := oko_secret.GetSecret(ctx, h, secretName, instance.Namespace)
 	needsCreation := false
 	var password string
@@ -286,8 +286,8 @@ func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *
 		}
 	}
 
-	// Delete secret
-	secretName := fmt.Sprintf("rabbitmq-user-%s", username)
+	// Delete secret (use CR name, same as in reconcileNormal)
+	secretName := fmt.Sprintf("rabbitmq-user-%s", instance.Name)
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      secretName,

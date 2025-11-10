@@ -272,6 +272,18 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 			return ctrl.Result{}, err
 		}
 
+		// Check if RabbitMQUser is ready and has a secret
+		if rabbitUser.Status.SecretName == "" {
+			err := fmt.Errorf("RabbitMQUser %s is not ready yet (no secret created)", instance.Spec.UserRef)
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				rabbitmqv1.TransportURLReadyCondition,
+				condition.RequestedReason,
+				condition.SeverityInfo,
+				rabbitmqv1.TransportURLInProgressMessage))
+			Log.Info(err.Error())
+			return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+		}
+
 		// Get user secret
 		userSecret, _, err := oko_secret.GetSecret(ctx, helper, rabbitUser.Status.SecretName, instance.Namespace)
 		if err != nil {
