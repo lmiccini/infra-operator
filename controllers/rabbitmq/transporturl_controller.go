@@ -405,27 +405,30 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 			instance.Status.PreviousRabbitmqUsername = instance.Status.RabbitmqUsername
 		}
 
+		// Resume using the last active rotated username if it exists
+		if instance.Status.RabbitmqUsername != "" && instance.Status.RabbitmqUsername != username {
+			username = instance.Status.RabbitmqUsername
+		}
+
 		// Handle password rotation via user migration
 		// If rotation is requested, create a new user with suffix and store old username
 		if instance.Annotations != nil && instance.Annotations["rabbitmq.openstack.org/rotate-password"] == "true" {
-			if instance.Status.RabbitmqUsername == "" || instance.Status.RabbitmqUsername == username {
-				// First rotation - create user with -r1 suffix
-				instance.Status.PreviousRabbitmqUsername = username
-				username = fmt.Sprintf("%s-r1", username)
-				Log.Info(fmt.Sprintf("Password rotation: creating new user %s (old: %s)", username, instance.Status.PreviousRabbitmqUsername))
-			} else {
-				// Subsequent rotation - increment suffix
-				instance.Status.PreviousRabbitmqUsername = instance.Status.RabbitmqUsername
-				// Extract number from current username (e.g., "user-r1" -> 1)
-				var currentGen int
-				fmt.Sscanf(instance.Status.RabbitmqUsername, fmt.Sprintf("%s-r%%d", dedicatedUsername), &currentGen)
+			// Store current username as previous for cleanup
+			instance.Status.PreviousRabbitmqUsername = username
+
+			// Generate new username with incremented suffix
+			var currentGen int
+			n, _ := fmt.Sscanf(username, fmt.Sprintf("%s-r%%d", dedicatedUsername), &currentGen)
+			if n == 1 {
+				// Already has rotation suffix, increment it
 				username = fmt.Sprintf("%s-r%d", dedicatedUsername, currentGen+1)
-				Log.Info(fmt.Sprintf("Password rotation: creating new user %s (old: %s)", username, instance.Status.PreviousRabbitmqUsername))
+			} else {
+				// First rotation
+				username = fmt.Sprintf("%s-r1", dedicatedUsername)
 			}
+
+			Log.Info(fmt.Sprintf("Password rotation: creating new user %s (old: %s)", username, instance.Status.PreviousRabbitmqUsername))
 			delete(instance.Annotations, "rabbitmq.openstack.org/rotate-password")
-		} else if instance.Status.RabbitmqUsername != "" && instance.Status.RabbitmqUsername != username {
-			// Resume using the last active rotated username
-			username = instance.Status.RabbitmqUsername
 		}
 
 		// Check if user secret exists
