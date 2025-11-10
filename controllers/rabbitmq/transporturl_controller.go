@@ -405,13 +405,36 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 			instance.Status.PreviousRabbitmqUsername = instance.Status.RabbitmqUsername
 		}
 
-		// Check if we need to create a new user or if credentials exist
+		// Handle password rotation via user migration
+		// If rotation is requested, create a new user with suffix and store old username
+		if instance.Annotations != nil && instance.Annotations["rabbitmq.openstack.org/rotate-password"] == "true" {
+			if instance.Status.RabbitmqUsername == "" || instance.Status.RabbitmqUsername == username {
+				// First rotation - create user with -r1 suffix
+				instance.Status.PreviousRabbitmqUsername = username
+				username = fmt.Sprintf("%s-r1", username)
+				Log.Info(fmt.Sprintf("Password rotation: creating new user %s (old: %s)", username, instance.Status.PreviousRabbitmqUsername))
+			} else {
+				// Subsequent rotation - increment suffix
+				instance.Status.PreviousRabbitmqUsername = instance.Status.RabbitmqUsername
+				// Extract number from current username (e.g., "user-r1" -> 1)
+				var currentGen int
+				fmt.Sscanf(instance.Status.RabbitmqUsername, fmt.Sprintf("%s-r%%d", dedicatedUsername), &currentGen)
+				username = fmt.Sprintf("%s-r%d", dedicatedUsername, currentGen+1)
+				Log.Info(fmt.Sprintf("Password rotation: creating new user %s (old: %s)", username, instance.Status.PreviousRabbitmqUsername))
+			}
+			delete(instance.Annotations, "rabbitmq.openstack.org/rotate-password")
+		} else if instance.Status.RabbitmqUsername != "" && instance.Status.RabbitmqUsername != username {
+			// Resume using the last active rotated username
+			username = instance.Status.RabbitmqUsername
+		}
+
+		// Check if user secret exists
 		userSecretName := fmt.Sprintf("rabbitmq-user-%s", username)
 		userSecret, _, err := oko_secret.GetSecret(ctx, helper, userSecretName, instance.Namespace)
 		needsCreation := false
+
 		if err != nil {
 			if k8s_errors.IsNotFound(err) {
-				// Generate new password for new user
 				needsCreation = true
 				password, err = generatePassword(32)
 				if err != nil {
@@ -436,10 +459,8 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 			password = string(userSecret.Data["password"])
 		}
 
-		// Only create/update RabbitMQ resources if the user doesn't exist yet
-		// Otherwise, the user secret already exists with the correct password
+		// Create RabbitMQ resources if needed
 		if needsCreation {
-			// Create RabbitMQ Management API client
 			tlsEnabled := rabbit.Spec.TLS.SecretName != ""
 			protocol := "http"
 			managementPort := "15672"
@@ -450,7 +471,6 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 			baseURL := fmt.Sprintf("%s://%s:%s", protocol, string(host), managementPort)
 			apiClient := rabbitmqapi.NewClient(baseURL, string(adminUsername), string(adminPassword), tlsEnabled)
 
-			// Create RabbitMQ user
 			err = r.createRabbitMQUser(ctx, instance, username, password, apiClient)
 			if err != nil {
 				instance.Status.Conditions.Set(condition.FalseCondition(
@@ -462,7 +482,6 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 				return ctrl.Result{}, err
 			}
 
-			// Create RabbitMQ vhost if needed
 			err = r.createRabbitMQVhost(ctx, instance, vhostName, apiClient)
 			if err != nil {
 				instance.Status.Conditions.Set(condition.FalseCondition(
@@ -474,7 +493,6 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 				return ctrl.Result{}, err
 			}
 
-			// Create RabbitMQ permissions
 			err = r.createRabbitMQPermission(ctx, instance, username, vhostName, apiClient)
 			if err != nil {
 				instance.Status.Conditions.Set(condition.FalseCondition(
