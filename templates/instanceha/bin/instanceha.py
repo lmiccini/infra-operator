@@ -1928,14 +1928,14 @@ def _redfish_reset(url, user, passwd, timeout, action):
                 else:
                     logging.info("Redfish reset successful: %s on %s", action, safe_url)
                     return True
-            elif response.status_code == 409:
+            elif response.status_code in [400, 409]:
                 # Check if server is already powered off
                 power_state = _redfish_get_power_state(url, user, passwd, timeout)
                 if power_state == 'OFF':
                     logging.info("Redfish reset successful: %s on %s (already off)", action, safe_url)
                     return True
                 else:
-                    logging.error("Redfish reset failed: 409 conflict but not OFF (status: %s) for %s", power_state, safe_url)
+                    logging.error("Redfish reset failed: %s conflict but not OFF (status: %s) for %s", response.status_code, power_state, safe_url)
                     return False
             elif response.status_code in [401, 403]:
                 # Authentication/authorization errors - don't retry

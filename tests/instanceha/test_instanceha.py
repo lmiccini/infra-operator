@@ -1515,6 +1515,66 @@ class TestRedfishFencing(unittest.TestCase):
         mock_get.assert_called_once()
 
     @patch('instanceha.requests.post')
+    @patch('instanceha.requests.get')
+    @patch('instanceha.config_manager.get_requests_ssl_config')
+    def test_redfish_reset_400_bad_request_already_off(self, mock_ssl_config, mock_get, mock_post):
+        """Test Redfish reset with 400 bad request when server is already off."""
+        # Mock SSL config
+        mock_ssl_config.return_value = False
+
+        # Mock POST response returning 400 Bad Request
+        mock_post_response = Mock()
+        mock_post_response.status_code = 400
+        mock_post.return_value = mock_post_response
+
+        # Mock GET response returning power state OFF
+        mock_get_response = Mock()
+        mock_get_response.status_code = 200
+        mock_get_response.json.return_value = {'PowerState': 'Off'}
+        mock_get.return_value = mock_get_response
+
+        # Test the function
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 30, 'ForceOff')
+
+        # Should return True because server is already off
+        self.assertTrue(result)
+
+        # Verify POST was called
+        mock_post.assert_called_once()
+
+        # Verify GET was called to check power state
+        mock_get.assert_called_once()
+
+    @patch('instanceha.requests.post')
+    @patch('instanceha.requests.get')
+    @patch('instanceha.config_manager.get_requests_ssl_config')
+    def test_redfish_reset_400_bad_request_not_off(self, mock_ssl_config, mock_get, mock_post):
+        """Test Redfish reset with 400 bad request when server is not off."""
+        # Mock SSL config
+        mock_ssl_config.return_value = False
+
+        # Mock POST response returning 400 Bad Request
+        mock_post_response = Mock()
+        mock_post_response.status_code = 400
+        mock_post.return_value = mock_post_response
+
+        # Mock GET response returning power state ON
+        mock_get_response = Mock()
+        mock_get_response.status_code = 200
+        mock_get_response.json.return_value = {'PowerState': 'On'}
+        mock_get.return_value = mock_get_response
+
+        # Test the function
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 30, 'ForceOff')
+
+        # Should return False because server is not off
+        self.assertFalse(result)
+
+        # Verify both POST and GET were called
+        mock_post.assert_called_once()
+        mock_get.assert_called_once()
+
+    @patch('instanceha.requests.post')
     @patch('instanceha.config_manager.get_requests_ssl_config')
     def test_redfish_reset_success(self, mock_ssl_config, mock_post):
         """Test successful Redfish reset."""
