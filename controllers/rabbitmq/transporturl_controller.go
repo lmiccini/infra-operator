@@ -18,8 +18,6 @@ package rabbitmq
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"fmt"
 	"time"
 
@@ -37,7 +35,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
-	rabbitmqapi "github.com/openstack-k8s-operators/infra-operator/pkg/rabbitmq/api"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	helper "github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	oko_secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
@@ -161,149 +158,17 @@ func (r *TransportURLReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return r.reconcileNormal(ctx, instance, helper)
 }
 
-// generatePassword generates a random password
-func generatePassword(length int) (string, error) {
-	bytes := make([]byte, length)
-	_, err := rand.Read(bytes)
-	if err != nil {
-		return "", err
-	}
-	return base64.URLEncoding.EncodeToString(bytes)[:length], nil
-}
-
-// getUsername returns the username to use, either from spec or generated from instance name
-func getUsername(instance *rabbitmqv1.TransportURL) string {
-	if instance.Spec.RabbitmqUsername != "" {
-		return instance.Spec.RabbitmqUsername
-	}
-	// Use the same prefix pattern as currently done (nova-api-, nova-cell1-, etc.)
-	return instance.Name
-}
-
-// getVhost returns the vhost to use, either from spec or default
-func getVhost(instance *rabbitmqv1.TransportURL) string {
-	if instance.Spec.RabbitmqVhost != "" {
-		return instance.Spec.RabbitmqVhost
-	}
-	return "/" // default vhost
-}
-
-// createRabbitMQUser creates a RabbitMQ user using the Management API
-func (r *TransportURLReconciler) createRabbitMQUser(ctx context.Context, instance *rabbitmqv1.TransportURL, username, password string, apiClient *rabbitmqapi.Client) error {
-	// Create the user credentials secret for our own tracking
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("rabbitmq-user-%s", username),
-			Namespace: instance.Namespace,
-		},
-		Data: map[string][]byte{
-			"username": []byte(username),
-			"password": []byte(password),
-		},
-	}
-
-	// Create or update the secret
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
-		secret.Data["username"] = []byte(username)
-		secret.Data["password"] = []byte(password)
-		return controllerutil.SetControllerReference(instance, secret, r.Scheme)
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create user secret: %w", err)
-	}
-
-	// Create or update the user via Management API
-	err = apiClient.CreateOrUpdateUser(username, password, []string{})
-	if err != nil {
-		return fmt.Errorf("failed to create RabbitMQ user via API: %w", err)
-	}
-
-	return nil
-}
-
-// createRabbitMQVhost creates a RabbitMQ vhost using the Management API
-func (r *TransportURLReconciler) createRabbitMQVhost(ctx context.Context, instance *rabbitmqv1.TransportURL, vhostName string, apiClient *rabbitmqapi.Client) error {
-	if vhostName == "/" {
-		// Default vhost already exists, no need to create
-		return nil
-	}
-
-	// Create or update the vhost via Management API
-	err := apiClient.CreateOrUpdateVhost(vhostName)
-	if err != nil {
-		return fmt.Errorf("failed to create RabbitMQ vhost via API: %w", err)
-	}
-
-	return nil
-}
-
-// createRabbitMQPermission creates RabbitMQ permissions for a user on a vhost using the Management API
-func (r *TransportURLReconciler) createRabbitMQPermission(ctx context.Context, instance *rabbitmqv1.TransportURL, username, vhostName string, apiClient *rabbitmqapi.Client) error {
-	// Set permissions via Management API
-	err := apiClient.SetPermissions(vhostName, username, ".*", ".*", ".*")
-	if err != nil {
-		return fmt.Errorf("failed to set RabbitMQ permissions via API: %w", err)
-	}
-
-	return nil
-}
-
-// cleanupOldUser removes the old RabbitMQ user and its associated resources
-// WARNING: This is a manual operation triggered by annotation. Only use when
-// you are certain no services are still using the old user credentials.
-func (r *TransportURLReconciler) cleanupOldUser(ctx context.Context, instance *rabbitmqv1.TransportURL, oldUsername string, apiClient *rabbitmqapi.Client) error {
-	Log := r.GetLogger(ctx)
-
-	if oldUsername == "" {
-		return nil
-	}
-
-	Log.Info(fmt.Sprintf("Cleaning up old user: %s", oldUsername))
-
-	// Delete old permissions for the old user via Management API
-	vhostName := instance.Status.RabbitmqVhost
-	err := apiClient.DeletePermissions(vhostName, oldUsername)
-	if err != nil {
-		Log.Error(err, fmt.Sprintf("Failed to delete old permissions for user %s", oldUsername))
-		return err
-	}
-
-	// Delete the old user via Management API
-	err = apiClient.DeleteUser(oldUsername)
-	if err != nil {
-		Log.Error(err, fmt.Sprintf("Failed to delete old user %s", oldUsername))
-		return err
-	}
-
-	// Delete the old user secret
-	oldSecretName := fmt.Sprintf("rabbitmq-user-%s", oldUsername)
-	oldSecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      oldSecretName,
-			Namespace: instance.Namespace,
-		},
-	}
-	err = r.Client.Delete(ctx, oldSecret)
-	if err != nil && !k8s_errors.IsNotFound(err) {
-		Log.Error(err, fmt.Sprintf("Failed to delete old user secret %s", oldSecretName))
-		return err
-	}
-
-	Log.Info(fmt.Sprintf("Successfully cleaned up old user: %s", oldUsername))
-	return nil
-}
-
 func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *rabbitmqv1.TransportURL, helper *helper.Helper) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info("Reconciling Service")
 
-	// TODO (implement a watch on the rabbitmq cluster resources to update things if there are changes)
+	// Get RabbitMQ cluster
 	rabbit, err := getRabbitmqCluster(ctx, helper, instance)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Wait on RabbitmqCluster to be ready
+	// Wait for RabbitMQ cluster to be ready
 	rabbitReady := false
 	for _, condition := range rabbit.Status.Conditions {
 		if condition.Reason == "AllPodsAreReady" && condition.Status == "True" {
@@ -320,14 +185,7 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
 	}
 
-	// Get username and vhost for this transport URL
-	dedicatedUsername := getUsername(instance)
-	vhostName := getVhost(instance)
-
-	// Check if we should use dedicated user or default RabbitMQ user
-	useDedicatedUser := instance.Spec.RabbitmqUsername != "" || instance.Spec.RabbitmqVhost != ""
-
-	// Get RabbitMQ cluster admin secret for both connection details and API access
+	// Get cluster admin secret for connection details
 	rabbitSecret, _, err := oko_secret.GetSecret(ctx, helper, rabbit.Status.DefaultUser.SecretReference.Name, instance.Namespace)
 	if err != nil {
 		if k8s_errors.IsNotFound(err) {
@@ -396,130 +254,59 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		return ctrl.Result{}, err
 	}
 
-	var username, password string
-	if useDedicatedUser {
-		username = dedicatedUsername
-		// Check if username has changed (for gradual migration)
-		if instance.Status.RabbitmqUsername != "" && instance.Status.RabbitmqUsername != username {
-			Log.Info(fmt.Sprintf("Username changed from %s to %s, creating new user while keeping old one", instance.Status.RabbitmqUsername, username))
-			instance.Status.PreviousRabbitmqUsername = instance.Status.RabbitmqUsername
-		}
-
-		// Resume using the last active rotated username if it exists
-		if instance.Status.RabbitmqUsername != "" && instance.Status.RabbitmqUsername != username {
-			username = instance.Status.RabbitmqUsername
-		}
-
-		// Handle password rotation via user migration
-		// If rotation is requested, create a new user with suffix and store old username
-		if instance.Annotations != nil && instance.Annotations["rabbitmq.openstack.org/rotate-password"] == "true" {
-			// Store current username as previous for cleanup
-			instance.Status.PreviousRabbitmqUsername = username
-
-			// Generate new username with incremented suffix
-			var currentGen int
-			n, _ := fmt.Sscanf(username, fmt.Sprintf("%s-r%%d", dedicatedUsername), &currentGen)
-			if n == 1 {
-				// Already has rotation suffix, increment it
-				username = fmt.Sprintf("%s-r%d", dedicatedUsername, currentGen+1)
-			} else {
-				// First rotation
-				username = fmt.Sprintf("%s-r1", dedicatedUsername)
-			}
-
-			Log.Info(fmt.Sprintf("Password rotation: creating new user %s (old: %s)", username, instance.Status.PreviousRabbitmqUsername))
-			delete(instance.Annotations, "rabbitmq.openstack.org/rotate-password")
-		}
-
-		// Check if user secret exists
-		userSecretName := fmt.Sprintf("rabbitmq-user-%s", username)
-		userSecret, _, err := oko_secret.GetSecret(ctx, helper, userSecretName, instance.Namespace)
-		needsCreation := false
-
+	// Determine credentials and vhost based on UserRef
+	var finalUsername, finalPassword, vhostName string
+	if instance.Spec.UserRef != "" {
+		// Use RabbitMQUser CRD reference
+		rabbitUser := &rabbitmqv1.RabbitMQUser{}
+		err = r.Get(ctx, types.NamespacedName{Name: instance.Spec.UserRef, Namespace: instance.Namespace}, rabbitUser)
 		if err != nil {
-			if k8s_errors.IsNotFound(err) {
-				needsCreation = true
-				password, err = generatePassword(32)
-				if err != nil {
-					instance.Status.Conditions.Set(condition.FalseCondition(
-						rabbitmqv1.TransportURLReadyCondition,
-						condition.ErrorReason,
-						condition.SeverityWarning,
-						rabbitmqv1.TransportURLReadyErrorMessage,
-						err.Error()))
-					return ctrl.Result{}, err
-				}
-			} else {
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					rabbitmqv1.TransportURLReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					rabbitmqv1.TransportURLReadyErrorMessage,
-					err.Error()))
-				return ctrl.Result{}, err
-			}
-		} else {
-			password = string(userSecret.Data["password"])
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				rabbitmqv1.TransportURLReadyCondition,
+				condition.ErrorReason,
+				condition.SeverityWarning,
+				rabbitmqv1.TransportURLReadyErrorMessage,
+				err.Error()))
+			return ctrl.Result{}, err
 		}
 
-		// Create RabbitMQ resources if needed
-		if needsCreation {
-			tlsEnabled := rabbit.Spec.TLS.SecretName != ""
-			protocol := "http"
-			managementPort := "15672"
-			if tlsEnabled {
-				protocol = "https"
-				managementPort = "15671"
-			}
-			baseURL := fmt.Sprintf("%s://%s:%s", protocol, string(host), managementPort)
-			apiClient := rabbitmqapi.NewClient(baseURL, string(adminUsername), string(adminPassword), tlsEnabled)
+		// Get user secret
+		userSecret, _, err := oko_secret.GetSecret(ctx, helper, rabbitUser.Status.SecretName, instance.Namespace)
+		if err != nil {
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				rabbitmqv1.TransportURLReadyCondition,
+				condition.ErrorReason,
+				condition.SeverityWarning,
+				rabbitmqv1.TransportURLReadyErrorMessage,
+				err.Error()))
+			return ctrl.Result{}, err
+		}
 
-			err = r.createRabbitMQUser(ctx, instance, username, password, apiClient)
-			if err != nil {
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					rabbitmqv1.TransportURLReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					rabbitmqv1.TransportURLReadyErrorMessage,
-					err.Error()))
-				return ctrl.Result{}, err
-			}
+		finalUsername = string(userSecret.Data["username"])
+		finalPassword = string(userSecret.Data["password"])
 
-			err = r.createRabbitMQVhost(ctx, instance, vhostName, apiClient)
-			if err != nil {
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					rabbitmqv1.TransportURLReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					rabbitmqv1.TransportURLReadyErrorMessage,
-					err.Error()))
-				return ctrl.Result{}, err
-			}
+		// Get vhost from RabbitMQUser's VhostRef
+		rabbitVhost := &rabbitmqv1.RabbitMQVhost{}
+		err = r.Get(ctx, types.NamespacedName{Name: rabbitUser.Spec.VhostRef, Namespace: instance.Namespace}, rabbitVhost)
+		if err != nil {
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				rabbitmqv1.TransportURLReadyCondition,
+				condition.ErrorReason,
+				condition.SeverityWarning,
+				rabbitmqv1.TransportURLReadyErrorMessage,
+				err.Error()))
+			return ctrl.Result{}, err
+		}
 
-			err = r.createRabbitMQPermission(ctx, instance, username, vhostName, apiClient)
-			if err != nil {
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					rabbitmqv1.TransportURLReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					rabbitmqv1.TransportURLReadyErrorMessage,
-					err.Error()))
-				return ctrl.Result{}, err
-			}
+		vhostName = rabbitVhost.Spec.Name
+		if vhostName == "" {
+			vhostName = "/"
 		}
 	} else {
-		// Use default RabbitMQ user behavior (backward compatibility)
-		Log.Info("Using default RabbitMQ user behavior (no dedicated user specified)")
-		username = string(adminUsername)
-		vhostName = "/"
-	}
-
-	// Determine final credentials for transport URL
-	finalUsername := username
-	finalPassword := password
-	if !useDedicatedUser {
+		// Use default cluster admin credentials
 		finalUsername = string(adminUsername)
 		finalPassword = string(adminPassword)
+		vhostName = "/"
 	}
 
 	tlsEnabled := rabbit.Spec.TLS.SecretName != ""
@@ -578,38 +365,6 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 	instance.Status.SecretName = secret.Name
 	instance.Status.RabbitmqUsername = finalUsername
 	instance.Status.RabbitmqVhost = vhostName
-
-	// Handle cleanup of old users ONLY if explicitly requested via annotation
-	// This is a manual operation to prevent accidentally breaking services
-	if instance.Annotations != nil && instance.Annotations["rabbitmq.openstack.org/cleanup-old-user"] == "true" {
-		if instance.Status.PreviousRabbitmqUsername != "" {
-			Log.Info(fmt.Sprintf("Manual cleanup requested for old user: %s", instance.Status.PreviousRabbitmqUsername))
-
-			// Create API client for cleanup operations
-			protocol := "http"
-			managementPort := "15672"
-			if tlsEnabled {
-				protocol = "https"
-				managementPort = "15671"
-			}
-			baseURL := fmt.Sprintf("%s://%s:%s", protocol, string(host), managementPort)
-			apiClient := rabbitmqapi.NewClient(baseURL, string(adminUsername), string(adminPassword), tlsEnabled)
-
-			err = r.cleanupOldUser(ctx, instance, instance.Status.PreviousRabbitmqUsername, apiClient)
-			if err != nil {
-				Log.Error(err, "Failed to cleanup old user, will retry on next reconciliation")
-				// Don't fail the reconciliation, just log the error and retry later
-			} else {
-				Log.Info(fmt.Sprintf("Successfully cleaned up old user: %s", instance.Status.PreviousRabbitmqUsername))
-				// Remove the cleanup annotation and clear previous username
-				delete(instance.Annotations, "rabbitmq.openstack.org/cleanup-old-user")
-				instance.Status.PreviousRabbitmqUsername = ""
-			}
-		} else {
-			// No previous username to clean up, remove the annotation
-			delete(instance.Annotations, "rabbitmq.openstack.org/cleanup-old-user")
-		}
-	}
 
 	instance.Status.Conditions.MarkTrue(rabbitmqv1.TransportURLReadyCondition, rabbitmqv1.TransportURLReadyMessage)
 

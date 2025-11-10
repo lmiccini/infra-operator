@@ -169,6 +169,22 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "TransportURL")
 		os.Exit(1)
 	}
+	if err = (&rabbitmqcontrollers.RabbitMQVhostReconciler{
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Kclient: kclient,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "RabbitMQVhost")
+		os.Exit(1)
+	}
+	if err = (&rabbitmqcontrollers.RabbitMQUserReconciler{
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Kclient: kclient,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "RabbitMQUser")
+		os.Exit(1)
+	}
 	if err = (&memcachedcontrollers.Reconciler{
 		Client:  mgr.GetClient(),
 		Kclient: kclient,
