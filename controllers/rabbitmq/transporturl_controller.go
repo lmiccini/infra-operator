@@ -408,9 +408,11 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		// Check if we need to create a new user or if credentials exist
 		userSecretName := fmt.Sprintf("rabbitmq-user-%s", username)
 		userSecret, _, err := oko_secret.GetSecret(ctx, helper, userSecretName, instance.Namespace)
+		needsCreation := false
 		if err != nil {
 			if k8s_errors.IsNotFound(err) {
 				// Generate new password for new user
+				needsCreation = true
 				password, err = generatePassword(32)
 				if err != nil {
 					instance.Status.Conditions.Set(condition.FalseCondition(
@@ -434,51 +436,55 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 			password = string(userSecret.Data["password"])
 		}
 
-		// Create RabbitMQ Management API client
-		tlsEnabled := rabbit.Spec.TLS.SecretName != ""
-		protocol := "http"
-		managementPort := "15672"
-		if tlsEnabled {
-			protocol = "https"
-			managementPort = "15671"
-		}
-		baseURL := fmt.Sprintf("%s://%s:%s", protocol, string(host), managementPort)
-		apiClient := rabbitmqapi.NewClient(baseURL, string(adminUsername), string(adminPassword), tlsEnabled)
+		// Only create/update RabbitMQ resources if the user doesn't exist yet
+		// Otherwise, the user secret already exists with the correct password
+		if needsCreation {
+			// Create RabbitMQ Management API client
+			tlsEnabled := rabbit.Spec.TLS.SecretName != ""
+			protocol := "http"
+			managementPort := "15672"
+			if tlsEnabled {
+				protocol = "https"
+				managementPort = "15671"
+			}
+			baseURL := fmt.Sprintf("%s://%s:%s", protocol, string(host), managementPort)
+			apiClient := rabbitmqapi.NewClient(baseURL, string(adminUsername), string(adminPassword), tlsEnabled)
 
-		// Create RabbitMQ user
-		err = r.createRabbitMQUser(ctx, instance, username, password, apiClient)
-		if err != nil {
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				rabbitmqv1.TransportURLReadyErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
-		}
+			// Create RabbitMQ user
+			err = r.createRabbitMQUser(ctx, instance, username, password, apiClient)
+			if err != nil {
+				instance.Status.Conditions.Set(condition.FalseCondition(
+					rabbitmqv1.TransportURLReadyCondition,
+					condition.ErrorReason,
+					condition.SeverityWarning,
+					rabbitmqv1.TransportURLReadyErrorMessage,
+					err.Error()))
+				return ctrl.Result{}, err
+			}
 
-		// Create RabbitMQ vhost if needed
-		err = r.createRabbitMQVhost(ctx, instance, vhostName, apiClient)
-		if err != nil {
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				rabbitmqv1.TransportURLReadyErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
-		}
+			// Create RabbitMQ vhost if needed
+			err = r.createRabbitMQVhost(ctx, instance, vhostName, apiClient)
+			if err != nil {
+				instance.Status.Conditions.Set(condition.FalseCondition(
+					rabbitmqv1.TransportURLReadyCondition,
+					condition.ErrorReason,
+					condition.SeverityWarning,
+					rabbitmqv1.TransportURLReadyErrorMessage,
+					err.Error()))
+				return ctrl.Result{}, err
+			}
 
-		// Create RabbitMQ permissions
-		err = r.createRabbitMQPermission(ctx, instance, username, vhostName, apiClient)
-		if err != nil {
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				rabbitmqv1.TransportURLReadyErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
+			// Create RabbitMQ permissions
+			err = r.createRabbitMQPermission(ctx, instance, username, vhostName, apiClient)
+			if err != nil {
+				instance.Status.Conditions.Set(condition.FalseCondition(
+					rabbitmqv1.TransportURLReadyCondition,
+					condition.ErrorReason,
+					condition.SeverityWarning,
+					rabbitmqv1.TransportURLReadyErrorMessage,
+					err.Error()))
+				return ctrl.Result{}, err
+			}
 		}
 	} else {
 		// Use default RabbitMQ user behavior (backward compatibility)
