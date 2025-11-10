@@ -403,15 +403,16 @@ func (r *TransportURLReconciler) createTransportURLSecret(
 	tlsEnabled bool,
 	quorum bool,
 ) *corev1.Secret {
-	query := ""
+	query := "?ssl=0"
 	if tlsEnabled {
-		query += "?ssl=1"
-	} else {
-		query += "?ssl=0"
+		query = "?ssl=1"
 	}
 
-	// Create a new secret with the transport URL for this CR
-	// Include vhost in the transport URL path
+	// Ensure vhost has leading / (e.g., "/" or "/nova")
+	if vhost != "/" && vhost[0] != '/' {
+		vhost = "/" + vhost
+	}
+
 	data := map[string][]byte{
 		"transport_url": fmt.Appendf(nil, "rabbit://%s:%s@%s:%s%s%s", username, password, host, port, vhost, query),
 	}
