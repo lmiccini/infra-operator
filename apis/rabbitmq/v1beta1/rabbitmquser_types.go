@@ -75,6 +75,9 @@ type RabbitMQUserStatus struct {
 
 	// Username - actual username used in RabbitMQ
 	Username string `json:"username,omitempty"`
+
+	// Vhost - actual vhost name used in RabbitMQ
+	Vhost string `json:"vhost,omitempty"`
 }
 
 //+kubebuilder:object:root=true
@@ -82,7 +85,7 @@ type RabbitMQUserStatus struct {
 //+kubebuilder:resource:path=rabbitmqusers,shortName=rmquser,categories=all;rabbitmq
 //+kubebuilder:printcolumn:name="Cluster",type="string",JSONPath=".spec.rabbitmqClusterName"
 //+kubebuilder:printcolumn:name="Username",type="string",JSONPath=".status.username"
-//+kubebuilder:printcolumn:name="Vhost",type="string",JSONPath=".spec.vhostRef"
+//+kubebuilder:printcolumn:name="Vhost",type="string",JSONPath=".status.vhost"
 //+kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.conditions[0].status"
 //+kubebuilder:printcolumn:name="Message",type="string",JSONPath=".status.conditions[0].message"
 

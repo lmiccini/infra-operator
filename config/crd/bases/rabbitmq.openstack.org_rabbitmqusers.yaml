@@ -26,7 +26,7 @@ spec:
     - jsonPath: .status.username
       name: Username
       type: string
-    - jsonPath: .spec.vhostRef
+    - jsonPath: .status.vhost
       name: Vhost
       type: string
     - jsonPath: .status.conditions[0].status
@@ -149,6 +149,9 @@ spec:
                 type: string
               username:
                 description: Username - actual username used in RabbitMQ
+                type: string
+              vhost:
+                description: Vhost - actual vhost name used in RabbitMQ
                 type: string
             type: object
         type: object

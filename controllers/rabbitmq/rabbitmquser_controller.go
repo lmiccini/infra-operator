@@ -235,6 +235,7 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 
 	instance.Status.SecretName = secretName
 	instance.Status.Username = username
+	instance.Status.Vhost = vhostName
 	instance.Status.Conditions.MarkTrue(rabbitmqv1.UserReadyCondition, rabbitmqv1.UserReadyMessage)
 	instance.Status.Conditions.MarkTrue(condition.ReadyCondition, condition.ReadyMessage)
 
