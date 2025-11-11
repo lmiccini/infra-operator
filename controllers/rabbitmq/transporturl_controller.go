@@ -76,7 +76,8 @@ func (r *TransportURLReconciler) GetLogger(ctx context.Context) logr.Logger {
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=transporturls/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=transporturls/finalizers,verbs=update
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs,verbs=get;list;watch
-//+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs,verbs=get;list;watch
+//+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqusers,verbs=get;list;watch;create;update;patch
+//+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqvhosts,verbs=get;list;watch;create;update;patch
 //+kubebuilder:rbac:groups=rabbitmq.com,resources=rabbitmqclusters,verbs=get;list;watch
 //+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete;
 
@@ -163,13 +164,13 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 	Log := r.GetLogger(ctx)
 	Log.Info("Reconciling Service")
 
-	// TODO (implement a watch on the rabbitmq cluster resources to update things if there are changes)
+	// Get RabbitMQ cluster
 	rabbit, err := getRabbitmqCluster(ctx, helper, instance)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Wait on RabbitmqCluster to be ready
+	// Wait for RabbitMQ cluster to be ready
 	rabbitReady := false
 	for _, condition := range rabbit.Status.Conditions {
 		if condition.Reason == "AllPodsAreReady" && condition.Status == "True" {
@@ -186,13 +187,10 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
 	}
 
-	// TODO(dprince): Future we may want to use vhosts for each OpenStackService instead.
-	// vhosts would likely require use of https://github.com/rabbitmq/messaging-topology-operator/ which we do not yet include
+	// Get cluster admin secret for connection details
 	rabbitSecret, _, err := oko_secret.GetSecret(ctx, helper, rabbit.Status.DefaultUser.SecretReference.Name, instance.Namespace)
 	if err != nil {
 		if k8s_errors.IsNotFound(err) {
-			// Since the RabbitMQ secret should have been automatically created by the RabbitMQ cluster,
-			// we treat this as a warning because it means that the service will not be able to start.
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				rabbitmqv1.TransportURLReadyCondition,
 				condition.ErrorReason,
@@ -209,38 +207,9 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		return ctrl.Result{}, err
 	}
 
-	var username string
-	if u, ok := rabbitSecret.Data["username"]; ok {
-		username = string(u)
-	} else {
-		err := fmt.Errorf("username does not exist in rabbitmq secret %s", rabbitSecret.Name)
-		instance.Status.Conditions.Set(condition.FalseCondition(
-			rabbitmqv1.TransportURLReadyCondition,
-			condition.ErrorReason,
-			condition.SeverityWarning,
-			rabbitmqv1.TransportURLReadyErrorMessage,
-			err.Error()))
-		return ctrl.Result{}, err
-	}
-
-	var password string
-	if p, ok := rabbitSecret.Data["password"]; ok {
-		password = string(p)
-	} else {
-		err := fmt.Errorf("password does not exist in rabbitmq secret %s", rabbitSecret.Name)
-		instance.Status.Conditions.Set(condition.FalseCondition(
-			rabbitmqv1.TransportURLReadyCondition,
-			condition.ErrorReason,
-			condition.SeverityWarning,
-			rabbitmqv1.TransportURLReadyErrorMessage,
-			err.Error()))
-		return ctrl.Result{}, err
-	}
-
-	var host string
-	if h, ok := rabbitSecret.Data["host"]; ok {
-		host = string(h)
-	} else {
+	// Extract connection details from secret
+	host, ok := rabbitSecret.Data["host"]
+	if !ok {
 		err := fmt.Errorf("host does not exist in rabbitmq secret %s", rabbitSecret.Name)
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			rabbitmqv1.TransportURLReadyCondition,
@@ -251,10 +220,8 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		return ctrl.Result{}, err
 	}
 
-	var port string
-	if p, ok := rabbitSecret.Data["port"]; ok {
-		port = string(p)
-	} else {
+	port, ok := rabbitSecret.Data["port"]
+	if !ok {
 		err := fmt.Errorf("port does not exist in rabbitmq secret %s", rabbitSecret.Name)
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			rabbitmqv1.TransportURLReadyCondition,
@@ -265,8 +232,121 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		return ctrl.Result{}, err
 	}
 
-	tlsEnabled := rabbit.Spec.TLS.SecretName != ""
+	adminUsername, ok := rabbitSecret.Data["username"]
+	if !ok {
+		err := fmt.Errorf("username does not exist in rabbitmq secret %s", rabbitSecret.Name)
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			rabbitmqv1.TransportURLReadyCondition,
+			condition.ErrorReason,
+			condition.SeverityWarning,
+			rabbitmqv1.TransportURLReadyErrorMessage,
+			err.Error()))
+		return ctrl.Result{}, err
+	}
 
+	adminPassword, ok := rabbitSecret.Data["password"]
+	if !ok {
+		err := fmt.Errorf("password does not exist in rabbitmq secret %s", rabbitSecret.Name)
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			rabbitmqv1.TransportURLReadyCondition,
+			condition.ErrorReason,
+			condition.SeverityWarning,
+			rabbitmqv1.TransportURLReadyErrorMessage,
+			err.Error()))
+		return ctrl.Result{}, err
+	}
+
+	// Determine credentials and vhost
+	var finalUsername, finalPassword, vhostName string
+	var userRef string
+
+	if instance.Spec.UserRef != "" {
+		userRef = instance.Spec.UserRef
+	} else if instance.Spec.Username != "" {
+		// Create RabbitMQVhost if needed
+		vhostName = instance.Spec.Vhost
+		if vhostName == "" {
+			vhostName = "/"
+		}
+		var vhostRef string
+		if vhostName != "/" {
+			vhostRef = fmt.Sprintf("%s-%s-vhost", instance.Name, vhostName)
+			vhost := &rabbitmqv1.RabbitMQVhost{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      vhostRef,
+					Namespace: instance.Namespace,
+				},
+				Spec: rabbitmqv1.RabbitMQVhostSpec{RabbitmqClusterName: instance.Spec.RabbitmqClusterName, Name: vhostName},
+			}
+			if err := controllerutil.SetControllerReference(instance, vhost, r.Scheme); err == nil {
+				controllerutil.CreateOrUpdate(ctx, r.Client, vhost, func() error {
+					if !controllerutil.ContainsFinalizer(vhost, rabbitmqv1.VhostFinalizer) {
+						controllerutil.AddFinalizer(vhost, rabbitmqv1.VhostFinalizer)
+					}
+					vhost.Spec.RabbitmqClusterName = instance.Spec.RabbitmqClusterName
+					vhost.Spec.Name = vhostName
+					return nil
+				})
+			}
+		}
+
+		// Create RabbitMQUser - use username in resource name for blue/green rotation
+		userRef = fmt.Sprintf("%s-%s-user", instance.Name, instance.Spec.Username)
+		user := &rabbitmqv1.RabbitMQUser{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      userRef,
+				Namespace: instance.Namespace,
+			},
+			Spec: rabbitmqv1.RabbitMQUserSpec{RabbitmqClusterName: instance.Spec.RabbitmqClusterName, Username: instance.Spec.Username, VhostRef: vhostRef},
+		}
+		if err := controllerutil.SetControllerReference(instance, user, r.Scheme); err == nil {
+			controllerutil.CreateOrUpdate(ctx, r.Client, user, func() error {
+				if !controllerutil.ContainsFinalizer(user, rabbitmqv1.UserFinalizer) {
+					controllerutil.AddFinalizer(user, rabbitmqv1.UserFinalizer)
+				}
+				user.Spec.RabbitmqClusterName = instance.Spec.RabbitmqClusterName
+				user.Spec.Username = instance.Spec.Username
+				user.Spec.VhostRef = vhostRef
+				return nil
+			})
+		}
+	}
+
+	if userRef != "" {
+		// Wait for RabbitMQUser to be ready
+		rabbitUser := &rabbitmqv1.RabbitMQUser{}
+		if err = r.Get(ctx, types.NamespacedName{Name: userRef, Namespace: instance.Namespace}, rabbitUser); err != nil {
+			if k8s_errors.IsNotFound(err) {
+				instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.TransportURLReadyCondition, condition.RequestedReason, condition.SeverityInfo, rabbitmqv1.TransportURLInProgressMessage))
+				Log.Info(fmt.Sprintf("RabbitMQUser %s not found, waiting for it to be created", userRef))
+				return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+			}
+			instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.TransportURLReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.TransportURLReadyErrorMessage, err.Error()))
+			return ctrl.Result{}, err
+		}
+		if rabbitUser.Status.SecretName == "" {
+			instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.TransportURLReadyCondition, condition.RequestedReason, condition.SeverityInfo, rabbitmqv1.TransportURLInProgressMessage))
+			Log.Info(fmt.Sprintf("RabbitMQUser %s not ready yet (no secret created)", userRef))
+			return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+		}
+
+		// Get credentials from user secret
+		userSecret, _, err := oko_secret.GetSecret(ctx, helper, rabbitUser.Status.SecretName, instance.Namespace)
+		if err != nil {
+			instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.TransportURLReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.TransportURLReadyErrorMessage, err.Error()))
+			return ctrl.Result{}, err
+		}
+		finalUsername = string(userSecret.Data["username"])
+		finalPassword = string(userSecret.Data["password"])
+		vhostName = rabbitUser.Status.Vhost
+	} else {
+		// Use default cluster admin credentials
+		finalUsername = string(adminUsername)
+		finalPassword = string(adminPassword)
+		vhostName = "/"
+	}
+
+	tlsEnabled := rabbit.Spec.TLS.SecretName != ""
 	Log.Info(fmt.Sprintf("rabbitmq cluster %s has TLS enabled: %t", rabbit.Name, tlsEnabled))
 
 	// Get RabbitMq CR for both secret generation and status update
@@ -298,7 +378,7 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 	}
 
 	// Create a new secret with the transport URL for this CR
-	secret := r.createTransportURLSecret(instance, string(username), string(password), string(host), string(port), tlsEnabled, quorum)
+	secret := r.createTransportURLSecret(instance, finalUsername, finalPassword, string(host), string(port), vhostName, tlsEnabled, quorum)
 	_, op, err := oko_secret.CreateOrPatchSecret(ctx, helper, instance, secret)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
@@ -318,8 +398,10 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		return ctrl.Result{RequeueAfter: time.Second * 5}, nil
 	}
 
-	// Update the CR and return
+	// Update the CR status with actual values used
 	instance.Status.SecretName = secret.Name
+	instance.Status.RabbitmqUsername = finalUsername
+	instance.Status.RabbitmqVhost = vhostName
 
 	instance.Status.Conditions.MarkTrue(rabbitmqv1.TransportURLReadyCondition, rabbitmqv1.TransportURLReadyMessage)
 
@@ -340,19 +422,22 @@ func (r *TransportURLReconciler) createTransportURLSecret(
 	password string,
 	host string,
 	port string,
+	vhost string,
 	tlsEnabled bool,
 	quorum bool,
 ) *corev1.Secret {
-	query := ""
+	query := "?ssl=0"
 	if tlsEnabled {
-		query += "?ssl=1"
-	} else {
-		query += "?ssl=0"
+		query = "?ssl=1"
 	}
 
-	// Create a new secret with the transport URL for this CR
+	// Ensure vhost has leading / (e.g., "/" or "/nova")
+	if vhost != "/" && vhost[0] != '/' {
+		vhost = "/" + vhost
+	}
+
 	data := map[string][]byte{
-		"transport_url": fmt.Appendf(nil, "rabbit://%s:%s@%s:%s/%s", username, password, host, port, query),
+		"transport_url": fmt.Appendf(nil, "rabbit://%s:%s@%s:%s%s%s", username, password, host, port, vhost, query),
 	}
 	if quorum {
 		data["quorumqueues"] = []byte("true")
