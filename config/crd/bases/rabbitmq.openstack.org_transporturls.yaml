@@ -53,7 +53,16 @@ spec:
                   which to configure the transport URL
                 type: string
               userRef:
-                description: UserRef - reference to a RabbitMQUser resource
+                description: UserRef - reference to a RabbitMQUser resource. If not
+                  specified, Username will be used to create a RabbitMQUser on-demand
+                type: string
+              username:
+                description: Username - RabbitMQ username. If UserRef is not specified,
+                  a RabbitMQUser will be created with this username
+                type: string
+              vhost:
+                description: Vhost - RabbitMQ vhost name. If specified and vhost doesn't
+                  exist, a RabbitMQVhost will be created. Defaults to "/" if not specified
                 type: string
             required:
             - rabbitmqClusterName

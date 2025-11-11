@@ -76,8 +76,8 @@ func (r *TransportURLReconciler) GetLogger(ctx context.Context) logr.Logger {
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=transporturls/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=transporturls/finalizers,verbs=update
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs,verbs=get;list;watch
-//+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqusers,verbs=get;list;watch
-//+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqvhosts,verbs=get;list;watch
+//+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqusers,verbs=get;list;watch;create;update;patch
+//+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqvhosts,verbs=get;list;watch;create;update;patch
 //+kubebuilder:rbac:groups=rabbitmq.com,resources=rabbitmqclusters,verbs=get;list;watch
 //+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete;
 
@@ -256,77 +256,68 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		return ctrl.Result{}, err
 	}
 
-	// Determine credentials and vhost based on UserRef
+	// Determine credentials and vhost
 	var finalUsername, finalPassword, vhostName string
+	var userRef string
+
 	if instance.Spec.UserRef != "" {
-		// Use RabbitMQUser CRD reference
-		rabbitUser := &rabbitmqv1.RabbitMQUser{}
-		err = r.Get(ctx, types.NamespacedName{Name: instance.Spec.UserRef, Namespace: instance.Namespace}, rabbitUser)
-		if err != nil {
-			if k8s_errors.IsNotFound(err) {
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					rabbitmqv1.TransportURLReadyCondition,
-					condition.RequestedReason,
-					condition.SeverityInfo,
-					rabbitmqv1.TransportURLInProgressMessage))
-				Log.Info(fmt.Sprintf("RabbitMQUser %s not found, waiting for it to be created", instance.Spec.UserRef))
-				return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+		userRef = instance.Spec.UserRef
+	} else if instance.Spec.Username != "" {
+		// Create RabbitMQVhost if needed
+		vhostName = instance.Spec.Vhost
+		if vhostName == "" {
+			vhostName = "/"
+		}
+		var vhostRef string
+		if vhostName != "/" {
+			vhostRef = fmt.Sprintf("%s-%s-vhost", instance.Name, vhostName)
+			vhost := &rabbitmqv1.RabbitMQVhost{
+				ObjectMeta: metav1.ObjectMeta{Name: vhostRef, Namespace: instance.Namespace},
+				Spec:       rabbitmqv1.RabbitMQVhostSpec{RabbitmqClusterName: instance.Spec.RabbitmqClusterName, Name: vhostName},
 			}
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				rabbitmqv1.TransportURLReadyErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
+			if err := controllerutil.SetControllerReference(instance, vhost, r.Scheme); err == nil {
+				controllerutil.CreateOrUpdate(ctx, r.Client, vhost, func() error { return nil })
+			}
 		}
 
-		// Check if RabbitMQUser is ready and has a secret
+		// Create RabbitMQUser - use username in resource name for blue/green rotation
+		userRef = fmt.Sprintf("%s-%s-user", instance.Name, instance.Spec.Username)
+		user := &rabbitmqv1.RabbitMQUser{
+			ObjectMeta: metav1.ObjectMeta{Name: userRef, Namespace: instance.Namespace},
+			Spec:       rabbitmqv1.RabbitMQUserSpec{RabbitmqClusterName: instance.Spec.RabbitmqClusterName, Username: instance.Spec.Username, VhostRef: vhostRef},
+		}
+		if err := controllerutil.SetControllerReference(instance, user, r.Scheme); err == nil {
+			controllerutil.CreateOrUpdate(ctx, r.Client, user, func() error { return nil })
+		}
+	}
+
+	if userRef != "" {
+		// Wait for RabbitMQUser to be ready
+		rabbitUser := &rabbitmqv1.RabbitMQUser{}
+		if err = r.Get(ctx, types.NamespacedName{Name: userRef, Namespace: instance.Namespace}, rabbitUser); err != nil {
+			if k8s_errors.IsNotFound(err) {
+				instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.TransportURLReadyCondition, condition.RequestedReason, condition.SeverityInfo, rabbitmqv1.TransportURLInProgressMessage))
+				Log.Info(fmt.Sprintf("RabbitMQUser %s not found, waiting for it to be created", userRef))
+				return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+			}
+			instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.TransportURLReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.TransportURLReadyErrorMessage, err.Error()))
+			return ctrl.Result{}, err
+		}
 		if rabbitUser.Status.SecretName == "" {
-			err := fmt.Errorf("RabbitMQUser %s is not ready yet (no secret created)", instance.Spec.UserRef)
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.RequestedReason,
-				condition.SeverityInfo,
-				rabbitmqv1.TransportURLInProgressMessage))
-			Log.Info(err.Error())
+			instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.TransportURLReadyCondition, condition.RequestedReason, condition.SeverityInfo, rabbitmqv1.TransportURLInProgressMessage))
+			Log.Info(fmt.Sprintf("RabbitMQUser %s not ready yet (no secret created)", userRef))
 			return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
 		}
 
-		// Get user secret
+		// Get credentials from user secret
 		userSecret, _, err := oko_secret.GetSecret(ctx, helper, rabbitUser.Status.SecretName, instance.Namespace)
 		if err != nil {
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				rabbitmqv1.TransportURLReadyErrorMessage,
-				err.Error()))
+			instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.TransportURLReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.TransportURLReadyErrorMessage, err.Error()))
 			return ctrl.Result{}, err
 		}
-
 		finalUsername = string(userSecret.Data["username"])
 		finalPassword = string(userSecret.Data["password"])
-
-		// Get vhost from RabbitMQUser's VhostRef - default to "/" if empty
-		vhostName = "/"
-		if rabbitUser.Spec.VhostRef != "" {
-			rabbitVhost := &rabbitmqv1.RabbitMQVhost{}
-			err = r.Get(ctx, types.NamespacedName{Name: rabbitUser.Spec.VhostRef, Namespace: instance.Namespace}, rabbitVhost)
-			if err != nil {
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					rabbitmqv1.TransportURLReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					rabbitmqv1.TransportURLReadyErrorMessage,
-					err.Error()))
-				return ctrl.Result{}, err
-			}
-			vhostName = rabbitVhost.Spec.Name
-			if vhostName == "" {
-				vhostName = "/"
-			}
-		}
+		vhostName = rabbitUser.Status.Vhost
 	} else {
 		// Use default cluster admin credentials
 		finalUsername = string(adminUsername)
