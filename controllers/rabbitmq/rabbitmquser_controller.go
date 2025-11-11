@@ -120,22 +120,23 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 		username = instance.Name
 	}
 
-	// Get vhost
-	vhost := &rabbitmqv1.RabbitMQVhost{}
-	err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.VhostRef, Namespace: instance.Namespace}, vhost)
-	if err != nil {
-		instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.UserReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.UserReadyErrorMessage, err.Error()))
-		return ctrl.Result{}, err
-	}
-
-	vhostName := vhost.Spec.Name
-	if vhostName == "" {
-		vhostName = "/"
+	// Get vhost - default to "/" if VhostRef is empty
+	vhostName := "/"
+	if instance.Spec.VhostRef != "" {
+		vhost := &rabbitmqv1.RabbitMQVhost{}
+		if err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.VhostRef, Namespace: instance.Namespace}, vhost); err != nil {
+			instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.UserReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.UserReadyErrorMessage, err.Error()))
+			return ctrl.Result{}, err
+		}
+		vhostName = vhost.Spec.Name
+		if vhostName == "" {
+			vhostName = "/"
+		}
 	}
 
 	// Get RabbitMQ cluster
 	rabbit := &rabbitmqclusterv2.RabbitmqCluster{}
-	err = r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbit)
+	err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbit)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.UserReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.UserReadyErrorMessage, err.Error()))
 		return ctrl.Result{}, err
@@ -249,20 +250,21 @@ func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *
 		}
 	}
 
-	// Get vhost
-	vhost := &rabbitmqv1.RabbitMQVhost{}
-	err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.VhostRef, Namespace: instance.Namespace}, vhost)
+	// Get vhost - default to "/" if VhostRef is empty
 	vhostName := "/"
-	if err == nil {
-		vhostName = vhost.Spec.Name
-		if vhostName == "" {
-			vhostName = "/"
+	if instance.Spec.VhostRef != "" {
+		vhost := &rabbitmqv1.RabbitMQVhost{}
+		if err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.VhostRef, Namespace: instance.Namespace}, vhost); err == nil {
+			vhostName = vhost.Spec.Name
+			if vhostName == "" {
+				vhostName = "/"
+			}
 		}
 	}
 
 	// Get RabbitMQ cluster
 	rabbit := &rabbitmqclusterv2.RabbitmqCluster{}
-	err = r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbit)
+	err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbit)
 	if err == nil {
 		// Get admin credentials
 		rabbitSecret, _, err := oko_secret.GetSecret(ctx, h, rabbit.Status.DefaultUser.SecretReference.Name, instance.Namespace)

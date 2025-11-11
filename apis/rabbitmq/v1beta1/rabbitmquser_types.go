@@ -45,9 +45,9 @@ type RabbitMQUserSpec struct {
 	// RabbitmqClusterName - the name of the RabbitMQ cluster
 	RabbitmqClusterName string `json:"rabbitmqClusterName"`
 
-	// +kubebuilder:validation:Required
-	// VhostRef - reference to the RabbitMQVhost resource
-	VhostRef string `json:"vhostRef"`
+	// +kubebuilder:validation:Optional
+	// VhostRef - reference to the RabbitMQVhost resource (defaults to default vhost "/" if empty)
+	VhostRef string `json:"vhostRef,omitempty"`
 
 	// +kubebuilder:validation:Optional
 	// Username - the username in RabbitMQ (defaults to CR name)

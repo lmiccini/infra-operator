@@ -299,22 +299,24 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		finalUsername = string(userSecret.Data["username"])
 		finalPassword = string(userSecret.Data["password"])
 
-		// Get vhost from RabbitMQUser's VhostRef
-		rabbitVhost := &rabbitmqv1.RabbitMQVhost{}
-		err = r.Get(ctx, types.NamespacedName{Name: rabbitUser.Spec.VhostRef, Namespace: instance.Namespace}, rabbitVhost)
-		if err != nil {
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				rabbitmqv1.TransportURLReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				rabbitmqv1.TransportURLReadyErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
-		}
-
-		vhostName = rabbitVhost.Spec.Name
-		if vhostName == "" {
-			vhostName = "/"
+		// Get vhost from RabbitMQUser's VhostRef - default to "/" if empty
+		vhostName = "/"
+		if rabbitUser.Spec.VhostRef != "" {
+			rabbitVhost := &rabbitmqv1.RabbitMQVhost{}
+			err = r.Get(ctx, types.NamespacedName{Name: rabbitUser.Spec.VhostRef, Namespace: instance.Namespace}, rabbitVhost)
+			if err != nil {
+				instance.Status.Conditions.Set(condition.FalseCondition(
+					rabbitmqv1.TransportURLReadyCondition,
+					condition.ErrorReason,
+					condition.SeverityWarning,
+					rabbitmqv1.TransportURLReadyErrorMessage,
+					err.Error()))
+				return ctrl.Result{}, err
+			}
+			vhostName = rabbitVhost.Spec.Name
+			if vhostName == "" {
+				vhostName = "/"
+			}
 		}
 	} else {
 		// Use default cluster admin credentials

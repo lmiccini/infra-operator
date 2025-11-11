@@ -88,11 +88,11 @@ spec:
                 description: Username - the username in RabbitMQ (defaults to CR name)
                 type: string
               vhostRef:
-                description: VhostRef - reference to the RabbitMQVhost resource
+                description: VhostRef - reference to the RabbitMQVhost resource (defaults
+                  to default vhost "/" if empty)
                 type: string
             required:
             - rabbitmqClusterName
-            - vhostRef
             type: object
           status:
             description: RabbitMQUserStatus defines the observed state of RabbitMQUser
