@@ -200,6 +200,8 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	err = (&rabbitmqv1.RabbitMq{}).SetupWebhookWithManager(k8sManager)
 	Expect(err).NotTo(HaveOccurred())
+	err = (&rabbitmqv1.RabbitMQUser{}).SetupWebhookWithManager(k8sManager)
+	Expect(err).NotTo(HaveOccurred())
 
 	err = (&network_ctrl.DNSMasqReconciler{
 		Client:  k8sManager.GetClient(),
@@ -251,6 +253,20 @@ var _ = BeforeSuite(func() {
 	Expect(err).ToNot(HaveOccurred())
 
 	err = (&rabbitmq_ctrl.Reconciler{
+		Client:  k8sManager.GetClient(),
+		Scheme:  k8sManager.GetScheme(),
+		Kclient: kclient,
+	}).SetupWithManager(k8sManager)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = (&rabbitmq_ctrl.RabbitMQVhostReconciler{
+		Client:  k8sManager.GetClient(),
+		Scheme:  k8sManager.GetScheme(),
+		Kclient: kclient,
+	}).SetupWithManager(k8sManager)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = (&rabbitmq_ctrl.RabbitMQUserReconciler{
 		Client:  k8sManager.GetClient(),
 		Scheme:  k8sManager.GetScheme(),
 		Kclient: kclient,

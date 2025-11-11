@@ -18,7 +18,6 @@ limitations under the License.
 package rabbitmq
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"time"
@@ -47,13 +46,14 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/ocp"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/pdb"
-	"github.com/openstack-k8s-operators/lib-common/modules/common/rsh"
+	oko_secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
 
 	"github.com/go-logr/logr"
 	rabbitmqv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	"github.com/openstack-k8s-operators/infra-operator/pkg/rabbitmq"
+	rabbitmqapi "github.com/openstack-k8s-operators/infra-operator/pkg/rabbitmq/api"
 	"github.com/openstack-k8s-operators/infra-operator/pkg/rabbitmq/impl"
 
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
@@ -469,25 +469,40 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 }
 
 func updateMirroredPolicy(ctx context.Context, helper *helper.Helper, instance *rabbitmqv1beta1.RabbitMq, config *rest.Config, apply bool) error {
-	cli := helper.GetKClient()
-
-	pod := types.NamespacedName{
-		Name:      instance.Name + "-server-0",
-		Namespace: instance.Namespace,
+	// Get RabbitMQ cluster
+	rabbit := &rabbitmqv2.RabbitmqCluster{}
+	err := helper.GetClient().Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, rabbit)
+	if err != nil {
+		return err
 	}
 
-	container := "rabbitmq"
-	s := []string{"/bin/bash", "-c", "rabbitmqctl clear_policy ha-all"}
+	// Get admin credentials
+	rabbitSecret, _, err := oko_secret.GetSecret(ctx, helper, rabbit.Status.DefaultUser.SecretReference.Name, instance.Namespace)
+	if err != nil {
+		return err
+	}
+
+	// Create API client
+	tlsEnabled := rabbit.Spec.TLS.SecretName != ""
+	protocol := "http"
+	managementPort := "15672"
+	if tlsEnabled {
+		protocol = "https"
+		managementPort = "15671"
+	}
+	baseURL := fmt.Sprintf("%s://%s:%s", protocol, string(rabbitSecret.Data["host"]), managementPort)
+	apiClient := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled)
 
 	if apply {
-		s = []string{"/bin/bash", "-c", "rabbitmqctl set_policy ha-all \"\" '{\"ha-mode\":\"exactly\",\"ha-params\":2,\"ha-promote-on-shutdown\":\"always\"}'"}
+		definition := map[string]interface{}{
+			"ha-mode":                "exactly",
+			"ha-params":              2,
+			"ha-promote-on-shutdown": "always",
+		}
+		return apiClient.CreateOrUpdatePolicy("/", "ha-all", "", definition, 0, "all")
 	}
 
-	err := rsh.ExecInPod(ctx, cli, config, pod, container, s,
-		func(_ *bytes.Buffer, _ *bytes.Buffer) error {
-			return nil
-		})
-	return err
+	return apiClient.DeletePolicy("/", "ha-all")
 }
 
 func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {

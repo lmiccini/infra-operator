@@ -26,6 +26,20 @@ type TransportURLSpec struct {
 	// +kubebuilder:validation:Required
 	// RabbitmqClusterName the name of the Rabbitmq cluster which to configure the transport URL
 	RabbitmqClusterName string `json:"rabbitmqClusterName"`
+
+	// +kubebuilder:validation:Optional
+	// UserRef - reference to a RabbitMQUser resource (takes precedence over RabbitmqUsername/RabbitmqVhost)
+	UserRef string `json:"userRef,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// RabbitmqUsername for the RabbitMQ user. If not specified, will use the same prefix as the TransportURL name
+	// DEPRECATED: Use UserRef instead for proper lifecycle management
+	RabbitmqUsername string `json:"rabbitmqUsername,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// RabbitmqVhost name for the RabbitMQ virtual host. If not specified, will use the default vhost "/"
+	// DEPRECATED: Use UserRef instead for proper lifecycle management
+	RabbitmqVhost string `json:"rabbitmqVhost,omitempty"`
 }
 
 // TransportURLStatus defines the observed state of TransportURL
@@ -39,6 +53,15 @@ type TransportURLStatus struct {
 
 	// QueueType - the queue type from the associated RabbitMq instance
 	QueueType string `json:"queueType,omitempty"`
+
+	// RabbitmqUsername - the actual username used for the RabbitMQ user
+	RabbitmqUsername string `json:"rabbitmqUsername,omitempty"`
+
+	// PreviousRabbitmqUsername - the previous username that was used (for gradual migration)
+	PreviousRabbitmqUsername string `json:"previousRabbitmqUsername,omitempty"`
+
+	// RabbitmqVhost - the actual vhost name used
+	RabbitmqVhost string `json:"rabbitmqVhost,omitempty"`
 
 	// ObservedGeneration - the most recent generation observed for this
 	// service. If the observed generation is less than the spec generation,
