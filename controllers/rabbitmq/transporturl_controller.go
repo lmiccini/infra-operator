@@ -272,8 +272,12 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		if vhostName != "/" {
 			vhostRef = fmt.Sprintf("%s-%s-vhost", instance.Name, vhostName)
 			vhost := &rabbitmqv1.RabbitMQVhost{
-				ObjectMeta: metav1.ObjectMeta{Name: vhostRef, Namespace: instance.Namespace},
-				Spec:       rabbitmqv1.RabbitMQVhostSpec{RabbitmqClusterName: instance.Spec.RabbitmqClusterName, Name: vhostName},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       vhostRef,
+					Namespace:  instance.Namespace,
+					Finalizers: []string{rabbitmqv1.VhostFinalizer},
+				},
+				Spec: rabbitmqv1.RabbitMQVhostSpec{RabbitmqClusterName: instance.Spec.RabbitmqClusterName, Name: vhostName},
 			}
 			if err := controllerutil.SetControllerReference(instance, vhost, r.Scheme); err == nil {
 				controllerutil.CreateOrUpdate(ctx, r.Client, vhost, func() error { return nil })
@@ -283,8 +287,12 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		// Create RabbitMQUser - use username in resource name for blue/green rotation
 		userRef = fmt.Sprintf("%s-%s-user", instance.Name, instance.Spec.Username)
 		user := &rabbitmqv1.RabbitMQUser{
-			ObjectMeta: metav1.ObjectMeta{Name: userRef, Namespace: instance.Namespace},
-			Spec:       rabbitmqv1.RabbitMQUserSpec{RabbitmqClusterName: instance.Spec.RabbitmqClusterName, Username: instance.Spec.Username, VhostRef: vhostRef},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       userRef,
+				Namespace:  instance.Namespace,
+				Finalizers: []string{rabbitmqv1.UserFinalizer},
+			},
+			Spec: rabbitmqv1.RabbitMQUserSpec{RabbitmqClusterName: instance.Spec.RabbitmqClusterName, Username: instance.Spec.Username, VhostRef: vhostRef},
 		}
 		if err := controllerutil.SetControllerReference(instance, user, r.Scheme); err == nil {
 			controllerutil.CreateOrUpdate(ctx, r.Client, user, func() error { return nil })

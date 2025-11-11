@@ -19,6 +19,7 @@ package rabbitmq
 import (
 	"context"
 	"fmt"
+	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -146,6 +147,18 @@ func (r *RabbitMQVhostReconciler) reconcileNormal(ctx context.Context, instance 
 }
 
 func (r *RabbitMQVhostReconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1.RabbitMQVhost, h *helper.Helper) (ctrl.Result, error) {
+	// Block deletion if owned by TransportURL and has protection finalizer
+	if controllerutil.ContainsFinalizer(instance, rabbitmqv1.VhostFinalizer) {
+		for _, owner := range instance.OwnerReferences {
+			if owner.Controller != nil && *owner.Controller && owner.Kind == "TransportURL" {
+				// Owned by TransportURL - block deletion, wait for owner to be deleted
+				return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+			}
+		}
+		// Not owned by TransportURL, remove protection finalizer
+		controllerutil.RemoveFinalizer(instance, rabbitmqv1.VhostFinalizer)
+	}
+
 	// Get RabbitMQ cluster
 	rabbit := &rabbitmqclusterv2.RabbitmqCluster{}
 	err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbit)

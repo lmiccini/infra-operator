@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -243,6 +244,18 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 }
 
 func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1.RabbitMQUser, h *helper.Helper) (ctrl.Result, error) {
+	// Block deletion if owned by TransportURL and has protection finalizer
+	if controllerutil.ContainsFinalizer(instance, rabbitmqv1.UserFinalizer) {
+		for _, owner := range instance.OwnerReferences {
+			if owner.Controller != nil && *owner.Controller && owner.Kind == "TransportURL" {
+				// Owned by TransportURL - block deletion, wait for owner to be deleted
+				return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+			}
+		}
+		// Not owned by TransportURL, remove protection finalizer
+		controllerutil.RemoveFinalizer(instance, rabbitmqv1.UserFinalizer)
+	}
+
 	username := instance.Status.Username
 	if username == "" {
 		username = instance.Spec.Username

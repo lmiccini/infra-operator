@@ -78,6 +78,9 @@ func (instance RabbitMQVhost) IsReady() bool {
 }
 
 const (
+	// VhostFinalizer - finalizer to protect vhost from deletion when owned by TransportURL
+	VhostFinalizer = "rabbitmqvhost.rabbitmq.openstack.org/finalizer"
+
 	// VhostReadyCondition indicates that the vhost is ready
 	VhostReadyCondition condition.Type = "VhostReady"
 

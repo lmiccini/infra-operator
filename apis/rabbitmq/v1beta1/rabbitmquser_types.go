@@ -117,6 +117,9 @@ func (instance RabbitMQUser) IsReady() bool {
 }
 
 const (
+	// UserFinalizer - finalizer to protect user from deletion when owned by TransportURL
+	UserFinalizer = "rabbitmquser.rabbitmq.openstack.org/finalizer"
+
 	// UserReadyCondition indicates that the user is ready
 	UserReadyCondition condition.Type = "UserReady"
 
