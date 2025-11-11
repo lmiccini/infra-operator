@@ -263,6 +263,15 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		rabbitUser := &rabbitmqv1.RabbitMQUser{}
 		err = r.Get(ctx, types.NamespacedName{Name: instance.Spec.UserRef, Namespace: instance.Namespace}, rabbitUser)
 		if err != nil {
+			if k8s_errors.IsNotFound(err) {
+				instance.Status.Conditions.Set(condition.FalseCondition(
+					rabbitmqv1.TransportURLReadyCondition,
+					condition.RequestedReason,
+					condition.SeverityInfo,
+					rabbitmqv1.TransportURLInProgressMessage))
+				Log.Info(fmt.Sprintf("RabbitMQUser %s not found, waiting for it to be created", instance.Spec.UserRef))
+				return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+			}
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				rabbitmqv1.TransportURLReadyCondition,
 				condition.ErrorReason,
