@@ -52,19 +52,8 @@ spec:
                 description: RabbitmqClusterName the name of the Rabbitmq cluster
                   which to configure the transport URL
                 type: string
-              rabbitmqUsername:
-                description: |-
-                  RabbitmqUsername for the RabbitMQ user. If not specified, will use the same prefix as the TransportURL name
-                  DEPRECATED: Use UserRef instead for proper lifecycle management
-                type: string
-              rabbitmqVhost:
-                description: |-
-                  RabbitmqVhost name for the RabbitMQ virtual host. If not specified, will use the default vhost "/"
-                  DEPRECATED: Use UserRef instead for proper lifecycle management
-                type: string
               userRef:
-                description: UserRef - reference to a RabbitMQUser resource (takes
-                  precedence over RabbitmqUsername/RabbitmqVhost)
+                description: UserRef - reference to a RabbitMQUser resource
                 type: string
             required:
             - rabbitmqClusterName

@@ -28,18 +28,8 @@ type TransportURLSpec struct {
 	RabbitmqClusterName string `json:"rabbitmqClusterName"`
 
 	// +kubebuilder:validation:Optional
-	// UserRef - reference to a RabbitMQUser resource (takes precedence over RabbitmqUsername/RabbitmqVhost)
+	// UserRef - reference to a RabbitMQUser resource
 	UserRef string `json:"userRef,omitempty"`
-
-	// +kubebuilder:validation:Optional
-	// RabbitmqUsername for the RabbitMQ user. If not specified, will use the same prefix as the TransportURL name
-	// DEPRECATED: Use UserRef instead for proper lifecycle management
-	RabbitmqUsername string `json:"rabbitmqUsername,omitempty"`
-
-	// +kubebuilder:validation:Optional
-	// RabbitmqVhost name for the RabbitMQ virtual host. If not specified, will use the default vhost "/"
-	// DEPRECATED: Use UserRef instead for proper lifecycle management
-	RabbitmqVhost string `json:"rabbitmqVhost,omitempty"`
 }
 
 // TransportURLStatus defines the observed state of TransportURL
