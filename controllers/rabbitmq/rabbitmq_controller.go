@@ -19,11 +19,13 @@ package rabbitmq
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	rabbitmqv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -46,14 +48,12 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/ocp"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/pdb"
-	oko_secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
 
 	"github.com/go-logr/logr"
 	rabbitmqv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	"github.com/openstack-k8s-operators/infra-operator/pkg/rabbitmq"
-	rabbitmqapi "github.com/openstack-k8s-operators/infra-operator/pkg/rabbitmq/api"
 	"github.com/openstack-k8s-operators/infra-operator/pkg/rabbitmq/impl"
 
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
@@ -469,40 +469,58 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 }
 
 func updateMirroredPolicy(ctx context.Context, helper *helper.Helper, instance *rabbitmqv1beta1.RabbitMq, config *rest.Config, apply bool) error {
-	// Get RabbitMQ cluster
-	rabbit := &rabbitmqv2.RabbitmqCluster{}
-	err := helper.GetClient().Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, rabbit)
-	if err != nil {
-		return err
+	policyName := types.NamespacedName{
+		Name:      instance.Name + "-ha-all",
+		Namespace: instance.Namespace,
 	}
 
-	// Get admin credentials
-	rabbitSecret, _, err := oko_secret.GetSecret(ctx, helper, rabbit.Status.DefaultUser.SecretReference.Name, instance.Namespace)
-	if err != nil {
-		return err
-	}
-
-	// Create API client
-	tlsEnabled := rabbit.Spec.TLS.SecretName != ""
-	protocol := "http"
-	managementPort := "15672"
-	if tlsEnabled {
-		protocol = "https"
-		managementPort = "15671"
-	}
-	baseURL := fmt.Sprintf("%s://%s:%s", protocol, string(rabbitSecret.Data["host"]), managementPort)
-	apiClient := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled)
+	policy := &rabbitmqv1beta1.RabbitMQPolicy{}
+	err := helper.GetClient().Get(ctx, policyName, policy)
 
 	if apply {
+		// Create or update the policy CR
 		definition := map[string]interface{}{
 			"ha-mode":                "exactly",
 			"ha-params":              2,
 			"ha-promote-on-shutdown": "always",
 		}
-		return apiClient.CreateOrUpdatePolicy("/", "ha-all", "", definition, 0, "all")
+		definitionJSON, marshalErr := json.Marshal(definition)
+		if marshalErr != nil {
+			return marshalErr
+		}
+
+		if err != nil && k8s_errors.IsNotFound(err) {
+			// Create new policy
+			policy = &rabbitmqv1beta1.RabbitMQPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      policyName.Name,
+					Namespace: policyName.Namespace,
+				},
+				Spec: rabbitmqv1beta1.RabbitMQPolicySpec{
+					RabbitmqClusterName: instance.Name,
+					Name:                "ha-all",
+					Pattern:             "",
+					Definition:          apiextensionsv1.JSON{Raw: definitionJSON},
+					Priority:            0,
+					ApplyTo:             "all",
+				},
+			}
+			if err := controllerutil.SetControllerReference(instance, policy, helper.GetScheme()); err != nil {
+				return err
+			}
+			return helper.GetClient().Create(ctx, policy)
+		}
+		return err
 	}
 
-	return apiClient.DeletePolicy("/", "ha-all")
+	// Delete the policy CR if it exists
+	if err == nil {
+		return helper.GetClient().Delete(ctx, policy)
+	}
+	if k8s_errors.IsNotFound(err) {
+		return nil
+	}
+	return err
 }
 
 func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
