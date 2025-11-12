@@ -838,19 +838,17 @@ func (r *Reconciler) createUpgradeUser(ctx context.Context, instance *rabbitmqv1
 		return err
 	}
 
-	// Set owner reference
 	if err := controllerutil.SetControllerReference(instance, user, r.Scheme); err != nil {
 		return err
 	}
 
-	// Create the user
 	if err := r.Client.Create(ctx, user); err != nil {
 		return err
 	}
 
 	// Update the secret with the preserved password
 	time.Sleep(2 * time.Second)
-	secretName := userName
+	secretName := fmt.Sprintf("rabbitmq-user-%s", userName)
 	secret := &corev1.Secret{}
 	if err := r.Client.Get(ctx, types.NamespacedName{Name: secretName, Namespace: instance.Namespace}, secret); err == nil {
 		secret.Data["password"] = []byte(password)
