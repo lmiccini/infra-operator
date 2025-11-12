@@ -280,7 +280,11 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 				Spec: rabbitmqv1.RabbitMQVhostSpec{RabbitmqClusterName: instance.Spec.RabbitmqClusterName, Name: vhostName},
 			}
 			if err := controllerutil.SetControllerReference(instance, vhost, r.Scheme); err == nil {
-				controllerutil.CreateOrUpdate(ctx, r.Client, vhost, func() error { return nil })
+				controllerutil.CreateOrUpdate(ctx, r.Client, vhost, func() error {
+					vhost.Spec.RabbitmqClusterName = instance.Spec.RabbitmqClusterName
+					vhost.Spec.Name = vhostName
+					return nil
+				})
 			}
 		}
 
@@ -295,7 +299,12 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 			Spec: rabbitmqv1.RabbitMQUserSpec{RabbitmqClusterName: instance.Spec.RabbitmqClusterName, Username: instance.Spec.Username, VhostRef: vhostRef},
 		}
 		if err := controllerutil.SetControllerReference(instance, user, r.Scheme); err == nil {
-			controllerutil.CreateOrUpdate(ctx, r.Client, user, func() error { return nil })
+			controllerutil.CreateOrUpdate(ctx, r.Client, user, func() error {
+				user.Spec.RabbitmqClusterName = instance.Spec.RabbitmqClusterName
+				user.Spec.Username = instance.Spec.Username
+				user.Spec.VhostRef = vhostRef
+				return nil
+			})
 		}
 	}
 
