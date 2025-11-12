@@ -248,11 +248,20 @@ func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *
 	if controllerutil.ContainsFinalizer(instance, rabbitmqv1.UserFinalizer) {
 		for _, owner := range instance.OwnerReferences {
 			if owner.Controller != nil && *owner.Controller && owner.Kind == "TransportURL" {
-				// Owned by TransportURL - block deletion, wait for owner to be deleted
-				return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+				// Check if TransportURL still references this user
+				transportURL := &rabbitmqv1.TransportURL{}
+				if err := r.Get(ctx, types.NamespacedName{Name: owner.Name, Namespace: instance.Namespace}, transportURL); err == nil {
+					expectedUserRef := transportURL.Spec.UserRef
+					if expectedUserRef == "" && transportURL.Spec.Username != "" {
+						expectedUserRef = fmt.Sprintf("%s-%s-user", transportURL.Name, transportURL.Spec.Username)
+					}
+					if expectedUserRef == instance.Name {
+						// Still in use - block deletion
+						return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+					}
+				}
 			}
 		}
-		// Not owned by TransportURL, remove protection finalizer
 		controllerutil.RemoveFinalizer(instance, rabbitmqv1.UserFinalizer)
 	}
 

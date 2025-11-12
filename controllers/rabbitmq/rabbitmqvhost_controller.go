@@ -151,11 +151,24 @@ func (r *RabbitMQVhostReconciler) reconcileDelete(ctx context.Context, instance 
 	if controllerutil.ContainsFinalizer(instance, rabbitmqv1.VhostFinalizer) {
 		for _, owner := range instance.OwnerReferences {
 			if owner.Controller != nil && *owner.Controller && owner.Kind == "TransportURL" {
-				// Owned by TransportURL - block deletion, wait for owner to be deleted
-				return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+				// Check if TransportURL still references this vhost
+				transportURL := &rabbitmqv1.TransportURL{}
+				if err := r.Get(ctx, types.NamespacedName{Name: owner.Name, Namespace: instance.Namespace}, transportURL); err == nil {
+					vhostName := transportURL.Spec.Vhost
+					if vhostName == "" {
+						vhostName = "/"
+					}
+					expectedVhostRef := ""
+					if vhostName != "/" {
+						expectedVhostRef = fmt.Sprintf("%s-%s-vhost", transportURL.Name, vhostName)
+					}
+					if expectedVhostRef == instance.Name {
+						// Still in use - block deletion
+						return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+					}
+				}
 			}
 		}
-		// Not owned by TransportURL, remove protection finalizer
 		controllerutil.RemoveFinalizer(instance, rabbitmqv1.VhostFinalizer)
 	}
 
