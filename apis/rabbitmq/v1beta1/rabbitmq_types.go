@@ -105,6 +105,9 @@ type RabbitMqStatus struct {
 
 	// QueueType - store whether default ha-all policy is present or not
 	QueueType string `json:"queueType,omitempty"`
+
+	// VersionUpgradeInProgress - target version during upgrade process
+	VersionUpgradeInProgress string `json:"versionUpgradeInProgress,omitempty"`
 }
 
 //+kubebuilder:object:root=true
