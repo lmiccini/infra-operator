@@ -132,9 +132,12 @@ python3 -m coverage html  # Generate HTML report
   - Exception handling during evacuation with proper host marking
 - **Kdump Detection**:
   - UDP listener thread operation
-  - Message parsing and validation
-  - Host filtering based on kdump status
-  - Cleanup of old entries
+  - Message parsing and validation (magic number 0x1B302A40)
+  - Waiting mechanism for KDUMP_TIMEOUT before evacuation
+  - Immediate evacuation when kdump messages received (kdump-fenced)
+  - Timeout-based evacuation when no kdump detected
+  - Power-on skip optimization for kdump-fenced hosts
+  - Cleanup of old entries and tracking state
 - **Threshold Protection**:
   - Mass failure prevention
   - Percentage-based limits

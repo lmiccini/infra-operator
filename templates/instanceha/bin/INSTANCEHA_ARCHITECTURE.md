@@ -545,8 +545,13 @@ def get_int(self, key: str, default: int = 0,
 
 **Special Validations**:
 - **LOGLEVEL**: Must be in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
-- **KDUMP_TIMEOUT + POLL**: Warning if both are 30 seconds (race condition)
+- **KDUMP_TIMEOUT + POLL**: Warning if both are 30 seconds (default values - not a functional issue, just informational)
 - **SSL Paths**: Check file existence before returning
+
+**Kdump Timing**:
+- Timeout is evaluated per-host based on when first detected as down
+- Multiple poll cycles can occur during the waiting period
+- Example: `POLL=45s`, `KDUMP_TIMEOUT=300s` → host waits across ~7 poll cycles before evacuation if no kdump detected
 
 ---
 
@@ -732,15 +737,23 @@ compute-03:
 
 ### 1. Kdump Detection
 
-**Purpose**: Prevent evacuation of hosts that are kdumping.
+**Purpose**: Detect when hosts are kdumping and evacuate them safely once fenced.
 
-**Location**: `instanceha.py:1341-1380, 1758-1828`
+**Location**: `instanceha.py:1340-1380, 1740-1798`
 
 **Architecture**:
 - Background UDP listener thread (port 7410)
 - Magic number validation (0x1B302A40)
 - Reverse DNS lookup (IP → hostname)
 - Timestamp tracking with cleanup
+
+**Behavior**:
+1. **First poll**: When host is detected as down, start waiting for `KDUMP_TIMEOUT` seconds
+2. **Kdump message received**: Host is fenced → evacuate immediately
+3. **Timeout expired**: No kdump detected → proceed with normal evacuation
+4. **Power-on optimization**: Skip power-on for kdump-fenced hosts during recovery
+   - Kdump `final_action` in `/etc/kdump.conf` determines host behavior (poweroff/reboot/halt)
+   - Skipping power-on avoids interfering with user-configured kdump recovery process
 
 ---
 
@@ -1011,11 +1024,17 @@ ERROR: Impacted (60.0%) exceeds threshold (50%).
 ```
 **Solution**: Increase `THRESHOLD` or investigate datacenter failure.
 
-**2. Kdump check slows evacuations**:
+**2. Kdump check delays evacuations**:
 ```
 INFO: Checking 10 hosts for kdump activity
+INFO: Host compute-0 down, waiting 30s for kdump
 ```
-**Solution**: Disable with `CHECK_KDUMP: false`.
+**Explanation**: When kdump checking is enabled, hosts wait for `KDUMP_TIMEOUT` seconds before evacuation to allow kdump messages to arrive.
+
+**Solutions**:
+- **Disable kdump check**: Set `CHECK_KDUMP: false` for immediate evacuation
+- **Reduce timeout**: Lower `KDUMP_TIMEOUT` (minimum 5 seconds)
+- **Enable kdump on computes**: Configure fence_kdump to send messages and benefit from safe fencing
 
 **3. Smart evacuation timeout**:
 ```

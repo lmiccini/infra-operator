@@ -64,8 +64,6 @@ HEALTH_CHECK_PORT = 8080
 DEFAULT_UDP_PORT = 7410
 KDUMP_MAGIC_NUMBER = 0x1B302A40
 MAX_PROCESSING_TIME_PADDING_SECONDS = 30
-KDUMP_TIMEOUT_PADDING_SECONDS = 5
-KDUMP_TIMEOUT_GRACE_SECONDS = 10
 MIGRATION_QUERY_MINUTES = 5
 MIGRATION_QUERY_LIMIT = 1000
 USERNAME_MAX_LENGTH = 64
@@ -714,6 +712,7 @@ class InstanceHAService(CloudConnectionProvider):
 
         # Evacuation tracking
         self.host_evacuation_counts = defaultdict(int)  # Track VM count evacuated per host
+        self.kdump_fenced_hosts = set()  # Track hosts fenced via kdump for power-on skip
 
         logging.info("InstanceHA service initialized successfully")
 
@@ -1379,23 +1378,6 @@ def _kdump_udp_listener(service: 'InstanceHAService') -> None:
     except Exception as e:
         logging.error(f'Kdump listener failed to start: {e}')
 
-def _check_kdump_single(host, service):
-    """Check if host is kdumping within timeout period."""
-    hostname = _extract_hostname(host)
-    last_seen = service.kdump_hosts_timestamp.get(hostname, 0)
-    kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
-
-    if last_seen > 0 and (time.time() - last_seen) <= kdump_timeout:
-        return True
-
-    start_time = time.time()
-    while (time.time() - start_time) < kdump_timeout:
-        time.sleep(1)
-        if service.kdump_hosts_timestamp.get(hostname, 0) > start_time:
-            return True
-
-    return False
-
 def _aggregate_ids(conn, service):
     """Get aggregate IDs for a service's host."""
     return [ag.id for ag in conn.aggregates.list() if service.host in ag.hosts]
@@ -1756,76 +1738,45 @@ def _host_disable(connection, service):
 
 
 def _check_kdump(stale_services: List[Any], service: InstanceHAService) -> Tuple[List[Any], List[str]]:
-    """Check for kdump messages using background UDP listener and filter hosts individually."""
+    """Check for kdump messages. Wait KDUMP_TIMEOUT for messages; evacuate immediately once received."""
     if not stale_services:
-        logging.debug("No stale services to check for kdump")
         return [], []
 
     logging.info(f"Checking {len(stale_services)} hosts for kdump activity")
-    kdumping_hosts = []
-    uncertain_hosts = []
+    kdump_fenced = []
+    waiting = []
     current_time = time.time()
     kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
 
-    # Clean up expired checking entries
-    service._cleanup_dict_by_condition(
-        service.kdump_hosts_checking,
-        lambda h, t: current_time - t > kdump_timeout + KDUMP_TIMEOUT_GRACE_SECONDS)
-
-    # Quick check: hosts with recent kdump messages or already being checked
     for svc in stale_services:
         hostname = _extract_hostname(svc.host)
-        last_seen = service.kdump_hosts_timestamp.get(hostname, 0)
+        last_msg = service.kdump_hosts_timestamp.get(hostname, 0)
         check_start = service.kdump_hosts_checking.get(hostname, 0)
 
-        if last_seen > 0 and (current_time - last_seen) <= kdump_timeout:
-            kdumping_hosts.append(svc.host)
-            logging.info(f'Host {svc.host} is kdumping, skipping evacuation')
-        elif check_start > 0 and (current_time - check_start) < kdump_timeout:
-            kdumping_hosts.append(svc.host)
-            logging.info(f'Host {svc.host} kdump check in progress, skipping evacuation')
-        else:
-            uncertain_hosts.append(svc)
+        # Kdump message received - host is fenced, evacuate immediately
+        if last_msg > 0 and (current_time - last_msg) <= kdump_timeout:
+            kdump_fenced.append(svc.host)
+            service.kdump_fenced_hosts.add(hostname)
+            service.kdump_hosts_checking.pop(hostname, None)
+            logging.info(f'Host {svc.host} fenced via kdump - evacuating')
+        # First time seeing host down - start waiting
+        elif check_start == 0:
             service.kdump_hosts_checking[hostname] = current_time
+            waiting.append(svc.host)
+            logging.info(f'Host {svc.host} down, waiting {kdump_timeout}s for kdump')
+        # Still waiting for timeout
+        elif (current_time - check_start) < kdump_timeout:
+            waiting.append(svc.host)
+            logging.info(f'Host {svc.host} waiting ({current_time - check_start:.1f}s/{kdump_timeout}s)')
+        # Timeout expired - proceed with evacuation
+        else:
+            service.kdump_hosts_checking.pop(hostname, None)
+            logging.info(f'Host {svc.host} timeout expired, no kdump - evacuating')
 
-    # Wait for delayed kdump starts (parallel)
-    if uncertain_hosts:
-        logging.info(f'Checking {len(uncertain_hosts)} hosts for delayed kdump start')
-        workers = service.config.get_workers()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(_check_kdump_single, s.host, service): s for s in uncertain_hosts}
-            kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
-
-            # Process results as they complete, handling timeouts gracefully
-            try:
-                for future in concurrent.futures.as_completed(futures, timeout=kdump_timeout + KDUMP_TIMEOUT_PADDING_SECONDS):
-                    try:
-                        if future.result():
-                            kdumping_hosts.append(futures[future].host)
-                            logging.info(f'Host {futures[future].host} started kdumping, skipping evacuation')
-                    except Exception as e:
-                        logging.debug(f"Exception checking kdump for host: {e}")
-            except concurrent.futures.TimeoutError:
-                # Some futures didn't complete within timeout - that's OK, just log it
-                pending = [futures[f] for f in futures if not f.done()]
-                if pending:
-                    logging.debug(f'Kdump check timed out for {len(pending)} hosts: {[s.host for s in pending]}')
-
-    # Clean up completed checks for hosts that were checked
-    # Remove entries for hosts that were checked in this iteration (were in uncertain_hosts)
-    # Once a check completes (successfully or with timeout), the entry should be removed
-    # so that future polls can properly detect kdump status based on kdump_hosts_timestamp
-    uncertain_hostnames = {_extract_hostname(s.host) for s in uncertain_hosts}
-    for hostname in uncertain_hostnames:
-        if hostname in service.kdump_hosts_checking:
-            del service.kdump_hosts_checking[hostname]
-
-    # Remove kdumping hosts from evacuation
-    to_evacuate = [s for s in stale_services if s.host not in kdumping_hosts]
-    if kdumping_hosts:
-        logging.info(f'Total hosts skipped due to kdumping: {len(kdumping_hosts)}')
-
-    return to_evacuate, kdumping_hosts
+    to_evacuate = [s for s in stale_services if s.host not in waiting]
+    if kdump_fenced:
+        logging.info(f'Total kdump-fenced: {len(kdump_fenced)}')
+    return to_evacuate, kdump_fenced
 
 
 def _host_enable(connection, service, reenable: bool = False) -> bool:
@@ -2372,16 +2323,22 @@ def _post_evacuation_recovery(conn, failed_service, service):
                     failed_service.host)
         return True
 
+    hostname = _extract_hostname(failed_service.host)
+    kdump_fenced = hostname in service.kdump_fenced_hosts
+
     logging.info("Evacuation successful. Starting recovery for %s", failed_service.host)
 
     try:
-        # Step 1: Power on the host
-        logging.debug("Powering on host %s", failed_service.host)
-        power_on_result = _host_fence(failed_service.host, 'on', service)
-
-        if not power_on_result:
-            logging.error("Failed to power on %s during recovery", failed_service.host)
-            return False
+        # Step 1: Power on the host (skip if kdump fenced)
+        if kdump_fenced:
+            logging.info("Skipping power on for %s (kdump fenced)", failed_service.host)
+            service.kdump_fenced_hosts.discard(hostname)
+        else:
+            logging.debug("Powering on host %s", failed_service.host)
+            power_on_result = _host_fence(failed_service.host, 'on', service)
+            if not power_on_result:
+                logging.error("Failed to power on %s during recovery", failed_service.host)
+                return False
 
         # Step 2: Re-enable the host in Nova
         logging.debug("Re-enabling host %s in Nova", failed_service.host)

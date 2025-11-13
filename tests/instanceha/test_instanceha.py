@@ -1140,53 +1140,6 @@ class TestKdumpFunctionality(unittest.TestCase):
         finally:
             os.unlink(config_path)
 
-    def test_kdump_single_host_recent_message(self):
-        """Test _check_kdump_single with recent kdump message."""
-        self.mock_service_instance.kdump_hosts_timestamp['compute-01'] = time.time() - 5
-        # Mock socket operations to avoid real UDP timeouts
-        with patch('socket.socket'):
-            result = instanceha._check_kdump_single('compute-01.example.com', self.mock_service_instance)
-        self.assertTrue(result)
-
-    def test_kdump_single_host_old_message(self):
-        """Test _check_kdump_single with old kdump message."""
-        current_time = time.time()
-        self.mock_service_instance.kdump_hosts_timestamp['compute-01'] = current_time - 60
-
-        # Mock time.time to simulate timeout loop completion immediately
-        time_calls = [current_time, current_time, current_time + 31]  # Exceed timeout quickly
-        with patch('socket.socket'), \
-             patch('time.sleep'), \
-             patch('time.time', side_effect=time_calls):
-            result = instanceha._check_kdump_single('compute-01.example.com', self.mock_service_instance)
-            self.assertFalse(result)
-
-    def test_kdump_single_host_no_message(self):
-        """Test _check_kdump_single with no kdump message."""
-        current_time = time.time()
-
-        # Mock time.time to simulate timeout loop completion immediately
-        time_calls = [current_time, current_time, current_time + 31]  # Exceed timeout quickly
-        with patch('socket.socket'), \
-             patch('time.sleep'), \
-             patch('time.time', side_effect=time_calls):
-            result = instanceha._check_kdump_single('compute-01.example.com', self.mock_service_instance)
-            self.assertFalse(result)
-
-    def test_kdump_single_host_delayed_message(self):
-        """Test _check_kdump_single with delayed kdump message."""
-        call_count = 0
-        def simulate_delayed_message(duration):
-            nonlocal call_count
-            call_count += 1
-            if call_count >= 3:  # After 3 calls to sleep
-                self.mock_service_instance.kdump_hosts_timestamp['compute-01'] = time.time()
-
-        # Mock socket operations to avoid real UDP timeouts
-        with patch('socket.socket'), patch('time.sleep', side_effect=simulate_delayed_message):
-            result = instanceha._check_kdump_single('compute-01.example.com', self.mock_service_instance)
-            self.assertTrue(result)
-
     def test_kdump_check_no_services(self):
         """Test _check_kdump with empty service list."""
         to_evacuate, kdumping_hosts = instanceha._check_kdump([], self.mock_service_instance)
@@ -1194,7 +1147,7 @@ class TestKdumpFunctionality(unittest.TestCase):
         self.assertEqual(kdumping_hosts, [])
 
     def test_kdump_check_immediate_detection(self):
-        """Test _check_kdump with immediate kdump detection."""
+        """Test _check_kdump with immediate kdump detection - host should be evacuated immediately."""
         mock_service1 = Mock()
         mock_service1.host = 'compute-01.example.com'
 
@@ -1202,18 +1155,20 @@ class TestKdumpFunctionality(unittest.TestCase):
         self.mock_service_instance.kdump_hosts_timestamp['compute-01'] = time.time() - 5
 
         to_evacuate, kdumping_hosts = instanceha._check_kdump([mock_service1], self.mock_service_instance)
-        self.assertEqual(len(to_evacuate), 0)  # Host should be filtered out
+        self.assertEqual(len(to_evacuate), 1)  # Host should be evacuated (kdump-fenced)
         self.assertEqual(len(kdumping_hosts), 1)  # Host should be in kdumping list
+        self.assertIn('compute-01', self.mock_service_instance.kdump_fenced_hosts)  # Host tracked as fenced
 
     def test_kdump_check_no_kdump_activity(self):
-        """Test _check_kdump with no kdump activity."""
+        """Test _check_kdump with no kdump activity - should wait for timeout."""
         mock_service1 = Mock()
         mock_service1.host = 'compute-01.example.com'
 
-        with patch('instanceha._check_kdump_single', return_value=False):
-            to_evacuate, kdumping_hosts = instanceha._check_kdump([mock_service1], self.mock_service_instance)
-            self.assertEqual(len(to_evacuate), 1)  # Host should not be filtered
-            self.assertEqual(len(kdumping_hosts), 0)  # Host should not be kdumping
+        to_evacuate, kdumping_hosts = instanceha._check_kdump([mock_service1], self.mock_service_instance)
+        self.assertEqual(len(to_evacuate), 0)  # Host should be waiting (not evacuated yet)
+        self.assertEqual(len(kdumping_hosts), 0)  # Host should not be kdumping
+        self.assertNotIn('compute-01', self.mock_service_instance.kdump_fenced_hosts)  # Not tracked as fenced
+        self.assertIn('compute-01', self.mock_service_instance.kdump_hosts_checking)  # Should be in checking state
 
     def test_kdump_message_processing_valid_magic(self):
         """Test UDP message processing with valid magic number."""
@@ -1251,8 +1206,8 @@ class TestKdumpFunctionality(unittest.TestCase):
         self.assertNotIn('old-host', self.mock_service_instance.kdump_hosts_timestamp)
         self.assertIn('recent-host', self.mock_service_instance.kdump_hosts_timestamp)
 
-    def test_kdump_parallel_checking(self):
-        """Test parallel kdump checking for multiple hosts."""
+    def test_kdump_multiple_hosts(self):
+        """Test kdump checking for multiple hosts."""
         mock_service1 = Mock()
         mock_service1.host = 'compute-01.example.com'
         mock_service2 = Mock()
@@ -1264,57 +1219,99 @@ class TestKdumpFunctionality(unittest.TestCase):
         mock_service_instance = instanceha.InstanceHAService(Mock())
         mock_service_instance.config = self.mock_service.config
 
-        with patch('instanceha._check_kdump_single') as mock_check:
-            mock_check.side_effect = [True, False]  # First host kdumping, second not
-            to_evacuate, kdumping_hosts = instanceha._check_kdump(services, mock_service_instance)
+        # First host has kdump message, second does not
+        mock_service_instance.kdump_hosts_timestamp['compute-01'] = time.time() - 5
 
-            # Should return only the non-kdumping host
-            self.assertEqual(len(to_evacuate), 1)
-            self.assertEqual(to_evacuate[0].host, 'compute-02.example.com')
-            self.assertEqual(len(kdumping_hosts), 1)
-            self.assertEqual(kdumping_hosts[0], 'compute-01.example.com')
+        to_evacuate, kdumping_hosts = instanceha._check_kdump(services, mock_service_instance)
 
-    def test_kdump_long_timeout_scenario(self):
-        """Test kdump detection with long timeout for delayed starts."""
-        # Create mock service with longer timeout
+        # compute-01 has kdump message → evacuate immediately (kdump-fenced)
+        # compute-02 has no kdump → waiting (not evacuated yet)
+        self.assertEqual(len(to_evacuate), 1)
+        self.assertEqual(to_evacuate[0].host, 'compute-01.example.com')
+        self.assertEqual(len(kdumping_hosts), 1)
+        self.assertEqual(kdumping_hosts[0], 'compute-01.example.com')
+        self.assertIn('compute-01', mock_service_instance.kdump_fenced_hosts)
+        self.assertIn('compute-02', mock_service_instance.kdump_hosts_checking)  # compute-02 waiting
+
+    def test_kdump_timeout_exceeded(self):
+        """Test kdump timeout exceeded - host should not be considered kdumping."""
         mock_service = Mock()
-        mock_service.config.get_config_value.return_value = 90  # 90 second timeout
+        mock_service.host = 'compute-01.example.com'
 
-        call_count = 0
         # Create a service instance for this test
         mock_service_instance = instanceha.InstanceHAService(Mock())
-        mock_service_instance.config = mock_service.config
+        mock_service_instance.config = self.mock_service.config
 
-        def simulate_very_delayed_kdump(duration):
-            nonlocal call_count
-            call_count += 1
-            if call_count >= 60:  # After 60 sleep calls (simulating 60+ seconds)
-                mock_service_instance.kdump_hosts_timestamp['compute-slow'] = time.time()
+        # Set checking timestamp beyond timeout (default 30s) - simulates waiting period expired
+        mock_service_instance.kdump_hosts_checking['compute-01'] = time.time() - 35
 
-        # Mock socket operations to avoid real UDP timeouts
-        with patch('socket.socket'), patch('time.sleep', side_effect=simulate_very_delayed_kdump):
-            result = instanceha._check_kdump_single('compute-slow.example.com', mock_service_instance)
+        to_evacuate, kdumping_hosts = instanceha._check_kdump([mock_service], mock_service_instance)
+        self.assertEqual(len(to_evacuate), 1)  # Host should be evacuated (timeout expired, no kdump)
+        self.assertEqual(len(kdumping_hosts), 0)  # Host is not kdumping (timeout exceeded)
+        self.assertNotIn('compute-01', mock_service_instance.kdump_fenced_hosts)
+        self.assertNotIn('compute-01', mock_service_instance.kdump_hosts_checking)  # Should be cleaned up
+
+    def test_post_evacuation_recovery_kdump_fenced_skip_power_on(self):
+        """Test that power on is skipped for kdump-fenced hosts."""
+        mock_conn = Mock()
+        mock_service_obj = Mock()
+        mock_service_obj.host = 'compute-01.example.com'
+
+        # Create service instance and mark host as kdump fenced
+        mock_service_instance = instanceha.InstanceHAService(Mock())
+        mock_service_instance.config = self.mock_service.config
+        mock_service_instance.config.is_leave_disabled_enabled.return_value = False
+        mock_service_instance.kdump_fenced_hosts.add('compute-01')
+
+        with patch('instanceha._host_fence') as mock_fence, \
+             patch('instanceha._host_enable', return_value=True):
+            result = instanceha._post_evacuation_recovery(mock_conn, mock_service_obj, mock_service_instance)
+
+            # Verify power on was NOT called
+            mock_fence.assert_not_called()
+            # Verify host was removed from kdump_fenced_hosts
+            self.assertNotIn('compute-01', mock_service_instance.kdump_fenced_hosts)
             self.assertTrue(result)
 
-    def test_kdump_timeout_exceeded_scenario(self):
-        """Test kdump timeout exceeded - host should not be considered kdumping."""
-        # Create mock service with short timeout
-        mock_service = Mock()
-        mock_service.config.get_config_value.return_value = 5  # 5 second timeout
+    def test_post_evacuation_recovery_normal_host_power_on(self):
+        """Test that power on is performed for non-kdump-fenced hosts."""
+        mock_conn = Mock()
+        mock_service_obj = Mock()
+        mock_service_obj.host = 'compute-01.example.com'
 
-        current_time = time.time()
-
-        # Mock time.time to simulate timeout exceeded immediately
-        # Create a service instance for this test
+        # Create service instance without kdump fencing
         mock_service_instance = instanceha.InstanceHAService(Mock())
-        mock_service_instance.config = mock_service.config
+        mock_service_instance.config = self.mock_service.config
+        mock_service_instance.config.is_leave_disabled_enabled.return_value = False
 
-        time_calls = [current_time, current_time, current_time + 6]  # Exceed 5s timeout quickly
-        with patch('socket.socket'), \
-             patch('time.sleep'), \
-             patch('time.time', side_effect=time_calls):
-            result = instanceha._check_kdump_single('compute-never-kdump.example.com', mock_service_instance)
-            self.assertFalse(result)
+        with patch('instanceha._host_fence', return_value=True) as mock_fence, \
+             patch('instanceha._host_enable', return_value=True):
+            result = instanceha._post_evacuation_recovery(mock_conn, mock_service_obj, mock_service_instance)
+
+            # Verify power on WAS called
+            mock_fence.assert_called_once_with('compute-01.example.com', 'on', mock_service_instance)
+            self.assertTrue(result)
+
+    def test_kdump_fenced_hosts_cleanup_on_recovery(self):
+        """Test that kdump_fenced_hosts is properly cleaned up after recovery."""
+        mock_service_instance = instanceha.InstanceHAService(Mock())
+        mock_service_instance.config = self.mock_service.config
+
+        # Add multiple hosts to kdump_fenced_hosts
+        mock_service_instance.kdump_fenced_hosts.add('compute-01')
+        mock_service_instance.kdump_fenced_hosts.add('compute-02')
+
+        mock_conn = Mock()
+        mock_service_obj = Mock()
+        mock_service_obj.host = 'compute-01.example.com'
+        mock_service_instance.config.is_leave_disabled_enabled.return_value = False
+
+        with patch('instanceha._host_enable', return_value=True):
+            instanceha._post_evacuation_recovery(mock_conn, mock_service_obj, mock_service_instance)
+
+            # Verify only compute-01 was removed, compute-02 remains
+            self.assertNotIn('compute-01', mock_service_instance.kdump_fenced_hosts)
+            self.assertIn('compute-02', mock_service_instance.kdump_fenced_hosts)
 
 
 class TestKdumpIntegration(unittest.TestCase):
@@ -1383,14 +1380,14 @@ class TestKdumpIntegration(unittest.TestCase):
         # Simulate one host kdumping, one not
         mock_service_instance.kdump_hosts_timestamp['compute-01'] = time.time() - 5
 
-        with patch('instanceha._check_kdump_single', return_value=False):
-            to_evacuate, kdumping_hosts = instanceha._check_kdump(services, mock_service_instance)
+        to_evacuate, kdumping_hosts = instanceha._check_kdump(services, mock_service_instance)
 
-            # Should filter out the kdumping host
-            self.assertEqual(len(to_evacuate), 1)
-            self.assertEqual(to_evacuate[0].host, 'compute-02.example.com')
-            self.assertEqual(len(kdumping_hosts), 1)
-            self.assertEqual(kdumping_hosts[0], 'compute-01.example.com')
+        # compute-01 has kdump → evacuate immediately, compute-02 waiting
+        self.assertEqual(len(to_evacuate), 1)
+        self.assertEqual(to_evacuate[0].host, 'compute-01.example.com')
+        self.assertEqual(len(kdumping_hosts), 1)
+        self.assertEqual(kdumping_hosts[0], 'compute-01.example.com')
+        self.assertIn('compute-02', mock_service_instance.kdump_hosts_checking)
 
     def test_kdump_thread_safety(self):
         """Test thread safety of kdump operations."""
