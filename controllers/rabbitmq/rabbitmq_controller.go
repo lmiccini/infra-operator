@@ -383,20 +383,30 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, fmt.Errorf("error configuring RabbitmqCluster: %w", err)
 	}
 
+	// Initialize labels if needed and set default version
+	if instance.Labels == nil {
+		instance.Labels = make(map[string]string)
+	}
+	if _, exists := instance.Labels["rabbitmqcurrentversion"]; !exists {
+		instance.Labels["rabbitmqcurrentversion"] = "3.9"
+		if err := helper.PatchInstance(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	// Check for version upgrade
 	var versionMismatch bool
 	var targetVersion string
-	if instance.Labels != nil {
-		if currentVersion, hasCurrent := instance.Labels["rabbitmqcurrentversion"]; hasCurrent {
-			if tv, hasTarget := instance.Labels["rabbitmqversion"]; hasTarget {
-				targetVersion = tv
-				if currentVersion != targetVersion && instance.Status.VersionUpgradeInProgress == "" {
-					Log.Info(fmt.Sprintf("RabbitMQ version upgrade detected: current=%s, target=%s", currentVersion, targetVersion))
-					instance.Status.VersionUpgradeInProgress = targetVersion
-					versionMismatch = true
-				} else if instance.Status.VersionUpgradeInProgress != "" {
-					versionMismatch = true
-				}
+	if currentVersion, hasCurrent := instance.Labels["rabbitmqcurrentversion"]; hasCurrent {
+		if tv, hasTarget := instance.Labels["rabbitmqversion"]; hasTarget {
+			targetVersion = tv
+			if currentVersion != targetVersion && instance.Status.VersionUpgradeInProgress == "" {
+				Log.Info(fmt.Sprintf("RabbitMQ version upgrade detected: current=%s, target=%s", currentVersion, targetVersion))
+				instance.Status.VersionUpgradeInProgress = targetVersion
+				versionMismatch = true
+			} else if instance.Status.VersionUpgradeInProgress != "" {
+				versionMismatch = true
 			}
 		}
 	}
