@@ -636,18 +636,18 @@ func (r *Reconciler) handleVersionUpgrade(ctx context.Context, instance *rabbitm
 			Log.Error(err, "Failed to delete RabbitMQ resources")
 			return ctrl.Result{}, err
 		}
+
+		// Step 4: Resume reconciliation immediately after deletion
+		if err := r.resumeClusterOperator(ctx, instance); err != nil {
+			Log.Error(err, "Failed to resume cluster-operator")
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Wait for resources to be fully deleted
 	if r.rabbitmqResourcesExist(ctx, instance) {
 		Log.Info("Waiting for RabbitMQ resources to be deleted")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-
-	// Step 4: Resume reconciliation
-	if err := r.resumeClusterOperator(ctx, instance); err != nil {
-		Log.Error(err, "Failed to resume cluster-operator")
-		return ctrl.Result{}, err
 	}
 
 	// Wait for cluster to be ready
