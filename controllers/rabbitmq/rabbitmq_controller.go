@@ -605,10 +605,21 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1be
 func (r *Reconciler) handleVersionUpgrade(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper, targetVersion string) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 
-	// Step 1: Delete StatefulSets to trigger recreation with new version
-	if err := r.deleteStatefulSets(ctx, instance); err != nil {
-		Log.Error(err, "Failed to delete StatefulSets")
-		return ctrl.Result{}, err
+	// Check if we've already deleted resources - use current version as marker
+	// When VersionUpgradeInProgress != currentVersion, we haven't deleted yet
+	currentVersion := instance.Labels["rabbitmqcurrentversion"]
+
+	// Step 1: Delete StatefulSets once to trigger recreation with new version
+	if instance.Status.VersionUpgradeInProgress != "" && currentVersion != targetVersion {
+		// First time through - delete StatefulSet and PVCs
+		if err := r.deleteStatefulSets(ctx, instance); err != nil {
+			Log.Error(err, "Failed to delete StatefulSets")
+			return ctrl.Result{}, err
+		}
+		// Mark current version as target to prevent re-deletion
+		instance.Labels["rabbitmqcurrentversion"] = targetVersion
+		Log.Info("Deleted StatefulSet and PVCs, waiting for recreation")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	// Step 2: Wait for cluster to be ready with new version
@@ -621,8 +632,7 @@ func (r *Reconciler) handleVersionUpgrade(ctx context.Context, instance *rabbitm
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	// Upgrade complete - update version label and clear status
-	instance.Labels["rabbitmqcurrentversion"] = targetVersion
+	// Upgrade complete - clear upgrade status
 	instance.Status.VersionUpgradeInProgress = ""
 	Log.Info(fmt.Sprintf("RabbitMQ version upgrade completed: %s", targetVersion))
 
