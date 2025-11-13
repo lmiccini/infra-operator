@@ -57,6 +57,7 @@ import (
 	"github.com/openstack-k8s-operators/infra-operator/pkg/rabbitmq/impl"
 
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
@@ -604,41 +605,13 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1be
 func (r *Reconciler) handleVersionUpgrade(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper, targetVersion string) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 
-	// Step 1: Preserve credentials in backup secret before cluster deletion
-	backupSecretName := instance.Name + "-upgrade-backup"
-	if !r.rabbitmqResourcesExist(ctx, instance) {
-		// Cluster already deleted, skip credential collection
-		Log.Info("Cluster already deleted, skipping credential backup")
-	} else {
-		// Check if backup secret already exists
-		backupSecret := &corev1.Secret{}
-		err := r.Client.Get(ctx, types.NamespacedName{Name: backupSecretName, Namespace: instance.Namespace}, backupSecret)
-		if k8s_errors.IsNotFound(err) {
-			// Collect and backup credentials
-			username, password, err := r.collectDefaultUserCredentials(ctx, instance)
-			if err != nil {
-				Log.Error(err, "Failed to collect default user credentials")
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-			}
-			if err := r.createBackupSecret(ctx, instance, backupSecretName, username, password); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-
-		// Step 2: Delete RabbitMQ resource, pods, and PVCs
-		if err := r.deleteRabbitMQResources(ctx, instance); err != nil {
-			Log.Error(err, "Failed to delete RabbitMQ resources")
-			return ctrl.Result{}, err
-		}
+	// Step 1: Delete StatefulSets to trigger recreation with new version
+	if err := r.deleteStatefulSets(ctx, instance); err != nil {
+		Log.Error(err, "Failed to delete StatefulSets")
+		return ctrl.Result{}, err
 	}
 
-	// Wait for resources to be fully deleted
-	if r.rabbitmqResourcesExist(ctx, instance) {
-		Log.Info("Waiting for RabbitMQ resources to be deleted")
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-
-	// Wait for cluster to be ready
+	// Step 2: Wait for cluster to be ready with new version
 	ready, err := r.isClusterReady(ctx, instance)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -646,24 +619,6 @@ func (r *Reconciler) handleVersionUpgrade(ctx context.Context, instance *rabbitm
 	if !ready {
 		Log.Info("Waiting for RabbitMQ cluster to be ready after upgrade")
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	// Step 3: Restore credentials from backup and create upgrade user
-	backupSecret := &corev1.Secret{}
-	if err := r.Client.Get(ctx, types.NamespacedName{Name: backupSecretName, Namespace: instance.Namespace}, backupSecret); err != nil {
-		return ctrl.Result{}, err
-	}
-	username := string(backupSecret.Data["username"])
-	password := string(backupSecret.Data["password"])
-
-	if err := r.createUpgradeUser(ctx, instance, username, password); err != nil {
-		Log.Error(err, "Failed to create upgrade user")
-		return ctrl.Result{}, err
-	}
-
-	// Cleanup backup secret
-	if err := r.Client.Delete(ctx, backupSecret); err != nil && !k8s_errors.IsNotFound(err) {
-		Log.Error(err, "Failed to delete backup secret")
 	}
 
 	// Upgrade complete - update version label and clear status
@@ -674,66 +629,40 @@ func (r *Reconciler) handleVersionUpgrade(ctx context.Context, instance *rabbitm
 	return ctrl.Result{}, nil
 }
 
-// collectDefaultUserCredentials retrieves the default user credentials from the secret
-func (r *Reconciler) collectDefaultUserCredentials(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) (string, string, error) {
-	rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
-	if err := r.Client.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, rabbitmqCluster); err != nil {
-		return "", "", err
-	}
-
-	secretName := rabbitmqCluster.Status.DefaultUser.SecretReference.Name
-	secret := &corev1.Secret{}
-	if err := r.Client.Get(ctx, types.NamespacedName{Name: secretName, Namespace: instance.Namespace}, secret); err != nil {
-		return "", "", err
-	}
-
-	username := string(secret.Data["username"])
-	password := string(secret.Data["password"])
-	if username == "" || password == "" {
-		return "", "", fmt.Errorf("username or password not found in secret %s", secretName)
-	}
-
-	return username, password, nil
-}
-
-// createBackupSecret creates a temporary secret to store credentials during upgrade
-func (r *Reconciler) createBackupSecret(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, secretName, username, password string) error {
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: instance.Namespace,
-		},
-		Data: map[string][]byte{
-			"username": []byte(username),
-			"password": []byte(password),
-		},
-	}
-	if err := controllerutil.SetControllerReference(instance, secret, r.Scheme); err != nil {
-		return err
-	}
-	return r.Client.Create(ctx, secret)
-}
-
-// deleteRabbitMQResources deletes the underlying RabbitmqCluster resource
-func (r *Reconciler) deleteRabbitMQResources(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) error {
+// deleteStatefulSets deletes the RabbitMQ StatefulSets and PVCs to trigger recreation
+func (r *Reconciler) deleteStatefulSets(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) error {
 	Log := r.GetLogger(ctx)
 
-	rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
-	err := r.Client.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, rabbitmqCluster)
+	// Delete StatefulSet
+	sts := &appsv1.StatefulSet{}
+	err := r.Client.Get(ctx, types.NamespacedName{Name: instance.Name + "-server", Namespace: instance.Namespace}, sts)
 	if err == nil {
-		if err := r.Client.Delete(ctx, rabbitmqCluster); err != nil && !k8s_errors.IsNotFound(err) {
+		if err := r.Client.Delete(ctx, sts); err != nil && !k8s_errors.IsNotFound(err) {
 			return err
 		}
-		Log.Info("Deleted RabbitmqCluster")
+		Log.Info("Deleted StatefulSet")
+	} else if !k8s_errors.IsNotFound(err) {
+		return err
+	}
+
+	// Delete PVCs
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	listOpts := []client.ListOption{
+		client.InNamespace(instance.Namespace),
+		client.MatchingLabels{"app.kubernetes.io/name": instance.Name},
+	}
+	if err := r.Client.List(ctx, pvcList, listOpts...); err == nil {
+		for i := range pvcList.Items {
+			if err := r.Client.Delete(ctx, &pvcList.Items[i]); err != nil && !k8s_errors.IsNotFound(err) {
+				return err
+			}
+		}
+		if len(pvcList.Items) > 0 {
+			Log.Info(fmt.Sprintf("Deleted %d PVCs", len(pvcList.Items)))
+		}
 	}
 
 	return nil
-}
-
-// rabbitmqResourcesExist checks if RabbitmqCluster still exists
-func (r *Reconciler) rabbitmqResourcesExist(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) bool {
-	rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
-	return r.Client.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, rabbitmqCluster) == nil
 }
 
 // isClusterReady checks if the RabbitMQ cluster is ready
