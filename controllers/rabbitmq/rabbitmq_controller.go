@@ -604,23 +604,38 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1be
 func (r *Reconciler) handleVersionUpgrade(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper, targetVersion string) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 
-	// Step 1: Collect default user credentials before any deletion
-	username, password, err := r.collectDefaultUserCredentials(ctx, instance)
-	if err != nil {
-		Log.Error(err, "Failed to collect default user credentials")
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
+	// Step 1: Preserve credentials in backup secret before cluster deletion
+	backupSecretName := instance.Name + "-upgrade-backup"
+	if !r.rabbitmqResourcesExist(ctx, instance) {
+		// Cluster already deleted, skip credential collection
+		Log.Info("Cluster already deleted, skipping credential backup")
+	} else {
+		// Check if backup secret already exists
+		backupSecret := &corev1.Secret{}
+		err := r.Client.Get(ctx, types.NamespacedName{Name: backupSecretName, Namespace: instance.Namespace}, backupSecret)
+		if k8s_errors.IsNotFound(err) {
+			// Collect and backup credentials
+			username, password, err := r.collectDefaultUserCredentials(ctx, instance)
+			if err != nil {
+				Log.Error(err, "Failed to collect default user credentials")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			if err := r.createBackupSecret(ctx, instance, backupSecretName, username, password); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 
-	// Step 2: Pause cluster-operator reconciliation
-	if err := r.pauseClusterOperator(ctx, instance); err != nil {
-		Log.Error(err, "Failed to pause cluster-operator")
-		return ctrl.Result{}, err
-	}
+		// Step 2: Pause cluster-operator reconciliation
+		if err := r.pauseClusterOperator(ctx, instance); err != nil {
+			Log.Error(err, "Failed to pause cluster-operator")
+			return ctrl.Result{}, err
+		}
 
-	// Step 3: Delete RabbitMQ resource, pods, and PVCs
-	if err := r.deleteRabbitMQResources(ctx, instance); err != nil {
-		Log.Error(err, "Failed to delete RabbitMQ resources")
-		return ctrl.Result{}, err
+		// Step 3: Delete RabbitMQ resource, pods, and PVCs
+		if err := r.deleteRabbitMQResources(ctx, instance); err != nil {
+			Log.Error(err, "Failed to delete RabbitMQ resources")
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Wait for resources to be fully deleted
@@ -645,10 +660,22 @@ func (r *Reconciler) handleVersionUpgrade(ctx context.Context, instance *rabbitm
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	// Step 5: Create RabbitMQUser with preserved credentials
+	// Step 5: Restore credentials from backup and create upgrade user
+	backupSecret := &corev1.Secret{}
+	if err := r.Client.Get(ctx, types.NamespacedName{Name: backupSecretName, Namespace: instance.Namespace}, backupSecret); err != nil {
+		return ctrl.Result{}, err
+	}
+	username := string(backupSecret.Data["username"])
+	password := string(backupSecret.Data["password"])
+
 	if err := r.createUpgradeUser(ctx, instance, username, password); err != nil {
 		Log.Error(err, "Failed to create upgrade user")
 		return ctrl.Result{}, err
+	}
+
+	// Cleanup backup secret
+	if err := r.Client.Delete(ctx, backupSecret); err != nil && !k8s_errors.IsNotFound(err) {
+		Log.Error(err, "Failed to delete backup secret")
 	}
 
 	// Upgrade complete - update version label and clear status
@@ -733,6 +760,24 @@ func (r *Reconciler) collectDefaultUserCredentials(ctx context.Context, instance
 	}
 
 	return username, password, nil
+}
+
+// createBackupSecret creates a temporary secret to store credentials during upgrade
+func (r *Reconciler) createBackupSecret(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, secretName, username, password string) error {
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: instance.Namespace,
+		},
+		Data: map[string][]byte{
+			"username": []byte(username),
+			"password": []byte(password),
+		},
+	}
+	if err := controllerutil.SetControllerReference(instance, secret, r.Scheme); err != nil {
+		return err
+	}
+	return r.Client.Create(ctx, secret)
 }
 
 // deleteRabbitMQResources deletes the RabbitMQ cluster, pods, and PVCs
