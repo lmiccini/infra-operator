@@ -604,17 +604,17 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1be
 func (r *Reconciler) handleVersionUpgrade(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper, targetVersion string) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 
-	// Step 1: Pause cluster-operator reconciliation
-	if err := r.pauseClusterOperator(ctx, instance); err != nil {
-		Log.Error(err, "Failed to pause cluster-operator")
-		return ctrl.Result{}, err
-	}
-
-	// Step 2: Collect default user credentials
+	// Step 1: Collect default user credentials before any deletion
 	username, password, err := r.collectDefaultUserCredentials(ctx, instance)
 	if err != nil {
 		Log.Error(err, "Failed to collect default user credentials")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// Step 2: Pause cluster-operator reconciliation
+	if err := r.pauseClusterOperator(ctx, instance); err != nil {
+		Log.Error(err, "Failed to pause cluster-operator")
+		return ctrl.Result{}, err
 	}
 
 	// Step 3: Delete RabbitMQ resource, pods, and PVCs
