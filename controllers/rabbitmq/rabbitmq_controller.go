@@ -715,17 +715,19 @@ func (r *Reconciler) resumeClusterOperator(ctx context.Context, instance *rabbit
 
 // collectDefaultUserCredentials retrieves the default user credentials from the secret
 func (r *Reconciler) collectDefaultUserCredentials(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) (string, string, error) {
-	secretName := instance.Name + "-default-user"
-	secret := &corev1.Secret{}
+	rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{}
+	if err := r.Client.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, rabbitmqCluster); err != nil {
+		return "", "", err
+	}
 
-	err := r.Client.Get(ctx, types.NamespacedName{Name: secretName, Namespace: instance.Namespace}, secret)
-	if err != nil {
+	secretName := rabbitmqCluster.Status.DefaultUser.SecretReference.Name
+	secret := &corev1.Secret{}
+	if err := r.Client.Get(ctx, types.NamespacedName{Name: secretName, Namespace: instance.Namespace}, secret); err != nil {
 		return "", "", err
 	}
 
 	username := string(secret.Data["username"])
 	password := string(secret.Data["password"])
-
 	if username == "" || password == "" {
 		return "", "", fmt.Errorf("username or password not found in secret %s", secretName)
 	}
