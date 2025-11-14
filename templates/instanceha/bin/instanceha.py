@@ -193,7 +193,7 @@ def validate_input(value: str, validation_type: str, context: str) -> bool:
                 logging.error(f"Blocked localhost/link-local access in {context}")
                 return False
             return True
-        except:
+        except Exception:
             return False
 
     if validation_type == 'ip_address':
