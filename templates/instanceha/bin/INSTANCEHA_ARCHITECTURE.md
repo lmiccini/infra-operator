@@ -133,9 +133,6 @@ self.kdump_listener_stop_event = threading.Event()  # Stop signal
 # Host processing tracking
 self.hosts_processing = defaultdict(float)      # Host -> processing start
 self.processing_lock = threading.Lock()         # Thread-safe tracking
-
-# Evacuation tracking
-self.host_evacuation_counts = defaultdict(int)  # Host -> VM count
 ```
 
 **Key Methods**:

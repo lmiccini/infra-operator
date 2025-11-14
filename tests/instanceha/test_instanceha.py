@@ -936,7 +936,6 @@ class TestEvacuationFunctions(unittest.TestCase):
         mock_service.config.get_workers.return_value = 4
         mock_service.config.get_delay.return_value = 0
         mock_service.is_server_evacuable.return_value = True
-        mock_service.host_evacuation_counts = {}  # Add proper dict for evacuation counts
 
         # Mock servers
         mock_server1 = Mock()
@@ -990,7 +989,6 @@ class TestEvacuationFunctions(unittest.TestCase):
         mock_service.config.get_workers.return_value = 4
         mock_service.config.get_delay.return_value = 0
         mock_service.is_server_evacuable.return_value = True
-        mock_service.host_evacuation_counts = {}  # Add proper dict for evacuation counts
 
         # Mock servers
         mock_server1 = Mock()
@@ -1051,7 +1049,6 @@ class TestEvacuationFunctions(unittest.TestCase):
         mock_service.config.get_workers.return_value = 4
         mock_service.config.get_delay.return_value = 0
         mock_service.is_server_evacuable.return_value = True
-        mock_service.host_evacuation_counts = {}  # Add proper dict for evacuation counts
 
         # Mock servers
         mock_server1 = Mock()

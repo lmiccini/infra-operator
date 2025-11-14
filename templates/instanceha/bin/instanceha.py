@@ -724,7 +724,6 @@ class InstanceHAService(CloudConnectionProvider):
         self.processing_lock = threading.Lock()  # Thread-safe access to processing dict
 
         # Evacuation tracking
-        self.host_evacuation_counts = defaultdict(int)  # Track VM count evacuated per host
         self.kdump_fenced_hosts = set()  # Track hosts fenced via kdump for power-on skip
 
         logging.info("InstanceHA service initialized successfully")
@@ -1439,10 +1438,6 @@ def _host_evacuate(connection, failed_service, service):
     if not evacuables:
         logging.info("Nothing to evacuate")
         return True
-
-    # Track evacuation count for this host
-    service.host_evacuation_counts[host] = len(evacuables)
-    logging.debug(f"Tracking {len(evacuables)} evacuations for host {host}")
 
     # Sleep for configured delay
     time.sleep(service.config.get_delay())
@@ -2664,21 +2659,19 @@ def _process_reenabling(conn, service, to_reenable) -> None:
             if force_enable:
                 _host_enable(conn, svc, reenable=True)
                 logging.info(f'Force re-enabled {svc.host}')
-                # Clean up evacuation count
-                service.host_evacuation_counts.pop(svc.host, None)
             else:
-                # Use stored evacuation count, default for backward compatibility
-                evacuation_count = service.host_evacuation_counts.get(svc.host, DEFAULT_EVACUATION_COUNT)
-                migrations = conn.migrations.list(source_compute=svc.host, migration_type='evacuation', limit=evacuation_count)
+                # Query recent migrations from this host
+                query_time = (datetime.now() - timedelta(minutes=MIGRATION_QUERY_MINUTES)).isoformat()
+                migrations = conn.migrations.list(source_compute=svc.host, migration_type='evacuation',
+                                                 changes_since=query_time, limit=MIGRATION_QUERY_LIMIT)
                 incomplete = [m for m in migrations if m.status not in MIGRATION_STATUS_COMPLETED and m.status not in MIGRATION_STATUS_ERROR]
 
                 if not incomplete:
                     _host_enable(conn, svc, reenable=True)
-                    logging.info(f'All {evacuation_count} migrations completed, re-enabled {svc.host}')
-                    # Clean up evacuation count
-                    service.host_evacuation_counts.pop(svc.host, None)
+                    completed_count = len([m for m in migrations if m.status in MIGRATION_STATUS_COMPLETED])
+                    logging.info(f'All {completed_count} migrations completed, re-enabled {svc.host}')
                 else:
-                    logging.debug(f'{len(incomplete)}/{evacuation_count} migration(s) incomplete for {svc.host}, not re-enabling')
+                    logging.debug(f'{len(incomplete)}/{len(migrations)} migration(s) incomplete for {svc.host}, not re-enabling')
         except Exception as e:
             logging.error(f'Failed to enable {svc.host}: {e}')
 
