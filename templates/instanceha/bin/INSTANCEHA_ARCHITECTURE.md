@@ -5,9 +5,8 @@
 InstanceHA is a high-availability service for OpenStack that automatically detects and evacuates instances from failed compute nodes. It provides intelligent failure detection, flexible tagging, multiple fencing mechanisms, and comprehensive error handling to ensure workload continuity in production OpenStack clouds.
 
 **Version**: 2.0
-**Code Coverage**: 70% (1132/1625 lines)
-**Test Suite**: 197 tests, ~14 seconds execution time
-**Status**: Production-ready ✅
+**Code Coverage**: 71% (1140/1625 lines)
+**Test Suite**: 200 tests, ~14 seconds execution time
 
 ## Table of Contents
 
@@ -943,17 +942,16 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
 
 ### Test Statistics
 
-- **Total Tests**: 197
-- **Code Coverage**: 70% (1132/1625 lines)
+- **Total Tests**: 200
+- **Code Coverage**: 71% (1140/1625 lines)
 - **Execution Time**: ~14 seconds
-- **Success Rate**: 100%
 
 ### Test Categories
 
-**1. Unit Tests** (131 tests):
-- Configuration, metrics, evacuation logic
-- Smart evacuation, kdump, fencing
-- Input validation, thread safety
+**1. Unit Tests** (134 tests):
+- Configuration, metrics, main function initialization
+- Evacuation logic, smart evacuation
+- Kdump, fencing, input validation, thread safety
 
 **2. Functional Tests** (60 tests):
 - End-to-end workflows

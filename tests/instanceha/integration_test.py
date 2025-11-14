@@ -308,7 +308,9 @@ class TestServiceInitialization(unittest.TestCase):
         config_manager.secure_path = secure_path
         config_manager.__init__(config_path)
 
-        with patch('threading.Thread') as mock_thread:
+        # Patch global config_manager for _initialize_service
+        with patch('instanceha.config_manager', config_manager), \
+             patch('threading.Thread') as mock_thread:
             mock_thread_instance = Mock()
             mock_thread.return_value = mock_thread_instance
 

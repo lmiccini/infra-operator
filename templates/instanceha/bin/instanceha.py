@@ -1310,16 +1310,8 @@ class InstanceHAService(CloudConnectionProvider):
         return True
 
 
-# Initialize global configuration manager
-try:
-    config_manager = ConfigManager()
-    logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=config_manager.get_log_level())
-    logging.info("Configuration loaded successfully")
-except ConfigurationError as e:
-    logging.error("Configuration failed: %s", e)
-    sys.exit(1)
-
-# Global service instance will be created in main()
+# Global config_manager will be initialized in main()
+config_manager = None
 
 class UDPSocketManager:
     """Context manager for UDP socket handling with proper resource cleanup."""
@@ -2691,6 +2683,16 @@ def _process_reenabling(conn, service, to_reenable) -> None:
             logging.error(f'Failed to enable {svc.host}: {e}')
 
 def main():
+    # Initialize configuration
+    global config_manager
+    try:
+        config_manager = ConfigManager()
+        logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=config_manager.get_log_level())
+        logging.info("Configuration loaded successfully")
+    except ConfigurationError as e:
+        logging.error("Configuration failed: %s", e)
+        sys.exit(1)
+
     # Initialize service and establish connections
     service, metrics = _initialize_service()
     conn = _establish_nova_connection(service)

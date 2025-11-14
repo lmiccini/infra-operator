@@ -1453,11 +1453,11 @@ class TestRedfishFencing(unittest.TestCase):
 
     @patch('instanceha.requests.post')
     @patch('instanceha.requests.get')
-    @patch('instanceha.config_manager.get_requests_ssl_config')
-    def test_redfish_reset_409_conflict_already_off(self, mock_ssl_config, mock_get, mock_post):
+    @patch('instanceha.config_manager')
+    def test_redfish_reset_409_conflict_already_off(self, mock_config_manager, mock_get, mock_post):
         """Test Redfish reset with 409 conflict when server is already off."""
         # Mock SSL config
-        mock_ssl_config.return_value = False
+        mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 409 Conflict
         mock_post_response = Mock()
@@ -1484,11 +1484,11 @@ class TestRedfishFencing(unittest.TestCase):
 
     @patch('instanceha.requests.post')
     @patch('instanceha.requests.get')
-    @patch('instanceha.config_manager.get_requests_ssl_config')
-    def test_redfish_reset_409_conflict_not_off(self, mock_ssl_config, mock_get, mock_post):
+    @patch('instanceha.config_manager')
+    def test_redfish_reset_409_conflict_not_off(self, mock_config_manager, mock_get, mock_post):
         """Test Redfish reset with 409 conflict when server is not off."""
         # Mock SSL config
-        mock_ssl_config.return_value = False
+        mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 409 Conflict
         mock_post_response = Mock()
@@ -1513,11 +1513,11 @@ class TestRedfishFencing(unittest.TestCase):
 
     @patch('instanceha.requests.post')
     @patch('instanceha.requests.get')
-    @patch('instanceha.config_manager.get_requests_ssl_config')
-    def test_redfish_reset_400_bad_request_already_off(self, mock_ssl_config, mock_get, mock_post):
+    @patch('instanceha.config_manager')
+    def test_redfish_reset_400_bad_request_already_off(self, mock_config_manager, mock_get, mock_post):
         """Test Redfish reset with 400 bad request when server is already off."""
         # Mock SSL config
-        mock_ssl_config.return_value = False
+        mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 400 Bad Request
         mock_post_response = Mock()
@@ -1544,11 +1544,11 @@ class TestRedfishFencing(unittest.TestCase):
 
     @patch('instanceha.requests.post')
     @patch('instanceha.requests.get')
-    @patch('instanceha.config_manager.get_requests_ssl_config')
-    def test_redfish_reset_400_bad_request_not_off(self, mock_ssl_config, mock_get, mock_post):
+    @patch('instanceha.config_manager')
+    def test_redfish_reset_400_bad_request_not_off(self, mock_config_manager, mock_get, mock_post):
         """Test Redfish reset with 400 bad request when server is not off."""
         # Mock SSL config
-        mock_ssl_config.return_value = False
+        mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 400 Bad Request
         mock_post_response = Mock()
@@ -1572,11 +1572,11 @@ class TestRedfishFencing(unittest.TestCase):
         mock_get.assert_called_once()
 
     @patch('instanceha.requests.post')
-    @patch('instanceha.config_manager.get_requests_ssl_config')
-    def test_redfish_reset_success(self, mock_ssl_config, mock_post):
+    @patch('instanceha.config_manager')
+    def test_redfish_reset_success(self, mock_config_manager, mock_post):
         """Test successful Redfish reset."""
         # Mock SSL config
-        mock_ssl_config.return_value = False
+        mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 200 OK
         mock_post_response = Mock()
@@ -1593,11 +1593,11 @@ class TestRedfishFencing(unittest.TestCase):
         mock_post.assert_called_once()
 
     @patch('requests.get')
-    @patch('instanceha.config_manager.get_requests_ssl_config')
-    def test_redfish_get_power_state_success(self, mock_ssl_config, mock_get):
+    @patch('instanceha.config_manager')
+    def test_redfish_get_power_state_success(self, mock_config_manager, mock_get):
         """Test successful power state retrieval."""
         # Mock SSL config
-        mock_ssl_config.return_value = False
+        mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock GET response - ensure it returns immediately
         mock_get_response = Mock()
@@ -1619,11 +1619,11 @@ class TestRedfishFencing(unittest.TestCase):
         self.assertEqual(call_args[1]['timeout'], 0.1)  # Verify timeout parameter
 
     @patch('requests.get')
-    @patch('instanceha.config_manager.get_requests_ssl_config')
-    def test_redfish_get_power_state_failure(self, mock_ssl_config, mock_get):
+    @patch('instanceha.config_manager')
+    def test_redfish_get_power_state_failure(self, mock_config_manager, mock_get):
         """Test power state retrieval failure."""
         # Mock SSL config
-        mock_ssl_config.return_value = False
+        mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock GET response returning error
         mock_get_response = Mock()
@@ -1641,16 +1641,16 @@ class TestRedfishFencing(unittest.TestCase):
 
     @patch('instanceha.requests.post')
     @patch('requests.get')
-    @patch('instanceha.config_manager.get_requests_ssl_config')
+    @patch('instanceha.config_manager')
     @patch('instanceha.time.sleep')
-    def test_redfish_reset_forceoff_wait_for_power_off(self, mock_sleep, mock_ssl_config, mock_get, mock_post):
+    def test_redfish_reset_forceoff_wait_for_power_off(self, mock_sleep, mock_config_manager, mock_get, mock_post):
         """Test Redfish ForceOff waits for actual power off confirmation."""
         # Reset mock call counts
         mock_get.reset_mock()
         mock_sleep.reset_mock()
 
         # Mock SSL config
-        mock_ssl_config.return_value = False
+        mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 200 OK
         mock_post_response = Mock()
@@ -1677,12 +1677,12 @@ class TestRedfishFencing(unittest.TestCase):
 
     @patch('instanceha.requests.post')
     @patch('requests.get')
-    @patch('instanceha.config_manager.get_requests_ssl_config')
+    @patch('instanceha.config_manager')
     @patch('instanceha.time.sleep')
-    def test_redfish_reset_forceoff_timeout(self, mock_sleep, mock_ssl_config, mock_get, mock_post):
+    def test_redfish_reset_forceoff_timeout(self, mock_sleep, mock_config_manager, mock_get, mock_post):
         """Test Redfish ForceOff times out waiting for power off."""
         # Mock SSL config
-        mock_ssl_config.return_value = False
+        mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 200 OK
         mock_post_response = Mock()
@@ -1707,11 +1707,11 @@ class TestRedfishFencing(unittest.TestCase):
         self.assertGreaterEqual(mock_sleep.call_count, 2)  # At least 2 sleep calls expected
 
     @patch('instanceha.requests.post')
-    @patch('instanceha.config_manager.get_requests_ssl_config')
-    def test_redfish_reset_on_no_wait(self, mock_ssl_config, mock_post):
+    @patch('instanceha.config_manager')
+    def test_redfish_reset_on_no_wait(self, mock_config_manager, mock_post):
         """Test Redfish On action doesn't wait for power off."""
         # Mock SSL config
-        mock_ssl_config.return_value = False
+        mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 200 OK
         mock_post_response = Mock()
@@ -1726,11 +1726,11 @@ class TestRedfishFencing(unittest.TestCase):
         mock_post.assert_called_once()
 
     @patch('instanceha.requests.post')
-    @patch('instanceha.config_manager.get_requests_ssl_config')
+    @patch('instanceha.config_manager')
     @patch('instanceha.time.sleep')
-    def test_redfish_reset_retry_on_server_error(self, mock_sleep, mock_ssl_config, mock_post):
+    def test_redfish_reset_retry_on_server_error(self, mock_sleep, mock_config_manager, mock_post):
         """Test Redfish reset retries on 5xx server errors."""
-        mock_ssl_config.return_value = False
+        mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST responses: first two 503 errors, then 200 success
         mock_post_responses = [
@@ -1748,11 +1748,11 @@ class TestRedfishFencing(unittest.TestCase):
         self.assertEqual(mock_sleep.call_count, 2)  # Sleep between retries
 
     @patch('instanceha.requests.post')
-    @patch('instanceha.config_manager.get_requests_ssl_config')
+    @patch('instanceha.config_manager')
     @patch('instanceha.time.sleep')
-    def test_redfish_reset_retry_exhausted(self, mock_sleep, mock_ssl_config, mock_post):
+    def test_redfish_reset_retry_exhausted(self, mock_sleep, mock_config_manager, mock_post):
         """Test Redfish reset fails after max retries on server errors."""
-        mock_ssl_config.return_value = False
+        mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST always returning 503
         mock_post_response = Mock(status_code=503)
@@ -1766,11 +1766,11 @@ class TestRedfishFencing(unittest.TestCase):
         self.assertEqual(mock_sleep.call_count, 2)
 
     @patch('instanceha.requests.post')
-    @patch('instanceha.config_manager.get_requests_ssl_config')
+    @patch('instanceha.config_manager')
     @patch('instanceha.time.sleep')
-    def test_redfish_reset_retry_on_network_error(self, mock_sleep, mock_ssl_config, mock_post):
+    def test_redfish_reset_retry_on_network_error(self, mock_sleep, mock_config_manager, mock_post):
         """Test Redfish reset retries on network errors."""
-        mock_ssl_config.return_value = False
+        mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock network errors then success
         import requests.exceptions
@@ -1788,10 +1788,10 @@ class TestRedfishFencing(unittest.TestCase):
         self.assertEqual(mock_sleep.call_count, 2)
 
     @patch('instanceha.requests.post')
-    @patch('instanceha.config_manager.get_requests_ssl_config')
-    def test_redfish_reset_no_retry_on_auth_error(self, mock_ssl_config, mock_post):
+    @patch('instanceha.config_manager')
+    def test_redfish_reset_no_retry_on_auth_error(self, mock_config_manager, mock_post):
         """Test Redfish reset doesn't retry on 401/403 auth errors."""
-        mock_ssl_config.return_value = False
+        mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 401
         mock_post_response = Mock(status_code=401)
@@ -1804,11 +1804,11 @@ class TestRedfishFencing(unittest.TestCase):
         mock_post.assert_called_once()  # Only called once, no retry
 
     @patch('instanceha.requests.post')
-    @patch('instanceha.config_manager.get_requests_ssl_config')
+    @patch('instanceha.config_manager')
     @patch('instanceha.logging.error')
-    def test_redfish_reset_url_sanitization(self, mock_log, mock_ssl_config, mock_post):
+    def test_redfish_reset_url_sanitization(self, mock_log, mock_config_manager, mock_post):
         """Test that URLs with embedded credentials are sanitized in logs."""
-        mock_ssl_config.return_value = False
+        mock_config_manager.get_requests_ssl_config.return_value = False
 
         # URL with embedded credentials
         url_with_creds = 'http://admin:secret123@test-server/redfish/v1/Systems/1'
@@ -3257,7 +3257,7 @@ class TestBMHFencingEdgeCases(unittest.TestCase):
         mock_session.get.return_value = mock_response
 
         with patch('requests.Session', return_value=mock_session), \
-             patch('instanceha.config_manager.get_requests_ssl_config', return_value=True), \
+             patch('instanceha.config_manager', Mock(get_requests_ssl_config=Mock(return_value=True))), \
              patch('time.sleep'), \
              patch('time.time', side_effect=[0, 2]):  # Simulate timeout
             get_url = 'https://api.test.com/apis/metal3.io/v1alpha1/namespaces/test-ns/baremetalhosts/test-bmh'
@@ -3288,7 +3288,7 @@ class TestBMHFencingEdgeCases(unittest.TestCase):
         mock_session.get.return_value = mock_response
 
         with patch('requests.Session', return_value=mock_session), \
-             patch('instanceha.config_manager.get_requests_ssl_config', return_value=True), \
+             patch('instanceha.config_manager', Mock(get_requests_ssl_config=Mock(return_value=True))), \
              patch('time.sleep'), \
              patch('time.time', side_effect=[0, 2]):  # Simulate timeout
             get_url = 'https://api.test.com/apis/metal3.io/v1alpha1/namespaces/test-ns/baremetalhosts/test-bmh'
@@ -3321,7 +3321,7 @@ class TestBMHFencingEdgeCases(unittest.TestCase):
             mock_session.get.return_value = mock_response
 
             with patch('requests.Session', return_value=mock_session), \
-                 patch('instanceha.config_manager.get_requests_ssl_config', return_value=True), \
+                 patch('instanceha.config_manager', Mock(get_requests_ssl_config=Mock(return_value=True))), \
                  patch('time.sleep'), \
                  patch('time.time', side_effect=[0, 2]):  # Simulate timeout
                 get_url = 'https://api.test.com/apis/metal3.io/v1alpha1/namespaces/test-ns/baremetalhosts/test-bmh'
@@ -3346,7 +3346,7 @@ class TestBMHFencingEdgeCases(unittest.TestCase):
         mock_session.get.side_effect = requests.exceptions.Timeout("Network timeout")
 
         with patch('requests.Session', return_value=mock_session), \
-             patch('instanceha.config_manager.get_requests_ssl_config', return_value=True), \
+             patch('instanceha.config_manager', Mock(get_requests_ssl_config=Mock(return_value=True))), \
              patch('time.time') as mock_time, \
              patch('time.sleep'):
             # Mock time to simulate timeout immediately
@@ -3388,7 +3388,7 @@ class TestBMHFencingEdgeCases(unittest.TestCase):
         mock_session.get.side_effect = side_effect
 
         with patch('requests.Session', return_value=mock_session), \
-             patch('instanceha.config_manager.get_requests_ssl_config', return_value=True), \
+             patch('instanceha.config_manager', Mock(get_requests_ssl_config=Mock(return_value=True))), \
              patch('time.sleep'):  # Mock sleep to avoid delays
             get_url = 'https://api.test.com/apis/metal3.io/v1alpha1/namespaces/test-ns/baremetalhosts/test-bmh'
             headers = {'Authorization': 'Bearer fake-token'}
@@ -3459,7 +3459,7 @@ class TestBMHFencingEdgeCases(unittest.TestCase):
         mock_session.get.return_value = mock_response
 
         with patch('requests.Session', return_value=mock_session), \
-             patch('instanceha.config_manager.get_requests_ssl_config', return_value=True), \
+             patch('instanceha.config_manager', Mock(get_requests_ssl_config=Mock(return_value=True))), \
              patch('time.sleep') as mock_sleep:
             get_url = 'https://api.test.com/apis/metal3.io/v1alpha1/namespaces/test-ns/baremetalhosts/test-bmh'
             headers = {'Authorization': 'Bearer fake-token'}
@@ -4959,7 +4959,12 @@ class TestAdvancedIntegration(unittest.TestCase):
             'timeout': 10
         }
 
-        with patch('instanceha.requests.post') as mock_post:
+        # Patch global config_manager for SSL config access
+        mock_global_config = Mock()
+        mock_global_config.get_requests_ssl_config.return_value = False
+
+        with patch('instanceha.config_manager', mock_global_config), \
+             patch('instanceha.requests.post') as mock_post:
             # First attempt: network error, second: success
             mock_response = Mock(status_code=200)
             mock_post.side_effect = [
@@ -5070,6 +5075,86 @@ class TestAdvancedIntegration(unittest.TestCase):
             self.assertEqual(summary['counters']['evacuations_total'], 5)
 
 
+class TestMainFunction(unittest.TestCase):
+    """Test main() function initialization."""
+
+    def test_main_config_initialization_success(self):
+        """Test main() successfully initializes global config_manager."""
+        with patch('instanceha.ConfigManager') as mock_cm_class, \
+             patch('instanceha._initialize_service') as mock_init, \
+             patch('instanceha._establish_nova_connection'), \
+             patch('instanceha.logging.basicConfig'):
+
+            # Mock ConfigManager instance
+            mock_cm = Mock()
+            mock_cm.get_log_level.return_value = 'INFO'
+            mock_cm_class.return_value = mock_cm
+
+            # Mock service and metrics with proper attributes
+            mock_service = Mock()
+            mock_service.update_health_hash = Mock()
+            mock_metrics = Mock()
+            mock_metrics._last_summary = 0
+            mock_init.return_value = (mock_service, mock_metrics)
+
+            # Mock the main loop to exit after config initialization
+            with patch.object(mock_service, 'update_health_hash', side_effect=KeyboardInterrupt):
+                try:
+                    instanceha.main()
+                except KeyboardInterrupt:
+                    pass
+
+            # Verify ConfigManager was created
+            mock_cm_class.assert_called_once()
+            # Verify _initialize_service was called
+            mock_init.assert_called_once()
+
+    def test_main_config_initialization_failure(self):
+        """Test main() handles ConfigurationError with sys.exit(1)."""
+        with patch('instanceha.ConfigManager') as mock_cm_class, \
+             patch('instanceha.sys.exit') as mock_exit:
+
+            # Mock ConfigManager to raise ConfigurationError
+            mock_cm_class.side_effect = instanceha.ConfigurationError("Invalid config")
+
+            # Make sys.exit raise SystemExit to stop execution
+            mock_exit.side_effect = SystemExit(1)
+
+            # Run main and expect SystemExit
+            with self.assertRaises(SystemExit):
+                instanceha.main()
+
+            # Verify sys.exit(1) was called
+            mock_exit.assert_called_once_with(1)
+
+    def test_main_global_config_manager_set(self):
+        """Test main() sets the global config_manager variable."""
+        with patch('instanceha.ConfigManager') as mock_cm_class, \
+             patch('instanceha._initialize_service') as mock_init, \
+             patch('instanceha._establish_nova_connection'), \
+             patch('instanceha.logging.basicConfig'):
+
+            mock_cm = Mock()
+            mock_cm.get_log_level.return_value = 'INFO'
+            mock_cm_class.return_value = mock_cm
+
+            mock_service = Mock()
+            mock_service.update_health_hash = Mock()
+            mock_metrics = Mock()
+            mock_metrics._last_summary = 0
+            mock_init.return_value = (mock_service, mock_metrics)
+
+            # Exit after initialization
+            with patch.object(mock_service, 'update_health_hash', side_effect=KeyboardInterrupt):
+                try:
+                    instanceha.main()
+                except KeyboardInterrupt:
+                    pass
+
+            # Verify _initialize_service was called (which uses global config_manager)
+            mock_init.assert_called_once()
+
+
 if __name__ == '__main__':
     # Create test suite
     test_suite = unittest.TestSuite()
@@ -5098,6 +5183,7 @@ if __name__ == '__main__':
         TestPerformanceAndMemory,
         TestFunctionalIntegration,
         TestAdvancedIntegration,
+        TestMainFunction,
     ]
 
     for test_class in test_classes:

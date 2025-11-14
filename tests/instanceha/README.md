@@ -4,8 +4,8 @@ This directory contains a comprehensive test suite for the InstanceHA service th
 
 ## Test Statistics
 
-- **Total Tests**: 197
-- **Code Coverage**: 70% (1132/1625 lines)
+- **Total Tests**: 200
+- **Code Coverage**: 71% (1140/1625 lines)
 - **Execution Time**: ~14 seconds
 - **Status**: All tests passing ✅
 
@@ -14,10 +14,11 @@ This directory contains a comprehensive test suite for the InstanceHA service th
 The test suite is organized into four main categories:
 
 ### 1. Unit Tests (`test_instanceha.py`)
-- **131 tests** validating individual components and isolated functionality
+- **134 tests** validating individual components and isolated functionality
 - Configuration management and validation
 - Metrics collection and timing
 - Service initialization and caching
+- Main function initialization and error handling
 - Evacuation logic and tag checking
 - Smart evacuation with success, failure, and exception path testing
 - Kdump detection and UDP message processing
@@ -104,6 +105,7 @@ python3 -m coverage html  # Generate HTML report
 - **Reserved Hosts**: 55%
 
 ### Core Functionality
+- Main function initialization with config loading and error handling
 - Service initialization and configuration loading
 - Nova API connection establishment
 - Service state categorization (stale, resume, re-enable)
