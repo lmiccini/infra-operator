@@ -26,6 +26,37 @@ InstanceHA is a high-availability service for OpenStack that automatically detec
 
 ## Core Components
 
+### 0. Data Structures
+
+**Location**: `instanceha.py:104-116`
+
+**Dataclasses**:
+
+```python
+@dataclass
+class EvacuationResult:
+    """Result of a server evacuation request."""
+    uuid: str
+    accepted: bool
+    reason: str
+
+@dataclass
+class EvacuationStatus:
+    """Status of an ongoing server evacuation."""
+    completed: bool
+    error: bool
+
+@dataclass
+class ConfigItem:
+    """Configuration item with type and validation constraints."""
+    type: str
+    default: Any
+    min_val: Optional[int]
+    max_val: Optional[int]
+```
+
+---
+
 ### 1. ConfigManager
 
 **Purpose**: Centralized configuration management with validation and secure access.
@@ -567,7 +598,7 @@ def get_int(self, key: str, default: int = 0,
 ```python
 for server in evacuables:
     response = _server_evacuate(connection, server.id)
-    if response["accepted"]:
+    if response.accepted:
         logging.debug("Evacuated %s", server.id)
     else:
         logging.warning("Failed to evacuate %s", server.id)
@@ -591,7 +622,7 @@ for server in evacuables:
 def _server_evacuate_future(connection, server) -> bool:
     # 1. Initiate evacuation
     response = _server_evacuate(connection, server.id)
-    if not response["accepted"]:
+    if not response.accepted:
         return False
 
     # 2. Wait before first poll
@@ -605,9 +636,9 @@ def _server_evacuate_future(connection, server) -> bool:
 
         status = _server_evacuation_status(connection, server.id)
 
-        if status["completed"]:
+        if status.completed:
             return True
-        if status["error"]:
+        if status.error:
             error_count += 1
             if error_count >= MAX_EVACUATION_RETRIES:
                 return False
@@ -835,10 +866,18 @@ cmd = ["ipmitool", "-U", login, "-E", ...]  # -E uses env var
 
 **Safe Exception Logging**:
 ```python
+_SECRET_PATTERNS = {
+    'password': re.compile(r'\bpassword=[^\s)\'\"]+', re.IGNORECASE),
+    'token': re.compile(r'\btoken=[^\s)\'\"]+', re.IGNORECASE),
+    'secret': re.compile(r'\bsecret=[^\s)\'\"]+', re.IGNORECASE),
+    'credential': re.compile(r'\bcredential=[^\s)\'\"]+', re.IGNORECASE),
+    'auth': re.compile(r'\bauth=[^\s)\'\"]+', re.IGNORECASE),
+}
+
 def _safe_log_exception(msg: str, e: Exception):
     safe_msg = str(e)
-    for secret in ['password', 'token', 'secret', 'credential']:
-        safe_msg = re.sub(rf'\\b{secret}=[^\\s)\\'\"]+', f'{secret}=***', safe_msg)
+    for secret_word, pattern in _SECRET_PATTERNS.items():
+        safe_msg = pattern.sub(f'{secret_word}=***', safe_msg)
     logging.error("%s: %s", msg, safe_msg)
 ```
 
@@ -854,13 +893,10 @@ def get_requests_ssl_config(self) -> Union[bool, str, tuple]:
     if not self.is_ssl_verification_enabled():
         return False  # Insecure
 
-    cert_path, key_path = self.get_ssl_cert_path(), self.get_ssl_key_path()
-    ca_bundle = self.get_ssl_ca_bundle()
-
-    if cert_path and key_path:
-        return (cert_path, key_path)  # Client cert
-    if ca_bundle:
-        return ca_bundle  # CA bundle
+    if self.ssl_cert_path and self.ssl_key_path:
+        return (self.ssl_cert_path, self.ssl_key_path)  # Client cert
+    if self.ssl_ca_bundle:
+        return self.ssl_ca_bundle  # CA bundle
     return True  # Default system CA
 ```
 

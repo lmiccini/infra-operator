@@ -91,7 +91,7 @@ MIGRATION_STATUS_COMPLETED = [MigrationStatus.COMPLETED.value, MigrationStatus.D
 MIGRATION_STATUS_ERROR = [MigrationStatus.ERROR.value, MigrationStatus.FAILED.value, MigrationStatus.CANCELLED.value]
 
 
-# Dataclass for configuration items
+# Dataclasses
 @dataclass
 class ConfigItem:
     """Configuration item with type and validation constraints."""
@@ -99,6 +99,21 @@ class ConfigItem:
     default: Any
     min_val: Optional[int] = None
     max_val: Optional[int] = None
+
+
+@dataclass
+class EvacuationResult:
+    """Result of a server evacuation request."""
+    uuid: str
+    accepted: bool
+    reason: str
+
+
+@dataclass
+class EvacuationStatus:
+    """Status of an ongoing server evacuation."""
+    completed: bool
+    error: bool
 
 
 # Pre-compiled regex patterns for credential sanitization
@@ -1476,10 +1491,10 @@ def _host_evacuate(connection, failed_service, service):
             logging.debug("Processing %s", server)
             if hasattr(server, 'id'):
                 response = _server_evacuate(connection, server.id)
-                if response["accepted"]:
-                    logging.debug("Evacuated %s from %s: %s", response["uuid"], host, response["reason"])
+                if response.accepted:
+                    logging.debug("Evacuated %s from %s: %s", response.uuid, host, response.reason)
                 else:
-                    logging.warning("Evacuation of %s on %s failed: %s", response["uuid"], host, response["reason"])
+                    logging.warning("Evacuation of %s on %s failed: %s", response.uuid, host, response.reason)
                     all_succeeded = False
             else:
                 logging.error("Could not evacuate instance: %s", server.to_dict())
@@ -1488,7 +1503,7 @@ def _host_evacuate(connection, failed_service, service):
         return all_succeeded
 
 
-def _server_evacuate(connection, server):
+def _server_evacuate(connection, server) -> EvacuationResult:
     """Evacuate a server instance."""
     success = False
     error_message = ""
@@ -1512,17 +1527,17 @@ def _server_evacuate(connection, server):
     except Exception as e:
         error_message = f"Error while evacuating instance {server}: {e}"
 
-    return {
-        "uuid": server,
-        "accepted": success,
-        "reason": error_message,
-    }
+    return EvacuationResult(
+        uuid=server,
+        accepted=success,
+        reason=error_message,
+    )
 
 
-def _server_evacuation_status(connection, server) -> Dict[str, bool]:
+def _server_evacuation_status(connection, server) -> EvacuationStatus:
     """Check the status of a server evacuation by querying recent migrations."""
     if not connection or not server:
-        return {"completed": False, "error": True}
+        return EvacuationStatus(completed=False, error=True)
 
     try:
         query_time = (datetime.now() - timedelta(minutes=MIGRATION_QUERY_MINUTES)).isoformat()
@@ -1534,20 +1549,20 @@ def _server_evacuation_status(connection, server) -> Dict[str, bool]:
         )
 
         if not migrations:
-            return {"completed": False, "error": True}
+            return EvacuationStatus(completed=False, error=True)
 
         # Get status from most recent migration
         migration = migrations[0]
         status = getattr(migration, 'status', None) or getattr(migration, '_info', {}).get('status')
 
-        return {
-            "completed": status in MIGRATION_STATUS_COMPLETED if status else False,
-            "error": status in MIGRATION_STATUS_ERROR if status else True
-        }
+        return EvacuationStatus(
+            completed=status in MIGRATION_STATUS_COMPLETED if status else False,
+            error=status in MIGRATION_STATUS_ERROR if status else True
+        )
 
     except Exception as e:
         logging.error("Failed to check evacuation status for %s: %s", server, e)
-        return {"completed": False, "error": True}
+        return EvacuationStatus(completed=False, error=True)
 
 
 def _server_evacuate_future(connection, server) -> bool:
@@ -1578,12 +1593,12 @@ def _server_evacuate_future(connection, server) -> bool:
         # Initiate evacuation
         response = _server_evacuate(connection, server.id)
 
-        if not response["accepted"]:
+        if not response.accepted:
             logging.warning("Evacuation of %s on %s failed: %s",
-                           response["uuid"], server.id, response["reason"])
+                           response.uuid, server.id, response.reason)
             return False
 
-        logging.debug("Starting evacuation of %s", response["uuid"])
+        logging.debug("Starting evacuation of %s", response.uuid)
 
         # Initial wait before polling
         time.sleep(INITIAL_EVACUATION_WAIT_SECONDS)
@@ -1593,45 +1608,45 @@ def _server_evacuate_future(connection, server) -> bool:
             # Check for overall timeout
             if time.time() - start_time > MAX_EVACUATION_TIMEOUT_SECONDS:
                 logging.error("Evacuation of %s timed out after %d seconds. Giving up.",
-                             response["uuid"], MAX_EVACUATION_TIMEOUT_SECONDS)
+                             response.uuid, MAX_EVACUATION_TIMEOUT_SECONDS)
                 return False
 
             try:
                 status = _server_evacuation_status(connection, server.id)
 
-                if status["completed"]:
-                    logging.info("Evacuation of %s completed successfully", response["uuid"])
+                if status.completed:
+                    logging.info("Evacuation of %s completed successfully", response.uuid)
                     return True
 
-                if status["error"]:
+                if status.error:
                     error_count += 1
                     if error_count >= MAX_EVACUATION_RETRIES:
                         logging.error("Failed evacuating %s %d times. Giving up.",
-                                     response["uuid"], MAX_EVACUATION_RETRIES)
+                                     response.uuid, MAX_EVACUATION_RETRIES)
                         return False
 
                     logging.warning("Evacuation of instance %s failed %d times. Retrying...",
-                                   response["uuid"], error_count)
+                                   response.uuid, error_count)
                     time.sleep(EVACUATION_RETRY_WAIT_SECONDS)
                     continue
 
                 # Evacuation still in progress
-                logging.debug("Evacuation of %s still in progress", response["uuid"])
+                logging.debug("Evacuation of %s still in progress", response.uuid)
                 time.sleep(EVACUATION_POLL_INTERVAL_SECONDS)
 
             except Exception as e:
                 error_count += 1
                 logging.error("Error checking evacuation status for %s: %s",
-                             response["uuid"], str(e))
+                             response.uuid, str(e))
                 logging.debug('Exception traceback:', exc_info=True)
 
                 if error_count >= MAX_EVACUATION_RETRIES:
                     logging.error("Too many errors checking evacuation status for %s. Giving up.",
-                                 response["uuid"])
+                                 response.uuid)
                     return False
 
                 logging.warning("Retrying evacuation status check for %s in %d seconds (attempt %d/%d)...",
-                               response["uuid"], EVACUATION_RETRY_WAIT_SECONDS, error_count, MAX_EVACUATION_RETRIES)
+                               response.uuid, EVACUATION_RETRY_WAIT_SECONDS, error_count, MAX_EVACUATION_RETRIES)
                 time.sleep(EVACUATION_RETRY_WAIT_SECONDS)
                 continue
 

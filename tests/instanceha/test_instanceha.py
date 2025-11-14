@@ -630,9 +630,9 @@ class TestEvacuationFunctions(unittest.TestCase):
 
         result = instanceha._server_evacuate(self.mock_connection, 'server-123')
 
-        self.assertTrue(result['accepted'])
-        self.assertEqual(result['uuid'], 'server-123')
-        self.assertEqual(result['reason'], 'OK')
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.uuid, 'server-123')
+        self.assertEqual(result.reason, 'OK')
 
     def test_server_evacuate_failure(self):
         """Test failed server evacuation."""
@@ -644,9 +644,9 @@ class TestEvacuationFunctions(unittest.TestCase):
 
         result = instanceha._server_evacuate(self.mock_connection, 'server-123')
 
-        self.assertFalse(result['accepted'])
-        self.assertEqual(result['uuid'], 'server-123')
-        self.assertEqual(result['reason'], 'Internal Server Error')
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.uuid, 'server-123')
+        self.assertEqual(result.reason, 'Internal Server Error')
 
     def test_server_evacuate_exception(self):
         """Test server evacuation with exception."""
@@ -660,8 +660,8 @@ class TestEvacuationFunctions(unittest.TestCase):
 
             result = instanceha._server_evacuate(self.mock_connection, 'server-123')
 
-            self.assertFalse(result['accepted'])
-            self.assertIn('not found', result['reason'])
+            self.assertFalse(result.accepted)
+            self.assertIn('not found', result.reason)
 
     def test_host_disable_success(self):
         """Test successful host disable operation."""
@@ -696,8 +696,8 @@ class TestEvacuationFunctions(unittest.TestCase):
 
         result = instanceha._server_evacuation_status(self.mock_connection, 'server-123')
 
-        self.assertTrue(result['completed'])
-        self.assertFalse(result['error'])
+        self.assertTrue(result.completed)
+        self.assertFalse(result.error)
 
     def test_check_evacuable_tag_dict(self):
         """Test evacuable tag checking with dictionary data."""
@@ -738,8 +738,8 @@ class TestEvacuationFunctions(unittest.TestCase):
 
         result = instanceha._server_evacuate(self.mock_connection, 'server-123')
 
-        self.assertFalse(result['accepted'])
-        self.assertEqual(result['reason'], 'No response received while evacuating instance')
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, 'No response received while evacuating instance')
 
     def test_server_evacuate_none_reason(self):
         """Test _server_evacuate when response.reason is None (uses fallback)."""
@@ -750,8 +750,8 @@ class TestEvacuationFunctions(unittest.TestCase):
 
         result = instanceha._server_evacuate(self.mock_connection, 'server-123')
 
-        self.assertTrue(result['accepted'])
-        self.assertEqual(result['reason'], 'Evacuation initiated successfully')
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.reason, 'Evacuation initiated successfully')
 
     def test_server_evacuate_error_status_no_reason(self):
         """Test _server_evacuate when status code is error but reason is None."""
@@ -762,8 +762,8 @@ class TestEvacuationFunctions(unittest.TestCase):
 
         result = instanceha._server_evacuate(self.mock_connection, 'server-123')
 
-        self.assertFalse(result['accepted'])
-        self.assertIn('status 500', result['reason'])
+        self.assertFalse(result.accepted)
+        self.assertIn('status 500', result.reason)
 
     def test_host_disable_log_reason_fails_non_critical(self):
         """Test that disable_log_reason failure is handled gracefully."""
@@ -912,8 +912,8 @@ class TestEvacuationFunctions(unittest.TestCase):
         mock_connection.migrations.list.return_value = [mock_migration]
 
         result = instanceha._server_evacuation_status(mock_connection, 'server-123')
-        self.assertTrue(result['completed'])
-        self.assertFalse(result['error'])
+        self.assertTrue(result.completed)
+        self.assertFalse(result.error)
 
         # Verify constants are used (indirectly - status 'completed' is in constant)
         self.assertIn(mock_migration.status, instanceha.MIGRATION_STATUS_COMPLETED)
@@ -3494,10 +3494,10 @@ class TestEvacuationStatusEdgeCases(unittest.TestCase):
             self.mock_nova, mock_server
         )
 
-        # Should return dict with completed and error flags
-        self.assertIsInstance(result, dict)
-        self.assertIn('completed', result)
-        self.assertIn('error', result)
+        # Should return EvacuationStatus dataclass with completed and error flags
+        self.assertIsInstance(result, instanceha.EvacuationStatus)
+        self.assertFalse(result.completed)
+        self.assertTrue(result.error)
 
     def test_server_evacuation_status_missing_attribute(self):
         """Test when migration object lacks status attribute."""
@@ -3513,7 +3513,9 @@ class TestEvacuationStatusEdgeCases(unittest.TestCase):
         )
 
         # Should handle missing attribute gracefully
-        self.assertIsInstance(result, dict)
+        self.assertIsInstance(result, instanceha.EvacuationStatus)
+        self.assertFalse(result.completed)
+        self.assertTrue(result.error)
 
     def test_server_evacuation_status_info_dict(self):
         """Test extracting status from _info dict fallback."""
@@ -3529,8 +3531,10 @@ class TestEvacuationStatusEdgeCases(unittest.TestCase):
             self.mock_nova, mock_server
         )
 
-        # Should return dict with status information
-        self.assertIsInstance(result, dict)
+        # Should return EvacuationStatus with status information
+        self.assertIsInstance(result, instanceha.EvacuationStatus)
+        self.assertTrue(result.completed)
+        self.assertFalse(result.error)
 
     def test_server_evacuation_status_multiple_migrations(self):
         """Test with multiple migrations, verify most recent is used."""
@@ -3555,8 +3559,10 @@ class TestEvacuationStatusEdgeCases(unittest.TestCase):
             self.mock_nova, mock_server
         )
 
-        # Should return dict with status information
-        self.assertIsInstance(result, dict)
+        # Should return EvacuationStatus - uses first migration from list (old_migration)
+        self.assertIsInstance(result, instanceha.EvacuationStatus)
+        self.assertTrue(result.completed)
+        self.assertFalse(result.error)
 
     def test_server_evacuation_status_old_migrations(self):
         """Test filtering migrations outside time window."""
@@ -3576,8 +3582,10 @@ class TestEvacuationStatusEdgeCases(unittest.TestCase):
             self.mock_nova, mock_server
         )
 
-        # Old migrations might be filtered out
-        self.assertIsInstance(result, dict)
+        # Old migrations are still processed (migration was returned by list)
+        self.assertIsInstance(result, instanceha.EvacuationStatus)
+        self.assertTrue(result.completed)
+        self.assertFalse(result.error)
 
     def test_server_evacuation_status_migration_query_limit(self):
         """Test migration query with large number of results."""
@@ -3598,8 +3606,10 @@ class TestEvacuationStatusEdgeCases(unittest.TestCase):
             self.mock_nova, mock_server
         )
 
-        # Should handle large result sets
-        self.assertIsInstance(result, dict)
+        # Should handle large result sets - uses first migration (completed)
+        self.assertIsInstance(result, instanceha.EvacuationStatus)
+        self.assertTrue(result.completed)
+        self.assertFalse(result.error)
 
     def test_server_evacuation_status_time_window_boundaries(self):
         """Test time window edge cases."""
@@ -3620,8 +3630,10 @@ class TestEvacuationStatusEdgeCases(unittest.TestCase):
             self.mock_nova, mock_server
         )
 
-        # Should handle boundary conditions
-        self.assertIsInstance(result, dict)
+        # Should handle boundary conditions - status 'running' is not in completed/error
+        self.assertIsInstance(result, instanceha.EvacuationStatus)
+        self.assertFalse(result.completed)
+        self.assertFalse(result.error)
 
 
 class TestRetryLogic(unittest.TestCase):
