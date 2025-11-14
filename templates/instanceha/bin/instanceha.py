@@ -2485,19 +2485,11 @@ def _cleanup_filtered_hosts(service, marked_hostnames, final_hostnames, current_
         if to_cleanup:
             logging.debug(f'Cleaned up {len(to_cleanup)} filtered hosts from processing tracking')
 
-def _process_stale_services(conn, service, services, compute_nodes, to_resume):
-    """Process stale compute services for evacuation."""
-    # Convert generators to lists only when needed for processing
-    compute_nodes = list(compute_nodes)
-    to_resume = list(to_resume)
-
-    if not (compute_nodes or to_resume):
-        return
-
-    # Filter out hosts already being processed to prevent race conditions
+def _filter_processing_hosts(service, compute_nodes, to_resume):
+    """Filter out hosts already being processed and mark new ones."""
     current_time = time.time()
     max_processing_time = max(service.config.get_config_value('FENCING_TIMEOUT'), MAX_EVACUATION_TIMEOUT_SECONDS)
-    marked_hostnames = set()  # Track hosts marked as processing in this cycle
+    marked_hostnames = set()
 
     with service.processing_lock:
         # Clean up expired processing entries
@@ -2507,7 +2499,6 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
             'Cleaned up expired processing entry for {}')
 
         # Filter out hosts currently being processed
-        # Cache hostname extractions to avoid repeated calls
         original_count = len(compute_nodes)
         compute_nodes_filtered = []
         to_resume_filtered = []
@@ -2522,18 +2513,75 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
             if hostname not in service.hosts_processing:
                 to_resume_filtered.append(svc)
 
-        compute_nodes = compute_nodes_filtered
-        to_resume = to_resume_filtered
-
-        if original_count > len(compute_nodes):
-            skipped_hosts = original_count - len(compute_nodes)
+        if original_count > len(compute_nodes_filtered):
+            skipped_hosts = original_count - len(compute_nodes_filtered)
             logging.info(f'Skipped {skipped_hosts} hosts already being processed by another poll cycle')
 
         # Mark hosts as being processed
-        for svc in compute_nodes + to_resume:
+        for svc in compute_nodes_filtered + to_resume_filtered:
             hostname = _extract_hostname(svc.host)
             service.hosts_processing[hostname] = current_time
             marked_hostnames.add(hostname)
+
+    return compute_nodes_filtered, to_resume_filtered, marked_hostnames, current_time
+
+
+def _prepare_evacuation_resources(conn, service, services, compute_nodes):
+    """Prepare and filter resources for evacuation."""
+    if not compute_nodes:
+        return compute_nodes, [], [], []
+
+    # Force refresh cache when compute nodes go down
+    service.refresh_evacuable_cache(conn, force=True)
+
+    # Filter compute nodes with servers
+    host_servers_cache = service.get_hosts_with_servers_cached(conn, compute_nodes)
+    original_count = len(compute_nodes)
+    compute_nodes = service.filter_hosts_with_servers(compute_nodes, host_servers_cache)
+    filtered_count = len(compute_nodes)
+    logging.info("Filtered compute nodes: %d -> %d (removed %d hosts with no servers)",
+                original_count, filtered_count, original_count - filtered_count)
+
+    if not compute_nodes:
+        logging.warning("No compute nodes with servers to evacuate - all filtered out")
+        return [], [], [], []
+
+    # Get reserved hosts if enabled
+    reserved_hosts = []
+    if service.config.is_reserved_hosts_enabled():
+        reserved_hosts = [svc for svc in services
+                          if 'disabled' in svc.status and 'reserved' in svc.disabled_reason]
+
+    # Get evacuable resources
+    images_enabled = service.config.is_tagged_images_enabled()
+    flavors_enabled = service.config.is_tagged_flavors_enabled()
+    images = service.get_evacuable_images(conn) if images_enabled else []
+    flavors = service.get_evacuable_flavors(conn) if flavors_enabled else []
+
+    # Filter evacuable servers if tagging is enabled
+    if (images_enabled or flavors_enabled) and host_servers_cache:
+        compute_nodes = service.filter_hosts_with_evacuable_servers(compute_nodes, host_servers_cache, flavors, images)
+        if not images and not flavors:
+            logging.info("No tagged resources found - will evacuate all servers")
+
+    # Apply aggregate filtering if enabled
+    if service.config.is_tagged_aggregates_enabled():
+        compute_nodes = _filter_by_aggregates(conn, service, compute_nodes, services)
+
+    return compute_nodes, reserved_hosts, images, flavors
+
+
+def _process_stale_services(conn, service, services, compute_nodes, to_resume):
+    """Process stale compute services for evacuation."""
+    # Convert generators to lists only when needed for processing
+    compute_nodes = list(compute_nodes)
+    to_resume = list(to_resume)
+
+    if not (compute_nodes or to_resume):
+        return
+
+    # Filter out hosts already being processed
+    compute_nodes, to_resume, marked_hostnames, current_time = _filter_processing_hosts(service, compute_nodes, to_resume)
 
     if not (compute_nodes or to_resume):
         _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
@@ -2541,52 +2589,14 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
 
     logging.warning(f'The following computes are down: {[svc.host for svc in compute_nodes]}')
 
-    # Force refresh cache when compute nodes go down to ensure fresh data
-    if compute_nodes:
-        service.refresh_evacuable_cache(conn, force=True)
+    # Prepare resources for evacuation
+    compute_nodes, reserved_hosts, images, flavors = _prepare_evacuation_resources(conn, service, services, compute_nodes)
 
-    # Filter compute nodes with servers
-    host_servers_cache = None
-    if compute_nodes:
-        # Convert to list for processing and caching
-        compute_nodes_list = list(compute_nodes)
-        host_servers_cache = service.get_hosts_with_servers_cached(conn, compute_nodes_list)
-        original_count = len(compute_nodes_list)
-        compute_nodes = service.filter_hosts_with_servers(compute_nodes_list, host_servers_cache)
-        filtered_count = len(compute_nodes)
-        logging.info("Filtered compute nodes: %d -> %d (removed %d hosts with no servers)",
-                    original_count, filtered_count, original_count - filtered_count)
-        if not compute_nodes:
-            logging.warning("No compute nodes with servers to evacuate - all filtered out")
-
-    # Get reserved hosts if enabled
-    reserved_hosts = []
-    if service.config.is_reserved_hosts_enabled() and compute_nodes:
-        reserved_hosts = [svc for svc in services
-                          if 'disabled' in svc.status and 'reserved' in svc.disabled_reason]
-
-    # Get evacuable resources (cache already refreshed above if compute nodes are down)
-    images_enabled = service.config.is_tagged_images_enabled()
-    flavors_enabled = service.config.is_tagged_flavors_enabled()
-    images = service.get_evacuable_images(conn) if images_enabled else []
-    flavors = service.get_evacuable_flavors(conn) if flavors_enabled else []
-
-    # Filter evacuable servers if tagging is enabled
-    if (images_enabled or flavors_enabled) and compute_nodes and host_servers_cache:
-        compute_nodes = service.filter_hosts_with_evacuable_servers(compute_nodes, host_servers_cache, flavors, images)
-        if not images and not flavors:
-            logging.info("No tagged resources found - will evacuate all servers")
-
-    # Apply aggregate filtering if enabled
-    if service.config.is_tagged_aggregates_enabled() and compute_nodes:
-        compute_nodes = _filter_by_aggregates(conn, service, compute_nodes, services)
-
-    # Check evacuation threshold (prevent division by zero)
+    # Check evacuation threshold
     if services and compute_nodes:
         threshold_percent = (len(compute_nodes) / len(services)) * 100
         if threshold_percent > service.config.get_threshold():
             logging.error(f'Number of impacted computes ({threshold_percent:.1f}%) exceeds threshold ({service.config.get_threshold()}%). Not evacuating.')
-            # Clean up all marked hosts since threshold prevents evacuation (none will be processed)
             _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
             return
 
