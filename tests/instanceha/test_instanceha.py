@@ -1139,9 +1139,9 @@ class TestKdumpFunctionality(unittest.TestCase):
 
     def test_kdump_check_no_services(self):
         """Test _check_kdump with empty service list."""
-        to_evacuate, kdumping_hosts = instanceha._check_kdump([], self.mock_service_instance)
+        to_evacuate, kdump_fenced = instanceha._check_kdump([], self.mock_service_instance)
         self.assertEqual(to_evacuate, [])
-        self.assertEqual(kdumping_hosts, [])
+        self.assertEqual(kdump_fenced, [])
 
     def test_kdump_check_immediate_detection(self):
         """Test _check_kdump with immediate kdump detection - host should be evacuated immediately."""
@@ -1151,9 +1151,9 @@ class TestKdumpFunctionality(unittest.TestCase):
         # Set recent kdump timestamp
         self.mock_service_instance.kdump_hosts_timestamp['compute-01'] = time.time() - 5
 
-        to_evacuate, kdumping_hosts = instanceha._check_kdump([mock_service1], self.mock_service_instance)
-        self.assertEqual(len(to_evacuate), 1)  # Host should be evacuated (kdump-fenced)
-        self.assertEqual(len(kdumping_hosts), 1)  # Host should be in kdumping list
+        to_evacuate, kdump_fenced = instanceha._check_kdump([mock_service1], self.mock_service_instance)
+        self.assertEqual(len(to_evacuate), 0)  # Host should NOT be in to_evacuate (kdump-fenced separately)
+        self.assertEqual(len(kdump_fenced), 1)  # Host should be in kdump_fenced list
         self.assertIn('compute-01', self.mock_service_instance.kdump_fenced_hosts)  # Host tracked as fenced
 
     def test_kdump_check_no_kdump_activity(self):
@@ -1161,9 +1161,9 @@ class TestKdumpFunctionality(unittest.TestCase):
         mock_service1 = Mock()
         mock_service1.host = 'compute-01.example.com'
 
-        to_evacuate, kdumping_hosts = instanceha._check_kdump([mock_service1], self.mock_service_instance)
+        to_evacuate, kdump_fenced = instanceha._check_kdump([mock_service1], self.mock_service_instance)
         self.assertEqual(len(to_evacuate), 0)  # Host should be waiting (not evacuated yet)
-        self.assertEqual(len(kdumping_hosts), 0)  # Host should not be kdumping
+        self.assertEqual(len(kdump_fenced), 0)  # Host should not be kdump-fenced
         self.assertNotIn('compute-01', self.mock_service_instance.kdump_fenced_hosts)  # Not tracked as fenced
         self.assertIn('compute-01', self.mock_service_instance.kdump_hosts_checking)  # Should be in checking state
 
@@ -1219,14 +1219,13 @@ class TestKdumpFunctionality(unittest.TestCase):
         # First host has kdump message, second does not
         mock_service_instance.kdump_hosts_timestamp['compute-01'] = time.time() - 5
 
-        to_evacuate, kdumping_hosts = instanceha._check_kdump(services, mock_service_instance)
+        to_evacuate, kdump_fenced = instanceha._check_kdump(services, mock_service_instance)
 
-        # compute-01 has kdump message → evacuate immediately (kdump-fenced)
+        # compute-01 has kdump message → in kdump_fenced (not to_evacuate)
         # compute-02 has no kdump → waiting (not evacuated yet)
-        self.assertEqual(len(to_evacuate), 1)
-        self.assertEqual(to_evacuate[0].host, 'compute-01.example.com')
-        self.assertEqual(len(kdumping_hosts), 1)
-        self.assertEqual(kdumping_hosts[0], 'compute-01.example.com')
+        self.assertEqual(len(to_evacuate), 0)  # Neither in to_evacuate yet
+        self.assertEqual(len(kdump_fenced), 1)  # compute-01 is kdump-fenced
+        self.assertEqual(kdump_fenced[0].host, 'compute-01.example.com')
         self.assertIn('compute-01', mock_service_instance.kdump_fenced_hosts)
         self.assertIn('compute-02', mock_service_instance.kdump_hosts_checking)  # compute-02 waiting
 
@@ -1242,9 +1241,9 @@ class TestKdumpFunctionality(unittest.TestCase):
         # Set checking timestamp beyond timeout (default 30s) - simulates waiting period expired
         mock_service_instance.kdump_hosts_checking['compute-01'] = time.time() - 35
 
-        to_evacuate, kdumping_hosts = instanceha._check_kdump([mock_service], mock_service_instance)
+        to_evacuate, kdump_fenced = instanceha._check_kdump([mock_service], mock_service_instance)
         self.assertEqual(len(to_evacuate), 1)  # Host should be evacuated (timeout expired, no kdump)
-        self.assertEqual(len(kdumping_hosts), 0)  # Host is not kdumping (timeout exceeded)
+        self.assertEqual(len(kdump_fenced), 0)  # Host is not kdump-fenced (timeout exceeded)
         self.assertNotIn('compute-01', mock_service_instance.kdump_fenced_hosts)
         self.assertNotIn('compute-01', mock_service_instance.kdump_hosts_checking)  # Should be cleaned up
 
@@ -1377,13 +1376,12 @@ class TestKdumpIntegration(unittest.TestCase):
         # Simulate one host kdumping, one not
         mock_service_instance.kdump_hosts_timestamp['compute-01'] = time.time() - 5
 
-        to_evacuate, kdumping_hosts = instanceha._check_kdump(services, mock_service_instance)
+        to_evacuate, kdump_fenced = instanceha._check_kdump(services, mock_service_instance)
 
-        # compute-01 has kdump → evacuate immediately, compute-02 waiting
-        self.assertEqual(len(to_evacuate), 1)
-        self.assertEqual(to_evacuate[0].host, 'compute-01.example.com')
-        self.assertEqual(len(kdumping_hosts), 1)
-        self.assertEqual(kdumping_hosts[0], 'compute-01.example.com')
+        # compute-01 has kdump → in kdump_fenced, compute-02 waiting
+        self.assertEqual(len(to_evacuate), 0)  # Neither in to_evacuate yet
+        self.assertEqual(len(kdump_fenced), 1)  # compute-01 is kdump-fenced
+        self.assertEqual(kdump_fenced[0].host, 'compute-01.example.com')
         self.assertIn('compute-02', mock_service_instance.kdump_hosts_checking)
 
     def test_kdump_thread_safety(self):

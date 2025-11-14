@@ -1766,10 +1766,11 @@ def _check_kdump(stale_services: List[Any], service: InstanceHAService) -> Tuple
             service.kdump_hosts_checking.pop(hostname, None)
             logging.info(f'Host {svc.host} timeout expired, no kdump - evacuating')
 
-    to_evacuate = [s for s in stale_services if s.host not in waiting]
+    kdump_fenced_services = [s for s in stale_services if s.host in kdump_fenced]
+    to_evacuate = [s for s in stale_services if s.host not in waiting and s.host not in kdump_fenced]
     if kdump_fenced:
         logging.info(f'Total kdump-fenced: {len(kdump_fenced)}')
-    return to_evacuate, kdump_fenced
+    return to_evacuate, kdump_fenced_services
 
 
 def _host_enable(connection, service, reenable: bool = False) -> bool:
@@ -2590,24 +2591,20 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
     # Process evacuations
     if not service.config.is_disabled():
         if service.config.is_kdump_check_enabled():
-            to_evacuate, kdumping_hosts = _check_kdump(compute_nodes, service)
-            # Remove kdumping hosts from hosts_processing so they can be re-checked in next poll
-            # This allows us to continuously monitor kdump status - evacuation will proceed
-            # automatically once kdump messages stop being received (beyond timeout period)
-            with service.processing_lock:
-                for kdumping_host_str in kdumping_hosts:
-                    hostname = _extract_hostname(kdumping_host_str)
-                    if hostname in service.hosts_processing:
-                        del service.hosts_processing[hostname]
-                        logging.debug(f'Removed kdumping host {hostname} from processing tracking - will re-check kdump status in next poll')
+            to_evacuate, kdump_fenced = _check_kdump(compute_nodes, service)
         else:
             to_evacuate = compute_nodes
+            kdump_fenced = []
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             # Process new evacuations
             results = list(executor.map(lambda svc: process_service(svc, reserved_hosts, False, service), to_evacuate))
             if not all(results):
                 logging.warning(f'Some services failed to evacuate. Retrying in {service.config.get_poll_interval()} seconds.')
+            # Process kdump-fenced hosts (skip fencing step)
+            results = list(executor.map(lambda svc: process_service(svc, reserved_hosts, True, service), kdump_fenced))
+            if not all(results):
+                logging.warning(f'Some kdump-fenced services failed to evacuate. Retrying in {service.config.get_poll_interval()} seconds.')
             # Process resumed evacuations
             results = list(executor.map(lambda svc: process_service(svc, reserved_hosts, True, service), to_resume))
             if not all(results):
@@ -2615,7 +2612,7 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
 
         # Clean up any hosts that were marked but filtered out before processing
         # (process_service cleans up hosts it processes, so we only need to clean up filtered ones)
-        final_hostnames = {_extract_hostname(svc.host) for svc in to_evacuate + to_resume}
+        final_hostnames = {_extract_hostname(svc.host) for svc in to_evacuate + kdump_fenced + to_resume}
         _cleanup_filtered_hosts(service, marked_hostnames, final_hostnames, current_time)
     else:
         logging.info('InstanceHA DISABLED is true, not evacuating')
