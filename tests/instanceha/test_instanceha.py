@@ -3406,7 +3406,6 @@ class TestBMHFencingEdgeCases(unittest.TestCase):
         service = Mock()
         service.config.get_requests_ssl_config.return_value = (None, None)
         service.config.is_ssl_verification_enabled.return_value = True
-        service.config.get_ssl_ca_bundle.return_value = None
 
         with patch('instanceha._make_ssl_request') as mock_ssl, \
              patch('instanceha.validate_inputs') as mock_validate:

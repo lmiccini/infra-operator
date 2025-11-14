@@ -5,8 +5,8 @@ import sys
 import time
 import atexit
 import logging
-import inspect
 import functools
+import re
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -22,7 +22,6 @@ import socket
 import struct
 import threading
 import hashlib
-from http import server
 import json
 from typing import Dict, Any, Optional, Union, List, Protocol, Tuple, Callable
 from collections import defaultdict
@@ -67,6 +66,8 @@ MAX_PROCESSING_TIME_PADDING_SECONDS = 30
 MIGRATION_QUERY_MINUTES = 5
 MIGRATION_QUERY_LIMIT = 1000
 USERNAME_MAX_LENGTH = 64
+FENCING_RETRY_DELAY_SECONDS = 1
+DEFAULT_EVACUATION_COUNT = 10
 
 
 # Enums
@@ -100,12 +101,21 @@ class ConfigItem:
     max_val: Optional[int] = None
 
 
+# Pre-compiled regex patterns for credential sanitization
+_SECRET_PATTERNS = {
+    'password': re.compile(r'\bpassword=[^\s)\'\"]+', re.IGNORECASE),
+    'token': re.compile(r'\btoken=[^\s)\'\"]+', re.IGNORECASE),
+    'secret': re.compile(r'\bsecret=[^\s)\'\"]+', re.IGNORECASE),
+    'credential': re.compile(r'\bcredential=[^\s)\'\"]+', re.IGNORECASE),
+    'auth': re.compile(r'\bauth=[^\s)\'\"]+', re.IGNORECASE),
+}
+
+
 def _safe_log_exception(msg: str, e: Exception, include_traceback: bool = False) -> None:
     """Log exception without exposing secrets in messages or tracebacks."""
-    import re
     safe_msg = str(e)
-    for secret_word in ['password', 'token', 'secret', 'credential', 'auth']:
-        safe_msg = re.sub(rf'\b{secret_word}=[^\s)\'"]+', f'{secret_word}=***', safe_msg, flags=re.IGNORECASE)
+    for secret_word, pattern in _SECRET_PATTERNS.items():
+        safe_msg = pattern.sub(f'{secret_word}=***', safe_msg)
     logging.error("%s: %s", msg, safe_msg)
     if include_traceback:
         logging.debug("Exception traceback (sanitized): %s", type(e).__name__)
@@ -150,7 +160,6 @@ VALIDATION_PATTERNS = {
 
 def validate_input(value: str, validation_type: str, context: str) -> bool:
     """Unified validation to prevent SSRF and injection attacks."""
-    import re
     from urllib.parse import urlparse
     import ipaddress
 
@@ -279,7 +288,6 @@ def _extract_hostname(host: str) -> str:
 
 def _sanitize_url(url: str) -> str:
     """Remove credentials from URL if present (e.g., http://user:pass@host -> http://***@host)."""
-    import re
     # Remove user:password from URLs to prevent credential leaks in logs
     return re.sub(r'://([^/:]+):([^@]+)@', r'://***@', url)
 
@@ -492,16 +500,6 @@ class ConfigManager:
     def ssl_key_path(self) -> Optional[str]:
         return self._get_ssl_path('SSL_KEY_PATH')
 
-    # Keep old method names for backward compatibility
-    def get_ssl_ca_bundle(self) -> Optional[str]:
-        return self.ssl_ca_bundle
-
-    def get_ssl_cert_path(self) -> Optional[str]:
-        return self.ssl_cert_path
-
-    def get_ssl_key_path(self) -> Optional[str]:
-        return self.ssl_key_path
-
     def _get_ssl_path(self, key: str) -> Optional[str]:
         """Get SSL file path if it exists."""
         path = self.get_str(key, '')
@@ -513,13 +511,10 @@ class ConfigManager:
             logging.warning("SSL verification is DISABLED - this is insecure for production use")
             return False
 
-        cert_path, key_path = self.get_ssl_cert_path(), self.get_ssl_key_path()
-        ca_bundle = self.get_ssl_ca_bundle()
-
-        if cert_path and key_path:
-            return (cert_path, key_path)
-        if ca_bundle:
-            return ca_bundle
+        if self.ssl_cert_path and self.ssl_key_path:
+            return (self.ssl_cert_path, self.ssl_key_path)
+        if self.ssl_ca_bundle:
+            return self.ssl_ca_bundle
         return True
 
     # Configuration property accessors
@@ -695,6 +690,9 @@ class InstanceHAService(CloudConnectionProvider):
         self._cache_timestamp = 0
         self._cache_lock = threading.Lock()
 
+        # Cache frequently accessed config values
+        self.evacuable_tag = config_manager.get_evacuable_tag()
+
         # Constants
         self.UDP_IP = ''
 
@@ -772,11 +770,10 @@ class InstanceHAService(CloudConnectionProvider):
 
         try:
             flavor_extra_specs = server.flavor.get('extra_specs', {})
-            evacuable_tag = self.config.get_evacuable_tag()
 
             # Check for exact key match or substring match in composite keys
             matching_key = next((k for k in flavor_extra_specs
-                               if k == evacuable_tag or evacuable_tag in k), None)
+                               if k == self.evacuable_tag or self.evacuable_tag in k), None)
 
             return matching_key and str(flavor_extra_specs[matching_key]).lower() == 'true'
         except (AttributeError, KeyError, TypeError):
@@ -826,7 +823,7 @@ class InstanceHAService(CloudConnectionProvider):
         ] if enabled]
         if criteria:
             logging.warning("Instance %s is not evacuable: not using any of the defined %s tagged with '%s'",
-                           server.id, " or ".join(criteria), self.config.get_evacuable_tag())
+                           server.id, " or ".join(criteria), self.evacuable_tag)
         return False
 
     def get_evacuable_flavors(self, connection: Optional[OpenStackClient] = None):
@@ -857,12 +854,11 @@ class InstanceHAService(CloudConnectionProvider):
         # Perform expensive API call outside lock
         try:
             flavors = connection.flavors.list(is_public=None)
-            evacuable_tag = self.config.get_evacuable_tag()
 
             cache_data = []
             for flavor in flavors:
                 try:
-                    if self._is_flavor_evacuable(flavor, evacuable_tag):
+                    if self._is_flavor_evacuable(flavor, self.evacuable_tag):
                         cache_data.append(flavor.id)
                         logging.debug("Added flavor %s to evacuable cache", flavor.id)
                 except Exception as e:
@@ -911,7 +907,6 @@ class InstanceHAService(CloudConnectionProvider):
         # Perform expensive API call outside lock
         try:
             images = []
-            evacuable_tag = self.config.get_evacuable_tag()
 
             # Method 1: Try direct Glance access through Nova client
             try:
@@ -952,7 +947,7 @@ class InstanceHAService(CloudConnectionProvider):
             if images:
                 for image in images:
                     # Check image for evacuable tags using unified method
-                    if self._is_resource_evacuable(image, evacuable_tag, ['tags', 'metadata', 'properties']):
+                    if self._is_resource_evacuable(image, self.evacuable_tag, ['tags', 'metadata', 'properties']):
                         cache_data.append(image.id)
 
                 logging.debug("Cached %d evacuable images from %d total images",
@@ -1090,8 +1085,6 @@ class InstanceHAService(CloudConnectionProvider):
                 logging.debug("Server %s has no image ID", server.id)
                 return False
 
-            evacuable_tag = self.config.get_evacuable_tag()
-
             # Try multiple methods to get image details and check evacuability
             for get_method, check_attrs in [
                 (lambda: connection.glance.get(server_image_id), ['tags']),
@@ -1099,7 +1092,7 @@ class InstanceHAService(CloudConnectionProvider):
             ]:
                 try:
                     image = get_method()
-                    if self._is_resource_evacuable(image, evacuable_tag, check_attrs):
+                    if self._is_resource_evacuable(image, self.evacuable_tag, check_attrs):
                         return True
                 except (AttributeError, TypeError, KeyError) as e:
                     logging.debug("Error checking image attributes: %s", e)
@@ -1125,11 +1118,10 @@ class InstanceHAService(CloudConnectionProvider):
         """
         try:
             aggregates = connection.aggregates.list()
-            evacuable_tag = self.config.get_evacuable_tag()
 
             # Use unified resource checking logic
             return any(host in agg.hosts for agg in aggregates
-                      if self._is_resource_evacuable(agg, evacuable_tag, ['metadata']))
+                      if self._is_resource_evacuable(agg, self.evacuable_tag, ['metadata']))
         except Exception as e:
             logging.error("Failed to check aggregate evacuability for %s: %s", host, e)
             logging.debug('Exception traceback:', exc_info=True)
@@ -1572,7 +1564,6 @@ def _server_evacuate_future(connection, server) -> bool:
 
     # Initialize variables
     error_count = 0
-    result = False
     start_time = time.time()
 
     # Validate server object
@@ -1863,8 +1854,6 @@ def _redfish_reset(url, user, passwd, timeout, action):
     headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
 
     # Retry logic for transient failures
-    retry_delay = 1
-
     for attempt in range(MAX_FENCING_RETRIES):
         try:
             response = _make_ssl_request('post', reset_url, (user, passwd), timeout,
@@ -1896,7 +1885,7 @@ def _redfish_reset(url, user, passwd, timeout, action):
                 # Transient server errors - retry
                 logging.warning("Redfish reset failed: server error %d (attempt %d/%d), retrying...",
                               response.status_code, attempt + 1, MAX_FENCING_RETRIES)
-                time.sleep(retry_delay * (attempt + 1))
+                time.sleep(FENCING_RETRY_DELAY_SECONDS * (attempt + 1))
                 continue
             else:
                 logging.error("Redfish reset failed: status %d for %s", response.status_code, safe_url)
@@ -1906,7 +1895,7 @@ def _redfish_reset(url, user, passwd, timeout, action):
             # Network errors - retry
             if attempt < MAX_FENCING_RETRIES - 1:
                 logging.warning("Redfish reset network error (attempt %d/%d), retrying...", attempt + 1, MAX_FENCING_RETRIES)
-                time.sleep(retry_delay * (attempt + 1))
+                time.sleep(FENCING_RETRY_DELAY_SECONDS * (attempt + 1))
                 continue
             else:
                 _safe_log_exception("Redfish reset failed for %s" % safe_url, e)
@@ -2085,8 +2074,6 @@ def _execute_fence_operation(host, action, fencing_data, service):
                    "-p", ipport, "power", action]
 
             # Retry logic for transient failures
-            retry_delay = 1
-
             for attempt in range(MAX_FENCING_RETRIES):
                 try:
                     subprocess.run(cmd, timeout=timeout, env=env, capture_output=True, text=True, check=True)
@@ -2096,7 +2083,7 @@ def _execute_fence_operation(host, action, fencing_data, service):
                     # Network timeout - retry
                     if attempt < MAX_FENCING_RETRIES - 1:
                         logging.warning("IPMI %s timeout for %s (attempt %d/%d), retrying...", action, host, attempt + 1, MAX_FENCING_RETRIES)
-                        time.sleep(retry_delay * (attempt + 1))
+                        time.sleep(FENCING_RETRY_DELAY_SECONDS * (attempt + 1))
                         continue
                     else:
                         # Use safe logging to avoid exposing any command details
@@ -2108,7 +2095,7 @@ def _execute_fence_operation(host, action, fencing_data, service):
                     if attempt < MAX_FENCING_RETRIES - 1:
                         logging.warning("IPMI %s failed for %s with return code %d (attempt %d/%d), retrying...",
                                       action, host, e.returncode, attempt + 1, MAX_FENCING_RETRIES)
-                        time.sleep(retry_delay * (attempt + 1))
+                        time.sleep(FENCING_RETRY_DELAY_SECONDS * (attempt + 1))
                         continue
                     else:
                         # Use safe logging - exception may contain stderr/stdout with sensitive info
@@ -2505,11 +2492,23 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
             'Cleaned up expired processing entry for {}')
 
         # Filter out hosts currently being processed
+        # Cache hostname extractions to avoid repeated calls
         original_count = len(compute_nodes)
-        compute_nodes = [svc for svc in compute_nodes
-                        if _extract_hostname(svc.host) not in service.hosts_processing]
-        to_resume = [svc for svc in to_resume
-                    if _extract_hostname(svc.host) not in service.hosts_processing]
+        compute_nodes_filtered = []
+        to_resume_filtered = []
+
+        for svc in compute_nodes:
+            hostname = _extract_hostname(svc.host)
+            if hostname not in service.hosts_processing:
+                compute_nodes_filtered.append(svc)
+
+        for svc in to_resume:
+            hostname = _extract_hostname(svc.host)
+            if hostname not in service.hosts_processing:
+                to_resume_filtered.append(svc)
+
+        compute_nodes = compute_nodes_filtered
+        to_resume = to_resume_filtered
 
         if original_count > len(compute_nodes):
             skipped_hosts = original_count - len(compute_nodes)
@@ -2546,8 +2545,10 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
             logging.warning("No compute nodes with servers to evacuate - all filtered out")
 
     # Get reserved hosts if enabled
-    reserved_hosts = ([svc for svc in services if 'disabled' in svc.status and 'reserved' in svc.disabled_reason]
-                     if service.config.is_reserved_hosts_enabled() and compute_nodes else [])
+    reserved_hosts = []
+    if service.config.is_reserved_hosts_enabled() and compute_nodes:
+        reserved_hosts = [svc for svc in services
+                          if 'disabled' in svc.status and 'reserved' in svc.disabled_reason]
 
     # Get evacuable resources (cache already refreshed above if compute nodes are down)
     images_enabled = service.config.is_tagged_images_enabled()
@@ -2612,11 +2613,10 @@ def _filter_by_aggregates(conn, service, compute_nodes, services):
     """Filter compute nodes by aggregate evacuability."""
     try:
         aggregates = conn.aggregates.list()
-        evacuable_tag = service.config.get_evacuable_tag()
         evacuable_hosts = set()
 
         for agg in aggregates:
-            if service._is_resource_evacuable(agg, evacuable_tag, ['metadata']):
+            if service._is_resource_evacuable(agg, service.evacuable_tag, ['metadata']):
                 evacuable_hosts.update(agg.hosts)
 
         compute_nodes_down = list(compute_nodes)
@@ -2650,8 +2650,8 @@ def _process_reenabling(conn, service, to_reenable) -> None:
                 # Clean up evacuation count
                 service.host_evacuation_counts.pop(svc.host, None)
             else:
-                # Use stored evacuation count, default to 10 for backward compatibility
-                evacuation_count = service.host_evacuation_counts.get(svc.host, 10)
+                # Use stored evacuation count, default for backward compatibility
+                evacuation_count = service.host_evacuation_counts.get(svc.host, DEFAULT_EVACUATION_COUNT)
                 migrations = conn.migrations.list(source_compute=svc.host, migration_type='evacuation', limit=evacuation_count)
                 incomplete = [m for m in migrations if m.status not in MIGRATION_STATUS_COMPLETED and m.status not in MIGRATION_STATUS_ERROR]
 
@@ -2709,19 +2709,12 @@ def main():
 
         time.sleep(service.config.get_poll_interval())
 
-    return service
-
 
 if __name__ == "__main__":
-    service_instance = None
     try:
-        # Get service instance from main for cleanup
-        service_instance = main()
+        main()
     except KeyboardInterrupt:
-        if service_instance:
-            service_instance.kdump_listener_stop_event.set()
+        logging.info("Shutting down due to keyboard interrupt")
     except Exception as e:
         logging.error(f'Error: {e}')
-        if service_instance:
-            service_instance.kdump_listener_stop_event.set()
         raise
