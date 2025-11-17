@@ -1356,7 +1356,7 @@ def _kdump_udp_listener(service: 'InstanceHAService') -> None:
                             try:
                                 hostname = _extract_hostname(socket.gethostbyaddr(address[0])[0])
                                 service.kdump_hosts_timestamp[hostname] = time.time()
-                                logging.info(f'Kdump message received from host: {hostname}')
+                                logging.debug(f'Kdump message received from host: {hostname}')
 
                                 # Cleanup old entries periodically
                                 if len(service.kdump_hosts_timestamp) > KDUMP_CLEANUP_THRESHOLD:

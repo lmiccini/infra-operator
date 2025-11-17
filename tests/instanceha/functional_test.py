@@ -1332,11 +1332,11 @@ class TestKdumpFunctionality(BaseTestCase):
 
         # compute-0 and compute-1 have kdump messages → evacuate immediately (kdump-fenced)
         # compute-2 has no kdump → waiting (not evacuated yet)
-        filtered_hosts = [svc.host for svc in filtered_services]
-        self.assertEqual(len(filtered_services), 2, "Should evacuate kdump-fenced hosts")
-        self.assertIn('compute-0', filtered_hosts, "Kdump-fenced host should be evacuated")
-        self.assertIn('compute-1', filtered_hosts, "Kdump-fenced host should be evacuated")
-        self.assertNotIn('compute-2', filtered_hosts, "Waiting host should not be evacuated yet")
+        kdump_hosts = [svc.host for svc in kdumping_hosts]
+        self.assertEqual(len(kdumping_hosts), 2, "Should evacuate kdump-fenced hosts")
+        self.assertIn('compute-0', kdump_hosts, "Kdump-fenced host should be evacuated")
+        self.assertIn('compute-1', kdump_hosts, "Kdump-fenced host should be evacuated")
+        self.assertEqual(len(filtered_services), 0, "Non-kdump hosts should be waiting, not in filtered_services yet")
         self.assertIn('compute-2', self.env.service.kdump_hosts_checking, "compute-2 should be in waiting state")
 
     def test_kdump_detection_no_messages(self):
@@ -1440,10 +1440,10 @@ class TestKdumpFunctionality(BaseTestCase):
         filtered_services, kdumping_hosts = instanceha._check_kdump(stale_services, self.env.service)
 
         # compute-0 has kdump → evacuate, compute-1 no kdump → waiting
-        filtered_hosts = [svc.host for svc in filtered_services]
-        self.assertEqual(len(filtered_services), 1, "Should evacuate kdump-fenced host")
-        self.assertIn('compute-0.example.com', filtered_hosts, "Kdump-fenced host should be evacuated")
-        self.assertNotIn('compute-1.example.com', filtered_hosts, "Waiting host should not be evacuated yet")
+        kdump_hosts = [svc.host for svc in kdumping_hosts]
+        self.assertEqual(len(kdumping_hosts), 1, "Should evacuate kdump-fenced host")
+        self.assertIn('compute-0.example.com', kdump_hosts, "Kdump-fenced host should be evacuated")
+        self.assertEqual(len(filtered_services), 0, "Waiting host should not be in filtered_services yet")
         self.assertIn('compute-1', self.env.service.kdump_hosts_checking)
 
     def test_kdump_detection_network_errors(self):
@@ -1590,11 +1590,11 @@ class TestKdumpFunctionality(BaseTestCase):
         filtered_services, kdumping_hosts = instanceha._check_kdump(stale_services, self.env.service)
 
         # Both compute nodes have kdump messages → evacuate immediately (kdump-fenced)
-        filtered_hosts = [svc.host for svc in filtered_services]
-        self.assertEqual(len(filtered_services), 2,
+        kdump_hosts = [svc.host for svc in kdumping_hosts]
+        self.assertEqual(len(kdumping_hosts), 2,
                         "Should evacuate all kdump-fenced compute hosts, ignoring non-compute hosts")
-        self.assertIn('compute-0', filtered_hosts)
-        self.assertIn('compute-1', filtered_hosts)
+        self.assertIn('compute-0', kdump_hosts)
+        self.assertIn('compute-1', kdump_hosts)
 
     def test_kdump_detection_mixed_compute_and_other_hosts(self):
         """Test kdump detection with mixed compute and non-compute hosts kdumping."""
@@ -1648,12 +1648,11 @@ class TestKdumpFunctionality(BaseTestCase):
 
         # compute-0 has kdump → evacuate, compute-1 and compute-2 no kdump → waiting
         # Messages from storage-0 and controller-0 should be ignored
-        filtered_hosts = [svc.host for svc in filtered_services]
-        self.assertEqual(len(filtered_services), 1,
+        kdump_hosts = [svc.host for svc in kdumping_hosts]
+        self.assertEqual(len(kdumping_hosts), 1,
                         "Should evacuate only kdump-fenced compute host")
-        self.assertIn('compute-0', filtered_hosts, "Kdump-fenced compute-0 should be evacuated")
-        self.assertNotIn('compute-1', filtered_hosts, "Waiting compute-1 should not be evacuated yet")
-        self.assertNotIn('compute-2', filtered_hosts, "Waiting compute-2 should not be evacuated yet")
+        self.assertIn('compute-0', kdump_hosts, "Kdump-fenced compute-0 should be evacuated")
+        self.assertEqual(len(filtered_services), 0, "Waiting hosts should not be in filtered_services yet")
         self.assertIn('compute-1', self.env.service.kdump_hosts_checking)
         self.assertIn('compute-2', self.env.service.kdump_hosts_checking)
 
@@ -1697,11 +1696,11 @@ class TestKdumpFunctionality(BaseTestCase):
 
             if magic == 0x1B302A40:
                 # Should evacuate the kdump-fenced host
-                self.assertEqual(len(filtered_services), 1,
+                self.assertEqual(len(kdumping_hosts), 1,
                                 f"Should evacuate kdump-fenced host with correct magic number: {hex(magic)}")
             else:
                 # Should start waiting (not evacuate yet)
-                self.assertEqual(len(filtered_services), 0,
+                self.assertEqual(len(kdumping_hosts), 0,
                                 f"Should wait for hosts with incorrect magic number: {hex(magic)}")
                 self.assertIn('compute-0', self.env.service.kdump_hosts_checking)
 
@@ -1863,9 +1862,9 @@ class TestKdumpFunctionality(BaseTestCase):
         elapsed_time = time.time() - start_time
 
         # Should detect kdump message and evacuate the host immediately (kdump-fenced)
-        self.assertEqual(len(filtered_services), 1,
+        self.assertEqual(len(kdumping_hosts), 1,
                         "Host should be evacuated when kdump detected (kdump-fenced)")
-        self.assertEqual(filtered_services[0].host, 'compute-timing-02')
+        self.assertEqual(kdumping_hosts[0].host, 'compute-timing-02')
         # With background listener, response should be immediate (< 1s)
         self.assertLess(elapsed_time, 1.0,
                        f"Should complete immediately with background listener (elapsed: {elapsed_time:.1f}s)")
