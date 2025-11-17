@@ -2323,6 +2323,8 @@ def _post_evacuation_recovery(conn, failed_service, service):
         if kdump_fenced:
             logging.info("Skipping power on for %s (kdump fenced)", failed_service.host)
             service.kdump_fenced_hosts.discard(hostname)
+            service.kdump_hosts_timestamp.pop(hostname, None)
+            service.kdump_hosts_checking.pop(hostname, None)
         else:
             logging.debug("Powering on host %s", failed_service.host)
             power_on_result = _host_fence(failed_service.host, 'on', service)

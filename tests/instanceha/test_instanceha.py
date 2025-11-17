@@ -1293,9 +1293,13 @@ class TestKdumpFunctionality(unittest.TestCase):
         mock_service_instance = instanceha.InstanceHAService(Mock())
         mock_service_instance.config = self.mock_service.config
 
-        # Add multiple hosts to kdump_fenced_hosts
+        # Add multiple hosts to kdump_fenced_hosts and tracking dicts
         mock_service_instance.kdump_fenced_hosts.add('compute-01')
         mock_service_instance.kdump_fenced_hosts.add('compute-02')
+        mock_service_instance.kdump_hosts_timestamp['compute-01'] = time.time()
+        mock_service_instance.kdump_hosts_timestamp['compute-02'] = time.time()
+        mock_service_instance.kdump_hosts_checking['compute-01'] = time.time()
+        mock_service_instance.kdump_hosts_checking['compute-02'] = time.time()
 
         mock_conn = Mock()
         mock_service_obj = Mock()
@@ -1305,9 +1309,13 @@ class TestKdumpFunctionality(unittest.TestCase):
         with patch('instanceha._host_enable', return_value=True):
             instanceha._post_evacuation_recovery(mock_conn, mock_service_obj, mock_service_instance)
 
-            # Verify only compute-01 was removed, compute-02 remains
+            # Verify only compute-01 was removed from all tracking structures, compute-02 remains
             self.assertNotIn('compute-01', mock_service_instance.kdump_fenced_hosts)
             self.assertIn('compute-02', mock_service_instance.kdump_fenced_hosts)
+            self.assertNotIn('compute-01', mock_service_instance.kdump_hosts_timestamp)
+            self.assertIn('compute-02', mock_service_instance.kdump_hosts_timestamp)
+            self.assertNotIn('compute-01', mock_service_instance.kdump_hosts_checking)
+            self.assertIn('compute-02', mock_service_instance.kdump_hosts_checking)
 
 
 class TestKdumpIntegration(unittest.TestCase):
