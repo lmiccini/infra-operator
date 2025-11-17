@@ -1252,6 +1252,8 @@ class TestKdumpFunctionality(unittest.TestCase):
         mock_conn = Mock()
         mock_service_obj = Mock()
         mock_service_obj.host = 'compute-01.example.com'
+        mock_service_obj.id = 'service-123'
+        mock_service_obj.status = 'disabled'
 
         # Create service instance and mark host as kdump fenced
         mock_service_instance = instanceha.InstanceHAService(Mock())
@@ -1274,6 +1276,8 @@ class TestKdumpFunctionality(unittest.TestCase):
         mock_conn = Mock()
         mock_service_obj = Mock()
         mock_service_obj.host = 'compute-01.example.com'
+        mock_service_obj.id = 'service-123'
+        mock_service_obj.status = 'disabled'
 
         # Create service instance without kdump fencing
         mock_service_instance = instanceha.InstanceHAService(Mock())
@@ -1304,6 +1308,8 @@ class TestKdumpFunctionality(unittest.TestCase):
         mock_conn = Mock()
         mock_service_obj = Mock()
         mock_service_obj.host = 'compute-01.example.com'
+        mock_service_obj.id = 'service-123'
+        mock_service_obj.status = 'disabled'
         mock_service_instance.config.is_leave_disabled_enabled.return_value = False
 
         with patch('instanceha._host_enable', return_value=True):

@@ -4,7 +4,7 @@ This directory contains a comprehensive test suite for the InstanceHA service th
 
 ## Test Statistics
 
-- **Total Tests**: 200
+- **Total Tests**: 202
 - **Code Coverage**: 71% (1140/1625 lines)
 - **Execution Time**: ~14 seconds
 - **Status**: All tests passing ✅
@@ -38,12 +38,16 @@ The test suite is organized into four main categories:
 - Error handling and edge cases
 
 ### 3. Integration Tests (`integration_test.py`)
-- **19 tests** validating cross-component interactions
+- **21 tests** validating cross-component interactions
 - Complete service initialization workflows
 - Nova connection establishment
 - Service categorization and filtering pipelines
 - Full evacuation workflows with all components
 - Re-enabling workflows with migration checks
+  - Two-stage re-enabling: unset force_down first, then enable when up
+  - Verification that force_down is unset to allow service to report up
+  - Verification that disabled services are NOT enabled until state='up'
+  - Verification that disabled services ARE enabled when back up with migrations complete
 - Performance and scaling under load
 - Error handling and recovery scenarios
 
@@ -109,9 +113,19 @@ python3 -m coverage html  # Generate HTML report
 - Service initialization and configuration loading
 - Nova API connection establishment
 - Service state categorization (stale, resume, re-enable)
+  - `disabled_reason` markers prevent resume loops:
+    - "instanceha evacuation: {timestamp}" → service needs resume/completion
+    - "instanceha evacuation complete: {timestamp}" → service ready for re-enable
 - Host and server filtering logic
 - Evacuation workflow execution
 - Service re-enabling after evacuation
+  - Two-stage re-enabling process:
+    1. Unset force_down first (allows nova-compute to report status)
+    2. Wait for service to report state='up'
+    3. Then enable disabled services
+  - Migration completion verification before starting re-enable process
+  - Resume bug fix: hosts not powered on repeatedly during resume cycles
+  - Resume loop fix: disabled_reason updated to prevent re-processing
 - Migration status tracking
 - Cache lifecycle management
 

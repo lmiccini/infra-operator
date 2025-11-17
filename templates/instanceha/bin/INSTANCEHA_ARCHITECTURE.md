@@ -6,7 +6,7 @@ InstanceHA is a high-availability service for OpenStack that automatically detec
 
 **Version**: 2.0
 **Code Coverage**: 71% (1140/1625 lines)
-**Test Suite**: 200 tests, ~14 seconds execution time
+**Test Suite**: 202 tests, ~14 seconds execution time
 
 ## Table of Contents
 
@@ -350,8 +350,9 @@ def validate_input(value: str, validation_type: str, context: str) -> bool:
     ┌──────────────────────────────────────────────────┐
     │ 3. Categorize Services                           │
     │    - compute_nodes: down or stale                │
-    │    - to_resume: forced_down + instanceha reason  │
-    │    - to_reenable: enabled + forced_down          │
+    │    - to_resume: 'evacuation:' marker + down      │
+    │    - to_reenable: forced_down OR 'complete:'     │
+    │      (excluding resume candidates)               │
     └──────────────────────────────────────────────────┘
                             │
                             ▼
@@ -366,7 +367,10 @@ def validate_input(value: str, validation_type: str, context: str) -> bool:
     ┌──────────────────────────────────────────────────┐
     │ 5. Process Re-enabling                           │
     │    - Check migration status                      │
-    │    - Unset force-down if migrations complete     │
+    │    - Unset force-down first (allows srv to go up)│
+    │    - Wait for service state='up'                 │
+    │    - Then enable disabled services               │
+    │    - Two-stage process for proper recovery       │
     └──────────────────────────────────────────────────┘
                             │
                             ▼
@@ -410,8 +414,8 @@ process_service(failed_service, reserved_hosts, resume, service)
     │   │
     │   └─ 2. Disable Host in Nova
     │       └─ _host_disable(connection, service)
-    │           ├─ Force service down
-    │           └─ Log disable reason
+    │           ├─ Force service down (forced_down=True)
+    │           └─ Set disabled_reason = 'instanceha evacuation: {timestamp}'
     │
     ├─ 3. Manage Reserved Hosts
     │   └─ _manage_reserved_hosts(conn, failed_service, reserved_hosts)
@@ -428,16 +432,20 @@ process_service(failed_service, reserved_hosts, resume, service)
     │           └─ Traditional: fire-and-forget
     │
     └─ 5. Post-Evacuation Recovery
-        └─ _post_evacuation_recovery(conn, failed_service)
+        └─ _post_evacuation_recovery(conn, failed_service, service, resume)
             ├─ Power on host (_host_fence(host, 'on'))
-            └─ Re-enable host in Nova
+            │   ├─ Skip if resume=True
+            │   └─ Skip if kdump-fenced
+            ├─ Update disabled_reason = 'instanceha evacuation complete: {timestamp}'
+            │   └─ Prevents resume loops (excludes from resume criteria)
+            └─ Service remains disabled until it comes back up
 ```
 
 ---
 
 ### Service Categorization Logic
 
-**Location**: `instanceha.py:2500-2516`
+**Location**: `instanceha.py:2456-2479`
 
 **Implementation**:
 ```python
@@ -448,24 +456,63 @@ def _categorize_services(services: List[Any], target_date: datetime) -> tuple:
                      and (svc.state == 'down' or
                           datetime.fromisoformat(svc.updated_at) < target_date))
 
-    # Resume: forced_down + disabled + instanceha reason + not FAILED
+    # Resume: forced_down + disabled + 'instanceha evacuation:' marker + not FAILED/complete
+    # Note: Must exclude 'evacuation complete:' to prevent resume loops
     resume = (svc for svc in services
               if svc.forced_down and svc.state == 'down'
               and 'disabled' in svc.status
               and 'instanceha evacuation' in svc.disabled_reason
-              and 'evacuation FAILED' not in svc.disabled_reason)
+              and 'evacuation FAILED' not in svc.disabled_reason
+              and 'evacuation complete' not in svc.disabled_reason)
 
-    # Re-enable: enabled + forced_down
+    # Re-enable: forced_down OR 'evacuation complete' marker (but NOT resume candidates)
     reenable = (svc for svc in services
-                if 'enabled' in svc.status and svc.forced_down)
+                if (('enabled' in svc.status and svc.forced_down)
+                   or ('disabled' in svc.status and 'instanceha evacuation complete' in svc.disabled_reason))
+                and not (svc.forced_down and svc.state == 'down' and 'disabled' in svc.status
+                        and 'instanceha evacuation' in svc.disabled_reason
+                        and 'evacuation FAILED' not in svc.disabled_reason
+                        and 'evacuation complete' not in svc.disabled_reason))
 
     return compute_nodes, resume, reenable
 ```
 
 **States Explained**:
 - **compute_nodes**: Fresh failures, need full evacuation workflow
-- **resume**: Previous evacuation interrupted, skip fencing/disable
-- **reenable**: Evacuations complete, waiting for migrations to finish
+- **resume**: Previous evacuation interrupted (still down+disabled+forced_down), skip fencing/disable
+  - Matches services with `disabled_reason` containing "instanceha evacuation:"
+  - Explicitly excludes "evacuation complete:" to prevent resume loops
+  - Explicitly excludes "evacuation FAILED:" to prevent retry of failed evacuations
+- **reenable**: Services needing re-enabling (two-stage process)
+  - Stage 1: Unset force_down to allow service to report up
+  - Stage 2: Once state='up', enable disabled services
+  - Matches services with `disabled_reason` containing "instanceha evacuation complete:"
+  - Excludes resume candidates to avoid double-processing
+
+**State Transitions**:
+1. Service fails → `compute_nodes` → evacuated → `disabled_reason` = "instanceha evacuation: {timestamp}"
+2. Next poll → `disabled_reason` updated to "instanceha evacuation complete: {timestamp}"
+   - Service now excluded from `resume` (has "complete" marker)
+   - Service now included in `reenable` (has "complete" marker)
+3. Subsequent polls → `reenable` → force_down unset → service reports up → enabled
+4. Service returns to normal operation
+
+**Disabled Reason Values**:
+
+The `disabled_reason` field tracks evacuation state and prevents processing loops:
+
+| Value | Set By | Categorization | Meaning |
+|-------|--------|----------------|---------|
+| `instanceha evacuation: {timestamp}` | `_host_disable()` during initial evacuation | `resume` | Evacuation in progress or interrupted |
+| `instanceha evacuation complete: {timestamp}` | `_post_evacuation_recovery()` after successful evacuation | `reenable` | Evacuation complete, waiting for re-enable |
+| `instanceha evacuation FAILED: {timestamp}` | `_update_service_disable_reason()` on evacuation failure | (none) | Evacuation failed, requires manual intervention |
+
+**Key Design Points**:
+- The `resume` check explicitly excludes "complete" and "FAILED" to prevent loops
+- The `reenable` exclusion also excludes "complete" to prevent excluding completed evacuations
+- Services transition from `resume` → `reenable` via the disabled_reason update
+- Failed evacuations remain disabled until manually resolved
+- Both checks use substring matching, so explicit exclusions are critical
 
 ---
 
@@ -939,7 +986,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
 
 ### Test Statistics
 
-- **Total Tests**: 200
+- **Total Tests**: 202
 - **Code Coverage**: 71% (1140/1625 lines)
 - **Execution Time**: ~14 seconds
 
@@ -955,9 +1002,11 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
 - Large-scale scenarios (100+ hosts)
 - Tag filtering, performance
 
-**3. Integration Tests** (19 tests):
+**3. Integration Tests** (21 tests):
 - Service initialization, Nova connection
 - Categorization, full workflows
+- Deferred re-enabling (disabled services only re-enabled when up)
+- Migration completion verification
 
 **4. Advanced Integration** (12 tests):
 - Smart evacuation (tracking, timeout, retry)

@@ -257,7 +257,8 @@ def _wait_for_power_off(check_func: Callable[[], Optional[str]], timeout: int,
         time.sleep(1)
         power_state = check_func()
         if power_state == expected_state:
-            logging.info("%s power off successful for %s", agent_type, host_identifier)
+            logging.debug("%s power off successful for %s", agent_type, host_identifier)
+            logging.info("%s power off successful", agent_type)
             return True
     logging.error('Power off of %s timed out', host_identifier)
     return False
@@ -1292,7 +1293,7 @@ class InstanceHAService(CloudConnectionProvider):
 
             # Refresh cache when cache_timeout exceeded or when forced
             if force or cache_age > cache_timeout or not self._evacuable_flavors_cache:
-                logging.info("Refreshing evacuable cache (age: %.1f seconds)", cache_age)
+                logging.debug("Refreshing evacuable cache (age: %.1f seconds)", cache_age)
                 self._evacuable_flavors_cache = None
                 self._evacuable_images_cache = None
                 self._cache_timestamp = current_time
@@ -1305,7 +1306,7 @@ class InstanceHAService(CloudConnectionProvider):
         evac_flavors = self.get_evacuable_flavors(connection)
         evac_images = self.get_evacuable_images(connection)
 
-        logging.info("Cache refreshed: %d flavors, %d images", len(evac_flavors), len(evac_images))
+        logging.debug("Cache refreshed: %d flavors, %d images", len(evac_flavors), len(evac_images))
         return True
 
 
@@ -1395,7 +1396,7 @@ def _update_service_disable_reason(connection, host, service_id=None):
 
         disable_reason = f"evacuation FAILED: {datetime.now().isoformat()}"
         connection.services.disable_log_reason(service_id, disable_reason)
-        logging.info('Evacuation failed. Updated disabled reason for host %s', host)
+        logging.debug('Updated disabled reason for host %s after evacuation failure', host)
         return True
     except Exception as e:
         logging.error('Failed to update disable_reason for host %s. Error: %s', host, e)
@@ -1777,9 +1778,9 @@ def _host_enable(connection, service, reenable: bool = False) -> bool:
     """Enable a host service, optionally unsetting force-down."""
     if reenable:
         try:
-            logging.info(f'Unsetting force-down on host {service.host} after evacuation')
+            logging.debug(f'Unsetting force-down on host {service.host} after evacuation')
             connection.services.force_down(service.id, False)
-            logging.info(f'Successfully unset force-down on host {service.host}')
+            logging.info(f'Unset force-down for {service.host}')
             return True
         except Exception as e:
             logging.warning(f'Could not unset force-down for {service.host}. Please check the host status and perform manual cleanup if necessary: {e}. Will try again the next poll cycle.')
@@ -1869,13 +1870,15 @@ def _redfish_reset(url, user, passwd, timeout, action):
                         lambda: _redfish_get_power_state(url, user, passwd, timeout),
                         timeout, safe_url, 'OFF', 'Redfish')
                 else:
-                    logging.info("Redfish reset successful: %s on %s", action, safe_url)
+                    logging.debug("Redfish reset successful: %s on %s", action, safe_url)
+                    logging.info("Redfish reset successful: %s", action)
                     return True
             elif response.status_code in [400, 409]:
                 # Check if server is already powered off
                 power_state = _redfish_get_power_state(url, user, passwd, timeout)
                 if power_state == 'OFF':
-                    logging.info("Redfish reset successful: %s on %s (already off)", action, safe_url)
+                    logging.debug("Redfish reset successful: %s on %s (already off)", action, safe_url)
+                    logging.info("Redfish reset successful: %s (already off)", action)
                     return True
                 else:
                     logging.error("Redfish reset failed: %s conflict but not OFF (status: %s) for %s", response.status_code, power_state, safe_url)
@@ -2297,30 +2300,30 @@ def _manage_reserved_hosts(conn, failed_service, reserved_hosts, service):
         return False
 
 
-def _post_evacuation_recovery(conn, failed_service, service):
+def _post_evacuation_recovery(conn, failed_service, service, resume=False):
     """
-    Perform post-evacuation recovery by powering on and re-enabling the host.
+    Perform post-evacuation recovery by powering on the host.
 
     Args:
         conn: Nova client connection
-        service: Service to recover
+        failed_service: Service to recover
+        service: InstanceHA service instance
+        resume: If True, skip power-on (host was already powered on previously)
 
     Returns:
         bool: True if recovery completed successfully, False otherwise
     """
-    if service.config.is_leave_disabled_enabled():
-        logging.info("Evacuation successful. Not re-enabling %s since LEAVE_DISABLED is enabled",
-                    failed_service.host)
-        return True
-
     hostname = _extract_hostname(failed_service.host)
     kdump_fenced = hostname in service.kdump_fenced_hosts
+    leave_disabled = service.config.is_leave_disabled_enabled()
 
     logging.info("Evacuation successful. Starting recovery for %s", failed_service.host)
 
     try:
-        # Step 1: Power on the host (skip if kdump fenced)
-        if kdump_fenced:
+        # Step 1: Power on the host (skip if kdump fenced or resuming)
+        if resume:
+            logging.debug("Skipping power on for %s (resume)", failed_service.host)
+        elif kdump_fenced:
             logging.info("Skipping power on for %s (kdump fenced)", failed_service.host)
             service.kdump_fenced_hosts.discard(hostname)
             service.kdump_hosts_timestamp.pop(hostname, None)
@@ -2332,15 +2335,22 @@ def _post_evacuation_recovery(conn, failed_service, service):
                 logging.error("Failed to power on %s during recovery", failed_service.host)
                 return False
 
-        # Step 2: Re-enable the host in Nova
-        logging.debug("Re-enabling host %s in Nova", failed_service.host)
-        enable_result = _host_enable(conn, failed_service, reenable=False)
+        # Update disabled reason to indicate evacuation complete (prevents resume loops)
+        if 'disabled' in failed_service.status:
+            try:
+                new_reason = f"instanceha evacuation complete: {datetime.now().isoformat()}"
+                conn.services.disable_log_reason(failed_service.id, new_reason)
+                logging.debug(f"Updated disable reason for {failed_service.host} to indicate evacuation complete")
+            except Exception as e:
+                logging.warning(f"Failed to update disable reason for {failed_service.host}: {e}")
 
-        if not enable_result:
-            logging.error("Failed to re-enable %s during recovery", failed_service.host)
-            return False
-
-        logging.info("Recovery completed successfully for %s", failed_service.host)
+        # Service re-enabling behavior depends on LEAVE_DISABLED setting
+        if leave_disabled:
+            logging.info("Recovery completed successfully for %s (will remain disabled due to LEAVE_DISABLED)",
+                        failed_service.host)
+        else:
+            logging.info("Recovery completed successfully for %s (will re-enable when host is up)",
+                        failed_service.host)
         return True
 
     except Exception as e:
@@ -2397,10 +2407,10 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
                 return False
 
             if not _execute_step("Recovery", _post_evacuation_recovery, host_name,
-                                conn, failed_service, service):
+                                conn, failed_service, service, resume):
                 return False
 
-            logging.info(f"Service processing completed successfully for {host_name}")
+            logging.debug(f"Service processing completed successfully for {host_name}")
             return True
 
         except Exception as e:
@@ -2453,14 +2463,22 @@ def _categorize_services(services: List[Any], target_date: datetime) -> tuple:
                      if not ('disabled' in svc.status or svc.forced_down)
                      and (svc.state == 'down' or datetime.fromisoformat(svc.updated_at) < target_date))
 
-    # Resume candidates (forced down, disabled with instanceha marker, not failed)
+    # Resume candidates (forced down, disabled with instanceha marker, not failed, not complete)
     resume = (svc for svc in services
               if svc.forced_down and svc.state == 'down' and 'disabled' in svc.status
               and 'instanceha evacuation' in svc.disabled_reason
-              and 'evacuation FAILED' not in svc.disabled_reason)
+              and 'evacuation FAILED' not in svc.disabled_reason
+              and 'evacuation complete' not in svc.disabled_reason)
 
-    # Re-enable candidates (enabled but forced down)
-    reenable = (svc for svc in services if 'enabled' in svc.status and svc.forced_down)
+    # Re-enable candidates (forced down OR disabled with instanceha complete marker, but NOT resume candidates)
+    # Note: We unset force_down first to allow service to report up, then enable once up
+    reenable = (svc for svc in services
+                if (('enabled' in svc.status and svc.forced_down)
+                   or ('disabled' in svc.status and 'instanceha evacuation complete' in svc.disabled_reason))
+                and not (svc.forced_down and svc.state == 'down' and 'disabled' in svc.status
+                        and 'instanceha evacuation' in svc.disabled_reason
+                        and 'evacuation FAILED' not in svc.disabled_reason
+                        and 'evacuation complete' not in svc.disabled_reason))
 
     return compute_nodes, resume, reenable
 
@@ -2529,11 +2547,11 @@ def _prepare_evacuation_resources(conn, service, services, compute_nodes):
     original_count = len(compute_nodes)
     compute_nodes = service.filter_hosts_with_servers(compute_nodes, host_servers_cache)
     filtered_count = len(compute_nodes)
-    logging.info("Filtered compute nodes: %d -> %d (removed %d hosts with no servers)",
+    logging.debug("Filtered compute nodes: %d -> %d (removed %d hosts with no servers)",
                 original_count, filtered_count, original_count - filtered_count)
 
     if not compute_nodes:
-        logging.warning("No compute nodes with servers to evacuate - all filtered out")
+        logging.debug("No compute nodes with servers to evacuate - all filtered out")
         return [], [], [], []
 
     # Get reserved hosts if enabled
@@ -2650,27 +2668,44 @@ def _process_reenabling(conn, service, to_reenable) -> None:
     if not to_reenable:
         return
 
+    # Filter out instanceha-evacuated services if LEAVE_DISABLED is enabled
+    leave_disabled = service.config.is_leave_disabled_enabled()
+    if leave_disabled:
+        to_reenable = [svc for svc in to_reenable
+                      if not ('disabled' in svc.status and 'instanceha evacuation complete' in svc.disabled_reason)]
+        if not to_reenable:
+            return
+
     logging.debug(f'Checking {len(to_reenable)} computes for re-enabling')
     force_enable = service.config.is_force_enable_enabled()
 
     for svc in to_reenable:
         try:
+            # Check if migrations are complete (or force enable)
             if force_enable:
-                _host_enable(conn, svc, reenable=True)
-                logging.info(f'Force re-enabled {svc.host}')
+                migrations_complete = True
             else:
-                # Query recent migrations from this host
                 query_time = (datetime.now() - timedelta(minutes=MIGRATION_QUERY_MINUTES)).isoformat()
                 migrations = conn.migrations.list(source_compute=svc.host, migration_type='evacuation',
                                                  changes_since=query_time, limit=MIGRATION_QUERY_LIMIT)
                 incomplete = [m for m in migrations if m.status not in MIGRATION_STATUS_COMPLETED and m.status not in MIGRATION_STATUS_ERROR]
+                migrations_complete = len(incomplete) == 0
 
-                if not incomplete:
-                    _host_enable(conn, svc, reenable=True)
-                    completed_count = len([m for m in migrations if m.status in MIGRATION_STATUS_COMPLETED])
-                    logging.info(f'All {completed_count} migrations completed, re-enabled {svc.host}')
+            if not migrations_complete:
+                logging.debug(f'{len(incomplete)}/{len(migrations)} migration(s) incomplete for {svc.host}, not re-enabling')
+                continue
+
+            # Unset force_down if needed (allows service to report up)
+            if svc.forced_down:
+                _host_enable(conn, svc, reenable=True)
+
+            # Enable disabled services only if they're now up
+            if 'disabled' in svc.status:
+                if svc.state == 'up':
+                    _host_enable(conn, svc, reenable=False)
+                    logging.info(f'Enabled {svc.host} (migrations complete, service is up)')
                 else:
-                    logging.debug(f'{len(incomplete)}/{len(migrations)} migration(s) incomplete for {svc.host}, not re-enabling')
+                    logging.debug(f'{svc.host} still down, will enable once up')
         except Exception as e:
             logging.error(f'Failed to enable {svc.host}: {e}')
 
@@ -2704,8 +2739,6 @@ def main():
 
             # Convert generator to list for logging and processing
             compute_nodes_list = list(compute_nodes)
-            if compute_nodes_list:
-                logging.info(f'Found {len(compute_nodes_list)} compute nodes needing evacuation: {[svc.host for svc in compute_nodes_list]}')
 
             # Process stale services for evacuation (convert back to generator for processing)
             _process_stale_services(conn, service, services, (svc for svc in compute_nodes_list), to_resume)

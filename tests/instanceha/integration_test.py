@@ -344,9 +344,9 @@ class TestServiceCategorization(unittest.TestCase):
             'compute-02', state='down', status='enabled'
         )
 
-        # Re-enable candidate (forced down but enabled)
+        # Re-enable candidate (forced down but enabled, and back up)
         reenable_service = self.mock_env.add_compute_service(
-            'compute-03', state='down', status='enabled', forced_down=True
+            'compute-03', state='up', status='enabled', forced_down=True
         )
 
         # Resume candidate (forced down, disabled with instanceha reason)
@@ -551,13 +551,14 @@ class TestReenablingWorkflow(unittest.TestCase):
         self.mock_env = MockOpenStackEnvironment()
         self.mock_config = Mock()
         self.mock_config.is_force_enable_enabled.return_value = False
+        self.mock_config.is_leave_disabled_enabled.return_value = False
         self.mock_config.get_config_value.return_value = 30  # Default FENCING_TIMEOUT
 
     def test_reenable_services_with_completed_migrations(self):
         """Test re-enabling services with completed migrations."""
-        # Setup service that can be re-enabled
+        # Setup service that can be re-enabled (must be 'up' to be re-enabled)
         service_to_reenable = self.mock_env.add_compute_service(
-            'compute-01', state='down', status='enabled', forced_down=True
+            'compute-01', state='up', status='enabled', forced_down=True
         )
 
         # Setup completed migration
@@ -577,7 +578,7 @@ class TestReenablingWorkflow(unittest.TestCase):
     def test_reenable_services_with_incomplete_migrations(self):
         """Test re-enabling blocked by incomplete migrations."""
         service_to_reenable = self.mock_env.add_compute_service(
-            'compute-01', state='down', status='enabled', forced_down=True
+            'compute-01', state='up', status='enabled', forced_down=True
         )
 
         # Setup incomplete migration
@@ -599,7 +600,7 @@ class TestReenablingWorkflow(unittest.TestCase):
         self.mock_config.is_force_enable_enabled.return_value = True
 
         service_to_reenable = self.mock_env.add_compute_service(
-            'compute-01', state='down', status='enabled', forced_down=True
+            'compute-01', state='up', status='enabled', forced_down=True
         )
 
         nova_client = self.mock_env.create_nova_client_mock()
@@ -610,6 +611,73 @@ class TestReenablingWorkflow(unittest.TestCase):
 
         # Verify enable was called without checking migrations
         nova_client.services.force_down.assert_called_with(service_to_reenable.id, False)
+
+    def test_disabled_service_not_reenabled_when_down(self):
+        """Test that disabled services have force_down unset, but are NOT enabled when still down."""
+        # Service is disabled (evacuation complete), force_down was already unset, but still down
+        # This represents the state after force_down was unset but before service reports up
+        service_disabled_down = self.mock_env.add_compute_service(
+            'compute-01', state='down', status='disabled', forced_down=False,
+            disabled_reason='instanceha evacuation complete: 2023-01-01T00:00:00'
+        )
+
+        # Setup completed migrations
+        completed_migration = Mock()
+        completed_migration.status = 'completed'
+        self.mock_env.migrations = [completed_migration]
+
+        nova_client = self.mock_env.create_nova_client_mock()
+        service = instanceha.InstanceHAService(self.mock_config, nova_client)
+
+        # Should be in reenable list to unset force_down
+        target_date = datetime.now() - timedelta(seconds=60)
+        _, _, to_reenable = instanceha._categorize_services(
+            self.mock_env.services, target_date
+        )
+        to_reenable_list = list(to_reenable)
+
+        self.assertEqual(len(to_reenable_list), 1)
+        self.assertIn(service_disabled_down, to_reenable_list)
+
+        # Process re-enabling
+        instanceha._process_reenabling(nova_client, service, to_reenable_list)
+
+        # Verify force_down was NOT called (already False) and service was NOT enabled (still down)
+        nova_client.services.force_down.assert_not_called()
+        nova_client.services.enable.assert_not_called()
+
+    def test_disabled_service_reenabled_when_up(self):
+        """Test that disabled services ARE re-enabled when they come back up."""
+        # Service is disabled (evacuation complete) and has come back up
+        service_disabled_up = self.mock_env.add_compute_service(
+            'compute-01', state='up', status='disabled', forced_down=True,
+            disabled_reason='instanceha evacuation complete: 2023-01-01T00:00:00'
+        )
+
+        # Setup completed migrations
+        completed_migration = Mock()
+        completed_migration.status = 'completed'
+        self.mock_env.migrations = [completed_migration]
+
+        nova_client = self.mock_env.create_nova_client_mock()
+        service = instanceha.InstanceHAService(self.mock_config, nova_client)
+
+        # Should be in reenable list
+        target_date = datetime.now() - timedelta(seconds=60)
+        _, _, to_reenable = instanceha._categorize_services(
+            self.mock_env.services, target_date
+        )
+        to_reenable_list = list(to_reenable)
+
+        self.assertEqual(len(to_reenable_list), 1)
+        self.assertIn(service_disabled_up, to_reenable_list)
+
+        # Test re-enabling
+        instanceha._process_reenabling(nova_client, service, to_reenable_list)
+
+        # Verify both force_down was unset AND service was enabled
+        nova_client.services.force_down.assert_called_with(service_disabled_up.id, False)
+        nova_client.services.enable.assert_called_with(service_disabled_up.id)
 
 
 class TestPerformanceAndScaling(unittest.TestCase):
