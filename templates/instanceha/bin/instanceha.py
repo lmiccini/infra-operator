@@ -2718,7 +2718,7 @@ def _process_reenabling(conn, service, to_reenable) -> None:
                 last_kdump = service.kdump_hosts_timestamp.get(hostname, 0)
                 time_since_kdump = time.time() - last_kdump if last_kdump > 0 else float('inf')
                 if time_since_kdump < 60:
-                    logging.debug(f'{svc.host} still dumping memory ({time_since_kdump:.0f}s since last kdump msg), not re-enabling yet')
+                    logging.info(f'{svc.host} waiting for kdump to complete ({time_since_kdump:.0f}s since last message, waiting for 60s)')
                     continue
                 else:
                     logging.info(f'{svc.host} kdump messages stopped ({time_since_kdump:.0f}s since last message), proceeding with re-enable')
