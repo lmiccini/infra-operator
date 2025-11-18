@@ -4,9 +4,9 @@ This directory contains a comprehensive test suite for the InstanceHA service th
 
 ## Test Statistics
 
-- **Total Tests**: 202
+- **Total Tests**: 210 (+6 new kdump tests)
 - **Code Coverage**: 71% (1140/1625 lines)
-- **Execution Time**: ~14 seconds
+- **Execution Time**: ~15 seconds
 - **Status**: All tests passing ✅
 
 ## Test Structure
@@ -14,7 +14,7 @@ This directory contains a comprehensive test suite for the InstanceHA service th
 The test suite is organized into four main categories:
 
 ### 1. Unit Tests (`test_instanceha.py`)
-- **134 tests** validating individual components and isolated functionality
+- **140 tests** validating individual components and isolated functionality (+6 new kdump tests)
 - Configuration management and validation
 - Metrics collection and timing
 - Service initialization and caching
@@ -154,6 +154,17 @@ python3 -m coverage html  # Generate HTML report
   - Timeout-based evacuation when no kdump detected
   - Power-on skip optimization for kdump-fenced hosts
   - Cleanup of old entries and tracking state
+  - **Disable Logic** (new tests):
+    - Kdump-fenced hosts call `_host_disable` despite `resume=True`
+    - Resume evacuations skip `_host_disable` (already disabled)
+    - New evacuations call both fence and disable
+    - Edge case handling for partial disable states
+  - **Disabled Reason Management** (new tests):
+    - Preservation of kdump marker in "evacuation complete" message
+    - Stale service object handling (pre-disable status)
+  - **Re-enable Delay**:
+    - 60-second wait after kdump messages stop
+    - Logging for waiting and completion states
 - **Threshold Protection**:
   - Mass failure prevention
   - Percentage-based limits

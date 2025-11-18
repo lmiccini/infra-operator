@@ -403,19 +403,24 @@ def validate_input(value: str, validation_type: str, context: str) -> bool:
 process_service(failed_service, reserved_hosts, resume, service)
     │
     ├─ (if not resume)
-    │   ├─ 1. Fence Host
-    │   │   └─ _host_fence(host, 'off')
-    │   │       ├─ Look up fencing config
-    │   │       ├─ Validate inputs (SSRF prevention)
-    │   │       └─ Execute fencing operation
-    │   │           ├─ IPMI: ipmitool with retries
-    │   │           ├─ Redfish: HTTP POST with retries
-    │   │           └─ BMH: Kubernetes PATCH with wait
-    │   │
-    │   └─ 2. Disable Host in Nova
-    │       └─ _host_disable(connection, service)
+    │   └─ 1. Fence Host (Power Off)
+    │       └─ _host_fence(host, 'off')
+    │           ├─ Look up fencing config
+    │           ├─ Validate inputs (SSRF prevention)
+    │           └─ Execute fencing operation
+    │               ├─ IPMI: ipmitool with retries
+    │               ├─ Redfish: HTTP POST with retries
+    │               └─ BMH: Kubernetes PATCH with wait
+    │
+    ├─ 2. Disable Host in Nova
+    │   └─ (if not (resume AND forced_down AND 'disabled' in status))
+    │       └─ _host_disable(connection, service, instanceha_service)
     │           ├─ Force service down (forced_down=True)
-    │           └─ Set disabled_reason = 'instanceha evacuation: {timestamp}'
+    │           └─ Set disabled_reason:
+    │               ├─ 'instanceha evacuation (kdump): {timestamp}' (if kdump-fenced)
+    │               └─ 'instanceha evacuation: {timestamp}' (otherwise)
+    │       Note: Skipped for resume evacuations (already disabled)
+    │             Called for kdump-fenced (not yet disabled)
     │
     ├─ 3. Manage Reserved Hosts
     │   └─ _manage_reserved_hosts(conn, failed_service, reserved_hosts)
@@ -436,8 +441,11 @@ process_service(failed_service, reserved_hosts, resume, service)
             ├─ Power on host (_host_fence(host, 'on'))
             │   ├─ Skip if resume=True
             │   └─ Skip if kdump-fenced
-            ├─ Update disabled_reason = 'instanceha evacuation complete: {timestamp}'
+            ├─ Update disabled_reason (always, even if service object is stale):
+            │   ├─ 'instanceha evacuation complete (kdump): {timestamp}' (if kdump-fenced)
+            │   └─ 'instanceha evacuation complete: {timestamp}' (otherwise)
             │   └─ Prevents resume loops (excludes from resume criteria)
+            │       Preserves kdump marker for re-enable delay
             └─ Service remains disabled until it comes back up
 ```
 
@@ -505,7 +513,8 @@ The `disabled_reason` field tracks evacuation state and prevents processing loop
 |-------|--------|----------------|---------|
 | `instanceha evacuation: {timestamp}` | `_host_disable()` during initial evacuation | `resume` | Evacuation in progress or interrupted |
 | `instanceha evacuation (kdump): {timestamp}` | `_host_disable()` when host is kdump-fenced | `resume` | Kdump evacuation in progress, host rebooting |
-| `instanceha evacuation complete: {timestamp}` | `_post_evacuation_recovery()` or `_host_enable()` after successful evacuation | `reenable` | Evacuation complete, waiting for re-enable |
+| `instanceha evacuation complete: {timestamp}` | `_post_evacuation_recovery()` after successful evacuation | `reenable` | Evacuation complete, waiting for re-enable |
+| `instanceha evacuation complete (kdump): {timestamp}` | `_post_evacuation_recovery()` after kdump-fenced evacuation | `reenable` | Kdump evacuation complete, waiting 60s for kdump messages to stop before re-enable |
 | `instanceha evacuation FAILED: {timestamp}` | `_update_service_disable_reason()` on evacuation failure | (none) | Evacuation failed, requires manual intervention |
 
 **Key Design Points**:
@@ -824,16 +833,24 @@ compute-03:
 
 **Behavior**:
 1. **First poll**: When host is detected as down, start waiting for `KDUMP_TIMEOUT` seconds
-2. **Kdump message received**: Host is fenced → evacuate immediately
+2. **Kdump message received**: Host is fenced → evacuate immediately (with `resume=True`)
    - Host marked with `disabled_reason = "instanceha evacuation (kdump): {timestamp}"`
+   - Power-off fencing is skipped (host already down/rebooting)
+   - `_host_disable()` is still called (host not yet disabled from Nova's perspective)
 3. **Timeout expired**: No kdump detected → proceed with normal evacuation
-4. **Power-on optimization**: Skip power-on for kdump-fenced hosts during recovery
+4. **Evacuation complete**: Update `disabled_reason` to preserve kdump marker
+   - `disabled_reason = "instanceha evacuation complete (kdump): {timestamp}"`
+   - Prevents resume loops (has "evacuation complete")
+   - Triggers re-enable delay (has "kdump" marker)
+5. **Power-on optimization**: Skip power-on for kdump-fenced hosts during recovery
    - Kdump `final_action` in `/etc/kdump.conf` determines host behavior (poweroff/reboot/halt)
    - Skipping power-on avoids interfering with user-configured kdump recovery process
-5. **Re-enablement delay**: After evacuation, wait 60s after last kdump message before unsetting force-down
+6. **Re-enablement delay**: After evacuation, wait 60s after last kdump message before unsetting force-down
    - Prevents premature re-enablement while host is still dumping memory and rebooting
-   - Once 60s have passed with no kdump messages, migrations should be in `completed` state
-   - Kdump marker removed from `disabled_reason` once force-down successfully unset
+   - Logs: `INFO {host} waiting for kdump to complete ({X}s since last message, waiting for 60s)`
+   - Once 60s passed: `INFO {host} kdump messages stopped ({X}s since last message), proceeding with re-enable`
+   - Only then attempts to unset force-down (requires migrations in `completed` state)
+   - Kdump marker cleaned up from `kdump_fenced_hosts` set once force-down successfully unset
 
 ---
 
