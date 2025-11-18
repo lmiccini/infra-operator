@@ -2595,7 +2595,8 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
         _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
         return
 
-    logging.warning(f'The following computes are down: {[svc.host for svc in compute_nodes]}')
+    if compute_nodes:
+        logging.warning(f'The following computes are down: {[svc.host for svc in compute_nodes]}')
 
     # Prepare resources for evacuation
     compute_nodes, reserved_hosts, images, flavors = _prepare_evacuation_resources(conn, service, services, compute_nodes)
