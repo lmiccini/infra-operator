@@ -2395,8 +2395,10 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
             if not resume:
                 if not _execute_step("Fencing", _host_fence, host_name, host_name, 'off', service):
                     return False
-                if not _execute_step("Host disable", _host_disable, host_name, conn, failed_service):
-                    return False
+
+            # Always disable the host (even for kdump-fenced hosts)
+            if not _execute_step("Host disable", _host_disable, host_name, conn, failed_service):
+                return False
 
             if not _execute_step("Reserved host management", _manage_reserved_hosts, host_name,
                                 conn, failed_service, reserved_hosts, service):
