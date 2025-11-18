@@ -2348,8 +2348,10 @@ def _post_evacuation_recovery(conn, failed_service, service, resume=False):
 
         # Update disabled reason to indicate evacuation complete (prevents resume loops)
         # Note: Service object may be stale (pre-disable status), so we always try to update
+        # Preserve kdump marker if present to ensure proper re-enable delay
         try:
-            new_reason = f"instanceha evacuation complete: {datetime.now().isoformat()}"
+            suffix = " (kdump)" if kdump_fenced else ""
+            new_reason = f"instanceha evacuation complete{suffix}: {datetime.now().isoformat()}"
             conn.services.disable_log_reason(failed_service.id, new_reason)
             logging.debug(f"Updated disable reason for {failed_service.host} to indicate evacuation complete")
         except Exception as e:

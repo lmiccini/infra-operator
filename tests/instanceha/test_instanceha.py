@@ -1686,6 +1686,30 @@ class TestKdumpIntegration(unittest.TestCase):
         self.assertEqual(call_args[0], 'service-123')
         self.assertIn('instanceha evacuation complete:', call_args[1])
 
+    def test_post_evacuation_recovery_preserves_kdump_marker(self):
+        """Test that kdump marker is preserved in 'evacuation complete' message."""
+        mock_conn = Mock()
+        failed_service = Mock()
+        failed_service.host = 'compute-01.example.com'
+        failed_service.id = 'service-123'
+        failed_service.status = 'disabled'
+
+        mock_service_instance = instanceha.InstanceHAService(Mock())
+        mock_service_instance.config.is_leave_disabled_enabled.return_value = False
+        mock_service_instance.kdump_fenced_hosts.add('compute-01')
+
+        # Call post_evacuation_recovery with resume=True
+        result = instanceha._post_evacuation_recovery(mock_conn, failed_service, mock_service_instance, resume=True)
+
+        # Should succeed
+        self.assertTrue(result)
+
+        # disabled_reason should have both "evacuation complete" AND "(kdump)" marker
+        mock_conn.services.disable_log_reason.assert_called_once()
+        call_args = mock_conn.services.disable_log_reason.call_args[0]
+        self.assertEqual(call_args[0], 'service-123')
+        self.assertIn('instanceha evacuation complete (kdump):', call_args[1])
+
 
 class TestRedfishFencing(unittest.TestCase):
     """Unit tests for Redfish fencing functionality."""
