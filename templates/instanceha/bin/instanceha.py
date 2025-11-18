@@ -2347,13 +2347,13 @@ def _post_evacuation_recovery(conn, failed_service, service, resume=False):
                 return False
 
         # Update disabled reason to indicate evacuation complete (prevents resume loops)
-        if 'disabled' in failed_service.status:
-            try:
-                new_reason = f"instanceha evacuation complete: {datetime.now().isoformat()}"
-                conn.services.disable_log_reason(failed_service.id, new_reason)
-                logging.debug(f"Updated disable reason for {failed_service.host} to indicate evacuation complete")
-            except Exception as e:
-                logging.warning(f"Failed to update disable reason for {failed_service.host}: {e}")
+        # Note: Service object may be stale (pre-disable status), so we always try to update
+        try:
+            new_reason = f"instanceha evacuation complete: {datetime.now().isoformat()}"
+            conn.services.disable_log_reason(failed_service.id, new_reason)
+            logging.debug(f"Updated disable reason for {failed_service.host} to indicate evacuation complete")
+        except Exception as e:
+            logging.warning(f"Failed to update disable reason for {failed_service.host}: {e}")
 
         # Service re-enabling behavior depends on LEAVE_DISABLED setting
         if leave_disabled:

@@ -1660,6 +1660,32 @@ class TestKdumpIntegration(unittest.TestCase):
             # _host_disable SHOULD be called (not fully disabled)
             mock_disable.assert_called_once()
 
+    def test_post_evacuation_recovery_updates_disabled_reason_for_stale_service(self):
+        """Test that disabled_reason is updated even when service object is stale (not yet disabled)."""
+        # Simulate a kdump-fenced host: service object is stale (shows 'enabled' status)
+        # but _host_disable was just called, so it's actually disabled in Nova
+        mock_conn = Mock()
+        failed_service = Mock()
+        failed_service.host = 'compute-01.example.com'
+        failed_service.id = 'service-123'
+        failed_service.status = 'enabled'  # Stale - shows pre-disable status
+
+        mock_service_instance = instanceha.InstanceHAService(Mock())
+        mock_service_instance.config.is_leave_disabled_enabled.return_value = False
+
+        # Call post_evacuation_recovery
+        result = instanceha._post_evacuation_recovery(mock_conn, failed_service, mock_service_instance, resume=True)
+
+        # Should succeed
+        self.assertTrue(result)
+
+        # disabled_reason should be updated even though status shows 'enabled'
+        # (service object is stale, but we know _host_disable was just called)
+        mock_conn.services.disable_log_reason.assert_called_once()
+        call_args = mock_conn.services.disable_log_reason.call_args[0]
+        self.assertEqual(call_args[0], 'service-123')
+        self.assertIn('instanceha evacuation complete:', call_args[1])
+
 
 class TestRedfishFencing(unittest.TestCase):
     """Unit tests for Redfish fencing functionality."""
