@@ -807,8 +807,8 @@ class InstanceHAService(CloudConnectionProvider):
         Returns:
             bool: True if server is evacuable, False otherwise
         """
-        evac_flavors = evac_flavors or self.get_evacuable_flavors()
-        evac_images = evac_images or self.get_evacuable_images()
+        evac_flavors = evac_flavors if evac_flavors is not None else self.get_evacuable_flavors()
+        evac_images = evac_images if evac_images is not None else self.get_evacuable_images()
 
         images_enabled = self.config.is_tagged_images_enabled()
         flavors_enabled = self.config.is_tagged_flavors_enabled()
@@ -2571,8 +2571,6 @@ def _prepare_evacuation_resources(conn, service, services, compute_nodes):
     # Filter evacuable servers if tagging is enabled
     if (images_enabled or flavors_enabled) and host_servers_cache:
         compute_nodes = service.filter_hosts_with_evacuable_servers(compute_nodes, host_servers_cache, flavors, images)
-        if not images and not flavors:
-            logging.info("No tagged resources found - will evacuate all servers")
 
     # Apply aggregate filtering if enabled
     if service.config.is_tagged_aggregates_enabled():
