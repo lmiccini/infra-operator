@@ -1685,7 +1685,7 @@ def _handle_nova_exception(operation: str, service_info: str, e: Exception, is_c
     return False
 
 
-def _host_disable(connection, service):
+def _host_disable(connection, service, instanceha_service=None):
     """
     Disable a compute service by forcing it down and logging the reason.
 
@@ -1696,6 +1696,7 @@ def _host_disable(connection, service):
     Args:
         connection: Nova client connection
         service: Service object to disable
+        instanceha_service: Optional InstanceHA service to check kdump state
 
     Returns:
         bool: True if both operations succeeded, False otherwise
@@ -1723,7 +1724,9 @@ def _host_disable(connection, service):
 
     # Step 2: Log the reason for disabling (only if force_down succeeded)
     try:
-        disable_reason = f"instanceha evacuation: {datetime.now().isoformat()}"
+        is_kdump = instanceha_service and _extract_hostname(service.host) in instanceha_service.kdump_fenced_hosts
+        suffix = " (kdump)" if is_kdump else ""
+        disable_reason = f"instanceha evacuation{suffix}: {datetime.now().isoformat()}"
         connection.services.disable_log_reason(service.id, disable_reason)
         logging.info("Successfully disabled %s with reason: %s", service_info, disable_reason)
         return True
@@ -1774,30 +1777,40 @@ def _check_kdump(stale_services: List[Any], service: InstanceHAService) -> Tuple
     return to_evacuate, kdump_fenced_services
 
 
-def _host_enable(connection, service, reenable: bool = False) -> bool:
+def _host_enable(connection, nova_service, reenable: bool = False, service=None) -> bool:
     """Enable a host service, optionally unsetting force-down."""
     if reenable:
         try:
-            logging.debug(f'Unsetting force-down on host {service.host} after evacuation')
-            connection.services.force_down(service.id, False)
-            logging.info(f'Unset force-down for {service.host}')
+            logging.debug(f'Unsetting force-down on host {nova_service.host} after evacuation')
+            connection.services.force_down(nova_service.id, False)
+            logging.info(f'Unset force-down for {nova_service.host}')
+            # Clean up kdump marker and tracking if present
+            if 'kdump' in getattr(nova_service, 'disabled_reason', ''):
+                try:
+                    connection.services.disable_log_reason(nova_service.id, f"instanceha evacuation complete: {datetime.now().isoformat()}")
+                    if service:
+                        hostname = _extract_hostname(nova_service.host)
+                        service.kdump_fenced_hosts.discard(hostname)
+                        service.kdump_hosts_timestamp.pop(hostname, None)
+                except Exception:
+                    pass
             return True
         except Exception as e:
-            logging.warning(f'Could not unset force-down for {service.host}. Please check the host status and perform manual cleanup if necessary: {e}. Will try again the next poll cycle.')
+            logging.warning(f'Could not unset force-down for {nova_service.host}. Please check the host status and perform manual cleanup if necessary: {e}. Will try again the next poll cycle.')
             return False
 
     # Retry logic for enabling service
     for attempt in range(MAX_ENABLE_RETRIES):
         try:
-            logging.info(f'Trying to enable {service.host} (attempt {attempt + 1}/{MAX_ENABLE_RETRIES})')
-            connection.services.enable(service.id)
-            logging.info(f'Host {service.host} is now enabled')
+            logging.info(f'Trying to enable {nova_service.host} (attempt {attempt + 1}/{MAX_ENABLE_RETRIES})')
+            connection.services.enable(nova_service.id)
+            logging.info(f'Host {nova_service.host} is now enabled')
             return True
         except Exception as e:
             if attempt < MAX_ENABLE_RETRIES - 1:
-                logging.warning(f'Failed to enable {service.host}, retrying: {e}')
+                logging.warning(f'Failed to enable {nova_service.host}, retrying: {e}')
             else:
-                logging.error(f'Failed to enable {service.host} after {MAX_ENABLE_RETRIES} attempts. Last error: {e}')
+                logging.error(f'Failed to enable {nova_service.host} after {MAX_ENABLE_RETRIES} attempts. Last error: {e}')
             continue
 
     return False
@@ -2325,8 +2338,6 @@ def _post_evacuation_recovery(conn, failed_service, service, resume=False):
             logging.debug("Skipping power on for %s (resume)", failed_service.host)
         elif kdump_fenced:
             logging.info("Skipping power on for %s (kdump fenced)", failed_service.host)
-            service.kdump_fenced_hosts.discard(hostname)
-            service.kdump_hosts_timestamp.pop(hostname, None)
             service.kdump_hosts_checking.pop(hostname, None)
         else:
             logging.debug("Powering on host %s", failed_service.host)
@@ -2393,12 +2404,15 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
 
             # Execute processing steps
             if not resume:
+                # Fence (power off) the host before evacuation
                 if not _execute_step("Fencing", _host_fence, host_name, host_name, 'off', service):
                     return False
 
-            # Always disable the host (even for kdump-fenced hosts)
-            if not _execute_step("Host disable", _host_disable, host_name, conn, failed_service):
-                return False
+            # Disable the host (skip if already disabled from previous evacuation attempt)
+            # Note: kdump-fenced hosts use resume=True but are NOT yet disabled, so we still disable them
+            if not (resume and failed_service.forced_down and 'disabled' in failed_service.status):
+                if not _execute_step("Host disable", _host_disable, host_name, conn, failed_service, service):
+                    return False
 
             if not _execute_step("Reserved host management", _manage_reserved_hosts, host_name,
                                 conn, failed_service, reserved_hosts, service):
@@ -2696,9 +2710,18 @@ def _process_reenabling(conn, service, to_reenable) -> None:
                 logging.debug(f'{len(incomplete)}/{len(migrations)} migration(s) incomplete for {svc.host}, not re-enabling')
                 continue
 
+            # For kdump hosts, wait until kdump messages stop (60s timeout)
+            if 'kdump' in getattr(svc, 'disabled_reason', ''):
+                hostname = _extract_hostname(svc.host)
+                last_kdump = service.kdump_hosts_timestamp.get(hostname, 0)
+                time_since_kdump = time.time() - last_kdump if last_kdump > 0 else float('inf')
+                if time_since_kdump < 60:
+                    logging.debug(f'{svc.host} still dumping memory ({time_since_kdump:.0f}s since last kdump msg), not re-enabling yet')
+                    continue
+
             # Unset force_down if needed (allows service to report up)
             if svc.forced_down:
-                _host_enable(conn, svc, reenable=True)
+                _host_enable(conn, svc, reenable=True, service=service)
 
             # Enable disabled services only if they're now up
             if 'disabled' in svc.status:

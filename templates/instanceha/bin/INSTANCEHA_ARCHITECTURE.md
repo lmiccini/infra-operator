@@ -504,7 +504,8 @@ The `disabled_reason` field tracks evacuation state and prevents processing loop
 | Value | Set By | Categorization | Meaning |
 |-------|--------|----------------|---------|
 | `instanceha evacuation: {timestamp}` | `_host_disable()` during initial evacuation | `resume` | Evacuation in progress or interrupted |
-| `instanceha evacuation complete: {timestamp}` | `_post_evacuation_recovery()` after successful evacuation | `reenable` | Evacuation complete, waiting for re-enable |
+| `instanceha evacuation (kdump): {timestamp}` | `_host_disable()` when host is kdump-fenced | `resume` | Kdump evacuation in progress, host rebooting |
+| `instanceha evacuation complete: {timestamp}` | `_post_evacuation_recovery()` or `_host_enable()` after successful evacuation | `reenable` | Evacuation complete, waiting for re-enable |
 | `instanceha evacuation FAILED: {timestamp}` | `_update_service_disable_reason()` on evacuation failure | (none) | Evacuation failed, requires manual intervention |
 
 **Key Design Points**:
@@ -824,10 +825,15 @@ compute-03:
 **Behavior**:
 1. **First poll**: When host is detected as down, start waiting for `KDUMP_TIMEOUT` seconds
 2. **Kdump message received**: Host is fenced → evacuate immediately
+   - Host marked with `disabled_reason = "instanceha evacuation (kdump): {timestamp}"`
 3. **Timeout expired**: No kdump detected → proceed with normal evacuation
 4. **Power-on optimization**: Skip power-on for kdump-fenced hosts during recovery
    - Kdump `final_action` in `/etc/kdump.conf` determines host behavior (poweroff/reboot/halt)
    - Skipping power-on avoids interfering with user-configured kdump recovery process
+5. **Re-enablement delay**: After evacuation, wait 60s after last kdump message before unsetting force-down
+   - Prevents premature re-enablement while host is still dumping memory and rebooting
+   - Once 60s have passed with no kdump messages, migrations should be in `completed` state
+   - Kdump marker removed from `disabled_reason` once force-down successfully unset
 
 ---
 
