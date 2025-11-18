@@ -2720,6 +2720,8 @@ def _process_reenabling(conn, service, to_reenable) -> None:
                 if time_since_kdump < 60:
                     logging.debug(f'{svc.host} still dumping memory ({time_since_kdump:.0f}s since last kdump msg), not re-enabling yet')
                     continue
+                else:
+                    logging.info(f'{svc.host} kdump messages stopped ({time_since_kdump:.0f}s since last message), proceeding with re-enable')
 
             # Unset force_down if needed (allows service to report up)
             if svc.forced_down:
