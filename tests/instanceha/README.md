@@ -4,19 +4,19 @@ This directory contains a comprehensive test suite for the InstanceHA service th
 
 ## Test Statistics
 
-- **Total Tests**: 210 (+6 new kdump tests)
-- **Code Coverage**: 71% (1140/1625 lines)
-- **Execution Time**: ~15 seconds
+- **Total Tests**: 334 (193 unit + 16 security + 29 critical error + 12 workflow + 9 config + 21 integration + 54 functional)
+- **Code Coverage**: 77% (unit tests alone), 82% (with integration + functional tests)
+- **Execution Time**: ~15 seconds (unit tests), ~16 seconds (all tests)
+- **Code Size**: 2,670 lines (reduced from 2,703 after removing unused code)
 - **Status**: All tests passing ✅
 
 ## Test Structure
 
-The test suite is organized into four main categories:
+The test suite is organized into eight main categories:
 
 ### 1. Unit Tests (`test_instanceha.py`)
-- **140 tests** validating individual components and isolated functionality (+6 new kdump tests)
+- **193 tests** validating individual components and isolated functionality
 - Configuration management and validation
-- Metrics collection and timing
 - Service initialization and caching
 - Main function initialization and error handling
 - Evacuation logic and tag checking
@@ -28,7 +28,7 @@ The test suite is organized into four main categories:
 - Input validation and SSRF prevention
 
 ### 2. Functional Tests (`functional_test.py`)
-- **60 tests** validating end-to-end scenarios
+- **54 tests** validating end-to-end scenarios
 - Basic evacuation workflows
 - Large-scale evacuation scenarios (100+ hosts)
 - Host state classification and filtering
@@ -70,6 +70,96 @@ The test suite is organized into four main categories:
   - Error recovery and continued operation
   - Metrics logging at intervals
 
+### 5. Security Validation Tests (`test_security_validation.py`)
+- **16 tests** validating security-critical input validation and SSRF prevention
+- **SSRF Prevention (6 tests)**
+  - URL validation blocks localhost addresses
+  - URL validation blocks loopback IPs (127.0.0.1, ::1, 0.0.0.0)
+  - URL validation blocks link-local addresses (169.254.x.x for AWS metadata)
+  - URL validation allows legitimate URLs
+  - URL validation rejects malformed URLs
+  - Redfish URL building rejects invalid configurations
+- **Injection Prevention (7 tests)**
+  - Port validation rejects out-of-range ports
+  - Port validation rejects non-numeric values
+  - Power action validation uses strict whitelisting
+  - Username validation rejects shell metacharacters
+  - Kubernetes resource name validation
+  - Kubernetes namespace validation
+- **Fencing Validation (3 tests)**
+  - Host fence rejects invalid power actions
+  - Host fence validates actions before lookup
+  - Host fence requires host parameter
+
+### 6. Critical Error Path Tests (`test_critical_error_paths.py`)
+- **29 tests** validating critical error handling paths
+- **Configuration Errors (7 tests)**
+  - YAML parsing errors (corrupted files)
+  - Missing configuration files
+  - Permission denied on config files
+  - Invalid configuration format (not dictionary)
+  - Type validation failures (non-integer, non-boolean)
+  - Invalid log level validation
+- **Nova API Exceptions (8 tests)**
+  - Server evacuation with NotFound exception
+  - Server evacuation with Forbidden exception
+  - Server evacuation with Unauthorized exception
+  - Evacuation status check with no connection
+  - Evacuation status check with API failure
+  - Nova login with DiscoveryFailure
+  - Nova login with Unauthorized
+- **Service Disable Validation (4 tests)**
+  - Host disable with missing connection
+  - Host disable with missing service
+  - Host disable with service missing ID attribute
+  - Host disable with service missing host attribute
+- **Evacuation Timeouts (3 tests)**
+  - Smart evacuation timeout handling
+  - Smart evacuation retry exhaustion
+  - Smart evacuation with invalid server object
+- **Fencing Failures (7 tests)**
+  - Host fence with no configuration
+  - Host fence with invalid fencing data
+  - Host fence with missing agent
+  - Redfish reset with missing parameters
+  - Redfish reset with invalid URL
+  - BMH fence with missing parameters
+  - BMH fence with invalid action
+
+### 7. Evacuation Workflow Tests (`test_evacuation_workflow.py`)
+- **12 tests** validating high-priority evacuation workflow paths
+- **Kdump Resume Disable Logic (3 tests)**
+  - Resume with already disabled service skips disable step
+  - Kdump-fenced hosts with resume=True still call disable
+  - New evacuation (resume=False) always calls disable
+- **Post-Evacuation Recovery Error Paths (3 tests)**
+  - Recovery failure when power-on fails
+  - Recovery continues when disable reason update fails (non-critical)
+  - Recovery handles unexpected exceptions during power-on
+- **Process Service Step Failures (6 tests)**
+  - Fencing step failure stops processing immediately
+  - Disable step failure stops processing immediately
+  - Reserved hosts step failure stops processing immediately
+  - Evacuation step failure stops processing immediately
+  - Recovery step failure stops processing immediately
+  - All steps succeeding results in success
+
+### 8. Configuration Feature Tests (`test_config_features.py`)
+- **9 tests** validating configuration parameter behaviors
+- **DISABLED Configuration (2 tests)**
+  - DISABLED=True skips all evacuations
+  - DISABLED=False processes evacuations normally
+- **FORCE_ENABLE Configuration (3 tests)**
+  - FORCE_ENABLE=True bypasses migration completion check
+  - FORCE_ENABLE=False waits for migration completion
+  - FORCE_ENABLE=True still respects kdump re-enable delay
+- **LEAVE_DISABLED Configuration (2 tests)**
+  - LEAVE_DISABLED=True filters instanceha-evacuated services from re-enable
+  - LEAVE_DISABLED=False enables all services including instanceha-evacuated
+- **TAGGED_AGGREGATES Configuration (2 tests)**
+  - TAGGED_AGGREGATES=True filters compute nodes by aggregate metadata
+  - TAGGED_AGGREGATES=False does not filter by aggregate
+
 ## Running Tests
 
 ### Run All Tests
@@ -79,8 +169,20 @@ The test suite is organized into four main categories:
 
 ### Run Individual Test Suites
 ```bash
-# Unit tests only
+# Unit and integration tests
 python3 test_instanceha.py
+
+# Security validation tests only
+python3 test_security_validation.py
+
+# Critical error path tests only
+python3 test_critical_error_paths.py
+
+# Evacuation workflow tests only
+python3 test_evacuation_workflow.py
+
+# Configuration feature tests only
+python3 test_config_features.py
 
 # Functional tests only
 python3 functional_test.py

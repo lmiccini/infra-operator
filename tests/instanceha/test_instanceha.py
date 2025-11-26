@@ -223,65 +223,6 @@ class TestMetrics(unittest.TestCase):
         """Set up test fixtures."""
         self.metrics = instanceha.Metrics()
 
-    def test_metrics_initialization(self):
-        """Test Metrics initialization."""
-        self.assertEqual(self.metrics.counters, {})
-        self.assertEqual(self.metrics.durations, {})
-        self.assertIsInstance(self.metrics.start_time, float)
-
-    def test_counter_operations(self):
-        """Test counter increment operations."""
-        self.metrics.increment('test_counter')
-        self.assertEqual(self.metrics.counters['test_counter'], 1)
-
-        self.metrics.increment('test_counter', 5)
-        self.assertEqual(self.metrics.counters['test_counter'], 6)
-
-    def test_duration_recording(self):
-        """Test duration recording."""
-        self.metrics.record_duration('test_operation', 1.5)
-        self.assertEqual(self.metrics.durations['test_operation'], 1.5)
-
-        self.metrics.record_duration('test_operation', 2.5)
-        self.assertEqual(self.metrics.durations['test_operation'], 4.0)
-
-    def test_timing_context(self):
-        """Test TimingContext manager."""
-        with self.metrics.timer('test_timer'):
-            time.sleep(0.1)
-
-        # Check that metrics were recorded
-        self.assertIn('test_timer_total', self.metrics.counters)
-        self.assertIn('test_timer_successful', self.metrics.counters)
-        self.assertIn('test_timer_duration', self.metrics.durations)
-        self.assertEqual(self.metrics.counters['test_timer_total'], 1)
-        self.assertEqual(self.metrics.counters['test_timer_successful'], 1)
-
-    def test_timing_context_with_exception(self):
-        """Test TimingContext with exception handling."""
-        try:
-            with self.metrics.timer('test_timer_error'):
-                raise ValueError("Test error")
-        except ValueError:
-            pass
-
-        # Check that failure was recorded
-        self.assertIn('test_timer_error_total', self.metrics.counters)
-        self.assertIn('test_timer_error_failed', self.metrics.counters)
-        self.assertEqual(self.metrics.counters['test_timer_error_failed'], 1)
-
-    def test_metrics_summary(self):
-        """Test metrics summary generation."""
-        self.metrics.increment('test_metric', 10)
-        self.metrics.record_duration('test_duration', 2.0)
-
-        summary = self.metrics.get_summary()
-
-        self.assertIn('uptime_seconds', summary)
-        self.assertIn('counters', summary)
-        self.assertIn('total_durations', summary)
-        self.assertEqual(summary['counters']['test_metric'], 10)
-        self.assertEqual(summary['total_durations']['test_duration'], 2.0)
 
 
 class TestHelperFunctions(unittest.TestCase):
@@ -414,45 +355,6 @@ class TestInstanceHAService(unittest.TestCase):
         flavors = self.service.get_evacuable_flavors(self.mock_cloud_client)
         self.assertEqual(flavors, ['new-flavor'])
 
-    def test_cache_thread_safety(self):
-        """Test that cache operations are thread-safe."""
-        import threading
-        import time
-
-        # Set up mock data
-        mock_flavor = Mock()
-        mock_flavor.id = 'thread-safe-flavor'
-        mock_flavor.get_keys.return_value = {'evacuable': 'true'}
-        self.mock_cloud_client.flavors.list.return_value = [mock_flavor]
-
-        errors = []
-
-        def cache_operation(thread_id):
-            try:
-                # Simulate concurrent cache operations
-                self.service.clear_cache()
-                with patch.object(self.service, 'get_evacuable_images', return_value=[]):
-                    self.service.refresh_evacuable_cache(self.mock_cloud_client, force=True)
-                flavors = self.service.get_evacuable_flavors(self.mock_cloud_client)
-                # Should not raise any exceptions
-                self.assertIsInstance(flavors, list)
-            except Exception as e:
-                errors.append(f"Thread {thread_id}: {e}")
-
-        # Run multiple threads concurrently
-        threads = []
-        for i in range(5):
-            thread = threading.Thread(target=cache_operation, args=(i,))
-            threads.append(thread)
-            thread.start()
-
-        # Wait for all threads to complete
-        for thread in threads:
-            thread.join()
-
-        # Should not have any errors from race conditions
-        self.assertEqual(errors, [], f"Thread safety errors: {errors}")
-
     def test_unified_resource_evacuable_checking(self):
         """Test the unified resource evacuable checking methods."""
         # Test _is_resource_evacuable with different resource types
@@ -576,10 +478,6 @@ class TestInstanceHAService(unittest.TestCase):
         hash_interval = real_config.get_config_value('HASH_INTERVAL')
         self.assertIsInstance(hash_interval, int)
         self.assertGreaterEqual(hash_interval, 30)
-
-        metrics_interval = real_config.get_config_value('METRICS_LOG_INTERVAL')
-        self.assertIsInstance(metrics_interval, int)
-        self.assertGreaterEqual(metrics_interval, 300)
 
     def test_filter_hosts_with_servers(self):
         """Test filtering hosts that have servers."""
@@ -1720,10 +1618,10 @@ class TestRedfishFencing(unittest.TestCase):
 
     @patch('instanceha.requests.post')
     @patch('instanceha.requests.get')
-    @patch('instanceha.config_manager')
-    def test_redfish_reset_409_conflict_already_off(self, mock_config_manager, mock_get, mock_post):
+    def test_redfish_reset_409_conflict_already_off(self, mock_get, mock_post):
         """Test Redfish reset with 409 conflict when server is already off."""
-        # Mock SSL config
+        # Mock config manager
+        mock_config_manager = Mock()
         mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 409 Conflict
@@ -1738,7 +1636,7 @@ class TestRedfishFencing(unittest.TestCase):
         mock_get.return_value = mock_get_response
 
         # Test the function
-        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 30, 'ForceOff')
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 30, 'ForceOff', mock_config_manager)
 
         # Should return True because server is already off
         self.assertTrue(result)
@@ -1751,10 +1649,10 @@ class TestRedfishFencing(unittest.TestCase):
 
     @patch('instanceha.requests.post')
     @patch('instanceha.requests.get')
-    @patch('instanceha.config_manager')
-    def test_redfish_reset_409_conflict_not_off(self, mock_config_manager, mock_get, mock_post):
+    def test_redfish_reset_409_conflict_not_off(self, mock_get, mock_post):
         """Test Redfish reset with 409 conflict when server is not off."""
-        # Mock SSL config
+        # Mock config manager
+        mock_config_manager = Mock()
         mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 409 Conflict
@@ -1769,7 +1667,7 @@ class TestRedfishFencing(unittest.TestCase):
         mock_get.return_value = mock_get_response
 
         # Test the function
-        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 30, 'ForceOff')
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 30, 'ForceOff', mock_config_manager)
 
         # Should return False because server is not off
         self.assertFalse(result)
@@ -1780,10 +1678,10 @@ class TestRedfishFencing(unittest.TestCase):
 
     @patch('instanceha.requests.post')
     @patch('instanceha.requests.get')
-    @patch('instanceha.config_manager')
-    def test_redfish_reset_400_bad_request_already_off(self, mock_config_manager, mock_get, mock_post):
+    def test_redfish_reset_400_bad_request_already_off(self, mock_get, mock_post):
         """Test Redfish reset with 400 bad request when server is already off."""
-        # Mock SSL config
+        # Mock config manager
+        mock_config_manager = Mock()
         mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 400 Bad Request
@@ -1798,7 +1696,7 @@ class TestRedfishFencing(unittest.TestCase):
         mock_get.return_value = mock_get_response
 
         # Test the function
-        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 30, 'ForceOff')
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 30, 'ForceOff', mock_config_manager)
 
         # Should return True because server is already off
         self.assertTrue(result)
@@ -1811,10 +1709,10 @@ class TestRedfishFencing(unittest.TestCase):
 
     @patch('instanceha.requests.post')
     @patch('instanceha.requests.get')
-    @patch('instanceha.config_manager')
-    def test_redfish_reset_400_bad_request_not_off(self, mock_config_manager, mock_get, mock_post):
+    def test_redfish_reset_400_bad_request_not_off(self, mock_get, mock_post):
         """Test Redfish reset with 400 bad request when server is not off."""
-        # Mock SSL config
+        # Mock config manager
+        mock_config_manager = Mock()
         mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 400 Bad Request
@@ -1829,7 +1727,7 @@ class TestRedfishFencing(unittest.TestCase):
         mock_get.return_value = mock_get_response
 
         # Test the function
-        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 30, 'ForceOff')
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 30, 'ForceOff', mock_config_manager)
 
         # Should return False because server is not off
         self.assertFalse(result)
@@ -1839,10 +1737,10 @@ class TestRedfishFencing(unittest.TestCase):
         mock_get.assert_called_once()
 
     @patch('instanceha.requests.post')
-    @patch('instanceha.config_manager')
-    def test_redfish_reset_success(self, mock_config_manager, mock_post):
+    def test_redfish_reset_success(self, mock_post):
         """Test successful Redfish reset."""
-        # Mock SSL config
+        # Mock config manager
+        mock_config_manager = Mock()
         mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 200 OK
@@ -1851,7 +1749,7 @@ class TestRedfishFencing(unittest.TestCase):
         mock_post.return_value = mock_post_response
 
         # Test the function with On action (no wait required)
-        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On')
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On', mock_config_manager)
 
         # Should return True
         self.assertTrue(result)
@@ -1860,10 +1758,10 @@ class TestRedfishFencing(unittest.TestCase):
         mock_post.assert_called_once()
 
     @patch('requests.get')
-    @patch('instanceha.config_manager')
-    def test_redfish_get_power_state_success(self, mock_config_manager, mock_get):
+    def test_redfish_get_power_state_success(self, mock_get):
         """Test successful power state retrieval."""
-        # Mock SSL config
+        # Mock config manager
+        mock_config_manager = Mock()
         mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock GET response - ensure it returns immediately
@@ -1875,7 +1773,7 @@ class TestRedfishFencing(unittest.TestCase):
         mock_get.return_value = mock_get_response
 
         # Test the function with a very short timeout
-        result = instanceha._redfish_get_power_state('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 0.1)
+        result = instanceha._redfish_get_power_state('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 0.1, mock_config_manager)
 
         # Should return 'ON'
         self.assertEqual(result, 'ON')
@@ -1886,10 +1784,10 @@ class TestRedfishFencing(unittest.TestCase):
         self.assertEqual(call_args[1]['timeout'], 0.1)  # Verify timeout parameter
 
     @patch('requests.get')
-    @patch('instanceha.config_manager')
-    def test_redfish_get_power_state_failure(self, mock_config_manager, mock_get):
+    def test_redfish_get_power_state_failure(self, mock_get):
         """Test power state retrieval failure."""
-        # Mock SSL config
+        # Mock config manager
+        mock_config_manager = Mock()
         mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock GET response returning error
@@ -1898,7 +1796,7 @@ class TestRedfishFencing(unittest.TestCase):
         mock_get.return_value = mock_get_response
 
         # Test the function
-        result = instanceha._redfish_get_power_state('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 30)
+        result = instanceha._redfish_get_power_state('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 30, mock_config_manager)
 
         # Should return None
         self.assertIsNone(result)
@@ -1908,15 +1806,15 @@ class TestRedfishFencing(unittest.TestCase):
 
     @patch('instanceha.requests.post')
     @patch('requests.get')
-    @patch('instanceha.config_manager')
     @patch('instanceha.time.sleep')
-    def test_redfish_reset_forceoff_wait_for_power_off(self, mock_sleep, mock_config_manager, mock_get, mock_post):
+    def test_redfish_reset_forceoff_wait_for_power_off(self, mock_sleep, mock_get, mock_post):
         """Test Redfish ForceOff waits for actual power off confirmation."""
         # Reset mock call counts
         mock_get.reset_mock()
         mock_sleep.reset_mock()
 
-        # Mock SSL config
+        # Mock config manager
+        mock_config_manager = Mock()
         mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 200 OK
@@ -1932,7 +1830,7 @@ class TestRedfishFencing(unittest.TestCase):
         mock_get.side_effect = mock_get_responses
 
         # Test the function
-        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 2, 'ForceOff')
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 2, 'ForceOff', mock_config_manager)
 
         # Should return True after power off confirmation
         self.assertTrue(result)
@@ -1944,11 +1842,11 @@ class TestRedfishFencing(unittest.TestCase):
 
     @patch('instanceha.requests.post')
     @patch('requests.get')
-    @patch('instanceha.config_manager')
     @patch('instanceha.time.sleep')
-    def test_redfish_reset_forceoff_timeout(self, mock_sleep, mock_config_manager, mock_get, mock_post):
+    def test_redfish_reset_forceoff_timeout(self, mock_sleep, mock_get, mock_post):
         """Test Redfish ForceOff times out waiting for power off."""
-        # Mock SSL config
+        # Mock config manager
+        mock_config_manager = Mock()
         mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 200 OK
@@ -1963,7 +1861,7 @@ class TestRedfishFencing(unittest.TestCase):
         mock_get.return_value = mock_get_response
 
         # Test the function with timeout=2
-        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 2, 'ForceOff')
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 2, 'ForceOff', mock_config_manager)
 
         # Should return False due to timeout
         self.assertFalse(result)
@@ -1974,10 +1872,10 @@ class TestRedfishFencing(unittest.TestCase):
         self.assertGreaterEqual(mock_sleep.call_count, 2)  # At least 2 sleep calls expected
 
     @patch('instanceha.requests.post')
-    @patch('instanceha.config_manager')
-    def test_redfish_reset_on_no_wait(self, mock_config_manager, mock_post):
+    def test_redfish_reset_on_no_wait(self, mock_post):
         """Test Redfish On action doesn't wait for power off."""
-        # Mock SSL config
+        # Mock config manager
+        mock_config_manager = Mock()
         mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 200 OK
@@ -1986,17 +1884,18 @@ class TestRedfishFencing(unittest.TestCase):
         mock_post.return_value = mock_post_response
 
         # Test the function
-        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On')
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On', mock_config_manager)
 
         # Should return True immediately
         self.assertTrue(result)
         mock_post.assert_called_once()
 
     @patch('instanceha.requests.post')
-    @patch('instanceha.config_manager')
     @patch('instanceha.time.sleep')
-    def test_redfish_reset_retry_on_server_error(self, mock_sleep, mock_config_manager, mock_post):
+    def test_redfish_reset_retry_on_server_error(self, mock_sleep, mock_post):
         """Test Redfish reset retries on 5xx server errors."""
+        # Mock config manager
+        mock_config_manager = Mock()
         mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST responses: first two 503 errors, then 200 success
@@ -2007,7 +1906,7 @@ class TestRedfishFencing(unittest.TestCase):
         ]
         mock_post.side_effect = mock_post_responses
 
-        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On')
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On', mock_config_manager)
 
         # Should succeed after retries
         self.assertTrue(result)
@@ -2015,17 +1914,18 @@ class TestRedfishFencing(unittest.TestCase):
         self.assertEqual(mock_sleep.call_count, 2)  # Sleep between retries
 
     @patch('instanceha.requests.post')
-    @patch('instanceha.config_manager')
     @patch('instanceha.time.sleep')
-    def test_redfish_reset_retry_exhausted(self, mock_sleep, mock_config_manager, mock_post):
+    def test_redfish_reset_retry_exhausted(self, mock_sleep, mock_post):
         """Test Redfish reset fails after max retries on server errors."""
+        # Mock config manager
+        mock_config_manager = Mock()
         mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST always returning 503
         mock_post_response = Mock(status_code=503)
         mock_post.return_value = mock_post_response
 
-        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On')
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On', mock_config_manager)
 
         # Should fail after 3 attempts
         self.assertFalse(result)
@@ -2033,10 +1933,11 @@ class TestRedfishFencing(unittest.TestCase):
         self.assertEqual(mock_sleep.call_count, 2)
 
     @patch('instanceha.requests.post')
-    @patch('instanceha.config_manager')
     @patch('instanceha.time.sleep')
-    def test_redfish_reset_retry_on_network_error(self, mock_sleep, mock_config_manager, mock_post):
+    def test_redfish_reset_retry_on_network_error(self, mock_sleep, mock_post):
         """Test Redfish reset retries on network errors."""
+        # Mock config manager
+        mock_config_manager = Mock()
         mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock network errors then success
@@ -2047,7 +1948,7 @@ class TestRedfishFencing(unittest.TestCase):
             Mock(status_code=200)
         ]
 
-        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On')
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On', mock_config_manager)
 
         # Should succeed after retries
         self.assertTrue(result)
@@ -2055,26 +1956,28 @@ class TestRedfishFencing(unittest.TestCase):
         self.assertEqual(mock_sleep.call_count, 2)
 
     @patch('instanceha.requests.post')
-    @patch('instanceha.config_manager')
-    def test_redfish_reset_no_retry_on_auth_error(self, mock_config_manager, mock_post):
+    def test_redfish_reset_no_retry_on_auth_error(self, mock_post):
         """Test Redfish reset doesn't retry on 401/403 auth errors."""
+        # Mock config manager
+        mock_config_manager = Mock()
         mock_config_manager.get_requests_ssl_config.return_value = False
 
         # Mock POST response returning 401
         mock_post_response = Mock(status_code=401)
         mock_post.return_value = mock_post_response
 
-        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On')
+        result = instanceha._redfish_reset('http://test-server/redfish/v1/Systems/1', 'user', 'pass', 1, 'On', mock_config_manager)
 
         # Should fail immediately without retry
         self.assertFalse(result)
         mock_post.assert_called_once()  # Only called once, no retry
 
     @patch('instanceha.requests.post')
-    @patch('instanceha.config_manager')
     @patch('instanceha.logging.error')
-    def test_redfish_reset_url_sanitization(self, mock_log, mock_config_manager, mock_post):
+    def test_redfish_reset_url_sanitization(self, mock_log, mock_post):
         """Test that URLs with embedded credentials are sanitized in logs."""
+        # Mock config manager
+        mock_config_manager = Mock()
         mock_config_manager.get_requests_ssl_config.return_value = False
 
         # URL with embedded credentials
@@ -2082,7 +1985,7 @@ class TestRedfishFencing(unittest.TestCase):
         mock_post_response = Mock(status_code=401)
         mock_post.return_value = mock_post_response
 
-        instanceha._redfish_reset(url_with_creds, 'user', 'pass', 1, 'On')
+        instanceha._redfish_reset(url_with_creds, 'user', 'pass', 1, 'On', mock_config_manager)
 
         # Verify URL was sanitized in logs (extract all log message arguments)
         log_messages = []
@@ -2804,12 +2707,16 @@ class TestSecretExposure(unittest.TestCase):
         test_password = 'secret_redfish_password_789'
         test_user = 'root'
 
+        # Mock config manager
+        mock_config_manager = Mock()
+        mock_config_manager.get_requests_ssl_config.return_value = False
+
         with patch('requests.get') as mock_get:
             mock_get.side_effect = Exception(f"Connection failed: auth password={test_password}")
 
             instanceha._redfish_get_power_state(
                 'http://192.168.1.101/redfish/v1/Systems/1',
-                test_user, test_password, 30
+                test_user, test_password, 30, mock_config_manager
             )
 
             self._assert_no_secrets_in_logs()
@@ -2823,12 +2730,16 @@ class TestSecretExposure(unittest.TestCase):
         test_password = 'secret_redfish_password_789'
         test_user = 'root'
 
+        # Mock config manager
+        mock_config_manager = Mock()
+        mock_config_manager.get_requests_ssl_config.return_value = False
+
         with patch('requests.post') as mock_post:
             mock_post.side_effect = Exception(f"POST failed: password={test_password}")
 
             instanceha._redfish_reset(
                 'http://192.168.1.101/redfish/v1/Systems/1',
-                test_user, test_password, 30, 'ForceOff'
+                test_user, test_password, 30, 'ForceOff', mock_config_manager
             )
 
             self._assert_no_secrets_in_logs()
@@ -3218,9 +3129,11 @@ class TestSSLTLSHandling(unittest.TestCase):
             key_path = key_file.name
 
         try:
-            with patch('instanceha.requests.get') as mock_get, \
-                 patch('instanceha.config_manager') as mock_config:
-                mock_config.get_requests_ssl_config.return_value = (cert_path, key_path)
+            # Mock config manager
+            mock_config_manager = Mock()
+            mock_config_manager.get_requests_ssl_config.return_value = (cert_path, key_path)
+
+            with patch('instanceha.requests.get') as mock_get:
                 mock_response = Mock()
                 mock_response.status_code = 200
                 mock_response.text = '{"status": "ok"}'
@@ -3228,7 +3141,7 @@ class TestSSLTLSHandling(unittest.TestCase):
 
                 result = instanceha._make_ssl_request(
                     'get', 'https://test.com/api',
-                    ('user', 'pass'), 30
+                    ('user', 'pass'), 30, mock_config_manager
                 )
 
                 self.assertEqual(result.status_code, 200)
@@ -3246,16 +3159,18 @@ class TestSSLTLSHandling(unittest.TestCase):
             ca_path = ca_file.name
 
         try:
-            with patch('instanceha.requests.post') as mock_post, \
-                 patch('instanceha.config_manager') as mock_config:
-                mock_config.get_requests_ssl_config.return_value = ca_path
+            # Mock config manager
+            mock_config_manager = Mock()
+            mock_config_manager.get_requests_ssl_config.return_value = ca_path
+
+            with patch('instanceha.requests.post') as mock_post:
                 mock_response = Mock()
                 mock_response.status_code = 200
                 mock_post.return_value = mock_response
 
                 result = instanceha._make_ssl_request(
                     'post', 'https://test.com/api',
-                    ('user', 'pass'), 30
+                    ('user', 'pass'), 30, mock_config_manager
                 )
 
                 self.assertEqual(result.status_code, 200)
@@ -3266,16 +3181,17 @@ class TestSSLTLSHandling(unittest.TestCase):
 
     def test_make_ssl_request_cert_not_found(self):
         """Test handling when certificate file doesn't exist."""
-        with patch('instanceha.requests.get') as mock_get, \
-             patch('instanceha.config_manager') as mock_config:
-            # Return nonexistent cert paths
-            mock_config.get_requests_ssl_config.return_value = ('/nonexistent/cert.pem', '/nonexistent/key.pem')
+        # Mock config manager
+        mock_config_manager = Mock()
+        mock_config_manager.get_requests_ssl_config.return_value = ('/nonexistent/cert.pem', '/nonexistent/key.pem')
+
+        with patch('instanceha.requests.get') as mock_get:
             mock_get.side_effect = FileNotFoundError("Certificate file not found")
 
             with self.assertRaises(FileNotFoundError):
                 instanceha._make_ssl_request(
                     'get', 'https://test.com/api',
-                    ('user', 'pass'), 30
+                    ('user', 'pass'), 30, mock_config_manager
                 )
 
     def test_make_ssl_request_invalid_cert_format(self):
@@ -3285,16 +3201,18 @@ class TestSSLTLSHandling(unittest.TestCase):
             cert_path = cert_file.name
 
         try:
-            with patch('instanceha.requests.post') as mock_post, \
-                 patch('instanceha.config_manager') as mock_config:
+            # Mock config manager
+            mock_config_manager = Mock()
+            mock_config_manager.get_requests_ssl_config.return_value = (cert_path, cert_path)
+
+            with patch('instanceha.requests.post') as mock_post:
                 import requests
-                mock_config.get_requests_ssl_config.return_value = (cert_path, cert_path)
                 mock_post.side_effect = requests.exceptions.SSLError("SSL certificate problem")
 
                 with self.assertRaises(requests.exceptions.SSLError):
                     instanceha._make_ssl_request(
                         'post', 'https://test.com/api',
-                        ('user', 'pass'), 30
+                        ('user', 'pass'), 30, mock_config_manager
                     )
         finally:
             os.unlink(cert_path)
@@ -3309,16 +3227,18 @@ class TestSSLTLSHandling(unittest.TestCase):
             key_path = key_file.name
 
         try:
-            with patch('instanceha.requests.put') as mock_put, \
-                 patch('instanceha.config_manager') as mock_config:
+            # Mock config manager
+            mock_config_manager = Mock()
+            mock_config_manager.get_requests_ssl_config.return_value = (cert_path, key_path)
+
+            with patch('instanceha.requests.put') as mock_put:
                 import requests
-                mock_config.get_requests_ssl_config.return_value = (cert_path, key_path)
                 mock_put.side_effect = requests.exceptions.SSLError("key values mismatch")
 
                 with self.assertRaises(requests.exceptions.SSLError):
                     instanceha._make_ssl_request(
                         'put', 'https://test.com/api',
-                        ('user', 'pass'), 30
+                        ('user', 'pass'), 30, mock_config_manager
                     )
         finally:
             os.unlink(cert_path)
@@ -3326,16 +3246,18 @@ class TestSSLTLSHandling(unittest.TestCase):
 
     def test_ssl_verification_disabled(self):
         """Test SSL request with verification disabled."""
-        with patch('instanceha.requests.get') as mock_get, \
-             patch('instanceha.config_manager') as mock_config:
-            mock_config.get_requests_ssl_config.return_value = False
+        # Mock config manager
+        mock_config_manager = Mock()
+        mock_config_manager.get_requests_ssl_config.return_value = False
+
+        with patch('instanceha.requests.get') as mock_get:
             mock_response = Mock()
             mock_response.status_code = 200
             mock_get.return_value = mock_response
 
             result = instanceha._make_ssl_request(
                 'get', 'https://test.com/api',
-                ('user', 'pass'), 30
+                ('user', 'pass'), 30, mock_config_manager
             )
 
             call_kwargs = mock_get.call_args[1]
@@ -3343,38 +3265,44 @@ class TestSSLTLSHandling(unittest.TestCase):
 
     def test_ssl_connection_refused(self):
         """Test handling of connection refused errors."""
-        with patch('instanceha.requests.get') as mock_get, \
-             patch('instanceha.config_manager') as mock_config:
+        # Mock config manager
+        mock_config_manager = Mock()
+        mock_config_manager.get_requests_ssl_config.return_value = True
+
+        with patch('instanceha.requests.get') as mock_get:
             import requests
-            mock_config.get_requests_ssl_config.return_value = True
             mock_get.side_effect = requests.exceptions.ConnectionError("Connection refused")
 
             with self.assertRaises(requests.exceptions.ConnectionError):
                 instanceha._make_ssl_request(
                     'get', 'https://unreachable.test.com/api',
-                    ('user', 'pass'), 30
+                    ('user', 'pass'), 30, mock_config_manager
                 )
 
     def test_ssl_timeout(self):
         """Test handling of SSL connection timeout."""
-        with patch('instanceha.requests.get') as mock_get, \
-             patch('instanceha.config_manager') as mock_config:
+        # Mock config manager
+        mock_config_manager = Mock()
+        mock_config_manager.get_requests_ssl_config.return_value = True
+
+        with patch('instanceha.requests.get') as mock_get:
             import requests
-            mock_config.get_requests_ssl_config.return_value = True
             mock_get.side_effect = requests.exceptions.Timeout("Connection timeout")
 
             with self.assertRaises(requests.exceptions.Timeout):
                 instanceha._make_ssl_request(
                     'get', 'https://slow.test.com/api',
-                    ('user', 'pass'), 5
+                    ('user', 'pass'), 5, mock_config_manager
                 )
 
     def test_ssl_hostname_mismatch(self):
         """Test handling of SSL hostname verification failure."""
-        with patch('instanceha.requests.get') as mock_get, \
-             patch('instanceha.config_manager') as mock_config:
+        # Mock config manager
+        mock_config_manager = Mock()
+        mock_config_manager.get_requests_ssl_config.return_value = True
+
+        with patch('instanceha.requests.get') as mock_get:
             import requests
-            mock_config.get_requests_ssl_config.return_value = True
             mock_get.side_effect = requests.exceptions.SSLError(
                 "hostname 'test.com' doesn't match 'other.com'"
             )
@@ -3382,7 +3310,7 @@ class TestSSLTLSHandling(unittest.TestCase):
             with self.assertRaises(requests.exceptions.SSLError):
                 instanceha._make_ssl_request(
                     'get', 'https://test.com/api',
-                    ('user', 'pass'), 30
+                    ('user', 'pass'), 30, mock_config_manager
                 )
 
 
@@ -3524,7 +3452,6 @@ class TestBMHFencingEdgeCases(unittest.TestCase):
         mock_session.get.return_value = mock_response
 
         with patch('requests.Session', return_value=mock_session), \
-             patch('instanceha.config_manager', Mock(get_requests_ssl_config=Mock(return_value=True))), \
              patch('time.sleep'), \
              patch('time.time', side_effect=[0, 2]):  # Simulate timeout
             get_url = 'https://api.test.com/apis/metal3.io/v1alpha1/namespaces/test-ns/baremetalhosts/test-bmh'
@@ -3555,7 +3482,6 @@ class TestBMHFencingEdgeCases(unittest.TestCase):
         mock_session.get.return_value = mock_response
 
         with patch('requests.Session', return_value=mock_session), \
-             patch('instanceha.config_manager', Mock(get_requests_ssl_config=Mock(return_value=True))), \
              patch('time.sleep'), \
              patch('time.time', side_effect=[0, 2]):  # Simulate timeout
             get_url = 'https://api.test.com/apis/metal3.io/v1alpha1/namespaces/test-ns/baremetalhosts/test-bmh'
@@ -3588,7 +3514,6 @@ class TestBMHFencingEdgeCases(unittest.TestCase):
             mock_session.get.return_value = mock_response
 
             with patch('requests.Session', return_value=mock_session), \
-                 patch('instanceha.config_manager', Mock(get_requests_ssl_config=Mock(return_value=True))), \
                  patch('time.sleep'), \
                  patch('time.time', side_effect=[0, 2]):  # Simulate timeout
                 get_url = 'https://api.test.com/apis/metal3.io/v1alpha1/namespaces/test-ns/baremetalhosts/test-bmh'
@@ -3613,7 +3538,6 @@ class TestBMHFencingEdgeCases(unittest.TestCase):
         mock_session.get.side_effect = requests.exceptions.Timeout("Network timeout")
 
         with patch('requests.Session', return_value=mock_session), \
-             patch('instanceha.config_manager', Mock(get_requests_ssl_config=Mock(return_value=True))), \
              patch('time.time') as mock_time, \
              patch('time.sleep'):
             # Mock time to simulate timeout immediately
@@ -3655,7 +3579,6 @@ class TestBMHFencingEdgeCases(unittest.TestCase):
         mock_session.get.side_effect = side_effect
 
         with patch('requests.Session', return_value=mock_session), \
-             patch('instanceha.config_manager', Mock(get_requests_ssl_config=Mock(return_value=True))), \
              patch('time.sleep'):  # Mock sleep to avoid delays
             get_url = 'https://api.test.com/apis/metal3.io/v1alpha1/namespaces/test-ns/baremetalhosts/test-bmh'
             headers = {'Authorization': 'Bearer fake-token'}
@@ -3726,7 +3649,6 @@ class TestBMHFencingEdgeCases(unittest.TestCase):
         mock_session.get.return_value = mock_response
 
         with patch('requests.Session', return_value=mock_session), \
-             patch('instanceha.config_manager', Mock(get_requests_ssl_config=Mock(return_value=True))), \
              patch('time.sleep') as mock_sleep:
             get_url = 'https://api.test.com/apis/metal3.io/v1alpha1/namespaces/test-ns/baremetalhosts/test-bmh'
             headers = {'Authorization': 'Bearer fake-token'}
@@ -3903,112 +3825,6 @@ class TestEvacuationStatusEdgeCases(unittest.TestCase):
         self.assertFalse(result.error)
 
 
-class TestRetryLogic(unittest.TestCase):
-    """Test retry logic and backoff behavior."""
-
-    def test_retry_with_backoff_custom_exceptions(self):
-        """Test retry decorator with custom exception types."""
-        call_count = [0]
-
-        @instanceha.retry_with_backoff(
-            max_retries=3,
-            initial_delay=0.01,
-            exceptions=(ValueError, KeyError)
-        )
-        def failing_function():
-            call_count[0] += 1
-            if call_count[0] < 3:
-                raise ValueError("Test error")
-            return "success"
-
-        result = failing_function()
-        self.assertEqual(result, "success")
-        self.assertEqual(call_count[0], 3)
-
-    def test_retry_with_backoff_custom_parameters(self):
-        """Test retry decorator with non-default parameters."""
-        import requests
-        call_count = [0]
-
-        @instanceha.retry_with_backoff(max_retries=5, initial_delay=0.01)
-        def failing_function():
-            call_count[0] += 1
-            if call_count[0] < 4:
-                raise requests.exceptions.Timeout("Test error")
-            return "success"
-
-        result = failing_function()
-        self.assertEqual(result, "success")
-        self.assertEqual(call_count[0], 4)
-
-    def test_retry_with_backoff_exponential_timing(self):
-        """Test that backoff timing is actually exponential."""
-        import time
-        import requests
-
-        call_times = []
-
-        @instanceha.retry_with_backoff(max_retries=4, initial_delay=0.1)
-        def failing_function():
-            call_times.append(time.time())
-            if len(call_times) < 3:
-                raise requests.exceptions.Timeout("Test error")
-            return "success"
-
-        result = failing_function()
-
-        # Verify exponential backoff
-        if len(call_times) >= 3:
-            delay1 = call_times[1] - call_times[0]
-            delay2 = call_times[2] - call_times[1]
-            # Second delay should be roughly 2x first delay
-            self.assertGreater(delay2, delay1 * 1.5)
-
-    def test_retry_with_backoff_wraps_preservation(self):
-        """Test that function metadata is preserved."""
-        @instanceha.retry_with_backoff()
-        def documented_function():
-            """This is a test function."""
-            return "success"
-
-        # Verify function name and docstring are preserved
-        self.assertEqual(documented_function.__name__, 'documented_function')
-        self.assertIn("test function", documented_function.__doc__)
-
-    def test_retry_with_backoff_exhaustion(self):
-        """Test retry exhaustion when max retries exceeded."""
-        import requests
-        call_count = [0]
-
-        @instanceha.retry_with_backoff(max_retries=2, initial_delay=0.01)
-        def always_failing_function():
-            call_count[0] += 1
-            raise requests.exceptions.Timeout("Always fails")
-
-        with self.assertRaises(requests.exceptions.Timeout):
-            always_failing_function()
-
-        # Should have tried at least max_retries times
-        self.assertGreaterEqual(call_count[0], 2)
-
-    def test_retry_with_backoff_mixed_success_failure(self):
-        """Test retry with intermittent failures."""
-        import requests
-        results = []
-
-        @instanceha.retry_with_backoff(max_retries=5, initial_delay=0.01)
-        def intermittent_function():
-            results.append(len(results))
-            if len(results) in [1]:  # Fail on first attempt only
-                raise requests.exceptions.ConnectionError("Intermittent failure")
-            return "success"
-
-        result = intermittent_function()
-        self.assertEqual(result, "success")
-        # Should have retried at least once
-        self.assertGreaterEqual(len(results), 2)
-
-
 class TestConcurrentOperations(unittest.TestCase):
     """Test concurrent operations and race conditions."""
 
@@ -4123,31 +3939,6 @@ class TestConcurrentOperations(unittest.TestCase):
                 # Timestamp should be updated or maintained
                 self.assertIn(short_name, self.service.hosts_processing)
 
-    def test_concurrent_metrics_updates(self):
-        """Test concurrent metrics counter updates."""
-        metrics = instanceha.Metrics()
-
-        def increment_counters(thread_id):
-            for i in range(100):
-                metrics.increment('test_counter')
-                metrics.increment(f'thread_{thread_id}_counter')
-                metrics.record_duration('test_duration', 0.01)
-
-        # Run 10 threads incrementing concurrently
-        threads = []
-        for i in range(10):
-            thread = threading.Thread(target=increment_counters, args=(i,))
-            threads.append(thread)
-            thread.start()
-
-        for thread in threads:
-            thread.join(timeout=5)
-
-        # Verify counts are correct
-        self.assertEqual(metrics.counters['test_counter'], 1000)  # 10 threads * 100
-        # Each thread counter should be 100
-        for i in range(10):
-            self.assertEqual(metrics.counters[f'thread_{i}_counter'], 100)
 
 
 class TestSignalHandling(unittest.TestCase):
@@ -4978,66 +4769,6 @@ class TestFunctionalIntegration(unittest.TestCase):
         cache_age = time.time() - service._cache_timestamp
         self.assertLess(cache_age, 5, "Cache should be fresh (< 5 seconds old)")
 
-    def test_metrics_workflow_integration(self):
-        """Test complete metrics workflow: accumulation and summary."""
-        # Create metrics instance (separate from service)
-        metrics = instanceha.Metrics()
-
-        # Simulate operations that generate metrics
-        initial_summary = metrics.get_summary()
-        initial_uptime = initial_summary['uptime_seconds']
-
-        # Simulate cache operations
-        with metrics.timer('cache_refresh'):
-            time.sleep(0.01)
-
-        # Simulate evacuation operations
-        for i in range(5):
-            metrics.increment('evacuations_attempted')
-            with metrics.timer('evacuation'):
-                time.sleep(0.01)
-                if i < 3:
-                    metrics.increment('evacuations_successful')
-                else:
-                    metrics.increment('evacuations_failed')
-
-        # Simulate fencing operations
-        for i in range(3):
-            metrics.increment('fencing_attempts')
-            with metrics.timer('fencing'):
-                time.sleep(0.01)
-                # Timer automatically increments fencing_successful
-
-        # Get metrics summary
-        summary = metrics.get_summary()
-
-        # Verify uptime increased
-        self.assertGreater(summary['uptime_seconds'], initial_uptime)
-
-        # Verify counters
-        self.assertEqual(summary['counters']['evacuations_attempted'], 5)
-        self.assertEqual(summary['counters']['evacuations_successful'], 3)
-        self.assertEqual(summary['counters']['evacuations_failed'], 2)
-        self.assertEqual(summary['counters']['fencing_attempts'], 3)
-        self.assertEqual(summary['counters']['fencing_successful'], 3)
-
-        # Verify timing metrics
-        self.assertIn('cache_refresh_total', summary['counters'])
-        self.assertIn('cache_refresh_successful', summary['counters'])
-        self.assertIn('evacuation_total', summary['counters'])
-        self.assertEqual(summary['counters']['cache_refresh_total'], 1)
-        self.assertEqual(summary['counters']['evacuation_total'], 5)
-
-        # Verify durations recorded
-        self.assertIn('cache_refresh_duration', summary['total_durations'])
-        self.assertIn('evacuation_duration', summary['total_durations'])
-        self.assertGreater(summary['total_durations']['evacuation_duration'], 0)
-
-        # Verify metrics can be logged (test format)
-        metrics_json = json.dumps(summary)
-        self.assertIsInstance(metrics_json, str)
-        self.assertIn('uptime_seconds', metrics_json)
-        self.assertIn('counters', metrics_json)
 
 
 class TestAdvancedIntegration(unittest.TestCase):
@@ -5226,12 +4957,7 @@ class TestAdvancedIntegration(unittest.TestCase):
             'timeout': 10
         }
 
-        # Patch global config_manager for SSL config access
-        mock_global_config = Mock()
-        mock_global_config.get_requests_ssl_config.return_value = False
-
-        with patch('instanceha.config_manager', mock_global_config), \
-             patch('instanceha.requests.post') as mock_post:
+        with patch('instanceha.requests.post') as mock_post:
             # First attempt: network error, second: success
             mock_response = Mock(status_code=200)
             mock_post.side_effect = [
@@ -5292,55 +5018,6 @@ class TestAdvancedIntegration(unittest.TestCase):
 
     # Priority 4: Main Loop (2 tests)
 
-    def test_main_poll_cycle_error_recovery(self):
-        """Test main loop continues after Nova API errors."""
-        service = instanceha.InstanceHAService(self.mock_config)
-        conn = Mock()
-
-        # First call: exception, second call: success
-        conn.services.list.side_effect = [
-            Exception("Nova API temporarily unavailable"),
-            []  # Empty services list
-        ]
-
-        # Simulate two poll cycles
-        metrics = instanceha.Metrics()
-
-        # First cycle should handle exception
-        try:
-            with metrics.timer('main_loop'):
-                services = conn.services.list(binary="nova-compute")
-        except Exception:
-            metrics.increment('main_loop_errors')
-
-        # Second cycle should succeed
-        with metrics.timer('main_loop'):
-            services = conn.services.list(binary="nova-compute")
-
-        self.assertEqual(services, [])
-        self.assertEqual(metrics.counters.get('main_loop_errors', 0), 1)
-
-    def test_metrics_periodic_logging(self):
-        """Test metrics are logged at configured intervals."""
-        metrics = instanceha.Metrics()
-        metrics._last_summary = 0
-
-        # Record some metrics
-        metrics.increment('evacuations_total', 5)
-        metrics.increment('evacuations_successful', 3)
-
-        # Simulate time passing
-        current_time = time.time()
-
-        # Should log if interval exceeded
-        metrics_interval = 60  # 1 minute
-        should_log = (current_time - metrics._last_summary) > metrics_interval
-
-        if should_log:
-            summary = metrics.get_summary()
-            self.assertIn('evacuations_total', summary['counters'])
-            self.assertEqual(summary['counters']['evacuations_total'], 5)
-
 
 class TestMainFunction(unittest.TestCase):
     """Test main() function initialization."""
@@ -5357,12 +5034,10 @@ class TestMainFunction(unittest.TestCase):
             mock_cm.get_log_level.return_value = 'INFO'
             mock_cm_class.return_value = mock_cm
 
-            # Mock service and metrics with proper attributes
+            # Mock service with proper attributes
             mock_service = Mock()
             mock_service.update_health_hash = Mock()
-            mock_metrics = Mock()
-            mock_metrics._last_summary = 0
-            mock_init.return_value = (mock_service, mock_metrics)
+            mock_init.return_value = mock_service
 
             # Mock the main loop to exit after config initialization
             with patch.object(mock_service, 'update_health_hash', side_effect=KeyboardInterrupt):
@@ -5407,9 +5082,7 @@ class TestMainFunction(unittest.TestCase):
 
             mock_service = Mock()
             mock_service.update_health_hash = Mock()
-            mock_metrics = Mock()
-            mock_metrics._last_summary = 0
-            mock_init.return_value = (mock_service, mock_metrics)
+            mock_init.return_value = mock_service
 
             # Exit after initialization
             with patch.object(mock_service, 'update_health_hash', side_effect=KeyboardInterrupt):
@@ -5444,7 +5117,6 @@ if __name__ == '__main__':
         TestInputValidation,
         TestBMHFencingEdgeCases,
         TestEvacuationStatusEdgeCases,
-        TestRetryLogic,
         TestConcurrentOperations,
         TestSignalHandling,
         TestPerformanceAndMemory,

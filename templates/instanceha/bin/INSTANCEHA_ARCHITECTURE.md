@@ -5,8 +5,9 @@
 InstanceHA is a high-availability service for OpenStack that automatically detects and evacuates instances from failed compute nodes. It provides intelligent failure detection, flexible tagging, multiple fencing mechanisms, and comprehensive error handling to ensure workload continuity in production OpenStack clouds.
 
 **Version**: 2.0
-**Code Coverage**: 71% (1140/1625 lines)
-**Test Suite**: 202 tests, ~14 seconds execution time
+**Code Size**: 2,670 lines
+**Code Coverage**: 77%
+**Test Suite**: 334 tests, ~15 seconds execution time
 
 ## Table of Contents
 
@@ -74,6 +75,7 @@ class ConfigItem:
 - **Validation**: Type checking, range validation (min/max), enum validation
 - **SSL Support**: CA bundle, client certificates, verification toggle
 - **Environment Overrides**: OS_CLOUD, UDP_PORT, SSL paths
+- **Property Accessors**: 18 explicit getter methods (lines 544-593) for type-safe access
 
 **Configuration Map**:
 ```python
@@ -107,32 +109,62 @@ _config_map: Dict[str, ConfigItem] = {
 
 **Purpose**: Main service orchestrator that coordinates all InstanceHA operations.
 
-**Location**: `instanceha.py:668-1305`
+**Location**: `instanceha.py:678-1350`
 
-**Architecture**: Dependency injection pattern with protocol-based interfaces.
+**Architecture**: Dependency injection pattern with protocol-based interfaces and modular initialization.
 
-**State Management**:
+**Initialization Pattern**:
 ```python
-# Service state
+def __init__(self, config_manager: ConfigManager, cloud_client: Optional[OpenStackClient] = None):
+    self.config = config_manager
+    self.cloud_client = cloud_client
+
+    # Modular initialization for clear separation of concerns
+    self._initialize_health_state()
+    self._initialize_cache()
+    self._initialize_threading()
+    self._initialize_kdump_state()
+    self._initialize_processing_state()
+```
+
+**State Management** (organized by domain):
+
+*Health Monitoring* (`_initialize_health_state()`):
+```python
 self.current_hash = ""                          # Health check hash
 self.hash_update_successful = True              # Health status
 self._last_hash_time = 0                        # Hash timestamp
+self._previous_hash = ""                        # Previous hash for validation
+```
 
-# Cache for performance
+*Caching* (`_initialize_cache()`):
+```python
 self._host_servers_cache = {}                   # Host -> servers mapping
 self._evacuable_flavors_cache = None            # Cached evacuable flavors
 self._evacuable_images_cache = None             # Cached evacuable images
 self._cache_timestamp = 0                       # Cache age
 self._cache_lock = threading.Lock()             # Thread-safe access
+self.evacuable_tag = config.get_evacuable_tag() # Cached config value
+```
 
-# Kdump state
+*Kdump Detection* (`_initialize_kdump_state()`):
+```python
 self.kdump_hosts_timestamp = defaultdict(float) # Host -> last kdump time
 self.kdump_hosts_checking = defaultdict(float)  # Host -> check start time
 self.kdump_listener_stop_event = threading.Event()  # Stop signal
+self.kdump_fenced_hosts = set()                 # Kdump-fenced host tracking
+```
 
-# Host processing tracking
+*Processing Tracking* (`_initialize_processing_state()`):
+```python
 self.hosts_processing = defaultdict(float)      # Host -> processing start
 self.processing_lock = threading.Lock()         # Thread-safe tracking
+```
+
+*Threading* (`_initialize_threading()`):
+```python
+self.health_check_thread = None                 # Health check thread handle
+self.UDP_IP = ''                                # UDP listener IP
 ```
 
 **Key Methods**:
@@ -144,28 +176,12 @@ self.processing_lock = threading.Lock()         # Thread-safe tracking
 - `refresh_evacuable_cache()` - Force cache refresh
 - `update_health_hash()` - Update health monitoring hash
 
----
-
-### 3. Metrics
-
-**Purpose**: Lightweight performance monitoring and metrics collection.
-
-**Location**: `instanceha.py:580-666`
-
-**Metrics Tracked**:
-- **Counters**: Operation counts (evacuations_total, evacuations_successful, etc.)
-- **Durations**: Operation timings (evacuation_duration, etc.)
-- **Timing History**: Last 100 measurements for percentile calculation
-
-**Features**:
-- Context manager for automatic timing: `with metrics.timer('operation'):`
-- Percentile calculation (P95)
-- Summary generation and logging
-- Automatic failure tracking
+**Modular Initialization Design**:
+The initialization is split into five focused methods, each responsible for a specific domain (health, cache, kdump, processing, threading). This provides clear separation of concerns and makes the state management easier to understand and test.
 
 ---
 
-### 4. CloudConnectionProvider (Protocol)
+### 3. CloudConnectionProvider (Protocol)
 
 **Purpose**: Abstract interface for cloud connection management.
 
@@ -195,7 +211,7 @@ class CloudConnectionProvider(ABC):
 
 ### 1. Dependency Injection
 
-**Pattern**: Constructor injection with optional test doubles.
+**Pattern**: Constructor injection with optional test doubles. No global state.
 
 **Example**:
 ```python
@@ -204,12 +220,22 @@ class InstanceHAService(CloudConnectionProvider):
                  cloud_client: Optional[OpenStackClient] = None):
         self.config = config_manager
         self.cloud_client = cloud_client  # None in production, mock in tests
+
+# SSL/TLS functions accept config_manager as parameter (no globals)
+def _make_ssl_request(method: str, url: str, auth: tuple, timeout: int,
+                      config_mgr: ConfigManager, **kwargs):
+    ssl_config = config_mgr.get_requests_ssl_config()
+    # ...
+
+def _redfish_reset(url, user, passwd, timeout, action, config_mgr):
+    # Uses config_mgr parameter instead of global variable
 ```
 
-**Benefits**:
-- Testability without mocking module-level functions
-- Clear dependency graph
-- Easy to swap implementations
+**Key Characteristics**:
+- All dependencies explicitly passed as parameters
+- No global state
+- Thread-safe by design
+- Supports dependency injection for testing
 
 ---
 
@@ -252,21 +278,30 @@ class UDPSocketManager:
 
 **Pattern**: Lock-protected shared state with fine-grained locking.
 
-**Cache Access**:
+**Cache Access** (Lock Granularity Pattern):
 ```python
-# Check cache with lock (read-only)
+# Pattern: read check → API call outside lock → write update
+# This minimizes lock hold time and prevents blocking during slow API calls
+
+# 1. Check cache with lock (fast read)
 with self._cache_lock:
     if self._evacuable_flavors_cache is not None:
         return self._evacuable_flavors_cache
 
-# Expensive API call outside lock (no blocking)
+# 2. Expensive API call outside lock (no blocking)
 flavors = connection.flavors.list()
 cache_data = [f.id for f in flavors if self._is_flavor_evacuable(f)]
 
-# Update cache with lock (write)
+# 3. Update cache with lock (fast write)
 with self._cache_lock:
     self._evacuable_flavors_cache = cache_data
 ```
+
+**Implementation Details**:
+- Lock held only for fast dictionary lookups
+- API calls performed outside lock to avoid blocking
+- Minimizes lock contention during I/O operations
+
 
 **Host Processing Tracking** (`instanceha.py:2543-2565`):
 ```python
@@ -375,14 +410,7 @@ def validate_input(value: str, validation_type: str, context: str) -> bool:
                             │
                             ▼
     ┌──────────────────────────────────────────────────┐
-    │ 6. Log Metrics (if interval elapsed)             │
-    │    - Uptime, evacuation counts, durations        │
-    │    - P95 latencies                               │
-    └──────────────────────────────────────────────────┘
-                            │
-                            ▼
-    ┌──────────────────────────────────────────────────┐
-    │ 7. Sleep (POLL seconds)                          │
+    │ 6. Sleep (POLL seconds)                          │
     └──────────────────────────────────────────────────┘
                             │
                             └──────────────┐
@@ -551,7 +579,6 @@ config:
   SSL_VERIFY: true
   FENCING_TIMEOUT: 30
   HASH_INTERVAL: 60
-  METRICS_LOG_INTERVAL: 3600
   LOGLEVEL: 'INFO'
 ```
 
@@ -664,9 +691,9 @@ for server in evacuables:
 
 ### 2. Smart Evacuation
 
-**Location**: `instanceha.py:1579-1671, 1470-1496`
+**Location**: `instanceha.py:1430-1451, 1473-1487`
 
-**Pattern**: Evacuation with migration tracking and completion verification.
+**Pattern**: Evacuation with migration tracking and completion verification (modular design).
 
 **Enabled By**: `SMART_EVACUATION: true`
 
@@ -724,7 +751,7 @@ def is_server_evacuable(self, server, evac_flavors=None, evac_images=None):
     images_enabled = self.config.is_tagged_images_enabled()
     flavors_enabled = self.config.is_tagged_flavors_enabled()
 
-    # Backward compatibility: if no tagging, evacuate all
+    # When tagging is disabled, evacuate all servers (default behavior)
     if not (images_enabled or flavors_enabled):
         return True
 
@@ -749,7 +776,7 @@ def is_server_evacuable(self, server, evac_flavors=None, evac_images=None):
 
 **Agent**: `fence_ipmilan`
 
-**Location**: `instanceha.py:2117-2175`
+**Location**: `instanceha.py:2068-2106`
 
 **Configuration**:
 ```yaml
@@ -904,10 +931,10 @@ if threshold_percent > service.config.get_threshold():
 
 ### 1. Input Validation
 
-**Location**: `instanceha.py:153-211`
+**Location**: `instanceha.py:183-244`
 
 **SSRF Prevention**:
-- URL validation (block localhost, link-local)
+- URL validation (block localhost, link-local) with specific exception handling
 - IP address validation (IPv4/IPv6)
 - Port range validation (1-65535)
 
@@ -915,6 +942,12 @@ if threshold_percent > service.config.get_threshold():
 - Kubernetes resource name validation
 - Power action whitelisting
 - Username validation
+
+**Exception Handling**:
+- URL parsing: catches `ValueError`, `AttributeError`, `TypeError`
+- Flavor validation: catches `AttributeError`, `KeyError`, `TypeError`
+- Kdump cleanup: catches `AttributeError`, `KeyError`
+- All exception handlers use specific types instead of bare `Exception`
 
 ---
 
@@ -951,7 +984,7 @@ def _safe_log_exception(msg: str, e: Exception):
 
 ### 3. SSL/TLS Configuration
 
-**Location**: `instanceha.py:512-525, 218-228`
+**Location**: `instanceha.py:512-525, 218-228, 240-251`
 
 **Requests SSL Config**:
 ```python
@@ -964,7 +997,25 @@ def get_requests_ssl_config(self) -> Union[bool, str, tuple]:
     if self.ssl_ca_bundle:
         return self.ssl_ca_bundle  # CA bundle
     return True  # Default system CA
+
+# SSL requests use dependency injection (no global state)
+def _make_ssl_request(method: str, url: str, auth: tuple, timeout: int,
+                      config_mgr: ConfigManager, **kwargs):
+    ssl_config = config_mgr.get_requests_ssl_config()
+    request_kwargs = {'auth': auth, 'timeout': timeout, **kwargs}
+
+    if isinstance(ssl_config, tuple):
+        request_kwargs['cert'] = ssl_config
+    else:
+        request_kwargs['verify'] = ssl_config
+
+    return getattr(requests, method)(url, **request_kwargs)
 ```
+
+**Implementation Details**:
+- Configuration passed explicitly as parameters
+- No global mutable state
+- Thread-safe by design (no shared global config)
 
 ---
 
@@ -990,7 +1041,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
     }
 ```
 
-**Speedup**: Linear with WORKERS (4 workers = 4x faster)
+**Performance**: Linear scaling with WORKERS configuration (4 workers processes 4 servers concurrently)
 
 ---
 
@@ -1009,39 +1060,71 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
 
 ### Test Statistics
 
-- **Total Tests**: 202
-- **Code Coverage**: 71% (1140/1625 lines)
-- **Execution Time**: ~14 seconds
+- **Total Tests**: 334 (193 unit + 16 security + 29 critical error + 12 workflow + 9 config + 21 integration + 54 functional)
+- **Code Coverage**: 77% (unit tests alone), 82% (with integration + functional tests)
+- **Execution Time**: ~15 seconds (unit tests), ~16 seconds (all tests)
 
 ### Test Categories
 
-**1. Unit Tests** (134 tests):
-- Configuration, metrics, main function initialization
-- Evacuation logic, smart evacuation
-- Kdump, fencing, input validation, thread safety
+**1. Unit Tests** (193 tests):
+- Configuration management and validation
+- Service initialization and caching
+- Main function initialization and error handling
+- Evacuation logic and tag checking
+- Smart evacuation with success, failure, and exception path testing
+- Kdump detection and UDP message processing
+- Redfish, IPMI, and BMH fencing operations
+- Thread safety and memory management
+- Security and secret sanitization
+- Input validation and SSRF prevention
 
-**2. Functional Tests** (60 tests):
+**2. Security Validation Tests** (16 tests):
+- SSRF prevention (URL, IP, port validation)
+- Injection attack prevention
+- Kubernetes resource name validation
+- Power action whitelisting
+- Fencing validation
+
+**3. Critical Error Path Tests** (29 tests):
+- Configuration errors (YAML parsing, missing files, permissions)
+- Nova API exceptions
+- Service disable validation
+- Evacuation timeouts
+- Fencing failures
+
+**4. Evacuation Workflow Tests** (12 tests):
+- Kdump resume disable logic
+- Post-evacuation recovery error paths
+- Process service step failures
+
+**5. Configuration Feature Tests** (9 tests):
+- DISABLED configuration behavior
+- FORCE_ENABLE configuration behavior
+- LEAVE_DISABLED configuration behavior
+- TAGGED_AGGREGATES configuration behavior
+
+**6. Functional Tests** (54 tests):
 - End-to-end workflows
 - Large-scale scenarios (100+ hosts)
-- Tag filtering, performance
+- Host state classification and filtering
+- Tagging logic combinations
+- Performance testing
+- Kdump integration workflows
 
-**3. Integration Tests** (21 tests):
-- Service initialization, Nova connection
-- Categorization, full workflows
-- Deferred re-enabling (disabled services only re-enabled when up)
-- Migration completion verification
-
-**4. Advanced Integration** (12 tests):
-- Smart evacuation (tracking, timeout, retry)
-- Kdump UDP listener, reserved hosts
-- Fencing resilience, main loop recovery
+**7. Integration Tests** (21 tests):
+- Service initialization workflows
+- Nova connection establishment
+- Service categorization and filtering pipelines
+- Full evacuation workflows with all components
+- Re-enabling workflows with migration checks
+- Performance and scaling under load
+- Error handling and recovery scenarios
 
 ### Coverage by Component
 
 | Component | Coverage |
 |-----------|----------|
 | ConfigManager | 95% |
-| Metrics | 85% |
 | Evacuation Logic | 80% |
 | Smart Evacuation | 75% |
 | Fencing | 70% |
@@ -1155,8 +1238,15 @@ ERROR: Redfish reset failed: authentication error
 
 ## References
 
-- **Code**: `instanceha.py` (2771 lines)
-- **Tests**: `test_instanceha.py` (5156 lines, 197 tests)
+- **Code**: `instanceha.py` (2,670 lines)
+- **Tests**: 334 tests across 7 test files
+  - `test_instanceha.py` (193 unit tests)
+  - `test_security_validation.py` (16 security tests)
+  - `test_critical_error_paths.py` (29 error path tests)
+  - `test_evacuation_workflow.py` (12 workflow tests)
+  - `test_config_features.py` (9 config tests)
+  - `integration_test.py` (21 integration tests)
+  - `functional_test.py` (54 functional tests)
 - **Documentation**: This file
 - **OpenStack API**: https://docs.openstack.org/api-ref/compute/
 - **Redfish**: https://www.dmtf.org/standards/redfish

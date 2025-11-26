@@ -43,3 +43,10 @@ go.work.sum
 
 # python cache
 __pycache__
+*.pyc
+*.pyo
+
+# python coverage
+.coverage
+*.cover
+htmlcov/
