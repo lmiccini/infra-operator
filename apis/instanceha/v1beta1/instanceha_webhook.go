@@ -20,13 +20,13 @@ limitations under the License.
 package v1beta1
 
 import (
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
 // InstanceHaDefaults -
@@ -58,6 +58,24 @@ func (r *InstanceHa) Default() {
 func (spec *InstanceHaSpec) Default() {
 	if spec.ContainerImage == "" {
 		spec.ContainerImage = instanceHaDefaults.ContainerImageURL
+	}
+	if spec.OpenStackCloud == "" {
+		spec.OpenStackCloud = OpenStackCloud
+	}
+	if spec.OpenStackConfigMap == "" {
+		spec.OpenStackConfigMap = "openstack-config"
+	}
+	if spec.OpenStackConfigSecret == "" {
+		spec.OpenStackConfigSecret = "openstack-config-secret"
+	}
+	if spec.FencingSecret == "" {
+		spec.FencingSecret = "fencing-secret"
+	}
+	if spec.InstanceHaConfigMap == "" {
+		spec.InstanceHaConfigMap = "instanceha-config"
+	}
+	if spec.InstanceHaKdumpPort == 0 {
+		spec.InstanceHaKdumpPort = 7410
 	}
 }
 
