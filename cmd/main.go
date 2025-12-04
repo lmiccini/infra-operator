@@ -307,6 +307,14 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "DNSData")
 		os.Exit(1)
 	}
+	if err := (&networkcontroller.ServiceReconciler{
+		Client:  mgr.GetClient(),
+		Kclient: kclient,
+		Scheme:  mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Service")
+		os.Exit(1)
+	}
 	if err := (&networkcontroller.IPSetReconciler{
 		Client:  mgr.GetClient(),
 		Scheme:  mgr.GetScheme(),
