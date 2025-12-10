@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,11 +68,170 @@ func (r *Reconciler) GetLogger(ctx context.Context) logr.Logger {
 	return log.FromContext(ctx).WithName("Controllers").WithName("RabbitMq")
 }
 
+// rabbitmqVersion represents a parsed RabbitMQ version
+type rabbitmqVersion struct {
+	major int
+	minor int
+	patch int
+}
+
+// parseRabbitMQVersion parses a RabbitMQ version string (e.g., "3.13", "3.13.0")
+// Format is always X.Y or X.Y.Z as controlled by OpenstackVersion CR
+func parseRabbitMQVersion(version string) (rabbitmqVersion, error) {
+	parts := strings.Split(version, ".")
+
+	var v rabbitmqVersion
+	if len(parts) < 2 {
+		return v, fmt.Errorf("invalid version format: %s (expected X.Y or X.Y.Z)", version)
+	}
+
+	var err error
+	v.major, err = strconv.Atoi(parts[0])
+	if err != nil {
+		return v, fmt.Errorf("invalid major version: %s", parts[0])
+	}
+
+	v.minor, err = strconv.Atoi(parts[1])
+	if err != nil {
+		return v, fmt.Errorf("invalid minor version: %s", parts[1])
+	}
+
+	if len(parts) > 2 {
+		v.patch, err = strconv.Atoi(parts[2])
+		if err != nil {
+			return v, fmt.Errorf("invalid patch version: %s", parts[2])
+		}
+	}
+
+	return v, nil
+}
+
+// isDirectUpgradeSupported checks if a version change can be done without storage wipe
+// For our use case:
+// - Patch version changes (e.g., 3.9.0 -> 3.9.1, 4.0.0 -> 4.0.1): Supported
+// - Major/minor version changes (e.g., 3.9 -> 4.0, 4.0 -> 3.9): Require storage wipe
+// Based on https://www.rabbitmq.com/docs/upgrade#rabbitmq-version-upgradability
+func isDirectUpgradeSupported(from, to rabbitmqVersion) bool {
+	// Same major.minor version (patch changes only) - no wipe needed
+	if from.major == to.major && from.minor == to.minor {
+		return true
+	}
+
+	// Any major or minor version change requires storage wipe
+	// This includes both upgrades (3.9 -> 4.0) and downgrades (4.0 -> 3.9)
+	return false
+}
+
+// requiresStorageWipe determines if an upgrade requires full storage wipe
+// Returns true if the versions are different but no direct upgrade path exists
+func requiresStorageWipe(fromStr, toStr string) (bool, error) {
+	if fromStr == toStr {
+		return false, nil
+	}
+
+	from, err := parseRabbitMQVersion(fromStr)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse current version %q: %w", fromStr, err)
+	}
+
+	to, err := parseRabbitMQVersion(toStr)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse target version %q: %w", toStr, err)
+	}
+
+	// If direct upgrade is supported, no wipe needed
+	if isDirectUpgradeSupported(from, to) {
+		return false, nil
+	}
+
+	// Versions are different and no direct path exists - requires wipe
+	return true, nil
+}
+
+// removePVCFinalizers removes all finalizers from a PVC to allow forced deletion
+// This is required for RabbitMQ major version upgrades where we must ensure
+// old Mnesia data is completely wiped before starting the new version.
+// Returns true if any finalizers were removed and PVC was updated
+func (r *Reconciler) removePVCFinalizers(ctx context.Context, pvc *corev1.PersistentVolumeClaim, log logr.Logger) (bool, error) {
+	if len(pvc.Finalizers) == 0 {
+		return false, nil
+	}
+
+	// Log which finalizers we're removing for observability
+	if len(pvc.Finalizers) > 0 {
+		log.Info("Removing PVC finalizers to force deletion during upgrade",
+			"pvcName", pvc.Name,
+			"finalizers", pvc.Finalizers)
+	}
+
+	// Remove all finalizers to ensure PVC can be deleted
+	// This is intentional for major version upgrades where data must be wiped
+	pvc.Finalizers = []string{}
+	if err := r.Client.Update(ctx, pvc); err != nil {
+		return false, fmt.Errorf("failed to remove finalizers: %w", err)
+	}
+
+	return true, nil
+}
+
+// forceReleasePV removes the claimRef from a PV to allow it to be reclaimed
+// This is necessary when reclaim policy is Retain and we need to ensure old data is not reused
+func (r *Reconciler) forceReleasePV(ctx context.Context, pvName string, log logr.Logger) error {
+	pv := &corev1.PersistentVolume{}
+	if err := r.Client.Get(ctx, types.NamespacedName{Name: pvName}, pv); err != nil {
+		if k8s_errors.IsNotFound(err) {
+			// PV already gone, that's fine
+			return nil
+		}
+		return fmt.Errorf("failed to get PV %s: %w", pvName, err)
+	}
+
+	// Remove claimRef for both Delete and Retain policies
+	// For Delete policy, this helps unstick Released PVs (e.g. local-storage volumes)
+	// For Retain policy, this is required to manually reclaim the volume
+	if pv.Spec.ClaimRef != nil {
+		pv.Spec.ClaimRef = nil
+		if err := r.Client.Update(ctx, pv); err != nil {
+			return fmt.Errorf("failed to remove claimRef from PV %s: %w", pvName, err)
+		}
+		log.Info("Removed claimRef from PV", "pvName", pvName, "reclaimPolicy", pv.Spec.PersistentVolumeReclaimPolicy)
+	}
+
+	// For Delete policy, expect Kubernetes to auto-delete the unbound PV
+	if pv.Spec.PersistentVolumeReclaimPolicy == corev1.PersistentVolumeReclaimDelete {
+		log.Info("PV has Delete reclaim policy, should be auto-deleted now that claimRef is cleared", "pvName", pvName)
+		return nil
+	}
+
+	// For Retain policy, explicitly delete the PV to ensure storage is cleaned
+	// This is required for RabbitMQ major version upgrades as Mnesia DB formats are incompatible
+	if pv.Spec.PersistentVolumeReclaimPolicy == corev1.PersistentVolumeReclaimRetain {
+		if err := r.Client.Delete(ctx, pv); err != nil && !k8s_errors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete retained PV %s: %w", pvName, err)
+		}
+		log.Info("Deleted retained PV to ensure clean storage", "pvName", pvName)
+	}
+
+	return nil
+}
+
 // fields to index to reconcile on CR change
 const (
 	serviceSecretNameField = ".spec.tls.SecretName"
 	caSecretNameField      = ".spec.tls.CASecretName"
 	topologyField          = ".spec.topologyRef.Name"
+)
+
+// RabbitMQ version upgrade constants
+const (
+	// DefaultRabbitMQVersion is the default RabbitMQ version when no label exists
+	DefaultRabbitMQVersion = "3.9"
+	// RabbitmqCurrentVersionLabel is the label key for tracking the current deployed version
+	RabbitmqCurrentVersionLabel = "rabbitmq-current-version"
+	// RabbitmqVersionLabel is the label key for the target version
+	RabbitmqVersionLabel = "rabbitmq-version"
+	// UpgradeCheckInterval is how often to check upgrade progress
+	UpgradeCheckInterval = 2 * time.Second
 )
 
 var rmqAllWatchFields = []string{
@@ -100,6 +260,12 @@ type Reconciler struct {
 // Required to exec into pods
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete;
 // +kubebuilder:rbac:groups=core,resources=pods/exec,verbs=create
+
+// Required to manage PersistentVolumeClaims for version upgrades
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;update;delete
+
+// Required to manage PersistentVolumes for version upgrades (ensuring clean storage)
+// +kubebuilder:rbac:groups=core,resources=persistentvolumes,verbs=get;list;watch;update;delete
 
 // Required to manage PodDisruptionBudgets for multi-replica deployments
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
@@ -134,6 +300,42 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+
+	// Initialize RabbitMQ version label if it doesn't exist
+	if instance.Labels == nil {
+		instance.Labels = make(map[string]string)
+	}
+	if currentVersion, exists := instance.Labels[RabbitmqCurrentVersionLabel]; !exists || currentVersion == "" {
+		instance.Labels[RabbitmqCurrentVersionLabel] = DefaultRabbitMQVersion
+		// Patch the instance to persist the default label
+		if err := helper.PatchInstance(ctx, instance); err != nil {
+			Log.Error(err, "Failed to set default RabbitMQ current version label")
+			return ctrl.Result{}, err
+		}
+		Log.Info("Set default RabbitMQ current version label", "version", DefaultRabbitMQVersion)
+		// Return to let the reconcile cycle continue with the updated labels
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Check if upgrade requires storage wipe based on RabbitMQ compatibility matrix
+	var requiresUpgrade bool
+	if currentVersion, hasCurrent := instance.Labels[RabbitmqCurrentVersionLabel]; hasCurrent {
+		if targetVersion, hasTarget := instance.Labels[RabbitmqVersionLabel]; hasTarget {
+			needsWipe, err := requiresStorageWipe(currentVersion, targetVersion)
+			if err != nil {
+				Log.Error(err, "Failed to determine upgrade compatibility",
+					"currentVersion", currentVersion,
+					"targetVersion", targetVersion)
+				return ctrl.Result{}, fmt.Errorf("failed to check upgrade compatibility: %w", err)
+			}
+			if needsWipe {
+				requiresUpgrade = true
+				Log.Info("RabbitMQ upgrade requires storage wipe (no direct upgrade path)",
+					"currentVersion", currentVersion,
+					"targetVersion", targetVersion)
+			}
+		}
 	}
 
 	// initialize status if Conditions is nil, but do not reset if it already
@@ -369,6 +571,101 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		instance.Status.LastAppliedTopology = nil
 	}
 
+	//
+	// Handle major version upgrades
+	//
+	if requiresUpgrade {
+		Log.Info("Starting RabbitMQ major version upgrade process")
+
+		// Step 1: Delete the RabbitMQCluster to trigger pod deletion
+		rmqCluster := impl.NewRabbitMqCluster(rabbitmqCluster, 5)
+		if err := rmqCluster.Delete(ctx, helper); err != nil && !k8s_errors.IsNotFound(err) {
+			Log.Error(err, "Failed to delete RabbitMQCluster during upgrade")
+			return ctrl.Result{}, fmt.Errorf("failed to delete RabbitMQCluster during upgrade: %w", err)
+		}
+
+		// Step 2: Wait for all pods to terminate before deleting PVCs
+		podList := &corev1.PodList{}
+		if err := r.Client.List(ctx, podList, client.InNamespace(instance.Namespace), client.MatchingLabels{
+			"app.kubernetes.io/name": instance.Name,
+		}); err != nil {
+			Log.Error(err, "Failed to list pods during upgrade")
+			return ctrl.Result{}, fmt.Errorf("failed to list pods during upgrade: %w", err)
+		}
+
+		if len(podList.Items) > 0 {
+			Log.Info("Waiting for pods to terminate before deleting PVCs", "podCount", len(podList.Items))
+			return ctrl.Result{RequeueAfter: UpgradeCheckInterval}, nil
+		}
+
+		// Step 3: Delete PVCs and ensure underlying storage is cleaned
+		// This is critical for RabbitMQ major upgrades as Mnesia DB formats are incompatible
+		pvcList := &corev1.PersistentVolumeClaimList{}
+		if err := r.Client.List(ctx, pvcList, client.InNamespace(instance.Namespace), client.MatchingLabels{
+			"app.kubernetes.io/name": instance.Name,
+		}); err != nil {
+			Log.Error(err, "Failed to list PVCs during upgrade")
+			return ctrl.Result{}, fmt.Errorf("failed to list PVCs during upgrade: %w", err)
+		}
+
+		if len(pvcList.Items) > 0 {
+			for i := range pvcList.Items {
+				pvc := &pvcList.Items[i]
+				pvName := pvc.Spec.VolumeName
+
+				// Remove all finalizers to allow forced deletion
+				// Required for major version upgrades where data must be wiped
+				if _, err := r.removePVCFinalizers(ctx, pvc, Log); err != nil {
+					Log.Error(err, "Failed to remove PVC finalizers", "pvcName", pvc.Name)
+					return ctrl.Result{}, fmt.Errorf("failed to remove finalizers from PVC %s: %w", pvc.Name, err)
+				}
+
+				// Delete the PVC
+				if err := r.Client.Delete(ctx, pvc); err != nil && !k8s_errors.IsNotFound(err) {
+					Log.Error(err, "Failed to delete PVC during upgrade", "pvcName", pvc.Name)
+					return ctrl.Result{}, fmt.Errorf("failed to delete PVC %s during upgrade: %w", pvc.Name, err)
+				}
+
+				// Ensure underlying PV is released/deleted to guarantee clean storage
+				if pvName != "" {
+					if err := r.forceReleasePV(ctx, pvName, Log); err != nil {
+						Log.Error(err, "Failed to release PV", "pvName", pvName, "pvcName", pvc.Name)
+						return ctrl.Result{}, fmt.Errorf("failed to release PV %s: %w", pvName, err)
+					}
+				}
+			}
+			Log.Info("Deleted PVCs and released PVs, waiting for cleanup to complete", "pvcCount", len(pvcList.Items))
+			return ctrl.Result{RequeueAfter: UpgradeCheckInterval}, nil
+		}
+
+		// Step 4: Verify all PVs are actually gone before proceeding
+		// List PVs that were bound to our PVCs to ensure they're deleted
+		pvList := &corev1.PersistentVolumeList{}
+		if err := r.Client.List(ctx, pvList); err != nil {
+			Log.Error(err, "Failed to list PVs during upgrade verification")
+			return ctrl.Result{}, fmt.Errorf("failed to list PVs during upgrade: %w", err)
+		}
+
+		// Check if any PVs are still referencing our namespace and instance
+		for _, pv := range pvList.Items {
+			if pv.Spec.ClaimRef != nil &&
+				pv.Spec.ClaimRef.Namespace == instance.Namespace &&
+				strings.HasPrefix(pv.Spec.ClaimRef.Name, fmt.Sprintf("persistence-%s-", instance.Name)) {
+				Log.Info("Waiting for PV cleanup", "pvName", pv.Name, "phase", pv.Status.Phase)
+				return ctrl.Result{RequeueAfter: UpgradeCheckInterval}, nil
+			}
+		}
+
+		// Step 5: All resources cleaned, update version label and proceed to recreate cluster with new version
+		// Update version label now to prevent infinite upgrade loop
+		if targetVersion, hasTarget := instance.Labels[RabbitmqVersionLabel]; hasTarget {
+			instance.Labels[RabbitmqCurrentVersionLabel] = targetVersion
+			Log.Info("Storage cleanup complete - updated current version label", "version", targetVersion)
+		}
+		Log.Info("Storage completely cleaned, proceeding to recreate cluster with new version")
+		// Fall through to ConfigureCluster below
+	}
+
 	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, instance.Spec.Override)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
@@ -394,6 +691,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			// us to import "github.com/rabbitmq/cluster-operator/internal/status"
 			if string(oldCond.Type) == "ClusterAvailable" && oldCond.Status == corev1.ConditionTrue {
 				clusterReady = true
+				break
 			}
 		}
 	}

@@ -25,6 +25,7 @@ import (
 	. "github.com/onsi/gomega"    //revive:disable:dot-imports
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
+	rabbitmqclusterv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 
 	//revive:disable-next-line:dot-imports
 
@@ -698,6 +699,151 @@ var _ = Describe("RabbitMQ Controller", func() {
 					g.Expect(svc.OwnerReferences[0].Name).To(Equal(rabbitmqDefaultName))
 				}
 			}, timeout, interval).Should(Succeed())
+		})
+	})
+
+	When("RabbitMQ version upgrade", func() {
+		When("RabbitMQ is created without version labels", func() {
+			BeforeEach(func() {
+				rabbitmq := CreateRabbitMQ(rabbitmqName, GetDefaultRabbitMQSpec())
+				DeferCleanup(th.DeleteInstance, rabbitmq)
+			})
+
+			It("should default rabbitmq-current-version to 3.9", func() {
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Labels).NotTo(BeNil())
+					g.Expect(instance.Labels["rabbitmq-current-version"]).To(Equal("3.9"))
+				}, timeout, interval).Should(Succeed())
+			})
+		})
+
+		When("RabbitMQ major version upgrade (3.9 to 4.0)", func() {
+			BeforeEach(func() {
+				spec := GetDefaultRabbitMQSpec()
+				spec["queueType"] = "Quorum"
+				rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+				DeferCleanup(th.DeleteInstance, rabbitmq)
+
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Labels["rabbitmq-current-version"]).To(Equal("3.9"))
+				}, timeout, interval).Should(Succeed())
+			})
+
+			It("should require storage wipe and update version label after upgrade", func() {
+				// 3.9 -> 4.0 requires storage wipe (no direct path)
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					if instance.Labels == nil {
+						instance.Labels = make(map[string]string)
+					}
+					instance.Labels["rabbitmq-version"] = "4.0"
+					g.Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
+				}, timeout, interval).Should(Succeed())
+
+				// Wait for upgrade to complete: cluster deleted, storage cleaned, cluster recreated
+				var newCluster *rabbitmqclusterv2.RabbitmqCluster
+				Eventually(func(g Gomega) {
+					newCluster = &rabbitmqclusterv2.RabbitmqCluster{}
+					err := k8sClient.Get(ctx, rabbitmqName, newCluster)
+					g.Expect(err).ToNot(HaveOccurred())
+					// Cluster should exist and have been created
+					g.Expect(newCluster.Generation).To(BeNumerically(">", 0))
+				}, timeout, interval).Should(Succeed())
+
+				// Now simulate the new cluster as ready
+				// Now simulate the new cluster as ready
+				SimulateRabbitMQClusterReady(rabbitmqName)
+
+				// Verify version label is updated after cluster is ready
+				Eventually(func(g Gomega) {
+					updatedInstance := GetRabbitMQ(rabbitmqName)
+					g.Expect(updatedInstance.Labels["rabbitmq-current-version"]).To(Equal("4.0"))
+					g.Expect(updatedInstance.Labels["rabbitmq-version"]).To(Equal("4.0"))
+				}, timeout, interval).Should(Succeed())
+			})
+		})
+
+		When("RabbitMQ patch version changes (3.9.0 to 3.9.1)", func() {
+			BeforeEach(func() {
+				spec := GetDefaultRabbitMQSpec()
+				rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+				DeferCleanup(th.DeleteInstance, rabbitmq)
+
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Labels["rabbitmq-current-version"]).To(Equal("3.9"))
+				}, timeout, interval).Should(Succeed())
+			})
+
+			It("should allow patch version changes without storage wipe", func() {
+				// Patch version changes don't require storage wipe
+				instance := GetRabbitMQ(rabbitmqName)
+				if instance.Labels == nil {
+					instance.Labels = make(map[string]string)
+				}
+				instance.Labels["rabbitmq-version"] = "3.9.1"
+				Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
+
+				// Should NOT trigger storage wipe
+				Consistently(func(g Gomega) {
+					updatedInstance := GetRabbitMQ(rabbitmqName)
+					g.Expect(updatedInstance.Labels["rabbitmq-current-version"]).To(Equal("3.9"))
+				}, "5s", interval).Should(Succeed())
+			})
+		})
+
+		When("RabbitMQ version downgrade (4.0 to 3.9)", func() {
+			BeforeEach(func() {
+				spec := GetDefaultRabbitMQSpec()
+				spec["queueType"] = "Quorum"
+				rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+				DeferCleanup(th.DeleteInstance, rabbitmq)
+
+				// Set initial version to 4.0
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					if instance.Labels == nil {
+						instance.Labels = make(map[string]string)
+					}
+					instance.Labels["rabbitmq-current-version"] = "4.0"
+					g.Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
+				}, timeout, interval).Should(Succeed())
+			})
+
+			It("should require storage wipe for downgrade", func() {
+				// 4.0 -> 3.9 is a downgrade and requires storage wipe
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					if instance.Labels == nil {
+						instance.Labels = make(map[string]string)
+					}
+					instance.Labels["rabbitmq-version"] = "3.9"
+					g.Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
+				}, timeout, interval).Should(Succeed())
+
+				// Wait for downgrade to complete: cluster deleted, storage cleaned, cluster recreated
+				var newCluster *rabbitmqclusterv2.RabbitmqCluster
+				Eventually(func(g Gomega) {
+					newCluster = &rabbitmqclusterv2.RabbitmqCluster{}
+					err := k8sClient.Get(ctx, rabbitmqName, newCluster)
+					g.Expect(err).ToNot(HaveOccurred())
+					// Cluster should exist and have been created
+					g.Expect(newCluster.Generation).To(BeNumerically(">", 0))
+				}, timeout, interval).Should(Succeed())
+
+				// Now simulate the new cluster as ready
+				// Now simulate the new cluster as ready
+				SimulateRabbitMQClusterReady(rabbitmqName)
+
+				// Verify version label is updated after cluster is ready
+				Eventually(func(g Gomega) {
+					updatedInstance := GetRabbitMQ(rabbitmqName)
+					g.Expect(updatedInstance.Labels["rabbitmq-current-version"]).To(Equal("3.9"))
+					g.Expect(updatedInstance.Labels["rabbitmq-version"]).To(Equal("3.9"))
+				}, timeout, interval).Should(Succeed())
+			})
 		})
 	})
 })

@@ -149,7 +149,7 @@ func (r *RabbitMq) ValidateCreate() (admission.Warnings, error) {
 }
 
 // ValidateUpdate implements webhook.Validator so a webhook will be registered for the type
-func (r *RabbitMq) ValidateUpdate(_ runtime.Object) (admission.Warnings, error) {
+func (r *RabbitMq) ValidateUpdate(old runtime.Object) (admission.Warnings, error) {
 	rabbitmqlog.Info("validate update", "name", r.Name)
 
 	var allErrs field.ErrorList
