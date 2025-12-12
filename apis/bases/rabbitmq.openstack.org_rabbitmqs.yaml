@@ -1955,6 +1955,44 @@ spec:
                       current project
                     type: string
                 type: object
+              migrationStatus:
+                description: MigrationStatus tracks the progress of queue migration
+                  from mirrored to quorum
+                properties:
+                  completionTime:
+                    description: CompletionTime is when the migration completed
+                    format: date-time
+                    type: string
+                  message:
+                    description: Message provides additional information about migration
+                      status
+                    type: string
+                  migratedQueues:
+                    description: MigratedQueues is the number of queues that have
+                      been successfully migrated
+                    type: integer
+                  phase:
+                    description: |-
+                      Phase indicates the current phase of migration
+                      Possible values: "", "Initializing", "InProgress", "Complete", "Failed"
+                    type: string
+                  remainingMessages:
+                    description: RemainingMessages is the total number of messages
+                      still in source queues
+                    format: int64
+                    type: integer
+                  shovelsActive:
+                    description: ShovelsActive is the number of active shovels moving
+                      messages
+                    type: integer
+                  startTime:
+                    description: StartTime is when the migration started
+                    format: date-time
+                    type: string
+                  totalQueues:
+                    description: TotalQueues is the total number of queues being migrated
+                    type: integer
+                type: object
               observedGeneration:
                 description: |-
                   ObservedGeneration - the most recent generation observed for this

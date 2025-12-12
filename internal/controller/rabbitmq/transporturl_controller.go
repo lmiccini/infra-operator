@@ -257,6 +257,13 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		return ctrl.Result{}, err
 	}
 
+	// Get RabbitMq CR early to determine queue type for vhost selection
+	rabbitmqCR := &rabbitmqv1.RabbitMq{}
+	rabbitmqCRErr := r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbitmqCR)
+	if rabbitmqCRErr != nil {
+		Log.Info(fmt.Sprintf("Could not fetch RabbitMQ CR: %v", rabbitmqCRErr))
+	}
+
 	// Determine credentials and vhost
 	var finalUsername, finalPassword, vhostName string
 	var userRef string
@@ -264,11 +271,23 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 	if instance.Spec.UserRef != "" {
 		userRef = instance.Spec.UserRef
 	} else if instance.Spec.Username != "" {
-		// Create RabbitMQVhost if needed
+		// Determine vhost - use quorum vhost if migrating from mirrored to quorum
 		vhostName = instance.Spec.Vhost
 		if vhostName == "" {
 			vhostName = "/"
 		}
+
+		// If RabbitMQ is using Quorum queues and a migration has occurred, switch to quorum vhost
+		if rabbitmqCRErr == nil && rabbitmqCR.Status.QueueType == rabbitmqv1.QueueTypeQuorum && vhostName == "/" {
+			// Check if a migration has occurred (migration status will be preserved)
+			if rabbitmqCR.Status.MigrationStatus != nil {
+				vhostName = "quorum" // Vhost name without leading slash
+				Log.Info("Switching to quorum vhost due to mirrored-to-quorum migration",
+					"vhost", vhostName,
+					"migrationPhase", rabbitmqCR.Status.MigrationStatus.Phase)
+			}
+		}
+
 		var vhostRef string
 		if vhostName != "/" {
 			vhostRef = fmt.Sprintf("%s-%s-vhost", instance.Name, vhostName)
@@ -374,18 +393,25 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		finalUsername = string(adminUsername)
 		finalPassword = string(adminPassword)
 		vhostName = "/"
+
+		// If RabbitMQ is using Quorum queues and a migration has occurred, switch to quorum vhost (admin credentials case)
+		if rabbitmqCRErr == nil && rabbitmqCR.Status.QueueType == rabbitmqv1.QueueTypeQuorum {
+			// Check if a migration has occurred (migration status will be preserved)
+			if rabbitmqCR.Status.MigrationStatus != nil {
+				vhostName = "quorum" // Vhost name without leading slash
+				Log.Info("Switching to quorum vhost due to mirrored-to-quorum migration (admin credentials)",
+					"vhost", vhostName,
+					"migrationPhase", rabbitmqCR.Status.MigrationStatus.Phase)
+			}
+		}
 	}
 
 	tlsEnabled := rabbit.Spec.TLS.SecretName != ""
 	Log.Info(fmt.Sprintf("rabbitmq cluster %s has TLS enabled: %t", rabbit.Name, tlsEnabled))
 
-	// Get RabbitMq CR for both secret generation and status update
-	rabbitmqCR := &rabbitmqv1.RabbitMq{}
-	err = r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbitmqCR)
-
 	// Build list of hosts - use ServiceHostnames from status if available, otherwise use host from secret
 	var hosts []string
-	if err == nil && len(rabbitmqCR.Status.ServiceHostnames) > 0 {
+	if rabbitmqCRErr == nil && len(rabbitmqCR.Status.ServiceHostnames) > 0 {
 		hosts = rabbitmqCR.Status.ServiceHostnames
 		Log.Info(fmt.Sprintf("Using per-pod service hostnames: %v", hosts))
 	} else {
@@ -406,8 +432,8 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 
 	// Determine quorum setting for secret generation
 	quorum := false
-	if err != nil {
-		Log.Info(fmt.Sprintf("Could not fetch RabbitMQ CR: %v", err))
+	if rabbitmqCRErr != nil {
+		Log.Info(fmt.Sprintf("Could not fetch RabbitMQ CR: %v", rabbitmqCRErr))
 		// Default to false for quorum if we can't fetch the CR
 	} else {
 		Log.Info(fmt.Sprintf("Found RabbitMQ CR: %s", rabbitmqCR.Name))

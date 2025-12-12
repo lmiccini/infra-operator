@@ -133,6 +133,39 @@ type RabbitMqStatus struct {
 	// When populated, transport URLs use these hostnames instead of pod names.
 	// +listType=atomic
 	ServiceHostnames []string `json:"serviceHostnames,omitempty"`
+
+	// MigrationStatus tracks the progress of queue migration from mirrored to quorum
+	MigrationStatus *MigrationStatus `json:"migrationStatus,omitempty"`
+}
+
+// MigrationStatus represents the current state of queue migration
+type MigrationStatus struct {
+	// Phase indicates the current phase of migration
+	// Possible values: "", "Initializing", "InProgress", "Complete", "Failed"
+	Phase string `json:"phase,omitempty"`
+
+	// TotalQueues is the total number of queues being migrated
+	TotalQueues int `json:"totalQueues,omitempty"`
+
+	// MigratedQueues is the number of queues that have been successfully migrated
+	MigratedQueues int `json:"migratedQueues,omitempty"`
+
+	// RemainingMessages is the total number of messages still in source queues
+	RemainingMessages int64 `json:"remainingMessages,omitempty"`
+
+	// ShovelsActive is the number of active shovels moving messages
+	ShovelsActive int `json:"shovelsActive,omitempty"`
+
+	// StartTime is when the migration started
+	// +optional
+	StartTime *metav1.Time `json:"startTime,omitempty"`
+
+	// CompletionTime is when the migration completed
+	// +optional
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+
+	// Message provides additional information about migration status
+	Message string `json:"message,omitempty"`
 }
 
 //+kubebuilder:object:root=true
