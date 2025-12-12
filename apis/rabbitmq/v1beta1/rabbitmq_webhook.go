@@ -69,8 +69,27 @@ func (r *RabbitMq) Default(k8sClient client.Client) {
 		}
 
 		if err == nil && existingRabbitMq.Spec.QueueType != nil && *existingRabbitMq.Spec.QueueType != "" {
-			r.Spec.QueueType = existingRabbitMq.Spec.QueueType
-			rabbitmqlog.Info("preserving QueueType from existing CR", "name", r.Name, "queueType", *r.Spec.QueueType)
+			// Check if this is a version upgrade scenario where queueType change is intentional
+			isVersionUpgrade := false
+			if r.Labels != nil && existingRabbitMq.Labels != nil {
+				currentVersion, hasCurrentVersion := existingRabbitMq.Labels["rabbitmq-current-version"]
+				targetVersion, hasTargetVersion := existingRabbitMq.Labels["rabbitmq-version"]
+				if hasCurrentVersion && hasTargetVersion && currentVersion != targetVersion {
+					isVersionUpgrade = true
+					rabbitmqlog.Info("detected version upgrade, allowing queueType change",
+						"name", r.Name,
+						"currentVersion", currentVersion,
+						"targetVersion", targetVersion,
+						"oldQueueType", *existingRabbitMq.Spec.QueueType,
+						"newQueueType", r.Spec.QueueType)
+				}
+			}
+
+			// Only preserve queueType if not in a version upgrade scenario
+			if !isVersionUpgrade {
+				r.Spec.QueueType = existingRabbitMq.Spec.QueueType
+				rabbitmqlog.Info("preserving QueueType from existing CR", "name", r.Name, "queueType", *r.Spec.QueueType)
+			}
 			isNew = false
 		} else {
 			// Check if RabbitMQCluster exists (upgrade scenario: cluster exists but CR is new)

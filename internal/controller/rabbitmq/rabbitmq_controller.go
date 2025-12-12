@@ -252,6 +252,8 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs/finalizers,verbs=update
 
+// +kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqvhosts,verbs=get;list;watch;create;update;patch;delete
+
 // +kubebuilder:rbac:groups=rabbitmq.com,resources=rabbitmqclusters,verbs=get;list;watch;create;update;patch;delete
 
 // Required to determine IPv6 and FIPS
@@ -577,6 +579,29 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	if requiresUpgrade {
 		Log.Info("Starting RabbitMQ major version upgrade process")
 
+		// Check if we need to migrate from Mirrored to Quorum queues
+		// This happens when upgrading to RabbitMQ 4.0+ with Mirrored queues
+		if instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeMirrored {
+			if targetVersion, hasTarget := instance.Labels[RabbitmqVersionLabel]; hasTarget {
+				targetVer, err := parseRabbitMQVersion(targetVersion)
+				if err == nil && targetVer.major >= 4 {
+					Log.Info("Upgrading to RabbitMQ 4.0+ with Mirrored queues - will migrate to Quorum queues",
+						"targetVersion", targetVersion)
+
+					// Update queueType to Quorum during upgrade to RabbitMQ 4.0+
+					// The webhook allows this change during version upgrades
+					instance.Spec.QueueType = ptr.To(rabbitmqv1beta1.QueueTypeQuorum)
+					if err := r.Client.Update(ctx, instance); err != nil {
+						Log.Error(err, "Failed to update queueType to Quorum during migration")
+						return ctrl.Result{}, err
+					}
+					Log.Info("Updated queueType from Mirrored to Quorum - requeuing to continue upgrade")
+					// Return and requeue to continue upgrade with updated queueType
+					return ctrl.Result{Requeue: true}, nil
+				}
+			}
+		}
+
 		// Step 1: Delete the RabbitMQCluster to trigger pod deletion
 		rmqCluster := impl.NewRabbitMqCluster(rabbitmqCluster, 5)
 		if err := rmqCluster.Delete(ctx, helper); err != nil && !k8s_errors.IsNotFound(err) {
@@ -699,6 +724,25 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	if clusterReady {
 		instance.Status.Conditions.MarkTrue(condition.DeploymentReadyCondition, condition.DeploymentReadyMessage)
 
+		// Handle migration to Quorum queues after upgrade to RabbitMQ 4.0+
+		// Create "quorum" vhost if we're using Quorum queues on version 4.0+
+		if instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
+			currentVersion := instance.Labels[RabbitmqCurrentVersionLabel]
+			parsedVersion, err := parseRabbitMQVersion(currentVersion)
+			if err == nil && parsedVersion.major >= 4 {
+				Log.Info("Creating quorum vhost for RabbitMQ 4.0+ with Quorum queues")
+				if err := ensureQuorumVhost(ctx, helper, instance); err != nil {
+					Log.Error(err, "Failed to create quorum vhost")
+					instance.Status.Conditions.Set(condition.FalseCondition(
+						condition.DeploymentReadyCondition,
+						condition.ErrorReason,
+						condition.SeverityWarning,
+						condition.DeploymentReadyErrorMessage, err.Error()))
+					return ctrl.Result{}, err
+				}
+			}
+		}
+
 		labelMap := map[string]string{
 			labels.K8sAppName:      instance.Name,
 			labels.K8sAppComponent: "rabbitmq",
@@ -765,10 +809,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		// QueueType should never be nil due to webhook defaulting, but add safety check
 		if instance.Spec.QueueType != nil {
 			if *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeMirrored && *instance.Spec.Replicas > 1 && instance.Status.QueueType != rabbitmqv1beta1.QueueTypeMirrored {
-				Log.Info("ha-all policy not present. Applying.")
-				err := ensureMirroredPolicy(ctx, helper, instance)
+				// Check RabbitMQ version before applying mirrored policy
+				currentVersion := instance.Labels[RabbitmqCurrentVersionLabel]
+				parsedVersion, err := parseRabbitMQVersion(currentVersion)
 				if err != nil {
-					Log.Error(err, "Could not apply ha-all policy")
+					Log.Error(err, "Failed to parse RabbitMQ version for mirrored queue check", "version", currentVersion)
 					instance.Status.Conditions.Set(condition.FalseCondition(
 						condition.DeploymentReadyCondition,
 						condition.ErrorReason,
@@ -776,7 +821,28 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 						condition.DeploymentReadyErrorMessage, err.Error()))
 					return ctrl.Result{}, err
 				}
-				instance.Status.QueueType = rabbitmqv1beta1.QueueTypeMirrored
+
+				// Mirrored queues are deprecated in RabbitMQ 4.0+
+				if parsedVersion.major >= 4 {
+					Log.Info("Skipping mirrored queue policy - mirrored queues are deprecated in RabbitMQ 4.0 and later",
+						"currentVersion", currentVersion)
+					// Clear the queue type status since we're not applying the policy
+					instance.Status.QueueType = ""
+				} else {
+					// RabbitMQ 3.x - apply mirrored policy
+					Log.Info("ha-all policy not present. Applying.")
+					err := ensureMirroredPolicy(ctx, helper, instance)
+					if err != nil {
+						Log.Error(err, "Could not apply ha-all policy")
+						instance.Status.Conditions.Set(condition.FalseCondition(
+							condition.DeploymentReadyCondition,
+							condition.ErrorReason,
+							condition.SeverityWarning,
+							condition.DeploymentReadyErrorMessage, err.Error()))
+						return ctrl.Result{}, err
+					}
+					instance.Status.QueueType = rabbitmqv1beta1.QueueTypeMirrored
+				}
 			} else if *instance.Spec.QueueType != rabbitmqv1beta1.QueueTypeMirrored && instance.Status.QueueType == rabbitmqv1beta1.QueueTypeMirrored {
 				Log.Info("QueueType changed from Mirrored. Removing ha-all policy")
 				err := deleteMirroredPolicy(ctx, helper, instance)
@@ -1000,6 +1066,42 @@ func deleteMirroredPolicy(ctx context.Context, helper *helper.Helper, instance *
 
 	// Delete the policy
 	return helper.GetClient().Delete(ctx, policy)
+}
+
+func ensureQuorumVhost(ctx context.Context, helper *helper.Helper, instance *rabbitmqv1beta1.RabbitMq) error {
+	vhostName := types.NamespacedName{
+		Name:      instance.Name + "-quorum-vhost",
+		Namespace: instance.Namespace,
+	}
+
+	vhost := &rabbitmqv1beta1.RabbitMQVhost{}
+	err := helper.GetClient().Get(ctx, vhostName, vhost)
+
+	// Vhost already exists
+	if err == nil {
+		return nil
+	}
+
+	// Return error if it's not NotFound
+	if !k8s_errors.IsNotFound(err) {
+		return err
+	}
+
+	// Create the vhost CR
+	vhost = &rabbitmqv1beta1.RabbitMQVhost{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      vhostName.Name,
+			Namespace: vhostName.Namespace,
+		},
+		Spec: rabbitmqv1beta1.RabbitMQVhostSpec{
+			RabbitmqClusterName: instance.Name,
+			Name:                "quorum",
+		},
+	}
+	if err := controllerutil.SetControllerReference(instance, vhost, helper.GetScheme()); err != nil {
+		return err
+	}
+	return helper.GetClient().Create(ctx, vhost)
 }
 
 func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
