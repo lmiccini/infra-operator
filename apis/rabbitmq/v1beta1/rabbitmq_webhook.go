@@ -69,26 +69,17 @@ func (r *RabbitMq) Default(k8sClient client.Client) {
 		}
 
 		if err == nil && existingRabbitMq.Spec.QueueType != nil && *existingRabbitMq.Spec.QueueType != "" {
-			// Check if this is a version upgrade scenario where queueType change is intentional
-			isVersionUpgrade := false
-			if r.Labels != nil && existingRabbitMq.Labels != nil {
-				currentVersion, hasCurrentVersion := existingRabbitMq.Labels["rabbitmq-current-version"]
-				targetVersion, hasTargetVersion := existingRabbitMq.Labels["rabbitmq-version"]
-				if hasCurrentVersion && hasTargetVersion && currentVersion != targetVersion {
-					isVersionUpgrade = true
-					rabbitmqlog.Info("detected version upgrade, allowing queueType change",
-						"name", r.Name,
-						"currentVersion", currentVersion,
-						"targetVersion", targetVersion,
-						"oldQueueType", *existingRabbitMq.Spec.QueueType,
-						"newQueueType", r.Spec.QueueType)
-				}
-			}
-
-			// Only preserve queueType if not in a version upgrade scenario
-			if !isVersionUpgrade {
+			// Only preserve queueType if the incoming request doesn't specify one
+			// This allows operators to explicitly change the queueType for migration purposes
+			if r.Spec.QueueType == nil || *r.Spec.QueueType == "" {
 				r.Spec.QueueType = existingRabbitMq.Spec.QueueType
 				rabbitmqlog.Info("preserving QueueType from existing CR", "name", r.Name, "queueType", *r.Spec.QueueType)
+			} else if *r.Spec.QueueType != *existingRabbitMq.Spec.QueueType {
+				// User is explicitly changing queueType - allow it
+				rabbitmqlog.Info("allowing queueType change",
+					"name", r.Name,
+					"oldQueueType", *existingRabbitMq.Spec.QueueType,
+					"newQueueType", *r.Spec.QueueType)
 			}
 			isNew = false
 		} else {
@@ -185,6 +176,25 @@ func (r *RabbitMq) ValidateUpdate(old runtime.Object) (admission.Warnings, error
 
 	// Validate QueueType if specified
 	allErrs = append(allErrs, r.Spec.ValidateQueueType(basePath)...)
+
+	// Block setting queueType to Mirrored on RabbitMQ 4.x (deprecated)
+	// Only block if queueType is being changed to Mirrored, not if it was already Mirrored
+	oldRabbitMq := old.(*RabbitMq)
+	if r.Spec.QueueType != nil && *r.Spec.QueueType == "Mirrored" {
+		// Check if queueType changed to Mirrored (wasn't Mirrored before)
+		queueTypeChanged := oldRabbitMq.Spec.QueueType == nil || *oldRabbitMq.Spec.QueueType != "Mirrored"
+
+		if queueTypeChanged && r.Labels != nil {
+			if currentVersion, hasVersion := r.Labels["rabbitmq-current-version"]; hasVersion {
+				// Simple version check - if major version is 4 or higher, block Mirrored
+				if len(currentVersion) > 0 && currentVersion[0] >= '4' {
+					allErrs = append(allErrs, field.Forbidden(
+						basePath.Child("queueType"),
+						"Mirrored queues are deprecated in RabbitMQ 4.x and cannot be used"))
+				}
+			}
+		}
+	}
 
 	if len(allErrs) != 0 {
 		return allWarn, apierrors.NewInvalid(

@@ -889,14 +889,26 @@ var _ = Describe("RabbitMQ Controller", func() {
 				rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
 				DeferCleanup(th.DeleteInstance, rabbitmq)
 
-				// Set version to 4.0
+				// Wait for controller to set default version first (3.9)
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Labels).ToNot(BeNil())
+					g.Expect(instance.Labels["rabbitmq-current-version"]).To(Equal("3.9"))
+				}, timeout, interval).Should(Succeed())
+
+				// Now update version to 4.0 and verify it sticks
 				Eventually(func(g Gomega) {
 					instance := GetRabbitMQ(rabbitmqName)
 					if instance.Labels == nil {
 						instance.Labels = make(map[string]string)
 					}
-					instance.Labels["rabbitmq-current-version"] = "4.0"
-					g.Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
+					if instance.Labels["rabbitmq-current-version"] != "4.0" {
+						instance.Labels["rabbitmq-current-version"] = "4.0"
+						g.Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
+					}
+					// Verify the label was actually updated by refetching
+					updated := GetRabbitMQ(rabbitmqName)
+					g.Expect(updated.Labels["rabbitmq-current-version"]).To(Equal("4.0"))
 				}, timeout, interval).Should(Succeed())
 			})
 
@@ -947,7 +959,7 @@ var _ = Describe("RabbitMQ Controller", func() {
 				}, timeout, interval).Should(Succeed())
 			})
 
-			It("should migrate from Mirrored to Quorum during upgrade to 4.0", func() {
+			It("should block upgrade to 4.0 with Mirrored queues and create quorum vhost", func() {
 				// Trigger upgrade to 4.0
 				Eventually(func(g Gomega) {
 					instance := GetRabbitMQ(rabbitmqName)
@@ -958,32 +970,14 @@ var _ = Describe("RabbitMQ Controller", func() {
 					g.Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
 				}, timeout, interval).Should(Succeed())
 
-				// Verify queueType is automatically changed to Quorum
-				Eventually(func(g Gomega) {
+				// Verify upgrade is blocked - queueType should NOT change automatically
+				Consistently(func(g Gomega) {
 					instance := GetRabbitMQ(rabbitmqName)
 					g.Expect(instance.Spec.QueueType).ToNot(BeNil())
-					g.Expect(*instance.Spec.QueueType).To(Equal(rabbitmqv1.QueueTypeQuorum))
-				}, timeout, interval).Should(Succeed())
+					g.Expect(*instance.Spec.QueueType).To(Equal(rabbitmqv1.QueueTypeMirrored))
+				}, "5s", interval).Should(Succeed())
 
-				// Wait for upgrade to complete
-				var newCluster *rabbitmqclusterv2.RabbitmqCluster
-				Eventually(func(g Gomega) {
-					newCluster = &rabbitmqclusterv2.RabbitmqCluster{}
-					err := k8sClient.Get(ctx, rabbitmqName, newCluster)
-					g.Expect(err).ToNot(HaveOccurred())
-					g.Expect(newCluster.Generation).To(BeNumerically(">", 0))
-				}, timeout, interval).Should(Succeed())
-
-				// Simulate new cluster as ready
-				SimulateRabbitMQClusterReady(rabbitmqName)
-
-				// Verify version is updated
-				Eventually(func(g Gomega) {
-					instance := GetRabbitMQ(rabbitmqName)
-					g.Expect(instance.Labels["rabbitmq-current-version"]).To(Equal("4.0"))
-				}, timeout, interval).Should(Succeed())
-
-				// Verify quorum vhost is created
+				// Verify quorum vhost is created for zero-downtime migration
 				vhostName := types.NamespacedName{
 					Name:      rabbitmqDefaultName + "-quorum-vhost",
 					Namespace: namespace,
@@ -996,10 +990,63 @@ var _ = Describe("RabbitMQ Controller", func() {
 					g.Expect(vhost.Spec.RabbitmqClusterName).To(Equal(rabbitmqDefaultName))
 				}, timeout, interval).Should(Succeed())
 
-				// Verify status is updated to Quorum
+				// Verify condition shows upgrade is blocked
 				Eventually(func(g Gomega) {
 					instance := GetRabbitMQ(rabbitmqName)
-					g.Expect(instance.Status.QueueType).To(Equal(rabbitmqv1.QueueTypeQuorum))
+					readyCondition := instance.Status.Conditions.Get(condition.DeploymentReadyCondition)
+					g.Expect(readyCondition).ToNot(BeNil())
+					g.Expect(readyCondition.Status).To(Equal(corev1.ConditionFalse))
+					g.Expect(readyCondition.Message).To(ContainSubstring("RabbitMQ upgrade blocked"))
+					g.Expect(readyCondition.Message).To(ContainSubstring("Mirrored queues are deprecated"))
+				}, timeout, interval).Should(Succeed())
+
+				// Verify cluster is NOT deleted (upgrade blocked)
+				Consistently(func(g Gomega) {
+					cluster := &rabbitmqclusterv2.RabbitmqCluster{}
+					err := k8sClient.Get(ctx, rabbitmqName, cluster)
+					g.Expect(err).ToNot(HaveOccurred())
+					g.Expect(cluster.DeletionTimestamp.IsZero()).To(BeTrue())
+				}, "5s", interval).Should(Succeed())
+
+				// Now manually change queueType to Quorum (simulating operator action)
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					queueType := rabbitmqv1.QueueTypeQuorum
+					instance.Spec.QueueType = &queueType
+					g.Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
+				}, timeout, interval).Should(Succeed())
+
+				// Verify queueType change was accepted
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Spec.QueueType).ToNot(BeNil())
+					g.Expect(*instance.Spec.QueueType).To(Equal(rabbitmqv1.QueueTypeQuorum))
+				}, timeout, interval).Should(Succeed())
+
+				// Now the upgrade should proceed
+				Eventually(func(g Gomega) {
+					cluster := &rabbitmqclusterv2.RabbitmqCluster{}
+					err := k8sClient.Get(ctx, rabbitmqName, cluster)
+					// Cluster should be deleted as part of upgrade process
+					g.Expect(k8s_errors.IsNotFound(err) || !cluster.DeletionTimestamp.IsZero()).To(BeTrue())
+				}, timeout, interval).Should(Succeed())
+
+				// Wait for upgrade to complete and new cluster to be created
+				var newCluster *rabbitmqclusterv2.RabbitmqCluster
+				Eventually(func(g Gomega) {
+					newCluster = &rabbitmqclusterv2.RabbitmqCluster{}
+					err := k8sClient.Get(ctx, rabbitmqName, newCluster)
+					g.Expect(err).ToNot(HaveOccurred())
+					g.Expect(newCluster.Generation).To(BeNumerically(">", 0))
+				}, timeout, interval).Should(Succeed())
+
+				// Simulate new cluster as ready
+				SimulateRabbitMQClusterReady(rabbitmqName)
+
+				// Verify version is updated to 4.0
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Labels["rabbitmq-current-version"]).To(Equal("4.0"))
 				}, timeout, interval).Should(Succeed())
 			})
 		})
@@ -1023,10 +1070,9 @@ var _ = Describe("RabbitMQ Controller", func() {
 				}, timeout, interval).Should(Succeed())
 			})
 
-			It("should create quorum vhost for RabbitMQ 4.0+ with Quorum queues", func() {
+			It("should create quorum vhost when queueType is Quorum", func() {
 				SimulateRabbitMQClusterReady(rabbitmqName)
 
-				// Verify quorum vhost is created
 				vhostName := types.NamespacedName{
 					Name:      rabbitmqDefaultName + "-quorum-vhost",
 					Namespace: namespace,
@@ -1037,6 +1083,121 @@ var _ = Describe("RabbitMQ Controller", func() {
 					g.Expect(err).ToNot(HaveOccurred())
 					g.Expect(vhost.Spec.Name).To(Equal("quorum"))
 					g.Expect(vhost.Spec.RabbitmqClusterName).To(Equal(rabbitmqDefaultName))
+				}, timeout, interval).Should(Succeed())
+			})
+		})
+
+		When("Changing queueType from Mirrored to Quorum on RabbitMQ 3.9", func() {
+			BeforeEach(func() {
+				spec := GetDefaultRabbitMQSpec()
+				spec["queueType"] = "Mirrored"
+				spec["replicas"] = 2
+				rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+				DeferCleanup(th.DeleteInstance, rabbitmq)
+
+				SimulateRabbitMQClusterReady(rabbitmqName)
+
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Status.QueueType).To(Equal(rabbitmqv1.QueueTypeMirrored))
+				}, timeout, interval).Should(Succeed())
+			})
+
+			It("should wait for vhost ready before updating status.queueType", func() {
+				// Change queueType to Quorum
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					queueType := rabbitmqv1.QueueTypeQuorum
+					instance.Spec.QueueType = &queueType
+					g.Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
+				}, timeout, interval).Should(Succeed())
+
+				// Verify queueType change was accepted
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Spec.QueueType).ToNot(BeNil())
+					g.Expect(*instance.Spec.QueueType).To(Equal(rabbitmqv1.QueueTypeQuorum))
+				}, timeout, interval).Should(Succeed())
+
+				// Verify quorum vhost is created
+				vhostName := types.NamespacedName{
+					Name:      rabbitmqDefaultName + "-quorum-vhost",
+					Namespace: namespace,
+				}
+				var vhost *rabbitmqv1.RabbitMQVhost
+				Eventually(func(g Gomega) {
+					vhost = &rabbitmqv1.RabbitMQVhost{}
+					err := k8sClient.Get(ctx, vhostName, vhost)
+					g.Expect(err).ToNot(HaveOccurred())
+					g.Expect(vhost.Spec.Name).To(Equal("quorum"))
+					g.Expect(vhost.Spec.RabbitmqClusterName).To(Equal(rabbitmqDefaultName))
+				}, timeout, interval).Should(Succeed())
+
+				// Status should NOT be updated yet (vhost not ready)
+				Consistently(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Status.QueueType).To(Equal(rabbitmqv1.QueueTypeMirrored))
+				}, "3s", interval).Should(Succeed())
+
+				// Simulate vhost becoming ready
+				Eventually(func(g Gomega) {
+					vhost := &rabbitmqv1.RabbitMQVhost{}
+					err := k8sClient.Get(ctx, vhostName, vhost)
+					g.Expect(err).ToNot(HaveOccurred())
+					vhost.Status.Conditions.MarkTrue(rabbitmqv1.RabbitMQVhostReadyCondition, rabbitmqv1.RabbitMQVhostReadyMessage)
+					g.Expect(k8sClient.Status().Update(ctx, vhost)).Should(Succeed())
+				}, timeout, interval).Should(Succeed())
+
+				// Now status.queueType should be updated to Quorum
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Status.QueueType).To(Equal(rabbitmqv1.QueueTypeQuorum))
+				}, timeout, interval).Should(Succeed())
+
+				// Verify cluster is not restarted
+				Consistently(func(g Gomega) {
+					cluster := &rabbitmqclusterv2.RabbitmqCluster{}
+					err := k8sClient.Get(ctx, rabbitmqName, cluster)
+					g.Expect(err).ToNot(HaveOccurred())
+					g.Expect(cluster.DeletionTimestamp.IsZero()).To(BeTrue())
+				}, "5s", interval).Should(Succeed())
+			})
+		})
+
+		When("RabbitMQ 4.0 blocking Mirrored queues", func() {
+			BeforeEach(func() {
+				spec := GetDefaultRabbitMQSpec()
+				spec["queueType"] = "Quorum"
+				rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+				DeferCleanup(th.DeleteInstance, rabbitmq)
+
+				// Set version to 4.0
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					if instance.Labels == nil {
+						instance.Labels = make(map[string]string)
+					}
+					instance.Labels["rabbitmq-current-version"] = "4.0"
+					g.Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
+				}, timeout, interval).Should(Succeed())
+			})
+
+			It("should reject setting queueType to Mirrored", func() {
+				// Try to change queueType to Mirrored
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					mirrored := rabbitmqv1.QueueTypeMirrored
+					instance.Spec.QueueType = &mirrored
+					err := k8sClient.Update(ctx, instance)
+					g.Expect(err).To(HaveOccurred())
+					g.Expect(err.Error()).To(ContainSubstring("Mirrored queues are deprecated"))
+				}, timeout, interval).Should(Succeed())
+
+				// Verify queueType remains Quorum
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Spec.QueueType).ToNot(BeNil())
+					g.Expect(*instance.Spec.QueueType).To(Equal(rabbitmqv1.QueueTypeQuorum))
 				}, timeout, interval).Should(Succeed())
 			})
 		})

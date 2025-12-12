@@ -579,25 +579,48 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	if requiresUpgrade {
 		Log.Info("Starting RabbitMQ major version upgrade process")
 
-		// Check if we need to migrate from Mirrored to Quorum queues
-		// This happens when upgrading to RabbitMQ 4.0+ with Mirrored queues
+		// Block upgrade to RabbitMQ 4.0+ if still using Mirrored queues
+		// Mirrored queues are deprecated in RabbitMQ 4.0+
 		if instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeMirrored {
 			if targetVersion, hasTarget := instance.Labels[RabbitmqVersionLabel]; hasTarget {
 				targetVer, err := parseRabbitMQVersion(targetVersion)
 				if err == nil && targetVer.major >= 4 {
-					Log.Info("Upgrading to RabbitMQ 4.0+ with Mirrored queues - will migrate to Quorum queues",
+					Log.Info("Blocking upgrade to RabbitMQ 4.0+ with Mirrored queues - zero-downtime migration required",
 						"targetVersion", targetVersion)
 
-					// Update queueType to Quorum during upgrade to RabbitMQ 4.0+
-					// The webhook allows this change during version upgrades
-					instance.Spec.QueueType = ptr.To(rabbitmqv1beta1.QueueTypeQuorum)
-					if err := r.Client.Update(ctx, instance); err != nil {
-						Log.Error(err, "Failed to update queueType to Quorum during migration")
-						return ctrl.Result{}, err
+					// Ensure quorum vhost exists for zero-downtime migration
+					currentVersion := instance.Labels[RabbitmqCurrentVersionLabel]
+					currentVer, err := parseRabbitMQVersion(currentVersion)
+					if err == nil && currentVer.major < 4 {
+						// On RabbitMQ 3.x, create quorum vhost for migration
+						Log.Info("Creating quorum vhost for zero-downtime migration", "currentVersion", currentVersion)
+						if err := ensureQuorumVhost(ctx, helper, instance); err != nil {
+							Log.Error(err, "Failed to create quorum vhost for migration")
+							instance.Status.Conditions.Set(condition.FalseCondition(
+								condition.DeploymentReadyCondition,
+								condition.ErrorReason,
+								condition.SeverityWarning,
+								"RabbitMQ upgrade blocked: failed to create quorum vhost: %s", err.Error()))
+							return ctrl.Result{}, err
+						}
 					}
-					Log.Info("Updated queueType from Mirrored to Quorum - requeuing to continue upgrade")
-					// Return and requeue to continue upgrade with updated queueType
-					return ctrl.Result{Requeue: true}, nil
+
+					// Block the upgrade with a clear error message
+					errMsg := fmt.Sprintf("RabbitMQ upgrade from %s to %s blocked: Mirrored queues are deprecated in RabbitMQ 4.0+. "+
+						"Please migrate to Quorum queues first:\n"+
+						"1. A 'quorum' vhost has been created for zero-downtime migration\n"+
+						"2. Update your services' TransportURLs to use vhost: 'quorum'\n"+
+						"3. Verify all services are working with the new vhost\n"+
+						"4. Change the RabbitMQ CR spec.queueType to 'Quorum'\n"+
+						"5. The upgrade to RabbitMQ 4.0 will then proceed automatically",
+						currentVersion, targetVersion)
+					Log.Info(errMsg)
+					instance.Status.Conditions.Set(condition.FalseCondition(
+						condition.DeploymentReadyCondition,
+						condition.RequestedReason,
+						condition.SeverityWarning,
+						"RabbitMQ upgrade blocked: %s", errMsg))
+					return ctrl.Result{RequeueAfter: time.Duration(30) * time.Second}, nil
 				}
 			}
 		}
@@ -724,22 +747,48 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	if clusterReady {
 		instance.Status.Conditions.MarkTrue(condition.DeploymentReadyCondition, condition.DeploymentReadyMessage)
 
-		// Handle migration to Quorum queues after upgrade to RabbitMQ 4.0+
-		// Create "quorum" vhost if we're using Quorum queues on version 4.0+
+		// Automatically create "quorum" vhost when queueType is Quorum
+		// This enables zero-downtime migration from Mirrored/None to Quorum queues
+		// Services can update their TransportURLs to use vhost: "quorum" and restart
 		if instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
-			currentVersion := instance.Labels[RabbitmqCurrentVersionLabel]
-			parsedVersion, err := parseRabbitMQVersion(currentVersion)
-			if err == nil && parsedVersion.major >= 4 {
-				Log.Info("Creating quorum vhost for RabbitMQ 4.0+ with Quorum queues")
-				if err := ensureQuorumVhost(ctx, helper, instance); err != nil {
-					Log.Error(err, "Failed to create quorum vhost")
-					instance.Status.Conditions.Set(condition.FalseCondition(
-						condition.DeploymentReadyCondition,
-						condition.ErrorReason,
-						condition.SeverityWarning,
-						condition.DeploymentReadyErrorMessage, err.Error()))
+			Log.Info("Ensuring quorum vhost exists for Quorum queue type")
+			if err := ensureQuorumVhost(ctx, helper, instance); err != nil {
+				Log.Error(err, "Failed to create quorum vhost")
+				instance.Status.Conditions.Set(condition.FalseCondition(
+					condition.DeploymentReadyCondition,
+					condition.ErrorReason,
+					condition.SeverityWarning,
+					condition.DeploymentReadyErrorMessage, err.Error()))
+				return ctrl.Result{}, err
+			}
+
+			// Check if vhost is ready before updating status.queueType
+			vhostName := types.NamespacedName{
+				Name:      instance.Name + "-quorum-vhost",
+				Namespace: instance.Namespace,
+			}
+			vhost := &rabbitmqv1beta1.RabbitMQVhost{}
+			if err := helper.GetClient().Get(ctx, vhostName, vhost); err != nil {
+				if !k8s_errors.IsNotFound(err) {
+					Log.Error(err, "Failed to get quorum vhost")
 					return ctrl.Result{}, err
 				}
+				// Vhost doesn't exist yet, requeue
+				Log.Info("Waiting for quorum vhost to be created")
+				return ctrl.Result{RequeueAfter: time.Duration(5) * time.Second}, nil
+			}
+
+			// Check if vhost is ready
+			vhostReady := vhost.Status.Conditions.IsTrue(rabbitmqv1beta1.RabbitMQVhostReadyCondition)
+			if !vhostReady {
+				Log.Info("Waiting for quorum vhost to be ready")
+				return ctrl.Result{RequeueAfter: time.Duration(5) * time.Second}, nil
+			}
+
+			// Vhost is ready, update status.queueType to Quorum
+			if instance.Status.QueueType != rabbitmqv1beta1.QueueTypeQuorum {
+				Log.Info("Quorum vhost is ready, updating status.queueType to Quorum")
+				instance.Status.QueueType = rabbitmqv1beta1.QueueTypeQuorum
 			}
 		}
 
@@ -1200,6 +1249,9 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&topologyv1.Topology{},
 			handler.EnqueueRequestsFromMapFunc(r.findObjectsForSrc),
 			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Watches(&rabbitmqv1beta1.RabbitMQVhost{},
+			handler.EnqueueRequestsFromMapFunc(r.findRabbitMQForVhost),
+			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{})).
 		Complete(r)
 }
 
@@ -1232,6 +1284,25 @@ func (r *Reconciler) findObjectsForSrc(ctx context.Context, src client.Object) [
 					},
 				},
 			)
+		}
+	}
+
+	return requests
+}
+
+// findRabbitMQForVhost maps RabbitMQVhost changes to RabbitMQ reconcile requests
+func (r *Reconciler) findRabbitMQForVhost(ctx context.Context, vhost client.Object) []reconcile.Request {
+	requests := []reconcile.Request{}
+
+	// Check owner references to find the RabbitMQ CR that owns this vhost
+	for _, ownerRef := range vhost.GetOwnerReferences() {
+		if ownerRef.Kind == "RabbitMq" {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      ownerRef.Name,
+					Namespace: vhost.GetNamespace(),
+				},
+			})
 		}
 	}
 
