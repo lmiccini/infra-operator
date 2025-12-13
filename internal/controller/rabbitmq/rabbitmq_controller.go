@@ -603,8 +603,51 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 				return ctrl.Result{}, err
 			}
 
-			// Step 2: Wait for TransportURLs to update to use quorum vhost
-			Log.Info("Step 2: Checking if all TransportURLs have updated to quorum vhost")
+			// Step 2: Initialize migration orchestrator
+			Log.Info("Step 2: Initializing migration orchestrator")
+			orchestrator, err := NewMigrationOrchestrator(ctx, helper, r.config, instance, Log)
+			if err != nil {
+				Log.Error(err, "Failed to create migration orchestrator")
+				instance.Status.Conditions.Set(condition.FalseCondition(
+					condition.DeploymentReadyCondition,
+					condition.ErrorReason,
+					condition.SeverityWarning,
+					"Migration failed: failed to initialize migration: %s", err.Error()))
+				return ctrl.Result{}, err
+			}
+
+			// Verify target vhost is ready
+			if err := orchestrator.VerifyTargetVhost(ctx); err != nil {
+				Log.Info("Waiting for quorum vhost to be ready", "error", err.Error())
+				instance.Status.Conditions.Set(condition.FalseCondition(
+					condition.DeploymentReadyCondition,
+					condition.RequestedReason,
+					condition.SeverityWarning,
+					"Migration in progress: Waiting for quorum vhost to be ready"))
+				return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+			}
+
+			// Export and import definitions (but don't create shovels yet)
+			if instance.Status.MigrationStatus == nil || instance.Status.MigrationStatus.Phase == "WaitingForTransportURLs" {
+				Log.Info("Exporting definitions from source vhost")
+				sourceDefs, err := orchestrator.client.ExportDefinitions(orchestrator.sourceVhost)
+				if err != nil {
+					return ctrl.Result{}, fmt.Errorf("failed to export definitions: %w", err)
+				}
+
+				Log.Info("Transforming definitions for quorum queues")
+				targetDefs := TransformDefinitionsForQuorum(sourceDefs, orchestrator.targetVhost)
+
+				Log.Info("Importing definitions to target vhost BEFORE TransportURL switch")
+				if err := orchestrator.client.ImportDefinitions(orchestrator.targetVhost, targetDefs); err != nil {
+					return ctrl.Result{}, fmt.Errorf("failed to import definitions: %w", err)
+				}
+
+				Log.Info("Definitions imported successfully, ready for TransportURL switch")
+			}
+
+			// Step 3: Wait for TransportURLs to update to use quorum vhost
+			Log.Info("Step 3: Checking if all TransportURLs have updated to quorum vhost")
 			transportURLList := &rabbitmqv1beta1.TransportURLList{}
 			if err := r.Client.List(ctx, transportURLList, client.InNamespace(instance.Namespace)); err == nil {
 				allUpdated := true
@@ -643,33 +686,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 				Log.Info("All TransportURLs have been updated to use quorum vhost")
 			}
 
-			// Step 3: Initialize migration orchestrator
-			orchestrator, err := NewMigrationOrchestrator(ctx, helper, r.config, instance, Log)
-			if err != nil {
-				Log.Error(err, "Failed to create migration orchestrator")
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					condition.DeploymentReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					"Migration failed: failed to initialize migration: %s", err.Error()))
-				return ctrl.Result{}, err
-			}
-
-			// Verify target vhost is ready
-			if err := orchestrator.VerifyTargetVhost(ctx); err != nil {
-				Log.Info("Waiting for quorum vhost to be ready", "error", err.Error())
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					condition.DeploymentReadyCondition,
-					condition.RequestedReason,
-					condition.SeverityWarning,
-					"Migration in progress: Waiting for quorum vhost to be ready"))
-				return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
-			}
-
-			// Step 4: Start migration (create shovels and migrate messages)
+			// Step 4: Enable shovel plugin and create shovels (definitions already imported)
 			if instance.Status.MigrationStatus == nil || instance.Status.MigrationStatus.Phase == "WaitingForTransportURLs" {
-				Log.Info("Step 3: Starting message migration with shovels")
-				if err := orchestrator.StartMigration(ctx); err != nil {
+				Log.Info("Step 4: Enabling shovel plugin and creating shovels for message migration")
+
+				// Enable shovel plugin
+				if err := orchestrator.EnableShovelPlugin(ctx); err != nil {
+					return ctrl.Result{}, fmt.Errorf("failed to enable shovel plugin: %w", err)
+				}
+
+				// Get the source definitions to know which queues to create shovels for
+				sourceDefs, err := orchestrator.client.ExportDefinitions(orchestrator.sourceVhost)
+				if err != nil {
+					return ctrl.Result{}, fmt.Errorf("failed to export definitions for shovel creation: %w", err)
+				}
+
+				// Create shovels
+				if err := orchestrator.createShovels(sourceDefs.Queues); err != nil {
 					Log.Error(err, "Failed to start migration")
 					instance.Status.MigrationStatus = &rabbitmqv1beta1.MigrationStatus{
 						Phase:   "Failed",

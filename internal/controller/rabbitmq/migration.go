@@ -374,44 +374,18 @@ func (c *RabbitMQAPIClient) ListQueues(vhost string) ([]QueueInfo, error) {
 }
 
 // TransformDefinitionsForQuorum transforms definitions to use quorum queues
+// NOTE: We do NOT import queues - services will declare them with quorum config from transport URL
 func TransformDefinitionsForQuorum(defs *RabbitMQDefinitions, targetVhost string) *RabbitMQDefinitions {
 	transformed := &RabbitMQDefinitions{
 		Vhosts:    []VhostDefinition{{Name: targetVhost}},
-		Queues:    make([]QueueDefinition, 0, len(defs.Queues)),
+		Queues:    make([]QueueDefinition, 0), // Empty - services will declare queues
 		Exchanges: make([]ExchangeDefinition, 0, len(defs.Exchanges)),
 		Bindings:  make([]BindingDefinition, 0, len(defs.Bindings)),
 	}
 
-	// Transform queues to quorum type
-	for _, q := range defs.Queues {
-		// Skip internal queues
-		if q.Name == "" || q.Name[0] == 'a' && q.Name[1] == 'm' && q.Name[2] == 'q' {
-			continue
-		}
-
-		newQueue := QueueDefinition{
-			Name:       q.Name,
-			Vhost:      targetVhost,
-			Durable:    true,  // Quorum queues must be durable
-			AutoDelete: false, // Quorum queues cannot be auto-delete
-			Arguments:  make(map[string]interface{}),
-		}
-
-		// Set queue type to quorum
-		newQueue.Arguments["x-queue-type"] = "quorum"
-
-		// Copy over message TTL if it exists
-		if ttl, ok := q.Arguments["x-message-ttl"]; ok {
-			newQueue.Arguments["x-message-ttl"] = ttl
-		}
-
-		// Copy over max length if it exists
-		if maxLen, ok := q.Arguments["x-max-length"]; ok {
-			newQueue.Arguments["x-max-length"] = maxLen
-		}
-
-		transformed.Queues = append(transformed.Queues, newQueue)
-	}
+	// Do NOT transform queues - let services declare them with quorum parameters
+	// The services will use the quorumqueues=true parameter from the transport URL
+	// to automatically declare queues as quorum type with correct configuration
 
 	// Transform exchanges (change vhost)
 	for _, e := range defs.Exchanges {
