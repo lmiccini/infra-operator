@@ -70,20 +70,29 @@ func (r *RabbitMq) Default(k8sClient client.Client) {
 
 		if err == nil && existingRabbitMq.Spec.QueueType != nil && *existingRabbitMq.Spec.QueueType != "" {
 			// Check if we should override Mirrored to Quorum on RabbitMQ 4.0+
-			// This must happen even if queueType is set in the incoming request,
-			// as Kubernetes fills in all spec fields during updates
+			// Only override if the queueType is NOT being explicitly CHANGED to Mirrored
 			shouldOverride := false
 			if *existingRabbitMq.Spec.QueueType == "Mirrored" && r.Labels != nil {
-				if currentVersion, hasVersion := r.Labels["rabbitmq-current-version"]; hasVersion {
-					// Simple version check - if major version is 4 or higher, enforce Quorum
-					if len(currentVersion) > 0 && currentVersion[0] >= '4' {
-						shouldOverride = true
-						queueType := "Quorum"
-						r.Spec.QueueType = &queueType
-						rabbitmqlog.Info("overriding Mirrored to Quorum on RabbitMQ 4.0+",
-							"name", r.Name,
-							"currentVersion", currentVersion,
-							"queueType", "Quorum")
+				// Kubernetes fills in all spec fields during updates, so we need to detect
+				// if the user is explicitly CHANGING to Mirrored (from something else)
+				// vs just preserving the existing Mirrored value
+				userChangingToMirrored := r.Spec.QueueType != nil &&
+					*r.Spec.QueueType == "Mirrored" &&
+					*existingRabbitMq.Spec.QueueType != "Mirrored"
+
+				if !userChangingToMirrored {
+					// User is not explicitly changing TO Mirrored, so we can auto-override
+					if currentVersion, hasVersion := r.Labels["rabbitmq-current-version"]; hasVersion {
+						// Simple version check - if major version is 4 or higher, enforce Quorum
+						if len(currentVersion) > 0 && currentVersion[0] >= '4' {
+							shouldOverride = true
+							queueType := "Quorum"
+							r.Spec.QueueType = &queueType
+							rabbitmqlog.Info("overriding Mirrored to Quorum on RabbitMQ 4.0+",
+								"name", r.Name,
+								"currentVersion", currentVersion,
+								"queueType", "Quorum")
+						}
 					}
 				}
 			}
@@ -96,7 +105,7 @@ func (r *RabbitMq) Default(k8sClient client.Client) {
 					r.Spec.QueueType = existingRabbitMq.Spec.QueueType
 					rabbitmqlog.Info("preserving QueueType from existing CR", "name", r.Name, "queueType", *r.Spec.QueueType)
 				} else if *r.Spec.QueueType != *existingRabbitMq.Spec.QueueType {
-					// User is explicitly changing queueType - allow it
+					// User is explicitly changing queueType - allow it to proceed to validation
 					rabbitmqlog.Info("allowing queueType change",
 						"name", r.Name,
 						"oldQueueType", *existingRabbitMq.Spec.QueueType,
@@ -206,13 +215,42 @@ func (r *RabbitMq) ValidateUpdate(old runtime.Object) (admission.Warnings, error
 		// Check if queueType changed to Mirrored (wasn't Mirrored before)
 		queueTypeChanged := oldRabbitMq.Spec.QueueType == nil || *oldRabbitMq.Spec.QueueType != "Mirrored"
 
-		if queueTypeChanged && r.Labels != nil {
-			if currentVersion, hasVersion := r.Labels["rabbitmq-current-version"]; hasVersion {
+		if queueTypeChanged {
+			// Check version from either new or old object labels
+			var currentVersion string
+			var hasVersion bool
+			if r.Labels != nil {
+				currentVersion, hasVersion = r.Labels["rabbitmq-current-version"]
+			}
+			if !hasVersion && oldRabbitMq.Labels != nil {
+				currentVersion, hasVersion = oldRabbitMq.Labels["rabbitmq-current-version"]
+			}
+
+			if hasVersion {
 				// Simple version check - if major version is 4 or higher, block Mirrored
 				if len(currentVersion) > 0 && currentVersion[0] >= '4' {
 					allErrs = append(allErrs, field.Forbidden(
 						basePath.Child("queueType"),
 						"Mirrored queues are deprecated in RabbitMQ 4.x and cannot be used"))
+				}
+			}
+		}
+	}
+
+	// Block migrating TO Quorum on RabbitMQ 3.x (no server-side enforcement available)
+	// Allow creating new clusters with Quorum on 3.x, only block migrations
+	if r.Spec.QueueType != nil && *r.Spec.QueueType == "Quorum" {
+		// Check if queueType is being changed TO Quorum (wasn't Quorum before)
+		queueTypeChanged := oldRabbitMq.Spec.QueueType != nil && *oldRabbitMq.Spec.QueueType != "Quorum"
+
+		if queueTypeChanged && r.Labels != nil {
+			if currentVersion, hasVersion := r.Labels["rabbitmq-current-version"]; hasVersion {
+				// Simple version check - if major version is 3.x, block migration to Quorum
+				if len(currentVersion) > 0 && currentVersion[0] == '3' {
+					allErrs = append(allErrs, field.Forbidden(
+						basePath.Child("queueType"),
+						"Migrating to Quorum queues on RabbitMQ 3.x is not supported due to lack of server-side enforcement. "+
+							"Upgrade to RabbitMQ 4.x first to enable automatic Quorum queue migration."))
 				}
 			}
 		}
