@@ -705,7 +705,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		// Fall through to ConfigureCluster below
 	}
 
-	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, instance.Spec.Override, instance.Spec.QueueType)
+	// Get current RabbitMQ version for configuration
+	currentVersion := instance.Labels[RabbitmqCurrentVersionLabel]
+	if currentVersion == "" {
+		currentVersion = DefaultRabbitMQVersion
+	}
+
+	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, instance.Spec.Override, instance.Spec.QueueType, currentVersion)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,

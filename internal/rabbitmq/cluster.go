@@ -27,6 +27,7 @@ func ConfigureCluster(
 	nodeselector *map[string]string,
 	override *rabbitmqv2.OverrideTrimmed,
 	queueType *string,
+	rabbitmqVersion string,
 ) error {
 	envVars := []corev1.EnvVar{
 		{
@@ -303,10 +304,11 @@ func ConfigureCluster(
 		// management ssl ip needs to be set in the AdvancedConfig
 	}
 
-	// Configure node-wide default queue type and migration settings
+	// Configure node-wide default queue type and migration settings (RabbitMQ 4.0+ only)
+	// These configuration options are only available in RabbitMQ 4.0 and later
 	// https://www.rabbitmq.com/docs/vhosts#node-wide-default-queue-type-node-wide-dqt
 	// https://www.rabbitmq.com/docs/vhosts#migration-to-quorum-queues-a-way-to-relax-queue-property-equivalence-checks
-	if queueType != nil && *queueType == "Quorum" {
+	if queueType != nil && *queueType == "Quorum" && len(rabbitmqVersion) > 0 && rabbitmqVersion[0] >= '4' {
 		settings = append(settings,
 			// Set default queue type to quorum - all newly declared queues will be quorum type
 			// This prevents services from accidentally creating classic queues
