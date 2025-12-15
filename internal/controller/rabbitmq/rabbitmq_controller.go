@@ -106,24 +106,18 @@ func parseRabbitMQVersion(version string) (rabbitmqVersion, error) {
 	return v, nil
 }
 
-// isDirectUpgradeSupported checks if a version change can be done without storage wipe
-// For our use case:
-// - Patch version changes (e.g., 3.9.0 -> 3.9.1, 4.0.0 -> 4.0.1): Supported
-// - Major/minor version changes (e.g., 3.9 -> 4.0, 4.0 -> 3.9): Require storage wipe
+// requiresStorageWipe determines if a version change requires full storage wipe
+// Returns true for major/minor version changes, false for same version or patch changes.
+//
+// Storage wipe is required for:
+// - Major/minor version changes (e.g., 3.9 -> 4.0, 4.0 -> 3.9, 3.9 -> 3.13)
+// - Both upgrades and downgrades
+//
+// Storage wipe is NOT required for:
+// - Same version (e.g., 3.9 -> 3.9)
+// - Patch version changes (e.g., 3.9.0 -> 3.9.1, 4.0.0 -> 4.0.1)
+//
 // Based on https://www.rabbitmq.com/docs/upgrade#rabbitmq-version-upgradability
-func isDirectUpgradeSupported(from, to rabbitmqVersion) bool {
-	// Same major.minor version (patch changes only) - no wipe needed
-	if from.major == to.major && from.minor == to.minor {
-		return true
-	}
-
-	// Any major or minor version change requires storage wipe
-	// This includes both upgrades (3.9 -> 4.0) and downgrades (4.0 -> 3.9)
-	return false
-}
-
-// requiresStorageWipe determines if an upgrade requires full storage wipe
-// Returns true if the versions are different but no direct upgrade path exists
 func requiresStorageWipe(fromStr, toStr string) (bool, error) {
 	if fromStr == toStr {
 		return false, nil
@@ -139,12 +133,13 @@ func requiresStorageWipe(fromStr, toStr string) (bool, error) {
 		return false, fmt.Errorf("failed to parse target version %q: %w", toStr, err)
 	}
 
-	// If direct upgrade is supported, no wipe needed
-	if isDirectUpgradeSupported(from, to) {
+	// Same major.minor version (patch changes only) - no wipe needed
+	if from.major == to.major && from.minor == to.minor {
 		return false, nil
 	}
 
-	// Versions are different and no direct path exists - requires wipe
+	// Any major or minor version change requires storage wipe
+	// This includes both upgrades (3.9 -> 4.0) and downgrades (4.0 -> 3.9)
 	return true, nil
 }
 
