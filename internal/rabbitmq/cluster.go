@@ -26,6 +26,7 @@ func ConfigureCluster(
 	topology *topologyv1.Topology,
 	nodeselector *map[string]string,
 	override *rabbitmqv2.OverrideTrimmed,
+	queueType *string,
 ) error {
 	envVars := []corev1.EnvVar{
 		{
@@ -301,6 +302,25 @@ func ConfigureCluster(
 		settings = append(settings, "ssl_options.verify = verify_none", "prometheus.ssl.ip = ::")
 		// management ssl ip needs to be set in the AdvancedConfig
 	}
+
+	// Configure node-wide default queue type and migration settings
+	// https://www.rabbitmq.com/docs/vhosts#node-wide-default-queue-type-node-wide-dqt
+	// https://www.rabbitmq.com/docs/vhosts#migration-to-quorum-queues-a-way-to-relax-queue-property-equivalence-checks
+	if queueType != nil && *queueType == "Quorum" {
+		settings = append(settings,
+			// Set default queue type to quorum - all newly declared queues will be quorum type
+			// This prevents services from accidentally creating classic queues
+			"default_queue_type = quorum",
+			// Disable classic queue mirroring to prevent accidental creation of mirrored queues
+			// Mirrored queues are deprecated in RabbitMQ 4.0+
+			"deprecated_features.permit.classic_queue_mirroring = false",
+			// Relax queue property equivalence checks on redeclaration
+			// This prevents channel exceptions when services redeclare queues after migration
+			// from classic/mirrored to quorum queues with different properties
+			"quorum_queue.property_equivalence.relaxed_checks_on_redeclaration = true",
+		)
+	}
+
 	additionalDefaults := strings.Join(settings, "\n")
 
 	// If additionalConfig is empty set let's our defaults, append otherwise.

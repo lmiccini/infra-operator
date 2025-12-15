@@ -321,6 +321,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 
 	// Check if upgrade requires storage wipe based on RabbitMQ compatibility matrix
+	// Also handle automatic queueType migration during 3.x -> 4.x upgrades
 	var requiresUpgrade bool
 	if currentVersion, hasCurrent := instance.Labels[RabbitmqCurrentVersionLabel]; hasCurrent {
 		if targetVersion, hasTarget := instance.Labels[RabbitmqVersionLabel]; hasTarget {
@@ -336,6 +337,30 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 				Log.Info("RabbitMQ upgrade requires storage wipe (no direct upgrade path)",
 					"currentVersion", currentVersion,
 					"targetVersion", targetVersion)
+
+				// Automatically migrate from Mirrored to Quorum when upgrading from 3.x to 4.x
+				// Mirrored queues are deprecated in RabbitMQ 4.0+
+				currentVer, err := parseRabbitMQVersion(currentVersion)
+				if err == nil {
+					targetVer, err := parseRabbitMQVersion(targetVersion)
+					if err == nil && currentVer.major == 3 && targetVer.major >= 4 {
+						// Upgrading from 3.x to 4.x - automatically enforce Quorum queues
+						if instance.Spec.QueueType == nil || *instance.Spec.QueueType != rabbitmqv1beta1.QueueTypeQuorum {
+							Log.Info("Upgrading from RabbitMQ 3.x to 4.x - automatically migrating to Quorum queues",
+								"currentVersion", currentVersion,
+								"targetVersion", targetVersion)
+							queueType := rabbitmqv1beta1.QueueTypeQuorum
+							instance.Spec.QueueType = &queueType
+							// Patch the instance to persist the queueType change
+							if err := helper.PatchInstance(ctx, instance); err != nil {
+								Log.Error(err, "Failed to update queueType to Quorum during upgrade")
+								return ctrl.Result{}, err
+							}
+							Log.Info("Updated spec.queueType to Quorum for RabbitMQ 4.x compatibility")
+							return ctrl.Result{Requeue: true}, nil
+						}
+					}
+				}
 			}
 		}
 	}
@@ -574,243 +599,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 
 	//
-	// Handle migration from Mirrored to Quorum queues
-	// This happens when user changes queueType from Mirrored to Quorum
-	//
-	if instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
-		// Check if we need to perform a migration from Mirrored to Quorum
-		// This is detected by checking if the previous QueueType was Mirrored
-		if instance.Status.QueueType == string(rabbitmqv1beta1.QueueTypeMirrored) ||
-			(instance.Status.MigrationStatus != nil && instance.Status.MigrationStatus.Phase != "Complete") {
-
-			Log.Info("Detected change from Mirrored to Quorum queue type, performing migration")
-
-			// Update status.queueType to Quorum immediately so TransportURLs can switch
-			if instance.Status.QueueType != string(rabbitmqv1beta1.QueueTypeQuorum) {
-				Log.Info("Updating status.queueType to Quorum to trigger TransportURL updates")
-				instance.Status.QueueType = string(rabbitmqv1beta1.QueueTypeQuorum)
-			}
-
-			// Step 1: Ensure quorum vhost exists
-			Log.Info("Step 1: Creating quorum vhost for migration")
-			if err := ensureQuorumVhost(ctx, helper, instance); err != nil {
-				Log.Error(err, "Failed to create quorum vhost for migration")
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					condition.DeploymentReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					"Migration failed: failed to create quorum vhost: %s", err.Error()))
-				return ctrl.Result{}, err
-			}
-
-			// Step 2: Initialize migration orchestrator
-			Log.Info("Step 2: Initializing migration orchestrator")
-			orchestrator, err := NewMigrationOrchestrator(ctx, helper, r.config, instance, Log)
-			if err != nil {
-				Log.Error(err, "Failed to create migration orchestrator")
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					condition.DeploymentReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					"Migration failed: failed to initialize migration: %s", err.Error()))
-				return ctrl.Result{}, err
-			}
-
-			// Verify target vhost is ready
-			if err := orchestrator.VerifyTargetVhost(ctx); err != nil {
-				Log.Info("Waiting for quorum vhost to be ready", "error", err.Error())
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					condition.DeploymentReadyCondition,
-					condition.RequestedReason,
-					condition.SeverityWarning,
-					"Migration in progress: Waiting for quorum vhost to be ready"))
-				return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
-			}
-
-			// Export and import definitions (but don't create shovels yet)
-			if instance.Status.MigrationStatus == nil || instance.Status.MigrationStatus.Phase == "WaitingForTransportURLs" {
-				Log.Info("Exporting definitions from source vhost")
-				sourceDefs, err := orchestrator.client.ExportDefinitions(orchestrator.sourceVhost)
-				if err != nil {
-					return ctrl.Result{}, fmt.Errorf("failed to export definitions: %w", err)
-				}
-
-				Log.Info("Transforming definitions for quorum queues")
-				targetDefs := TransformDefinitionsForQuorum(sourceDefs, orchestrator.targetVhost)
-
-				Log.Info("Importing definitions to target vhost BEFORE TransportURL switch")
-				if err := orchestrator.client.ImportDefinitions(orchestrator.targetVhost, targetDefs); err != nil {
-					return ctrl.Result{}, fmt.Errorf("failed to import definitions: %w", err)
-				}
-
-				Log.Info("Definitions imported successfully, ready for TransportURL switch")
-			}
-
-			// Step 3: Wait for TransportURLs to update to use quorum vhost
-			Log.Info("Step 3: Checking if all TransportURLs have updated to quorum vhost")
-			transportURLList := &rabbitmqv1beta1.TransportURLList{}
-			if err := r.Client.List(ctx, transportURLList, client.InNamespace(instance.Namespace)); err == nil {
-				allUpdated := true
-				for _, transportURL := range transportURLList.Items {
-					if transportURL.Spec.RabbitmqClusterName == instance.Name {
-						// Check if this TransportURL is still using "/" instead of "/quorum"
-						if transportURL.Status.RabbitmqVhost == "/" {
-							allUpdated = false
-							Log.Info("TransportURL not yet updated to quorum vhost",
-								"transportURL", transportURL.Name,
-								"currentVhost", transportURL.Status.RabbitmqVhost)
-						}
-					}
-				}
-
-				if !allUpdated {
-					// Initialize migration status if not already set
-					if instance.Status.MigrationStatus == nil {
-						now := metav1.Now()
-						instance.Status.MigrationStatus = &rabbitmqv1beta1.MigrationStatus{
-							Phase:     "WaitingForTransportURLs",
-							StartTime: &now,
-							Message:   "Waiting for all TransportURLs to switch to quorum vhost before starting message migration",
-						}
-					}
-
-					Log.Info("Waiting for all TransportURLs to update to quorum vhost before creating shovels")
-					instance.Status.Conditions.Set(condition.FalseCondition(
-						condition.DeploymentReadyCondition,
-						condition.RequestedReason,
-						condition.SeverityInfo,
-						"Migration in progress: Waiting for all TransportURLs to switch to quorum vhost"))
-					return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
-				}
-
-				Log.Info("All TransportURLs have been updated to use quorum vhost")
-			}
-
-			// Step 4: Enable shovel plugin and create shovels (definitions already imported)
-			if instance.Status.MigrationStatus == nil || instance.Status.MigrationStatus.Phase == "WaitingForTransportURLs" {
-				Log.Info("Step 4: Enabling shovel plugin and creating shovels for message migration")
-
-				// Enable shovel plugin
-				if err := orchestrator.EnableShovelPlugin(ctx); err != nil {
-					return ctrl.Result{}, fmt.Errorf("failed to enable shovel plugin: %w", err)
-				}
-
-				// Get the source definitions to know which queues to create shovels for
-				sourceDefs, err := orchestrator.client.ExportDefinitions(orchestrator.sourceVhost)
-				if err != nil {
-					return ctrl.Result{}, fmt.Errorf("failed to export definitions for shovel creation: %w", err)
-				}
-
-				// Create shovels
-				if err := orchestrator.createShovels(sourceDefs.Queues); err != nil {
-					Log.Error(err, "Failed to start migration")
-					instance.Status.MigrationStatus = &rabbitmqv1beta1.MigrationStatus{
-						Phase:   "Failed",
-						Message: fmt.Sprintf("Failed to start migration: %s", err.Error()),
-					}
-					instance.Status.Conditions.Set(condition.FalseCondition(
-						condition.DeploymentReadyCondition,
-						condition.ErrorReason,
-						condition.SeverityWarning,
-						"Migration failed: %s", err.Error()))
-					return ctrl.Result{}, err
-				}
-
-				// Initialize migration status
-				now := metav1.Now()
-				instance.Status.MigrationStatus = &rabbitmqv1beta1.MigrationStatus{
-					Phase:     "InProgress",
-					StartTime: &now,
-					Message:   "Migration started - moving messages from default vhost to quorum vhost using shovels",
-				}
-				Log.Info("Migration started successfully")
-			}
-
-			// Step 5: Monitor migration progress
-			migrationStatus, err := orchestrator.GetMigrationStatus(ctx)
-			if err != nil {
-				Log.Error(err, "Failed to get migration status")
-				return ctrl.Result{RequeueAfter: time.Duration(30) * time.Second}, nil
-			}
-
-			// Update status with current progress
-			instance.Status.MigrationStatus.TotalQueues = migrationStatus.TotalQueues
-			instance.Status.MigrationStatus.MigratedQueues = migrationStatus.MigratedQueues
-			instance.Status.MigrationStatus.RemainingMessages = migrationStatus.RemainingMessages
-			instance.Status.MigrationStatus.ShovelsActive = migrationStatus.ShovelsActive
-
-			// Check if migration is complete
-			isComplete, err := orchestrator.IsMigrationComplete(ctx)
-			if err != nil {
-				Log.Error(err, "Failed to check migration completion")
-				return ctrl.Result{RequeueAfter: time.Duration(30) * time.Second}, nil
-			}
-
-			if !isComplete {
-				// Migration still in progress
-				progressMsg := fmt.Sprintf("Migrating messages: %d/%d queues complete, %d messages remaining, %d shovels active",
-					migrationStatus.MigratedQueues,
-					migrationStatus.TotalQueues,
-					migrationStatus.RemainingMessages,
-					migrationStatus.ShovelsActive)
-				instance.Status.MigrationStatus.Message = progressMsg
-				Log.Info(progressMsg)
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					condition.DeploymentReadyCondition,
-					condition.RequestedReason,
-					condition.SeverityInfo,
-					"Migration in progress: %s", progressMsg))
-				return ctrl.Result{RequeueAfter: time.Duration(30) * time.Second}, nil
-			}
-
-			// Step 6: Migration complete - clean up shovels
-			Log.Info("Migration complete - cleaning up shovels")
-			if err := orchestrator.CleanupMigration(ctx); err != nil {
-				Log.Error(err, "Failed to cleanup migration resources")
-				// Continue anyway - this is not critical
-			}
-
-			// Update migration status to complete
-			now := metav1.Now()
-			instance.Status.MigrationStatus.Phase = "Complete"
-			instance.Status.MigrationStatus.CompletionTime = &now
-			instance.Status.MigrationStatus.Message = "Migration from Mirrored to Quorum queues completed successfully"
-
-			Log.Info("Migration from Mirrored to Quorum queues completed successfully")
-			instance.Status.Conditions.Set(condition.TrueCondition(
-				condition.DeploymentReadyCondition,
-				"Migration complete"))
-
-			// Continue with normal reconciliation
-		}
-	}
-
-	//
-	// Handle major version upgrades
+	// Handle major version upgrades (requires storage wipe)
+	// Queue type migration from Mirrored to Quorum happens automatically during 3.x -> 4.x upgrades
 	//
 	if requiresUpgrade {
 		Log.Info("Starting RabbitMQ major version upgrade process")
-
-		// Block upgrade to RabbitMQ 4.0+ if still using Mirrored queues
-		// Mirrored queues are deprecated in RabbitMQ 4.0+
-		if instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeMirrored {
-			if targetVersion, hasTarget := instance.Labels[RabbitmqVersionLabel]; hasTarget {
-				targetVer, err := parseRabbitMQVersion(targetVersion)
-				if err == nil && targetVer.major >= 4 {
-					// Block upgrade to RabbitMQ 4.0+ if still using Mirrored queues
-					// User must change queueType to Quorum to trigger the migration
-					errMsg := "RabbitMQ upgrade to 4.0+ blocked: Mirrored queues are deprecated in RabbitMQ 4.0+. " +
-						"Please change spec.queueType to 'Quorum' to trigger the migration from Mirrored to Quorum queues."
-					Log.Info(errMsg)
-					instance.Status.Conditions.Set(condition.FalseCondition(
-						condition.DeploymentReadyCondition,
-						condition.RequestedReason,
-						condition.SeverityWarning,
-						"%s", errMsg))
-					return ctrl.Result{}, fmt.Errorf("%s", errMsg)
-				}
-			}
-		}
 
 		// Step 1: Delete the RabbitMQCluster to trigger pod deletion
 		rmqCluster := impl.NewRabbitMqCluster(rabbitmqCluster, 5)
@@ -891,17 +684,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			}
 		}
 
-		// Step 5: All resources cleaned, update version label and proceed to recreate cluster with new version
+		// Step 5: All resources cleaned, update labels and proceed to recreate cluster
 		// Update version label now to prevent infinite upgrade loop
 		if targetVersion, hasTarget := instance.Labels[RabbitmqVersionLabel]; hasTarget {
 			instance.Labels[RabbitmqCurrentVersionLabel] = targetVersion
 			Log.Info("Storage cleanup complete - updated current version label", "version", targetVersion)
 		}
-		Log.Info("Storage completely cleaned, proceeding to recreate cluster with new version")
+
+		Log.Info("Storage completely cleaned, proceeding to recreate cluster")
 		// Fall through to ConfigureCluster below
 	}
 
-	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, instance.Spec.Override)
+	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, instance.Spec.Override, instance.Spec.QueueType)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -933,51 +727,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 
 	if clusterReady {
 		instance.Status.Conditions.MarkTrue(condition.DeploymentReadyCondition, condition.DeploymentReadyMessage)
-
-		// Automatically create "quorum" vhost when queueType is Quorum
-		// This enables zero-downtime migration from Mirrored/None to Quorum queues
-		// Services can update their TransportURLs to use vhost: "quorum" and restart
-		if instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
-			Log.Info("Ensuring quorum vhost exists for Quorum queue type")
-			if err := ensureQuorumVhost(ctx, helper, instance); err != nil {
-				Log.Error(err, "Failed to create quorum vhost")
-				instance.Status.Conditions.Set(condition.FalseCondition(
-					condition.DeploymentReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					condition.DeploymentReadyErrorMessage, err.Error()))
-				return ctrl.Result{}, err
-			}
-
-			// Check if vhost is ready before updating status.queueType
-			vhostName := types.NamespacedName{
-				Name:      instance.Name + "-quorum-vhost",
-				Namespace: instance.Namespace,
-			}
-			vhost := &rabbitmqv1beta1.RabbitMQVhost{}
-			if err := helper.GetClient().Get(ctx, vhostName, vhost); err != nil {
-				if !k8s_errors.IsNotFound(err) {
-					Log.Error(err, "Failed to get quorum vhost")
-					return ctrl.Result{}, err
-				}
-				// Vhost doesn't exist yet, requeue
-				Log.Info("Waiting for quorum vhost to be created")
-				return ctrl.Result{RequeueAfter: time.Duration(5) * time.Second}, nil
-			}
-
-			// Check if vhost is ready
-			vhostReady := vhost.Status.Conditions.IsTrue(rabbitmqv1beta1.RabbitMQVhostReadyCondition)
-			if !vhostReady {
-				Log.Info("Waiting for quorum vhost to be ready")
-				return ctrl.Result{RequeueAfter: time.Duration(5) * time.Second}, nil
-			}
-
-			// Vhost is ready, update status.queueType to Quorum
-			if instance.Status.QueueType != rabbitmqv1beta1.QueueTypeQuorum {
-				Log.Info("Quorum vhost is ready, updating status.queueType to Quorum")
-				instance.Status.QueueType = rabbitmqv1beta1.QueueTypeQuorum
-			}
-		}
 
 		labelMap := map[string]string{
 			labels.K8sAppName:      instance.Name,
@@ -1302,42 +1051,6 @@ func deleteMirroredPolicy(ctx context.Context, helper *helper.Helper, instance *
 
 	// Delete the policy
 	return helper.GetClient().Delete(ctx, policy)
-}
-
-func ensureQuorumVhost(ctx context.Context, helper *helper.Helper, instance *rabbitmqv1beta1.RabbitMq) error {
-	vhostName := types.NamespacedName{
-		Name:      instance.Name + "-quorum-vhost",
-		Namespace: instance.Namespace,
-	}
-
-	vhost := &rabbitmqv1beta1.RabbitMQVhost{}
-	err := helper.GetClient().Get(ctx, vhostName, vhost)
-
-	// Vhost already exists
-	if err == nil {
-		return nil
-	}
-
-	// Return error if it's not NotFound
-	if !k8s_errors.IsNotFound(err) {
-		return err
-	}
-
-	// Create the vhost CR
-	vhost = &rabbitmqv1beta1.RabbitMQVhost{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      vhostName.Name,
-			Namespace: vhostName.Namespace,
-		},
-		Spec: rabbitmqv1beta1.RabbitMQVhostSpec{
-			RabbitmqClusterName: instance.Name,
-			Name:                "quorum",
-		},
-	}
-	if err := controllerutil.SetControllerReference(instance, vhost, helper.GetScheme()); err != nil {
-		return err
-	}
-	return helper.GetClient().Create(ctx, vhost)
 }
 
 func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
