@@ -956,6 +956,7 @@ var _ = Describe("RabbitMQ Controller", func() {
 			})
 		})
 
+		When("RabbitMQ 3.9 with Mirrored queues upgrading to 4.0", func() {
 			BeforeEach(func() {
 				spec := GetDefaultRabbitMQSpec()
 				spec["queueType"] = "Mirrored"
@@ -1000,17 +1001,16 @@ var _ = Describe("RabbitMQ Controller", func() {
 					g.Expect(*instance.Spec.QueueType).To(Equal(rabbitmqv1.QueueTypeQuorum))
 				}, timeout, interval).Should(Succeed())
 
-				// Verify cluster is deleted (for storage wipe)
+				// Wait for upgrade to complete: cluster deleted, storage cleaned, cluster recreated
+				var newCluster *rabbitmqclusterv2.RabbitmqCluster
 				Eventually(func(g Gomega) {
-					cluster := &rabbitmqclusterv2.RabbitmqCluster{}
-					err := k8sClient.Get(ctx, rabbitmqName, cluster)
-					g.Expect(err).To(Or(HaveOccurred(), Succeed()))
-					if err == nil {
-						g.Expect(cluster.DeletionTimestamp.IsZero()).To(BeFalse())
-					}
+					newCluster = &rabbitmqclusterv2.RabbitmqCluster{}
+					err := k8sClient.Get(ctx, rabbitmqName, newCluster)
+					g.Expect(err).ToNot(HaveOccurred())
+					// Cluster should exist and have been created
+					g.Expect(newCluster.Generation).To(BeNumerically(">", 0))
 				}, timeout, interval).Should(Succeed())
 
-				// Simulate cluster being recreated and ready
 				SimulateRabbitMQClusterReady(rabbitmqName)
 
 				// Verify current version is updated

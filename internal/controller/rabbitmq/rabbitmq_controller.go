@@ -313,9 +313,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Check if upgrade requires storage wipe based on RabbitMQ compatibility matrix
-	// Also handle automatic queueType migration during 3.x -> 4.x upgrades
-	var requiresUpgrade bool
+	// Check if storage wipe is needed for:
+	// 1. Version upgrades (major/minor version changes)
+	// 2. Queue type migration from Mirrored to Quorum
+	var requiresWipe bool
+	var wipeReason string
+
+	// Check for version upgrade requiring wipe
 	if currentVersion, hasCurrent := instance.Labels[RabbitmqCurrentVersionLabel]; hasCurrent {
 		if targetVersion, hasTarget := instance.Labels[RabbitmqVersionLabel]; hasTarget {
 			needsWipe, err := requiresStorageWipe(currentVersion, targetVersion)
@@ -326,7 +330,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 				return ctrl.Result{}, fmt.Errorf("failed to check upgrade compatibility: %w", err)
 			}
 			if needsWipe {
-				requiresUpgrade = true
+				requiresWipe = true
+				wipeReason = "version upgrade"
 				Log.Info("RabbitMQ upgrade requires storage wipe (no direct upgrade path)",
 					"currentVersion", currentVersion,
 					"targetVersion", targetVersion)
@@ -344,18 +349,27 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 								"targetVersion", targetVersion)
 							queueType := rabbitmqv1beta1.QueueTypeQuorum
 							instance.Spec.QueueType = &queueType
-							// Patch the instance to persist the queueType change
-							if err := helper.PatchInstance(ctx, instance); err != nil {
-								Log.Error(err, "Failed to update queueType to Quorum during upgrade")
-								return ctrl.Result{}, err
-							}
 							Log.Info("Updated spec.queueType to Quorum for RabbitMQ 4.x compatibility")
-							return ctrl.Result{Requeue: true}, nil
+							// Don't return here - continue with storage wipe process below
 						}
 					}
 				}
 			}
 		}
+	}
+
+	// Check for manual queue type migration from Mirrored to Quorum
+	// This requires storage wipe as mirrored queues cannot be converted to quorum in-place
+	if !requiresWipe && instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
+		if instance.Status.QueueType == rabbitmqv1beta1.QueueTypeMirrored {
+			requiresWipe = true
+			wipeReason = "queue type migration"
+			Log.Info("Queue type change from Mirrored to Quorum requires storage wipe",
+				"oldQueueType", instance.Status.QueueType,
+				"newQueueType", *instance.Spec.QueueType)
+		}
+		// Clear status to prevent infinite wipe loop
+		instance.Status.QueueType = ""
 	}
 
 	// initialize status if Conditions is nil, but do not reset if it already
@@ -592,11 +606,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 
 	//
-	// Handle major version upgrades (requires storage wipe)
-	// Queue type migration from Mirrored to Quorum happens automatically during 3.x -> 4.x upgrades
+	// Handle storage wipe scenarios:
+	// 1. Version upgrades (major/minor version changes)
+	// 2. Queue type migration from Mirrored to Quorum
 	//
-	if requiresUpgrade {
-		Log.Info("Starting RabbitMQ major version upgrade process")
+	if requiresWipe {
+		Log.Info("Starting RabbitMQ storage wipe process", "reason", wipeReason)
 
 		// Step 1: Delete the RabbitMQCluster to trigger pod deletion
 		rmqCluster := impl.NewRabbitMqCluster(rabbitmqCluster, 5)
@@ -678,10 +693,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		}
 
 		// Step 5: All resources cleaned, update labels and proceed to recreate cluster
-		// Update version label now to prevent infinite upgrade loop
-		if targetVersion, hasTarget := instance.Labels[RabbitmqVersionLabel]; hasTarget {
-			instance.Labels[RabbitmqCurrentVersionLabel] = targetVersion
-			Log.Info("Storage cleanup complete - updated current version label", "version", targetVersion)
+		// Update version label only for version upgrades to prevent infinite upgrade loop
+		if wipeReason == "version upgrade" {
+			if targetVersion, hasTarget := instance.Labels[RabbitmqVersionLabel]; hasTarget {
+				instance.Labels[RabbitmqCurrentVersionLabel] = targetVersion
+				Log.Info("Storage cleanup complete - updated current version label", "version", targetVersion)
+			}
 		}
 
 		Log.Info("Storage completely cleaned, proceeding to recreate cluster")
