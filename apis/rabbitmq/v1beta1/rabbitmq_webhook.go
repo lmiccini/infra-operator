@@ -72,8 +72,33 @@ func (r *RabbitMq) Default(k8sClient client.Client) {
 			// Only preserve queueType if the incoming request doesn't specify one
 			// This allows operators to explicitly change the queueType for migration purposes
 			if r.Spec.QueueType == nil || *r.Spec.QueueType == "" {
-				r.Spec.QueueType = existingRabbitMq.Spec.QueueType
-				rabbitmqlog.Info("preserving QueueType from existing CR", "name", r.Name, "queueType", *r.Spec.QueueType)
+				// Check if we should override Mirrored to Quorum on RabbitMQ 4.0+
+				// Mirrored queues are deprecated in 4.0 and must be migrated
+				if *existingRabbitMq.Spec.QueueType == "Mirrored" && r.Labels != nil {
+					if currentVersion, hasVersion := r.Labels["rabbitmq-current-version"]; hasVersion {
+						// Simple version check - if major version is 4 or higher, enforce Quorum
+						if len(currentVersion) > 0 && currentVersion[0] >= '4' {
+							queueType := "Quorum"
+							r.Spec.QueueType = &queueType
+							rabbitmqlog.Info("overriding Mirrored to Quorum on RabbitMQ 4.0+",
+								"name", r.Name,
+								"currentVersion", currentVersion,
+								"queueType", "Quorum")
+						} else {
+							// RabbitMQ 3.x - preserve Mirrored
+							r.Spec.QueueType = existingRabbitMq.Spec.QueueType
+							rabbitmqlog.Info("preserving QueueType from existing CR", "name", r.Name, "queueType", *r.Spec.QueueType)
+						}
+					} else {
+						// No version label - preserve existing
+						r.Spec.QueueType = existingRabbitMq.Spec.QueueType
+						rabbitmqlog.Info("preserving QueueType from existing CR", "name", r.Name, "queueType", *r.Spec.QueueType)
+					}
+				} else {
+					// Not Mirrored - preserve existing queueType
+					r.Spec.QueueType = existingRabbitMq.Spec.QueueType
+					rabbitmqlog.Info("preserving QueueType from existing CR", "name", r.Name, "queueType", *r.Spec.QueueType)
+				}
 			} else if *r.Spec.QueueType != *existingRabbitMq.Spec.QueueType {
 				// User is explicitly changing queueType - allow it
 				rabbitmqlog.Info("allowing queueType change",

@@ -934,6 +934,26 @@ var _ = Describe("RabbitMQ Controller", func() {
 					g.Expect(k8s_errors.IsNotFound(err)).To(BeTrue())
 				}, "5s", interval).Should(Succeed())
 			})
+
+			It("should override Mirrored to Quorum via webhook on updates", func() {
+				// Trigger an update to the CR (webhook should override Mirrored to Quorum)
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					// Make a trivial change to trigger webhook defaulting
+					if instance.Annotations == nil {
+						instance.Annotations = make(map[string]string)
+					}
+					instance.Annotations["test-update"] = "trigger-webhook"
+					g.Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
+				}, timeout, interval).Should(Succeed())
+
+				// Verify webhook overrode queueType to Quorum
+				Eventually(func(g Gomega) {
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(instance.Spec.QueueType).ToNot(BeNil())
+					g.Expect(*instance.Spec.QueueType).To(Equal(rabbitmqv1.QueueTypeQuorum))
+				}, timeout, interval).Should(Succeed())
+			})
 		})
 
 			BeforeEach(func() {
