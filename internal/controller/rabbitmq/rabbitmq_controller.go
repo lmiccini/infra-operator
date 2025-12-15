@@ -252,8 +252,6 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs/finalizers,verbs=update
 
-// +kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqvhosts,verbs=get;list;watch;create;update;patch;delete
-
 // +kubebuilder:rbac:groups=rabbitmq.com,resources=rabbitmqclusters,verbs=get;list;watch;create;update;patch;delete
 
 // Required to determine IPv6 and FIPS
@@ -1149,9 +1147,6 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&topologyv1.Topology{},
 			handler.EnqueueRequestsFromMapFunc(r.findObjectsForSrc),
 			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
-		Watches(&rabbitmqv1beta1.RabbitMQVhost{},
-			handler.EnqueueRequestsFromMapFunc(r.findRabbitMQForVhost),
-			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{})).
 		Complete(r)
 }
 
@@ -1184,25 +1179,6 @@ func (r *Reconciler) findObjectsForSrc(ctx context.Context, src client.Object) [
 					},
 				},
 			)
-		}
-	}
-
-	return requests
-}
-
-// findRabbitMQForVhost maps RabbitMQVhost changes to RabbitMQ reconcile requests
-func (r *Reconciler) findRabbitMQForVhost(ctx context.Context, vhost client.Object) []reconcile.Request {
-	requests := []reconcile.Request{}
-
-	// Check owner references to find the RabbitMQ CR that owns this vhost
-	for _, ownerRef := range vhost.GetOwnerReferences() {
-		if ownerRef.Kind == "RabbitMq" {
-			requests = append(requests, reconcile.Request{
-				NamespacedName: types.NamespacedName{
-					Name:      ownerRef.Name,
-					Namespace: vhost.GetNamespace(),
-				},
-			})
 		}
 	}
 
