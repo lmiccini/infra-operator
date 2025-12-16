@@ -2,7 +2,13 @@
 package bgp
 
 import (
+	"context"
 	"net"
+
+	corev1 "k8s.io/api/core/v1"
+	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	k8s_networkv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	frrk8sv1 "github.com/metallb/frr-k8s/api/v1beta1"
@@ -64,4 +70,26 @@ func GetNodesRunningPods(podNetworkDetailList []PodDetail) []string {
 	}
 
 	return nodes
+}
+
+// GetFRRConfigurationNamespace - determines the appropriate namespace for FRRConfiguration resources
+// Returns "openshift-frr-k8s" if that namespace exists (OpenShift 4.20+), otherwise returns the
+// provided defaultNamespace (typically "metallb-system" for older versions)
+func GetFRRConfigurationNamespace(ctx context.Context, c client.Client, defaultNamespace string) (string, error) {
+	openshiftFRRNamespace := "openshift-frr-k8s"
+
+	// Check if the openshift-frr-k8s namespace exists
+	ns := &corev1.Namespace{}
+	err := c.Get(ctx, types.NamespacedName{Name: openshiftFRRNamespace}, ns)
+	if err != nil {
+		if k8s_errors.IsNotFound(err) {
+			// Namespace doesn't exist, use the default (metallb-system)
+			return defaultNamespace, nil
+		}
+		// Some other error occurred
+		return "", err
+	}
+
+	// Namespace exists, use it
+	return openshiftFRRNamespace, nil
 }

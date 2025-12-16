@@ -69,6 +69,7 @@ func (r *BGPConfigurationReconciler) GetLogger(ctx context.Context) logr.Logger 
 //+kubebuilder:rbac:groups=network.openstack.org,resources=bgpconfigurations/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=network.openstack.org,resources=bgpconfigurations/finalizers,verbs=update
 //+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;update;patch
+//+kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch
 //+kubebuilder:rbac:groups=frrk8s.metallb.io,resources=frrconfigurations,verbs=get;list;watch;create;update;patch;delete;deletecollection
 //+kubebuilder:rbac:groups=k8s.cni.cncf.io,resources=network-attachment-definitions,verbs=get;list;watch
 
@@ -353,12 +354,18 @@ func (r *BGPConfigurationReconciler) reconcileDelete(ctx context.Context, instan
 	Log := r.GetLogger(ctx)
 	Log.Info("Reconciling Service delete")
 
-	// Delete all FRRConfiguration in the Spec.FRRConfigurationNamespace namespace,
+	// Determine the appropriate FRR namespace
+	frrNamespace, err := bgp.GetFRRConfigurationNamespace(ctx, r.Client, instance.Spec.FRRConfigurationNamespace)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("unable to determine FRR namespace: %w", err)
+	}
+
+	// Delete all FRRConfiguration in the determined namespace,
 	// which have the correct owner and ownernamespace label
-	err := r.DeleteAllOf(
+	err = r.DeleteAllOf(
 		ctx,
 		&frrk8sv1.FRRConfiguration{},
-		client.InNamespace(instance.Spec.FRRConfigurationNamespace),
+		client.InNamespace(frrNamespace),
 		client.MatchingLabels{
 			labels.GetOwnerNameLabelSelector(labels.GetGroupLabel("bgpconfiguration")):      instance.Name,
 			labels.GetOwnerNameSpaceLabelSelector(labels.GetGroupLabel("bgpconfiguration")): instance.Namespace,
@@ -366,6 +373,23 @@ func (r *BGPConfigurationReconciler) reconcileDelete(ctx context.Context, instan
 	)
 	if err != nil && !k8s_errors.IsNotFound(err) {
 		return ctrl.Result{}, fmt.Errorf("error DeleteAllOf FRRConfiguration: %w", err)
+	}
+
+	// Also clean up from the old namespace if we've migrated
+	if frrNamespace != instance.Spec.FRRConfigurationNamespace {
+		err = r.DeleteAllOf(
+			ctx,
+			&frrk8sv1.FRRConfiguration{},
+			client.InNamespace(instance.Spec.FRRConfigurationNamespace),
+			client.MatchingLabels{
+				labels.GetOwnerNameLabelSelector(labels.GetGroupLabel("bgpconfiguration")):      instance.Name,
+				labels.GetOwnerNameSpaceLabelSelector(labels.GetGroupLabel("bgpconfiguration")): instance.Namespace,
+			},
+		)
+		if err != nil && !k8s_errors.IsNotFound(err) {
+			Log.Error(err, fmt.Sprintf("Failed to cleanup FRRConfigurations from old namespace %s", instance.Spec.FRRConfigurationNamespace))
+			// Don't fail deletion if cleanup fails, just log the error
+		}
 	}
 
 	// Service is deleted so remove the finalizer.
@@ -378,6 +402,14 @@ func (r *BGPConfigurationReconciler) reconcileDelete(ctx context.Context, instan
 func (r *BGPConfigurationReconciler) reconcileNormal(ctx context.Context, instance *networkv1.BGPConfiguration, helper *helper.Helper) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info("Reconciling Service")
+
+	// Determine the appropriate FRR namespace based on cluster configuration
+	// For OpenShift 4.20+, use openshift-frr-k8s if it exists, otherwise use the configured namespace
+	frrNamespace, err := bgp.GetFRRConfigurationNamespace(ctx, r.Client, instance.Spec.FRRConfigurationNamespace)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("unable to determine FRR namespace: %w", err)
+	}
+	Log.Info(fmt.Sprintf("Using FRR namespace: %s", frrNamespace))
 
 	// Get a list of pods which are in the same namespace as the ctlplane
 	// to verify if a FRRConfiguration needs to be created for.
@@ -398,7 +430,7 @@ func (r *BGPConfigurationReconciler) reconcileNormal(ctx context.Context, instan
 	// get all frrconfigs
 	frrConfigList := &frrk8sv1.FRRConfigurationList{}
 	listOpts = []client.ListOption{
-		client.InNamespace(instance.Spec.FRRConfigurationNamespace), // defaults to metallb-system
+		client.InNamespace(frrNamespace),
 	}
 	if err := r.List(ctx, frrConfigList, listOpts...); err != nil {
 		return ctrl.Result{}, fmt.Errorf("unable to retrieve FRRConfigurationList %w", err)
@@ -462,6 +494,7 @@ func (r *BGPConfigurationReconciler) reconcileNormal(ctx context.Context, instan
 				map[string]string{
 					groupLabel + "/pod-name": podNetworkDetail.Name,
 				}),
+			frrNamespace,
 		)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -472,6 +505,14 @@ func (r *BGPConfigurationReconciler) reconcileNormal(ctx context.Context, instan
 	// because the pod was deleted/completed/failed/unknown
 	if err := r.deleteStaleFRRConfigurations(ctx, instance, podNetworkDetailList, frrConfigList, groupLabel); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	// Clean up old FRRConfigurations from the old namespace if we've migrated to a new one
+	if frrNamespace != instance.Spec.FRRConfigurationNamespace {
+		if err := r.cleanupOldNamespaceFRRConfigurations(ctx, instance, instance.Spec.FRRConfigurationNamespace, groupLabel); err != nil {
+			Log.Error(err, fmt.Sprintf("Failed to cleanup old FRRConfigurations from namespace %s", instance.Spec.FRRConfigurationNamespace))
+			// Don't fail reconciliation if cleanup fails, just log the error
+		}
 	}
 
 	Log.Info("Reconciled Service successfully")
@@ -497,6 +538,35 @@ func (r *BGPConfigurationReconciler) deleteStaleFRRConfigurations(ctx context.Co
 			}
 		}
 	}
+	return nil
+}
+
+// cleanupOldNamespaceFRRConfigurations - removes all managed FRRConfigurations from the old namespace
+// when migrating to a new namespace (e.g., from metallb-system to openshift-frr-k8s)
+func (r *BGPConfigurationReconciler) cleanupOldNamespaceFRRConfigurations(
+	ctx context.Context,
+	instance *networkv1.BGPConfiguration,
+	oldNamespace string,
+	groupLabel string,
+) error {
+	Log := r.GetLogger(ctx)
+	Log.Info(fmt.Sprintf("Cleaning up old FRRConfigurations from namespace %s", oldNamespace))
+
+	// Delete all our managed FRRConfiguration in the old namespace
+	err := r.DeleteAllOf(
+		ctx,
+		&frrk8sv1.FRRConfiguration{},
+		client.InNamespace(oldNamespace),
+		client.MatchingLabels{
+			labels.GetOwnerNameLabelSelector(labels.GetGroupLabel("bgpconfiguration")):      instance.Name,
+			labels.GetOwnerNameSpaceLabelSelector(labels.GetGroupLabel("bgpconfiguration")): instance.Namespace,
+		},
+	)
+	if err != nil && !k8s_errors.IsNotFound(err) {
+		return fmt.Errorf("error DeleteAllOf FRRConfiguration in old namespace %s: %w", oldNamespace, err)
+	}
+
+	Log.Info(fmt.Sprintf("Successfully cleaned up old FRRConfigurations from namespace %s", oldNamespace))
 	return nil
 }
 
@@ -650,6 +720,7 @@ func (r *BGPConfigurationReconciler) createOrPatchFRRConfiguration(
 	podDtl *bgp.PodDetail,
 	nodeFRRCfgs map[string]frrk8sv1.FRRConfiguration,
 	frrLabels map[string]string,
+	frrNamespace string,
 ) error {
 	Log := r.GetLogger(ctx)
 	Log.Info("Reconciling createOrUpdateFRRConfiguration")
@@ -662,7 +733,7 @@ func (r *BGPConfigurationReconciler) createOrPatchFRRConfiguration(
 	frrConfig := &frrk8sv1.FRRConfiguration{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      instance.Namespace + "-" + podDtl.Name,
-			Namespace: instance.Spec.FRRConfigurationNamespace,
+			Namespace: frrNamespace,
 		},
 	}
 

@@ -26,6 +26,7 @@ import (
 	frrk8sv1 "github.com/metallb/frr-k8s/api/v1beta1"
 	networkv1 "github.com/openstack-k8s-operators/infra-operator/apis/network/v1beta1"
 	corev1 "k8s.io/api/core/v1"
+	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -571,6 +572,67 @@ var _ = Describe("BGPConfiguration controller", func() {
 					g.Expect(frr.Spec.BGP.Routers[0].Prefixes).To(ContainElement("172.67.0.102/32")) // Predictable IP
 				}, timeout, interval).Should(Succeed())
 			})
+		})
+	})
+
+	When("openshift-frr-k8s namespace exists (OpenShift 4.20+ migration)", func() {
+		var podFrrName types.NamespacedName
+		var podName types.NamespacedName
+		var metallbNS *corev1.Namespace
+		var openshiftFRRNS *corev1.Namespace
+		openshiftFRRNamespace := "openshift-frr-k8s"
+
+		BeforeEach(func() {
+			// Create both metallb-system and openshift-frr-k8s namespaces
+			metallbNS = th.CreateNamespace(frrCfgNamespace + "-" + namespace)
+			openshiftFRRNS = th.CreateNamespace(openshiftFRRNamespace)
+
+			// Create FRR configuration in the new openshift-frr-k8s namespace
+			openshiftFRRCfgName := types.NamespacedName{Namespace: openshiftFRRNS.Name, Name: "worker-0"}
+			openshiftFRRCfg := CreateFRRConfiguration(openshiftFRRCfgName, GetMetalLBFRRConfigurationSpec("worker-0"))
+			Expect(openshiftFRRCfg).To(Not(BeNil()))
+
+			// Create a nad config
+			nad := th.CreateNAD(types.NamespacedName{Namespace: namespace, Name: "internalapi"}, GetNADSpec())
+
+			// Create BGPConfiguration with metallb-system as default
+			bgpcfg := CreateBGPConfiguration(namespace, GetBGPConfigurationSpec(metallbNS.Name))
+			bgpcfgName.Name = bgpcfg.GetName()
+			bgpcfgName.Namespace = bgpcfg.GetNamespace()
+
+			podName = types.NamespacedName{Namespace: namespace, Name: uuid.New().String()}
+			// Create pod with NAD annotation
+			th.CreatePod(podName, GetPodAnnotation(namespace), GetPodSpec("worker-0"))
+			th.SimulatePodPhaseRunning(podName)
+
+			podFrrName.Name = podName.Namespace + "-" + podName.Name
+			podFrrName.Namespace = openshiftFRRNS.Name
+
+			DeferCleanup(th.DeleteInstance, bgpcfg)
+			DeferCleanup(th.DeleteInstance, nad)
+			DeferCleanup(th.DeleteInstance, openshiftFRRCfg)
+			DeferCleanup(th.DeleteNamespace, openshiftFRRNamespace)
+		})
+
+		It("should create FRRConfiguration in openshift-frr-k8s namespace instead of metallb-system", func() {
+			pod := th.GetPod(podName)
+			Expect(pod).To(Not(BeNil()))
+
+			// Check that FRRConfiguration is created in openshift-frr-k8s
+			Eventually(func(g Gomega) {
+				frr := GetFRRConfiguration(types.NamespacedName{Namespace: openshiftFRRNS.Name, Name: podFrrName.Name})
+				g.Expect(frr).To(Not(BeNil()))
+				g.Expect(frr.Namespace).To(Equal(openshiftFRRNS.Name))
+				g.Expect(frr.Spec.BGP.Routers[0].Prefixes[0]).To(Equal("172.17.0.40/32"))
+			}, timeout, interval).Should(Succeed())
+
+			// Verify that no FRRConfiguration was created in metallb-system
+			frr := &frrk8sv1.FRRConfiguration{}
+			Consistently(func(g Gomega) {
+				err := k8sClient.Get(ctx, types.NamespacedName{Namespace: metallbNS.Name, Name: podFrrName.Name}, frr)
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(k8s_errors.IsNotFound(err)).To(BeTrue())
+			}, timeout, interval).Should(Succeed())
 		})
 	})
 })
