@@ -509,10 +509,18 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		return ctrl.Result{}, err
 	}
 
-	// Wait for RabbitMQ cluster to be ready
+	// Wait for RabbitMQ cluster to be available
+	// Use ClusterAvailable instead of AllPodsAreReady to allow graceful rolling restarts
+	// ClusterAvailable remains true as long as quorum is maintained (e.g., 2/3 nodes up)
+	// Note: We don't check observedGeneration here because the cluster operator only updates it
+	// after all reconciliation completes. During rolling restarts, observedGeneration lags behind
+	// generation even though ClusterAvailable stays true, which would incorrectly mark the
+	// TransportURL as unavailable.
 	rabbitReady := false
 	for _, condition := range rabbit.Status.Conditions {
-		if condition.Reason == "AllPodsAreReady" && condition.Status == "True" {
+		// Check ClusterAvailable condition which indicates the cluster is functional
+		// even during rolling restarts when not all pods are ready
+		if string(condition.Type) == "ClusterAvailable" && condition.Status == "True" {
 			rabbitReady = true
 			break
 		}

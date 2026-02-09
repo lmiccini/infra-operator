@@ -1706,4 +1706,543 @@ var _ = Describe("TransportURL controller", func() {
 			}, time.Second*45, interval).Should(Succeed())
 		})
 	})
+
+	When("RabbitMQ cluster is available during rolling restart", func() {
+		var rabbitmqName types.NamespacedName
+
+		BeforeEach(func() {
+			rabbitmqName = types.NamespacedName{
+				Name:      "rabbitmq-rolling-restart",
+				Namespace: namespace,
+			}
+
+			// Create RabbitMQCluster
+			CreateRabbitMQCluster(rabbitmqName, GetDefaultRabbitMQClusterSpec(false))
+			DeferCleanup(DeleteRabbitMQCluster, rabbitmqName)
+
+			// Create TransportURL
+			spec := map[string]any{
+				"rabbitmqClusterName": rabbitmqName.Name,
+			}
+			DeferCleanup(th.DeleteInstance, CreateTransportURL(transportURLName, spec))
+		})
+
+		It("should create TransportURL when ClusterAvailable is True but not all pods are ready", func() {
+			// Simulate RabbitMQ cluster during rolling restart:
+			// - ClusterAvailable = True (quorum maintained, e.g., 2/3 nodes up)
+			// - AllPodsAreReady = False (one pod restarting)
+			// - observedGeneration matches generation (status is current)
+			Eventually(func(g Gomega) {
+				secretName := types.NamespacedName{Name: rabbitmqName.Name + "-default-user", Namespace: namespace}
+
+				mq := GetRabbitMQCluster(rabbitmqName)
+				g.Expect(mq).ToNot(BeNil())
+
+				// Create rabbitmq secret
+				CreateOrUpdateRabbitMQClusterSecret(secretName, mq)
+
+				raw := map[string]any{
+					"apiVersion": "rabbitmq.com/v1beta1",
+					"kind":       "RabbitmqCluster",
+					"metadata": map[string]any{
+						"name":      rabbitmqName.Name,
+						"namespace": rabbitmqName.Namespace,
+					},
+				}
+
+				status := make(map[string]any)
+
+				// Set ClusterAvailable=True (cluster has quorum)
+				// Set AllPodsAreReady=False (rolling restart in progress)
+				statusCondition := []map[string]any{
+					{
+						"reason": "NotAllPodsReady",
+						"status": "False",
+						"type":   "AllReplicasReady",
+					},
+					{
+						"reason": "ClusterAvailable",
+						"status": "True",
+						"type":   "ClusterAvailable",
+					},
+				}
+
+				statusDefaultUser := map[string]any{
+					"secretReference": map[string]any{
+						"keys": map[string]any{
+							"password": "password",
+							"username": "username",
+						},
+						"name":      secretName.Name,
+						"namespace": rabbitmqName.Namespace,
+					},
+					"serviceReference": map[string]any{
+						"name":      rabbitmqName.Name,
+						"namespace": rabbitmqName.Namespace,
+					},
+				}
+
+				status["conditions"] = statusCondition
+				status["defaultUser"] = statusDefaultUser
+				// IMPORTANT: observedGeneration matches generation (status is current)
+				status["observedGeneration"] = mq.Generation
+				raw["status"] = status
+
+				un := &unstructured.Unstructured{Object: raw}
+				deploymentRes := schema.GroupVersionResource{
+					Group:    "rabbitmq.com",
+					Version:  "v1beta1",
+					Resource: "rabbitmqclusters",
+				}
+				_, err := dynClient.Resource(deploymentRes).Namespace(namespace).ApplyStatus(ctx, rabbitmqName.Name, un, metav1.ApplyOptions{FieldManager: "application/apply-patch"})
+				g.Expect(err).ShouldNot(HaveOccurred())
+			}, timeout, interval).Should(Succeed())
+
+			// Verify TransportURL is created successfully despite not all pods being ready
+			Eventually(func(g Gomega) {
+				s := th.GetSecret(transportURLSecretName)
+				g.Expect(s.Data).To(HaveLen(1))
+				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@host.%s.svc:5672/?ssl=0", namespace)))
+			}, timeout, interval).Should(Succeed())
+
+			th.ExpectCondition(
+				transportURLName,
+				ConditionGetterFunc(TransportURLConditionGetter),
+				rabbitmqv1.TransportURLReadyCondition,
+				corev1.ConditionTrue,
+			)
+		})
+	})
+
+	When("RabbitMQ cluster has stale observedGeneration but ClusterAvailable is true", func() {
+		var rabbitmqName types.NamespacedName
+
+		BeforeEach(func() {
+			rabbitmqName = types.NamespacedName{
+				Name:      "rabbitmq-stale-generation",
+				Namespace: namespace,
+			}
+
+			// Create RabbitMQCluster
+			CreateRabbitMQCluster(rabbitmqName, GetDefaultRabbitMQClusterSpec(false))
+			DeferCleanup(DeleteRabbitMQCluster, rabbitmqName)
+
+			// Create TransportURL
+			spec := map[string]any{
+				"rabbitmqClusterName": rabbitmqName.Name,
+			}
+			DeferCleanup(th.DeleteInstance, CreateTransportURL(transportURLName, spec))
+		})
+
+		It("should stay available when observedGeneration lags but ClusterAvailable is true", func() {
+			// Simulate RabbitMQ cluster with stale status:
+			// - ClusterAvailable = True (from old status)
+			// - observedGeneration < generation (spec changed but not reconciled yet)
+			Eventually(func(g Gomega) {
+				secretName := types.NamespacedName{Name: rabbitmqName.Name + "-default-user", Namespace: namespace}
+
+				mq := GetRabbitMQCluster(rabbitmqName)
+				g.Expect(mq).ToNot(BeNil())
+
+				// Create rabbitmq secret
+				CreateOrUpdateRabbitMQClusterSecret(secretName, mq)
+
+				raw := map[string]any{
+					"apiVersion": "rabbitmq.com/v1beta1",
+					"kind":       "RabbitmqCluster",
+					"metadata": map[string]any{
+						"name":      rabbitmqName.Name,
+						"namespace": rabbitmqName.Namespace,
+					},
+				}
+
+				status := make(map[string]any)
+
+				statusCondition := []map[string]any{
+					{
+						"reason": "AllPodsAreReady",
+						"status": "True",
+						"type":   "AllReplicasReady",
+					},
+					{
+						"reason": "ClusterAvailable",
+						"status": "True",
+						"type":   "ClusterAvailable",
+					},
+				}
+
+				statusDefaultUser := map[string]any{
+					"secretReference": map[string]any{
+						"keys": map[string]any{
+							"password": "password",
+							"username": "username",
+						},
+						"name":      secretName.Name,
+						"namespace": rabbitmqName.Namespace,
+					},
+					"serviceReference": map[string]any{
+						"name":      rabbitmqName.Name,
+						"namespace": rabbitmqName.Namespace,
+					},
+				}
+
+				status["conditions"] = statusCondition
+				status["defaultUser"] = statusDefaultUser
+				// IMPORTANT: observedGeneration is less than generation (stale status)
+				status["observedGeneration"] = mq.Generation - 1
+				raw["status"] = status
+
+				un := &unstructured.Unstructured{Object: raw}
+				deploymentRes := schema.GroupVersionResource{
+					Group:    "rabbitmq.com",
+					Version:  "v1beta1",
+					Resource: "rabbitmqclusters",
+				}
+				_, err := dynClient.Resource(deploymentRes).Namespace(namespace).ApplyStatus(ctx, rabbitmqName.Name, un, metav1.ApplyOptions{FieldManager: "application/apply-patch"})
+				g.Expect(err).ShouldNot(HaveOccurred())
+			}, timeout, interval).Should(Succeed())
+
+			// Verify TransportURL STAYS ready despite stale observedGeneration
+			// because ClusterAvailable = True is sufficient
+			Consistently(func(g Gomega) {
+				th.ExpectCondition(
+					transportURLName,
+					ConditionGetterFunc(TransportURLConditionGetter),
+					rabbitmqv1.TransportURLReadyCondition,
+					corev1.ConditionTrue,
+				)
+			}, time.Second*5, interval).Should(Succeed())
+
+			// Verify the transport URL secret is still accessible
+			Eventually(func(g Gomega) {
+				s := th.GetSecret(transportURLSecretName)
+				g.Expect(s.Data).To(HaveLen(1))
+				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@host.%s.svc:5672/?ssl=0", namespace)))
+			}, timeout, interval).Should(Succeed())
+
+			th.ExpectCondition(
+				transportURLName,
+				ConditionGetterFunc(TransportURLConditionGetter),
+				rabbitmqv1.TransportURLReadyCondition,
+				corev1.ConditionTrue,
+			)
+		})
+	})
+
+	When("RabbitMQ cluster image is updated triggering rolling restart", func() {
+		var rabbitmqName types.NamespacedName
+
+		BeforeEach(func() {
+			rabbitmqName = types.NamespacedName{
+				Name:      "rabbitmq-image-update",
+				Namespace: namespace,
+			}
+
+			// Create RabbitMQCluster
+			CreateRabbitMQCluster(rabbitmqName, GetDefaultRabbitMQClusterSpec(false))
+			DeferCleanup(DeleteRabbitMQCluster, rabbitmqName)
+
+			// Create TransportURL
+			spec := map[string]any{
+				"rabbitmqClusterName": rabbitmqName.Name,
+			}
+			DeferCleanup(th.DeleteInstance, CreateTransportURL(transportURLName, spec))
+		})
+
+		It("should keep TransportURL available during rolling restart regardless of observedGeneration", func() {
+			// First, make cluster fully ready with generation=1
+			SimulateRabbitMQClusterReady(rabbitmqName)
+
+			// Verify TransportURL becomes ready
+			Eventually(func(g Gomega) {
+				s := th.GetSecret(transportURLSecretName)
+				g.Expect(s.Data).To(HaveLen(1))
+			}, timeout, interval).Should(Succeed())
+
+			th.ExpectCondition(
+				transportURLName,
+				ConditionGetterFunc(TransportURLConditionGetter),
+				rabbitmqv1.TransportURLReadyCondition,
+				corev1.ConditionTrue,
+			)
+
+			// Now simulate image update: generation increments
+			// Simulate behavior where cluster operator updates observedGeneration early
+			// (when it starts processing the change) and keeps ClusterAvailable=True
+			// during rolling restart (quorum maintained)
+			Eventually(func(g Gomega) {
+				mq := GetRabbitMQCluster(rabbitmqName)
+				g.Expect(mq).ToNot(BeNil())
+
+				// Increment generation by updating spec
+				// This would normally happen when user updates image
+				if mq.Spec.Replicas == nil {
+					replicas := int32(3)
+					mq.Spec.Replicas = &replicas
+				} else {
+					replicas := *mq.Spec.Replicas + 1
+					mq.Spec.Replicas = &replicas
+				}
+				g.Expect(k8sClient.Update(ctx, mq)).Should(Succeed())
+			}, timeout, interval).Should(Succeed())
+
+			// Now update status to reflect rolling restart in progress
+			// - generation has incremented
+			// - observedGeneration matches (cluster operator processed the change)
+			// - ClusterAvailable stays True (quorum maintained)
+			// - AllPodsAreReady is False (rolling restart in progress)
+			Eventually(func(g Gomega) {
+				secretName := types.NamespacedName{Name: rabbitmqName.Name + "-default-user", Namespace: namespace}
+				mq := GetRabbitMQCluster(rabbitmqName)
+				g.Expect(mq).ToNot(BeNil())
+
+				raw := map[string]any{
+					"apiVersion": "rabbitmq.com/v1beta1",
+					"kind":       "RabbitmqCluster",
+					"metadata": map[string]any{
+						"name":      rabbitmqName.Name,
+						"namespace": rabbitmqName.Namespace,
+					},
+				}
+
+				status := make(map[string]any)
+
+				// During rolling restart:
+				// - AllPodsAreReady = False
+				// - ClusterAvailable = True (quorum maintained)
+				statusCondition := []map[string]any{
+					{
+						"reason": "RollingRestart",
+						"status": "False",
+						"type":   "AllReplicasReady",
+					},
+					{
+						"reason": "ClusterAvailable",
+						"status": "True",
+						"type":   "ClusterAvailable",
+					},
+				}
+
+				statusDefaultUser := map[string]any{
+					"secretReference": map[string]any{
+						"keys": map[string]any{
+							"password": "password",
+							"username": "username",
+						},
+						"name":      secretName.Name,
+						"namespace": rabbitmqName.Namespace,
+					},
+					"serviceReference": map[string]any{
+						"name":      rabbitmqName.Name,
+						"namespace": rabbitmqName.Namespace,
+					},
+				}
+
+				status["conditions"] = statusCondition
+				status["defaultUser"] = statusDefaultUser
+				// CRITICAL: observedGeneration is updated to match new generation
+				// This simulates cluster operator updating observedGeneration when
+				// it starts processing the spec change (best practice)
+				status["observedGeneration"] = mq.Generation
+				raw["status"] = status
+
+				un := &unstructured.Unstructured{Object: raw}
+				deploymentRes := schema.GroupVersionResource{
+					Group:    "rabbitmq.com",
+					Version:  "v1beta1",
+					Resource: "rabbitmqclusters",
+				}
+				_, err := dynClient.Resource(deploymentRes).Namespace(namespace).ApplyStatus(ctx, rabbitmqName.Name, un, metav1.ApplyOptions{FieldManager: "application/apply-patch"})
+				g.Expect(err).ShouldNot(HaveOccurred())
+			}, timeout, interval).Should(Succeed())
+
+			// Verify TransportURL STAYS ready during rolling restart
+			// (this is the desired behavior - no service interruption)
+			Consistently(func(g Gomega) {
+				th.ExpectCondition(
+					transportURLName,
+					ConditionGetterFunc(TransportURLConditionGetter),
+					rabbitmqv1.TransportURLReadyCondition,
+					corev1.ConditionTrue,
+				)
+			}, time.Second*5, interval).Should(Succeed())
+		})
+
+	})
+
+	When("RabbitMQ cluster is not available", func() {
+		var rabbitmqName types.NamespacedName
+
+		BeforeEach(func() {
+			rabbitmqName = types.NamespacedName{
+				Name:      "rabbitmq-not-available",
+				Namespace: namespace,
+			}
+
+			// Create RabbitMQCluster
+			CreateRabbitMQCluster(rabbitmqName, GetDefaultRabbitMQClusterSpec(false))
+			DeferCleanup(DeleteRabbitMQCluster, rabbitmqName)
+
+			// Create TransportURL
+			spec := map[string]any{
+				"rabbitmqClusterName": rabbitmqName.Name,
+			}
+			DeferCleanup(th.DeleteInstance, CreateTransportURL(transportURLName, spec))
+		})
+
+		It("should wait when ClusterAvailable is False even with current observedGeneration", func() {
+			// Simulate RabbitMQ cluster that is genuinely not available:
+			// - ClusterAvailable = False (lost quorum)
+			// - observedGeneration matches generation (status is current)
+			Eventually(func(g Gomega) {
+				secretName := types.NamespacedName{Name: rabbitmqName.Name + "-default-user", Namespace: namespace}
+
+				mq := GetRabbitMQCluster(rabbitmqName)
+				g.Expect(mq).ToNot(BeNil())
+
+				// Create rabbitmq secret
+				CreateOrUpdateRabbitMQClusterSecret(secretName, mq)
+
+				raw := map[string]any{
+					"apiVersion": "rabbitmq.com/v1beta1",
+					"kind":       "RabbitmqCluster",
+					"metadata": map[string]any{
+						"name":      rabbitmqName.Name,
+						"namespace": rabbitmqName.Namespace,
+					},
+				}
+
+				status := make(map[string]any)
+
+				// ClusterAvailable = False (cluster lost quorum)
+				statusCondition := []map[string]any{
+					{
+						"reason": "NotAllPodsReady",
+						"status": "False",
+						"type":   "AllReplicasReady",
+					},
+					{
+						"reason": "QuorumLost",
+						"status": "False",
+						"type":   "ClusterAvailable",
+					},
+				}
+
+				statusDefaultUser := map[string]any{
+					"secretReference": map[string]any{
+						"keys": map[string]any{
+							"password": "password",
+							"username": "username",
+						},
+						"name":      secretName.Name,
+						"namespace": rabbitmqName.Namespace,
+					},
+					"serviceReference": map[string]any{
+						"name":      rabbitmqName.Name,
+						"namespace": rabbitmqName.Namespace,
+					},
+				}
+
+				status["conditions"] = statusCondition
+				status["defaultUser"] = statusDefaultUser
+				// observedGeneration matches generation (status is current)
+				status["observedGeneration"] = mq.Generation
+				raw["status"] = status
+
+				un := &unstructured.Unstructured{Object: raw}
+				deploymentRes := schema.GroupVersionResource{
+					Group:    "rabbitmq.com",
+					Version:  "v1beta1",
+					Resource: "rabbitmqclusters",
+				}
+				_, err := dynClient.Resource(deploymentRes).Namespace(namespace).ApplyStatus(ctx, rabbitmqName.Name, un, metav1.ApplyOptions{FieldManager: "application/apply-patch"})
+				g.Expect(err).ShouldNot(HaveOccurred())
+			}, timeout, interval).Should(Succeed())
+
+			// Verify TransportURL remains not ready
+			Consistently(func(g Gomega) {
+				th.ExpectCondition(
+					transportURLName,
+					ConditionGetterFunc(TransportURLConditionGetter),
+					rabbitmqv1.TransportURLReadyCondition,
+					corev1.ConditionFalse,
+				)
+			}, time.Second*5, interval).Should(Succeed())
+
+			// Now make cluster available
+			Eventually(func(g Gomega) {
+				mq := GetRabbitMQCluster(rabbitmqName)
+				g.Expect(mq).ToNot(BeNil())
+
+				raw := map[string]any{
+					"apiVersion": "rabbitmq.com/v1beta1",
+					"kind":       "RabbitmqCluster",
+					"metadata": map[string]any{
+						"name":      rabbitmqName.Name,
+						"namespace": rabbitmqName.Namespace,
+					},
+				}
+
+				status := make(map[string]any)
+				secretName := types.NamespacedName{Name: rabbitmqName.Name + "-default-user", Namespace: namespace}
+
+				// ClusterAvailable = True (quorum restored)
+				statusCondition := []map[string]any{
+					{
+						"reason": "AllPodsAreReady",
+						"status": "True",
+						"type":   "AllReplicasReady",
+					},
+					{
+						"reason": "ClusterAvailable",
+						"status": "True",
+						"type":   "ClusterAvailable",
+					},
+				}
+
+				statusDefaultUser := map[string]any{
+					"secretReference": map[string]any{
+						"keys": map[string]any{
+							"password": "password",
+							"username": "username",
+						},
+						"name":      secretName.Name,
+						"namespace": rabbitmqName.Namespace,
+					},
+					"serviceReference": map[string]any{
+						"name":      rabbitmqName.Name,
+						"namespace": rabbitmqName.Namespace,
+					},
+				}
+
+				status["conditions"] = statusCondition
+				status["defaultUser"] = statusDefaultUser
+				status["observedGeneration"] = mq.Generation
+				raw["status"] = status
+
+				un := &unstructured.Unstructured{Object: raw}
+				deploymentRes := schema.GroupVersionResource{
+					Group:    "rabbitmq.com",
+					Version:  "v1beta1",
+					Resource: "rabbitmqclusters",
+				}
+				_, err := dynClient.Resource(deploymentRes).Namespace(namespace).ApplyStatus(ctx, rabbitmqName.Name, un, metav1.ApplyOptions{FieldManager: "application/apply-patch"})
+				g.Expect(err).ShouldNot(HaveOccurred())
+			}, timeout, interval).Should(Succeed())
+
+			// Verify TransportURL becomes ready after cluster is available
+			Eventually(func(g Gomega) {
+				s := th.GetSecret(transportURLSecretName)
+				g.Expect(s.Data).To(HaveLen(1))
+				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@host.%s.svc:5672/?ssl=0", namespace)))
+			}, timeout, interval).Should(Succeed())
+
+			th.ExpectCondition(
+				transportURLName,
+				ConditionGetterFunc(TransportURLConditionGetter),
+				rabbitmqv1.TransportURLReadyCondition,
+				corev1.ConditionTrue,
+			)
+		})
+	})
 })
