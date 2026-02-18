@@ -1113,14 +1113,23 @@ func GetTopologyRef(name string, namespace string) []types.NamespacedName {
 }
 
 func CreateRabbitMQ(rabbitmq types.NamespacedName, spec map[string]any) client.Object {
+	return CreateRabbitMQWithAnnotations(rabbitmq, spec, nil)
+}
+
+func CreateRabbitMQWithAnnotations(rabbitmq types.NamespacedName, spec map[string]any, annotations map[string]string) client.Object {
+	metadata := map[string]any{
+		"name":      rabbitmq.Name,
+		"namespace": rabbitmq.Namespace,
+	}
+	if len(annotations) > 0 {
+		metadata["annotations"] = annotations
+	}
+
 	raw := map[string]any{
 		"apiVersion": "rabbitmq.openstack.org/v1beta1",
 		"kind":       "RabbitMq",
-		"metadata": map[string]any{
-			"name":      rabbitmq.Name,
-			"namespace": rabbitmq.Namespace,
-		},
-		"spec": spec,
+		"metadata":   metadata,
+		"spec":       spec,
 	}
 
 	return th.CreateUnstructured(raw)
@@ -1237,4 +1246,35 @@ func GetRabbitMQPolicy(name types.NamespacedName) *rabbitmqv1.RabbitMQPolicy {
 func RabbitMQPolicyConditionGetter(name types.NamespacedName) condition.Conditions {
 	instance := GetRabbitMQPolicy(name)
 	return instance.Status.Conditions
+}
+
+// SimulateGarbageCollection simulates Kubernetes garbage collection by deleting
+// resources owned by the specified owner. This is needed in envtest which doesn't
+// have a garbage collector.
+func SimulateGarbageCollection(ownerUID types.UID, namespace string) {
+	// Delete ConfigMaps owned by the CR
+	configMapList := &corev1.ConfigMapList{}
+	Expect(k8sClient.List(ctx, configMapList, client.InNamespace(namespace))).Should(Succeed())
+
+	for _, cm := range configMapList.Items {
+		for _, ownerRef := range cm.OwnerReferences {
+			if ownerRef.UID == ownerUID {
+				_ = k8sClient.Delete(ctx, &cm)
+				break
+			}
+		}
+	}
+
+	// Delete Secrets owned by the CR
+	secretList := &corev1.SecretList{}
+	Expect(k8sClient.List(ctx, secretList, client.InNamespace(namespace))).Should(Succeed())
+
+	for _, secret := range secretList.Items {
+		for _, ownerRef := range secret.OwnerReferences {
+			if ownerRef.UID == ownerUID {
+				_ = k8sClient.Delete(ctx, &secret)
+				break
+			}
+		}
+	}
 }
