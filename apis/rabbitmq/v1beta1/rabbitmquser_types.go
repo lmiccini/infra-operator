@@ -174,5 +174,6 @@ const (
 func IsInternalFinalizer(finalizer string) bool {
 	return finalizer == UserFinalizer ||
 		finalizer == TransportURLFinalizer ||
-		finalizer == userControllerFinalizer
+		finalizer == userControllerFinalizer ||
+		finalizer == RabbitMQUserCleanupBlockedFinalizer
 }
