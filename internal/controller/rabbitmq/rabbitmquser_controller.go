@@ -39,6 +39,8 @@ import (
 	helper "github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/object"
 	oko_secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
+	dataplanev1 "github.com/openstack-k8s-operators/openstack-operator/api/dataplane/v1beta1"
 	rabbitmqclusterv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -54,6 +56,24 @@ const userFinalizer = "rabbitmquser.openstack.org/finalizer"
 
 // credentialSecretNameField is the field index for the credential secret
 const credentialSecretNameField = ".spec.secret"
+
+// ConnectionCheckInterval is how often to recheck deployment and nodeset status during deletion
+const ConnectionCheckInterval = 30 * time.Second
+
+// DeletionGracePeriod is the default time to wait before allowing deletion despite check failures
+// This prevents indefinite blocking on transient API errors or RBAC issues
+const DeletionGracePeriod = 1 * time.Hour
+
+// Annotation keys for deletion safety
+const (
+	// FirstDeletionCheckFailureAnnotation records when deletion checks first started failing
+	FirstDeletionCheckFailureAnnotation = "rabbitmq.openstack.org/first-deletion-check-failure"
+	// DeletionGracePeriodAnnotation allows overriding the default grace period (duration format like "2h", "30m")
+	DeletionGracePeriodAnnotation = "rabbitmq.openstack.org/deletion-grace-period"
+)
+
+// RabbitMQ user secret prefix
+const rabbitmqUserSecretPrefix = "rabbitmq-user-"
 
 // generatePassword generates a random password
 func generatePassword(length int) (string, error) {
@@ -81,6 +101,7 @@ type RabbitMQUserReconciler struct {
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqvhosts/finalizers,verbs=update
 //+kubebuilder:rbac:groups=rabbitmq.com,resources=rabbitmqclusters,verbs=get;list;watch
 //+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=dataplane.openstack.org,resources=openstackdataplanenodesets,verbs=get;list;watch
 
 // Reconcile reconciles a RabbitMQUser object
 func (r *RabbitMQUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -401,6 +422,129 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 	return ctrl.Result{}, nil
 }
 
+// isUserStillInUseByNodeSets checks if any nodeset still has nodes that haven't been
+// updated with new credentials yet. This prevents premature deletion when nodes are
+// offline or when partial deployments (AnsibleLimit) haven't covered all nodes.
+func (r *RabbitMQUserReconciler) isUserStillInUseByNodeSets(
+	ctx context.Context,
+	instance *rabbitmqv1.RabbitMQUser,
+	secretName string,
+) (stillInUse bool, nodesetInfo string, err error) {
+	log := log.FromContext(ctx)
+
+	// 1. Get THIS user's secret
+	secret := &corev1.Secret{}
+	err = r.Get(ctx, types.NamespacedName{
+		Name:      secretName,
+		Namespace: instance.Namespace,
+	}, secret)
+	if err != nil {
+		if k8s_errors.IsNotFound(err) {
+			// Secret doesn't exist - can't be in use
+			log.Info("Secret not found, not in use", "secret", secretName)
+			return false, "", nil
+		}
+		// Conservative: if we can't get the secret, block deletion
+		return true, "", fmt.Errorf("failed to get secret: %w", err)
+	}
+
+	// 2. Compute THIS user's secret hash
+	if secret.Data == nil {
+		// Secret exists but has no data - can't be in use
+		log.Info("Secret has no data, not in use", "secret", secretName)
+		return false, "", nil
+	}
+
+	thisUserSecretHash, err := util.ObjectHash(secret.Data)
+	if err != nil {
+		// Conservative: if we can't compute hash, block deletion
+		return true, "", fmt.Errorf("failed to compute secret hash: %w", err)
+	}
+
+	log.Info("Checking nodesets for credential usage",
+		"secret", secretName,
+		"thisUserHash", thisUserSecretHash)
+
+	// 3. List OpenStackDataPlaneNodeSets in the same namespace
+	// NOTE: This lists all nodesets in the namespace. For large-scale deployments,
+	// consider adding field indexing or label selectors to filter by credential usage.
+	nodesets := &dataplanev1.OpenStackDataPlaneNodeSetList{}
+	if err := r.List(ctx, nodesets, client.InNamespace(instance.Namespace)); err != nil {
+		// Conservative: if we can't list nodesets, block deletion
+		return true, "", fmt.Errorf("failed to list OpenStackDataPlaneNodeSets: %w", err)
+	}
+
+	if len(nodesets.Items) == 0 {
+		log.Info("No nodesets found in namespace - credentials not in use",
+			"namespace", instance.Namespace,
+			"secret", secretName)
+		return false, "", nil
+	}
+
+	log.V(1).Info("Checking credential status across nodesets",
+		"nodesetCount", len(nodesets.Items),
+		"namespace", instance.Namespace)
+
+	// 4. Check each nodeset's credential status
+	for i := range nodesets.Items {
+		nodeset := &nodesets.Items[i]
+
+		// Check for context cancellation
+		if err := ctx.Err(); err != nil {
+			// Context cancelled (e.g., pod shutdown)
+			// Return error so caller can apply grace period logic
+			return true, "", fmt.Errorf("context cancelled during nodeset check: %w", err)
+		}
+
+		// Skip if nodeset has no credential status
+		if nodeset.Status.ServiceCredentialStatus == nil {
+			log.V(1).Info("Skipping nodeset with no credential status",
+				"nodeset", nodeset.Name)
+			continue
+		}
+
+		// Check each service in the nodeset
+		for serviceName, credInfo := range nodeset.Status.ServiceCredentialStatus {
+			// Check if this service uses this secret name
+			if credInfo.SecretName == secretName {
+				// Check if it's using THIS user's hash
+				if credInfo.SecretHash == thisUserSecretHash {
+					// NodeSet is tracking this credential - means dataplane nodes have been
+					// deployed with this credential and are using it
+					// BLOCK deletion regardless of allNodesUpdated status
+					info := fmt.Sprintf("nodeset %s/%s, service %s: %d/%d nodes have this credential (allNodesUpdated: %v)",
+						nodeset.Namespace, nodeset.Name, serviceName,
+						len(credInfo.UpdatedNodes), credInfo.TotalNodes, credInfo.AllNodesUpdated)
+
+					log.Info("User credentials deployed to nodeset, blocking deletion",
+						"nodeset", nodeset.Name,
+						"namespace", nodeset.Namespace,
+						"service", serviceName,
+						"updatedNodes", len(credInfo.UpdatedNodes),
+						"totalNodes", credInfo.TotalNodes,
+						"allNodesUpdated", credInfo.AllNodesUpdated,
+						"secretHash", thisUserSecretHash)
+
+					return true, info, nil
+				} else {
+					log.V(1).Info("Nodeset using different credential version",
+						"nodeset", nodeset.Name,
+						"service", serviceName,
+						"nodesetHash", credInfo.SecretHash,
+						"thisUserHash", thisUserSecretHash)
+				}
+			}
+		}
+	}
+
+	// No nodesets are using this user's credentials on nodes that haven't been updated
+	log.Info("All deletion safety checks passed - credentials not in use by any nodesets",
+		"secret", secretName,
+		"thisUserHash", thisUserSecretHash,
+		"nodesetsChecked", len(nodesets.Items))
+	return false, "", nil
+}
+
 func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1.RabbitMQUser, h *helper.Helper) (ctrl.Result, error) {
 	Log := log.FromContext(ctx)
 
@@ -417,7 +561,164 @@ func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *
 		return ctrl.Result{RequeueAfter: time.Duration(2) * time.Second}, nil
 	}
 
-	// Check for external finalizers (not managed by this controller)
+	// Check if cleanup-blocked finalizer exists and remove it if safety checks pass
+	// This finalizer was used as a temporary measure to prevent automatic cleanup
+	// Now we check nodeset status to determine if it's safe to remove
+	if controllerutil.ContainsFinalizer(instance, rabbitmqv1.RabbitMQUserCleanupBlockedFinalizer) {
+		// Get secret name for nodeset check
+		secretName := instance.Status.SecretName
+		if secretName == "" {
+			if instance.Spec.Secret != nil && *instance.Spec.Secret != "" {
+				secretName = *instance.Spec.Secret
+			} else {
+				// Auto-generated secret name
+				secretName = fmt.Sprintf("%s%s", rabbitmqUserSecretPrefix, instance.Name)
+			}
+		}
+
+		if secretName != "" {
+			// Check if any nodeset still has nodes that haven't been updated
+			// This prevents deletion when nodes are offline or partial deployments haven't covered all nodes
+			stillInUse, nodesetInfo, err := r.isUserStillInUseByNodeSets(ctx, instance, secretName)
+			if err != nil {
+				// Check if we've exceeded the grace period for check failures
+				// This prevents indefinite blocking on transient API errors or RBAC issues
+				now := time.Now()
+				gracePeriod := DeletionGracePeriod
+
+				// Check for custom grace period annotation
+				if customPeriod, ok := instance.Annotations[DeletionGracePeriodAnnotation]; ok {
+					if parsed, parseErr := time.ParseDuration(customPeriod); parseErr == nil {
+						gracePeriod = parsed
+						Log.Info("Using custom deletion grace period from annotation",
+							"gracePeriod", gracePeriod,
+							"annotation", DeletionGracePeriodAnnotation)
+					} else {
+						Log.Error(parseErr, "Failed to parse custom grace period annotation, using default",
+							"annotation", customPeriod,
+							"default", DeletionGracePeriod)
+					}
+				}
+
+				// Check if we already have a failure timestamp
+				firstFailureStr, hasFailureAnnotation := instance.Annotations[FirstDeletionCheckFailureAnnotation]
+				var shouldAllowDeletion bool
+
+				if hasFailureAnnotation {
+					// Parse the existing timestamp
+					if firstFailure, parseErr := time.Parse(time.RFC3339, firstFailureStr); parseErr == nil {
+						elapsed := now.Sub(firstFailure)
+						if elapsed > gracePeriod {
+							// Grace period exceeded - allow deletion despite check failure
+							shouldAllowDeletion = true
+							Log.Info("Deletion check failures exceeded grace period, allowing deletion",
+								"secret", secretName,
+								"firstFailure", firstFailure,
+								"elapsed", elapsed,
+								"gracePeriod", gracePeriod,
+								"checkError", err)
+						} else {
+							Log.Info("Deletion check failed but within grace period, continuing to block",
+								"secret", secretName,
+								"firstFailure", firstFailure,
+								"elapsed", elapsed,
+								"gracePeriod", gracePeriod,
+								"remaining", gracePeriod-elapsed)
+						}
+					} else {
+						// Invalid timestamp - reset it
+						Log.Error(parseErr, "Failed to parse first failure timestamp, resetting",
+							"annotation", firstFailureStr)
+						shouldAllowDeletion = false
+						// Will set new annotation below
+						hasFailureAnnotation = false
+					}
+				}
+
+				if !shouldAllowDeletion {
+					// Record first failure time if not already set
+					if !hasFailureAnnotation {
+						if instance.Annotations == nil {
+							instance.Annotations = make(map[string]string)
+						}
+						instance.Annotations[FirstDeletionCheckFailureAnnotation] = now.Format(time.RFC3339)
+
+						if updateErr := r.Update(ctx, instance); updateErr != nil {
+							Log.Error(updateErr, "Failed to update first deletion check failure annotation")
+							// Continue anyway - we'll retry next reconcile
+						} else {
+							Log.Info("Recorded first deletion check failure timestamp",
+								"secret", secretName,
+								"timestamp", now.Format(time.RFC3339),
+								"gracePeriod", gracePeriod)
+						}
+					}
+
+					// Block deletion and wait
+					Log.Error(err, "Failed to check nodeset status, delaying cleanup-blocked finalizer removal", "secret", secretName)
+
+					instance.Status.Conditions.MarkFalse(
+						rabbitmqv1.RabbitMQUserReadyCondition,
+						condition.DeletingReason,
+						condition.SeverityWarning,
+						"Unable to verify nodeset status: %v",
+						err,
+					)
+
+					return ctrl.Result{RequeueAfter: ConnectionCheckInterval}, nil
+				}
+
+				// Grace period exceeded - clear the annotation and allow deletion to proceed
+				if hasFailureAnnotation {
+					delete(instance.Annotations, FirstDeletionCheckFailureAnnotation)
+					if updateErr := r.Update(ctx, instance); updateErr != nil {
+						Log.Error(updateErr, "Failed to clear first deletion check failure annotation")
+						// Continue anyway - deletion safety is more important
+					}
+				}
+
+				Log.Info("Allowing deletion despite check failure - grace period exceeded",
+					"secret", secretName,
+					"gracePeriod", gracePeriod)
+				// Fall through to allow deletion
+			}
+
+			if stillInUse {
+				Log.Info("Credentials still in use by nodesets, keeping cleanup-blocked finalizer",
+					"secret", secretName,
+					"nodesetInfo", nodesetInfo)
+
+				instance.Status.Conditions.MarkFalse(
+					rabbitmqv1.RabbitMQUserReadyCondition,
+					condition.DeletingReason,
+					condition.SeverityInfo,
+					"Credentials still in use: %s",
+					nodesetInfo,
+				)
+
+				return ctrl.Result{RequeueAfter: ConnectionCheckInterval}, nil
+			}
+
+			Log.Info("All nodesets have been updated, removing cleanup-blocked finalizer", "secret", secretName)
+		}
+
+		// Clear any deletion check failure annotation since checks are now succeeding
+		if _, hasFailureAnnotation := instance.Annotations[FirstDeletionCheckFailureAnnotation]; hasFailureAnnotation {
+			delete(instance.Annotations, FirstDeletionCheckFailureAnnotation)
+			Log.Info("Clearing deletion check failure annotation - checks now succeeding")
+		}
+
+		// All safety checks passed - remove the cleanup-blocked finalizer
+		controllerutil.RemoveFinalizer(instance, rabbitmqv1.RabbitMQUserCleanupBlockedFinalizer)
+		if err := r.Update(ctx, instance); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to remove cleanup-blocked finalizer: %w", err)
+		}
+
+		Log.Info("Removed cleanup-blocked finalizer, requeuing for deletion", "user", instance.Name)
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Check for other external finalizers (not managed by this controller)
 	// Wait for all external finalizers to be removed before proceeding with cleanup
 	// This ensures other controllers (e.g., dataplane) finish using this user before deletion
 	externalFinalizers := []string{}
@@ -442,7 +743,12 @@ func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *
 		return ctrl.Result{RequeueAfter: time.Duration(2) * time.Second}, nil
 	}
 
-	// All external finalizers removed, mark as ready for deletion
+	// All safety checks passed - ready to delete user
+	Log.Info("All safety checks passed, proceeding with user deletion",
+		"user", instance.Name,
+		"username", instance.Spec.Username)
+
+	// Mark as ready for deletion
 	instance.Status.Conditions.MarkTrue(
 		rabbitmqv1.RabbitMQUserReadyCondition,
 		"RabbitMQ user ready for deletion",
@@ -491,9 +797,9 @@ func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *
 		}
 	}
 
+	// Get username for deletion
 	username := instance.Status.Username
 	if username == "" {
-		// Username is defaulted by webhook
 		username = instance.Spec.Username
 	}
 
@@ -508,16 +814,16 @@ func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *
 	} else if instance.Spec.VhostRef != "" {
 		// Try to get vhost CR to determine the vhost name
 		vhost := &rabbitmqv1.RabbitMQVhost{}
-		err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.VhostRef, Namespace: instance.Namespace}, vhost)
-		if err != nil && !k8s_errors.IsNotFound(err) {
+		vhostErr := r.Get(ctx, types.NamespacedName{Name: instance.Spec.VhostRef, Namespace: instance.Namespace}, vhost)
+		if vhostErr != nil && !k8s_errors.IsNotFound(vhostErr) {
 			// Log non-NotFound errors but continue with deletion
-			Log.Error(err, "Failed to get vhost", "vhost", instance.Spec.VhostRef)
-		} else if err == nil && vhost.Spec.Name != "" {
+			Log.Error(vhostErr, "Failed to get vhost", "vhost", instance.Spec.VhostRef)
+		} else if vhostErr == nil && vhost.Spec.Name != "" {
 			vhostName = vhost.Spec.Name
 		}
 	}
 
-	// Get RabbitMQ cluster
+	// Get RabbitMQ cluster for deletion
 	rabbit := &rabbitmqclusterv2.RabbitmqCluster{}
 	err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbit)
 

@@ -62,6 +62,7 @@ import (
 	redisv1 "github.com/openstack-k8s-operators/infra-operator/apis/redis/v1beta1"
 	topologyv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/operator"
+	dataplanev1 "github.com/openstack-k8s-operators/openstack-operator/api/dataplane/v1beta1"
 	rabbitmqclusterv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
@@ -85,6 +86,7 @@ func init() {
 	utilruntime.Must(k8s_networkv1.AddToScheme(scheme))
 	utilruntime.Must(topologyv1beta1.AddToScheme(scheme))
 	utilruntime.Must(ocp_configv1.AddToScheme(scheme))
+	utilruntime.Must(dataplanev1.AddToScheme(scheme))
 	//+kubebuilder:scaffold:scheme
 }
 
