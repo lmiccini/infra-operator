@@ -505,7 +505,7 @@ func (r *RabbitMQUserReconciler) isUserStillInUseByNodeSets(
 
 		// Check each service in the nodeset
 		for serviceName, credInfo := range nodeset.Status.ServiceCredentialStatus {
-			// Check if this service uses this secret name
+			// Check if this service uses this secret name (current version)
 			if credInfo.SecretName == secretName {
 				// Check if it's using THIS user's hash
 				if credInfo.SecretHash == thisUserSecretHash {
@@ -516,7 +516,7 @@ func (r *RabbitMQUserReconciler) isUserStillInUseByNodeSets(
 						nodeset.Namespace, nodeset.Name, serviceName,
 						len(credInfo.UpdatedNodes), credInfo.TotalNodes, credInfo.AllNodesUpdated)
 
-					log.Info("User credentials deployed to nodeset, blocking deletion",
+					log.Info("User credentials deployed to nodeset (current version), blocking deletion",
 						"nodeset", nodeset.Name,
 						"namespace", nodeset.Namespace,
 						"service", serviceName,
@@ -526,12 +526,35 @@ func (r *RabbitMQUserReconciler) isUserStillInUseByNodeSets(
 						"secretHash", thisUserSecretHash)
 
 					return true, info, nil
-				} else {
-					log.V(1).Info("Nodeset using different credential version",
+				}
+			}
+
+			// BUG FIX: Also check if this service uses this secret as PREVIOUS version
+			// During credential rotation, nodes may still have old credentials.
+			// The PreviousSecretHash field is only set when a new credential is deployed but
+			// not all nodes have it yet. It's cleared when AllNodesUpdated becomes true for
+			// the current version. So if PreviousSecretHash exists, by definition some nodes
+			// still have the old credential and we must block deletion.
+			if credInfo.PreviousSecretName == secretName {
+				if credInfo.PreviousSecretHash == thisUserSecretHash {
+					// Previous credential still tracked - means rotation in progress
+					// BLOCK deletion until all nodes migrated to new version
+					info := fmt.Sprintf("nodeset %s/%s, service %s: previous credential still tracked during rotation (current: %d/%d nodes updated)",
+						nodeset.Namespace, nodeset.Name, serviceName,
+						len(credInfo.UpdatedNodes), credInfo.TotalNodes)
+
+					log.Info("User credentials in previous version during rotation, blocking deletion",
 						"nodeset", nodeset.Name,
+						"namespace", nodeset.Namespace,
 						"service", serviceName,
-						"nodesetHash", credInfo.SecretHash,
-						"thisUserHash", thisUserSecretHash)
+						"currentSecret", credInfo.SecretName,
+						"previousSecret", credInfo.PreviousSecretName,
+						"updatedNodes", len(credInfo.UpdatedNodes),
+						"totalNodes", credInfo.TotalNodes,
+						"allNodesUpdated", credInfo.AllNodesUpdated,
+						"previousSecretHash", thisUserSecretHash)
+
+					return true, info, nil
 				}
 			}
 		}
