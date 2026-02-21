@@ -485,6 +485,10 @@ func (r *RabbitMQUserReconciler) isUserStillInUseByNodeSets(
 		"nodesetCount", len(nodesets.Items),
 		"namespace", instance.Namespace)
 
+	// Track nodesets with empty status
+	// This is important for the bootstrapping case where tracking hasn't run yet
+	var nodesetsWithEmptyStatus []string
+
 	// 4. Check each nodeset's credential status
 	for i := range nodesets.Items {
 		nodeset := &nodesets.Items[i]
@@ -496,10 +500,15 @@ func (r *RabbitMQUserReconciler) isUserStillInUseByNodeSets(
 			return true, "", fmt.Errorf("context cancelled during nodeset check: %w", err)
 		}
 
-		// Skip if nodeset has no credential status
+		// Check if nodeset has no credential status
+		// This can happen when:
+		// 1. New tracking code deployed, old deployments not yet reconciled
+		// 2. Deployments ran before tracking was implemented
 		if nodeset.Status.ServiceCredentialStatus == nil {
-			log.V(1).Info("Skipping nodeset with no credential status",
-				"nodeset", nodeset.Name)
+			log.Info("Nodeset has no credential status - cannot verify safety",
+				"nodeset", nodeset.Name,
+				"namespace", nodeset.Namespace)
+			nodesetsWithEmptyStatus = append(nodesetsWithEmptyStatus, nodeset.Name)
 			continue
 		}
 
@@ -558,6 +567,16 @@ func (r *RabbitMQUserReconciler) isUserStillInUseByNodeSets(
 				}
 			}
 		}
+	}
+
+	// Check if any nodesets had empty status
+	// If so, we cannot safely determine if credentials are in use
+	// Return error to trigger grace period and allow time for status to be populated
+	if len(nodesetsWithEmptyStatus) > 0 {
+		return true, "", fmt.Errorf("cannot verify credential safety: %d nodeset(s) have empty serviceCredentialStatus - "+
+			"credential tracking may not be initialized yet. "+
+			"Will retry after grace period allows operators to reconcile and populate status",
+			len(nodesetsWithEmptyStatus))
 	}
 
 	// No nodesets are using this user's credentials on nodes that haven't been updated
