@@ -55,9 +55,9 @@ require (
 	golang.org/x/exp v0.0.0-20241217172543-b2144cdd0a67 // indirect
 	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/oauth2 v0.30.0 // indirect
-	golang.org/x/sys v0.40.0 // indirect
-	golang.org/x/term v0.39.0 // indirect
-	golang.org/x/text v0.33.0 // indirect
+	golang.org/x/sys v0.41.0 // indirect
+	golang.org/x/term v0.40.0 // indirect
+	golang.org/x/text v0.34.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
 	gomodules.xyz/jsonpatch/v2 v2.5.0 // indirect
 	google.golang.org/protobuf v1.36.7 // indirect
@@ -98,4 +98,4 @@ replace k8s.io/kube-openapi => k8s.io/kube-openapi v0.0.0-20250627150254-e9823e9
 
 replace github.com/cert-manager/cmctl/v2 => github.com/cert-manager/cmctl/v2 v2.1.2-0.20241127223932-88edb96860cf //allow-merging
 
-replace github.com/openstack-k8s-operators/openstack-operator/api => github.com/lmiccini/openstack-operator/api v0.0.0-20260221075805-1968e2a1bb53
+replace github.com/openstack-k8s-operators/openstack-operator/api => github.com/lmiccini/openstack-operator/api v0.0.0-20260305171738-3157e2baf011
