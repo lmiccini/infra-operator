@@ -26,7 +26,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
-	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
 	dataplanev1 "github.com/openstack-k8s-operators/openstack-operator/api/dataplane/v1beta1"
 )
 
@@ -48,19 +47,6 @@ func TestIsUserStillInUseByNodeSets(t *testing.T) {
 		wantInfoSubstr string
 		wantErr        bool
 	}{
-		{
-			name: "secret doesn't exist",
-			user: &rabbitmqv1.RabbitMQUser{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:              "test-user",
-					Namespace:         "test",
-					CreationTimestamp: metav1.Time{Time: baseTime},
-				},
-			},
-			secretName:     "nonexistent",
-			wantStillInUse: false,
-			wantErr:        false,
-		},
 		{
 			name: "no nodesets exist",
 			user: &rabbitmqv1.RabbitMQUser{
@@ -118,21 +104,18 @@ func TestIsUserStillInUseByNodeSets(t *testing.T) {
 						},
 					},
 					Status: dataplanev1.OpenStackDataPlaneNodeSetStatus{
-						ServiceCredentialStatus: map[string]dataplanev1.ServiceCredentialInfo{
-							"nova": {
-								SecretName:      "test-secret",
-								SecretHash:      "", // Will be set below to match actual hash
-								UpdatedNodes:    []string{"compute-0", "compute-1"},
-								TotalNodes:      3,
-								AllNodesUpdated: false,
-							},
+						SecretDeployment: &dataplanev1.SecretDeploymentStatus{
+							AllNodesUpdated: false,
+							TotalNodes:      3,
+							UpdatedNodes:    2,
+							ConfigMapName:   "test-nodeset-secret-tracking",
 						},
 					},
 				},
 			},
 			secretName:     "test-secret",
 			wantStillInUse: true,
-			wantInfoSubstr: "2/3 nodes have this credential",
+			wantInfoSubstr: "2/3 nodes updated",
 			wantErr:        false,
 		},
 		{
@@ -169,14 +152,11 @@ func TestIsUserStillInUseByNodeSets(t *testing.T) {
 						},
 					},
 					Status: dataplanev1.OpenStackDataPlaneNodeSetStatus{
-						ServiceCredentialStatus: map[string]dataplanev1.ServiceCredentialInfo{
-							"nova": {
-								SecretName:      "test-secret",
-								SecretHash:      "test-hash",
-								UpdatedNodes:    []string{"compute-0", "compute-1", "compute-2"},
-								TotalNodes:      3,
-								AllNodesUpdated: true,
-							},
+						SecretDeployment: &dataplanev1.SecretDeploymentStatus{
+							AllNodesUpdated: true,
+							TotalNodes:      3,
+							UpdatedNodes:    3,
+							ConfigMapName:   "test-nodeset-secret-tracking",
 						},
 					},
 				},
@@ -186,7 +166,7 @@ func TestIsUserStillInUseByNodeSets(t *testing.T) {
 			wantErr:        false,
 		},
 		{
-			name: "nodeset created before user with partial update blocks deletion",
+			name: "nodeset with no deployment status blocks deletion",
 			user: &rabbitmqv1.RabbitMQUser{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:              "test-user",
@@ -217,25 +197,16 @@ func TestIsUserStillInUseByNodeSets(t *testing.T) {
 						},
 					},
 					Status: dataplanev1.OpenStackDataPlaneNodeSetStatus{
-						ServiceCredentialStatus: map[string]dataplanev1.ServiceCredentialInfo{
-							"nova": {
-								SecretName:      "test-secret",
-								SecretHash:      "", // Will be set to match actual hash
-								UpdatedNodes:    []string{},
-								TotalNodes:      1,
-								AllNodesUpdated: false,
-							},
-						},
+						SecretDeployment: nil, // No tracking yet
 					},
 				},
 			},
 			secretName:     "test-secret",
-			wantStillInUse: true, // Even older nodesets block deletion if using credentials
-			wantInfoSubstr: "0/1 nodes have this credential",
-			wantErr:        false,
+			wantStillInUse: true,
+			wantErr:        true, // Cannot verify safety
 		},
 		{
-			name: "nodeset with different hash allows deletion",
+			name: "multiple nodesets - one incomplete blocks deletion",
 			user: &rabbitmqv1.RabbitMQUser{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:              "test-user",
@@ -256,9 +227,8 @@ func TestIsUserStillInUseByNodeSets(t *testing.T) {
 			nodesets: []*dataplanev1.OpenStackDataPlaneNodeSet{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:              "test-nodeset",
-						Namespace:         "test",
-						CreationTimestamp: metav1.Time{Time: baseTime.Add(1 * time.Second)},
+						Name:      "complete-nodeset",
+						Namespace: "test",
 					},
 					Spec: dataplanev1.OpenStackDataPlaneNodeSetSpec{
 						Nodes: map[string]dataplanev1.NodeSection{
@@ -266,47 +236,42 @@ func TestIsUserStillInUseByNodeSets(t *testing.T) {
 						},
 					},
 					Status: dataplanev1.OpenStackDataPlaneNodeSetStatus{
-						ServiceCredentialStatus: map[string]dataplanev1.ServiceCredentialInfo{
-							"nova": {
-								SecretName:      "test-secret",
-								SecretHash:      "different-hash-new-credentials",
-								UpdatedNodes:    []string{"compute-0"},
-								TotalNodes:      1,
-								AllNodesUpdated: true,
-							},
+						SecretDeployment: &dataplanev1.SecretDeploymentStatus{
+							AllNodesUpdated: true,
+							TotalNodes:      1,
+							UpdatedNodes:    1,
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "incomplete-nodeset",
+						Namespace: "test",
+					},
+					Spec: dataplanev1.OpenStackDataPlaneNodeSetSpec{
+						Nodes: map[string]dataplanev1.NodeSection{
+							"compute-1": {},
+							"compute-2": {},
+						},
+					},
+					Status: dataplanev1.OpenStackDataPlaneNodeSetStatus{
+						SecretDeployment: &dataplanev1.SecretDeploymentStatus{
+							AllNodesUpdated: false,
+							TotalNodes:      2,
+							UpdatedNodes:    1,
 						},
 					},
 				},
 			},
 			secretName:     "test-secret",
-			wantStillInUse: false, // Different hash = different credentials
+			wantStillInUse: true,
+			wantInfoSubstr: "1/2 nodes updated",
 			wantErr:        false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// If we have a secret, compute its hash and update nodesets that reference it
-			var actualHash string
-			if tt.secret != nil {
-				// Use util.ObjectHash to match production code
-				hash, err := util.ObjectHash(tt.secret.Data)
-				if err != nil {
-					t.Fatalf("Failed to compute hash: %v", err)
-				}
-				actualHash = hash
-
-				// Update nodeset status with actual hash
-				for _, ns := range tt.nodesets {
-					for svcName, credInfo := range ns.Status.ServiceCredentialStatus {
-						if credInfo.SecretName == tt.secret.Name && credInfo.SecretHash == "" {
-							credInfo.SecretHash = actualHash
-							ns.Status.ServiceCredentialStatus[svcName] = credInfo
-						}
-					}
-				}
-			}
-
 			// Build list of runtime objects
 			objs := []runtime.Object{tt.user}
 			if tt.secret != nil {

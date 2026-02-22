@@ -39,7 +39,6 @@ import (
 	helper "github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/object"
 	oko_secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
-	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
 	dataplanev1 "github.com/openstack-k8s-operators/openstack-operator/api/dataplane/v1beta1"
 	rabbitmqclusterv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
@@ -423,8 +422,12 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 }
 
 // isUserStillInUseByNodeSets checks if any nodeset still has nodes that haven't been
-// updated with new credentials yet. This prevents premature deletion when nodes are
-// offline or when partial deployments (AnsibleLimit) haven't covered all nodes.
+// updated with new secrets yet. This prevents premature deletion of old credentials when
+// nodes are offline or when partial deployments (AnsibleLimit) haven't covered all nodes.
+//
+// With the new generic secret tracking, we check if all nodes in all nodesets have been
+// updated with their current secret versions. If any nodeset has AllNodesUpdated=false,
+// it means some nodes may still be using old credentials, so we block deletion.
 func (r *RabbitMQUserReconciler) isUserStillInUseByNodeSets(
 	ctx context.Context,
 	instance *rabbitmqv1.RabbitMQUser,
@@ -432,42 +435,11 @@ func (r *RabbitMQUserReconciler) isUserStillInUseByNodeSets(
 ) (stillInUse bool, nodesetInfo string, err error) {
 	log := log.FromContext(ctx)
 
-	// 1. Get THIS user's secret
-	secret := &corev1.Secret{}
-	err = r.Get(ctx, types.NamespacedName{
-		Name:      secretName,
-		Namespace: instance.Namespace,
-	}, secret)
-	if err != nil {
-		if k8s_errors.IsNotFound(err) {
-			// Secret doesn't exist - can't be in use
-			log.Info("Secret not found, not in use", "secret", secretName)
-			return false, "", nil
-		}
-		// Conservative: if we can't get the secret, block deletion
-		return true, "", fmt.Errorf("failed to get secret: %w", err)
-	}
-
-	// 2. Compute THIS user's secret hash
-	if secret.Data == nil {
-		// Secret exists but has no data - can't be in use
-		log.Info("Secret has no data, not in use", "secret", secretName)
-		return false, "", nil
-	}
-
-	thisUserSecretHash, err := util.ObjectHash(secret.Data)
-	if err != nil {
-		// Conservative: if we can't compute hash, block deletion
-		return true, "", fmt.Errorf("failed to compute secret hash: %w", err)
-	}
-
-	log.Info("Checking nodesets for credential usage",
+	log.Info("Checking nodesets for secret deployment status",
 		"secret", secretName,
-		"thisUserHash", thisUserSecretHash)
+		"namespace", instance.Namespace)
 
-	// 3. List OpenStackDataPlaneNodeSets in the same namespace
-	// NOTE: This lists all nodesets in the namespace. For large-scale deployments,
-	// consider adding field indexing or label selectors to filter by credential usage.
+	// List OpenStackDataPlaneNodeSets in the same namespace
 	nodesets := &dataplanev1.OpenStackDataPlaneNodeSetList{}
 	if err := r.List(ctx, nodesets, client.InNamespace(instance.Namespace)); err != nil {
 		// Conservative: if we can't list nodesets, block deletion
@@ -481,108 +453,67 @@ func (r *RabbitMQUserReconciler) isUserStillInUseByNodeSets(
 		return false, "", nil
 	}
 
-	log.V(1).Info("Checking credential status across nodesets",
+	log.V(1).Info("Checking secret deployment status across nodesets",
 		"nodesetCount", len(nodesets.Items),
 		"namespace", instance.Namespace)
 
-	// Track nodesets with empty status
-	// This is important for the bootstrapping case where tracking hasn't run yet
+	// Track nodesets with empty status or incomplete rollout
 	var nodesetsWithEmptyStatus []string
+	var nodesetsWithIncompleteRollout []string
 
-	// 4. Check each nodeset's credential status
+	// Check each nodeset's secret deployment status
 	for i := range nodesets.Items {
 		nodeset := &nodesets.Items[i]
 
 		// Check for context cancellation
 		if err := ctx.Err(); err != nil {
-			// Context cancelled (e.g., pod shutdown)
-			// Return error so caller can apply grace period logic
 			return true, "", fmt.Errorf("context cancelled during nodeset check: %w", err)
 		}
 
-		// Check if nodeset has no credential status
-		// This can happen when:
-		// 1. New tracking code deployed, old deployments not yet reconciled
-		// 2. Deployments ran before tracking was implemented
-		if nodeset.Status.ServiceCredentialStatus == nil {
-			log.Info("Nodeset has no credential status - cannot verify safety",
+		// Check if all nodes in this nodeset have been updated using helper function
+		if !nodeset.AreAllNodesUpdated() {
+			// Either tracking not initialized OR not all nodes have current versions
+			// Check which case it is for better error messaging
+			if nodeset.Status.SecretDeployment == nil {
+				log.Info("Nodeset has no secret deployment status - cannot verify safety",
+					"nodeset", nodeset.Name,
+					"namespace", nodeset.Namespace)
+				nodesetsWithEmptyStatus = append(nodesetsWithEmptyStatus, nodeset.Name)
+				continue
+			}
+
+			// Not all nodes have current versions - some may still have old credentials
+			// Block deletion to prevent breaking nodes that haven't been updated
+			info := fmt.Sprintf("nodeset %s/%s: %d/%d nodes updated with current secrets",
+				nodeset.Namespace, nodeset.Name,
+				nodeset.Status.SecretDeployment.UpdatedNodes,
+				nodeset.Status.SecretDeployment.TotalNodes)
+
+			log.Info("Nodeset has nodes with pending secret updates, blocking deletion",
 				"nodeset", nodeset.Name,
-				"namespace", nodeset.Namespace)
-			nodesetsWithEmptyStatus = append(nodesetsWithEmptyStatus, nodeset.Name)
-			continue
+				"namespace", nodeset.Namespace,
+				"updatedNodes", nodeset.Status.SecretDeployment.UpdatedNodes,
+				"totalNodes", nodeset.Status.SecretDeployment.TotalNodes)
+
+			nodesetsWithIncompleteRollout = append(nodesetsWithIncompleteRollout, nodeset.Name)
+			return true, info, nil
 		}
 
-		// Check each service in the nodeset
-		for serviceName, credInfo := range nodeset.Status.ServiceCredentialStatus {
-			// Check if this service uses this secret name (current version)
-			if credInfo.SecretName == secretName {
-				// Check if it's using THIS user's hash
-				if credInfo.SecretHash == thisUserSecretHash {
-					// NodeSet is tracking this credential - means dataplane nodes have been
-					// deployed with this credential and are using it
-					// BLOCK deletion regardless of allNodesUpdated status
-					info := fmt.Sprintf("nodeset %s/%s, service %s: %d/%d nodes have this credential (allNodesUpdated: %v)",
-						nodeset.Namespace, nodeset.Name, serviceName,
-						len(credInfo.UpdatedNodes), credInfo.TotalNodes, credInfo.AllNodesUpdated)
-
-					log.Info("User credentials deployed to nodeset (current version), blocking deletion",
-						"nodeset", nodeset.Name,
-						"namespace", nodeset.Namespace,
-						"service", serviceName,
-						"updatedNodes", len(credInfo.UpdatedNodes),
-						"totalNodes", credInfo.TotalNodes,
-						"allNodesUpdated", credInfo.AllNodesUpdated,
-						"secretHash", thisUserSecretHash)
-
-					return true, info, nil
-				}
-			}
-
-			// BUG FIX: Also check if this service uses this secret as PREVIOUS version
-			// During credential rotation, nodes may still have old credentials.
-			// The PreviousSecretHash field is only set when a new credential is deployed but
-			// not all nodes have it yet. It's cleared when AllNodesUpdated becomes true for
-			// the current version. So if PreviousSecretHash exists, by definition some nodes
-			// still have the old credential and we must block deletion.
-			if credInfo.PreviousSecretName == secretName {
-				if credInfo.PreviousSecretHash == thisUserSecretHash {
-					// Previous credential still tracked - means rotation in progress
-					// BLOCK deletion until all nodes migrated to new version
-					info := fmt.Sprintf("nodeset %s/%s, service %s: previous credential still tracked during rotation (current: %d/%d nodes updated)",
-						nodeset.Namespace, nodeset.Name, serviceName,
-						len(credInfo.UpdatedNodes), credInfo.TotalNodes)
-
-					log.Info("User credentials in previous version during rotation, blocking deletion",
-						"nodeset", nodeset.Name,
-						"namespace", nodeset.Namespace,
-						"service", serviceName,
-						"currentSecret", credInfo.SecretName,
-						"previousSecret", credInfo.PreviousSecretName,
-						"updatedNodes", len(credInfo.UpdatedNodes),
-						"totalNodes", credInfo.TotalNodes,
-						"allNodesUpdated", credInfo.AllNodesUpdated,
-						"previousSecretHash", thisUserSecretHash)
-
-					return true, info, nil
-				}
-			}
-		}
+		log.V(1).Info("Nodeset has all nodes updated",
+			"nodeset", nodeset.Name)
 	}
 
 	// Check if any nodesets had empty status
-	// If so, we cannot safely determine if credentials are in use
-	// Return error to trigger grace period and allow time for status to be populated
 	if len(nodesetsWithEmptyStatus) > 0 {
-		return true, "", fmt.Errorf("cannot verify credential safety: %d nodeset(s) have empty serviceCredentialStatus - "+
-			"credential tracking may not be initialized yet. "+
+		return true, "", fmt.Errorf("cannot verify credential safety: %d nodeset(s) have empty SecretDeployment status - "+
+			"secret tracking may not be initialized yet. "+
 			"Will retry after grace period allows operators to reconcile and populate status",
 			len(nodesetsWithEmptyStatus))
 	}
 
-	// No nodesets are using this user's credentials on nodes that haven't been updated
-	log.Info("All deletion safety checks passed - credentials not in use by any nodesets",
+	// All nodesets have all nodes updated with current secrets
+	log.Info("All deletion safety checks passed - all nodesets have updated nodes",
 		"secret", secretName,
-		"thisUserHash", thisUserSecretHash,
 		"nodesetsChecked", len(nodesets.Items))
 	return false, "", nil
 }
