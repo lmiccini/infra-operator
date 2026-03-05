@@ -51,6 +51,10 @@ const (
 	QueueTypeQuorum = "Quorum"
 	// QueueTypeNone - no special queue type
 	QueueTypeNone = "None"
+
+	// Annotations
+	// AnnotationTargetVersion - annotation key for target RabbitMQ version (set by openstack-operator)
+	AnnotationTargetVersion = "rabbitmq.openstack.org/target-version"
 )
 
 // PodOverride defines per-pod service configurations
@@ -133,6 +137,25 @@ type RabbitMqStatus struct {
 	// When populated, transport URLs use these hostnames instead of pod names.
 	// +listType=atomic
 	ServiceHostnames []string `json:"serviceHostnames,omitempty"`
+
+	// CurrentVersion - the currently deployed RabbitMQ version (e.g., "3.9", "4.2")
+	// This is controller-managed and reflects the actual running version.
+	// openstack-operator should use the "rabbitmq.openstack.org/target-version" annotation to request version changes.
+	CurrentVersion string `json:"currentVersion,omitempty"`
+
+	// UpgradePhase - tracks the current phase of a version upgrade or migration
+	// Valid values:
+	//   "" (no upgrade in progress)
+	//   "DeletingResources" (deleting ha-all policy and StatefulSet)
+	//   "WaitingForCluster" (waiting for cluster to become ready with new version)
+	// This allows resuming upgrades that failed midway.
+	UpgradePhase string `json:"upgradePhase,omitempty"`
+
+	// ProxyRequired - tracks whether the AMQP proxy sidecar is required for this cluster.
+	// Set to true when upgrading from RabbitMQ 3.x to 4.x with Quorum queues.
+	// The proxy allows non-durable clients to work with quorum queues during the upgrade window.
+	// Only cleared when the "rabbitmq.openstack.org/clients-reconfigured" annotation is set.
+	ProxyRequired bool `json:"proxyRequired,omitempty"`
 }
 
 //+kubebuilder:object:root=true
@@ -169,7 +192,7 @@ func (instance RabbitMq) IsReady() bool {
 }
 
 // RbacConditionsSet - set the conditions for the rbac object
-func (instance RabbitMq) RbacConditionsSet(c *condition.Condition) {
+func (instance *RabbitMq) RbacConditionsSet(c *condition.Condition) {
 	instance.Status.Conditions.Set(c)
 }
 
@@ -180,12 +203,12 @@ func (instance RabbitMq) RbacNamespace() string {
 
 // RbacResourceName - return the name to be used for rbac objects (serviceaccount, role, rolebinding)
 func (instance RabbitMq) RbacResourceName() string {
-	return "redis-" + instance.Name
+	return "rabbitmq-" + instance.Name
 }
 
 // SetupDefaults - initializes any CRD field defaults based on environment variables (the defaulting mechanism itself is implemented via webhooks)
 func SetupDefaults() {
-	// Acquire environmental defaults and initialize Redis defaults with them
+	// Acquire environmental defaults and initialize RabbitMQ defaults with them
 	rabbitMqDefaults := RabbitMqDefaults{
 		ContainerImageURL: util.GetEnvVar("RELATED_IMAGE_RABBITMQ_IMAGE_URL_DEFAULT", RabbitMqContainerImage),
 	}
