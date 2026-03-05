@@ -4,6 +4,7 @@ package impl
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
@@ -14,6 +15,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+)
+
+const (
+	// managedAnnotationPrefix is the prefix for annotations managed by this operator.
+	// Only annotations with this prefix will be synced/removed on the RabbitmqCluster.
+	managedAnnotationPrefix = "rabbitmq.openstack.org/"
 )
 
 // NewRabbitMqCluster returns an initialized RabbitmqCluster.
@@ -40,6 +47,37 @@ func (r *RabbitMqCluster) CreateOrPatch(
 	}
 
 	op, err := controllerutil.CreateOrPatch(ctx, h.GetClient(), rabbitmq, func() error {
+		// Sync annotations with managed prefix to match desired state.
+		// Only annotations with the managedAnnotationPrefix are added/removed.
+		// Annotations from other controllers/tools are left untouched.
+		if rabbitmq.Annotations == nil {
+			rabbitmq.Annotations = make(map[string]string)
+		}
+		// Add/update managed annotations from desired spec
+		for k, v := range r.rabbitmqCluster.Annotations {
+			if strings.HasPrefix(k, managedAnnotationPrefix) {
+				rabbitmq.Annotations[k] = v
+			}
+		}
+		// Remove managed annotations that exist on the cluster but not in desired spec
+		for k := range rabbitmq.Annotations {
+			if strings.HasPrefix(k, managedAnnotationPrefix) {
+				if _, existsInDesired := r.rabbitmqCluster.Annotations[k]; !existsInDesired {
+					delete(rabbitmq.Annotations, k)
+				}
+			}
+		}
+
+		// Sync labels from desired spec
+		if r.rabbitmqCluster.Labels != nil {
+			if rabbitmq.Labels == nil {
+				rabbitmq.Labels = make(map[string]string)
+			}
+			for k, v := range r.rabbitmqCluster.Labels {
+				rabbitmq.Labels[k] = v
+			}
+		}
+
 		rabbitmq.Spec.Image = r.rabbitmqCluster.Spec.Image
 		rabbitmq.Spec.Replicas = r.rabbitmqCluster.Spec.Replicas
 		rabbitmq.Spec.Tolerations = r.rabbitmqCluster.Spec.Tolerations

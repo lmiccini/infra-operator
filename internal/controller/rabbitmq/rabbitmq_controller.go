@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -67,6 +69,43 @@ func (r *Reconciler) GetLogger(ctx context.Context) logr.Logger {
 	return log.FromContext(ctx).WithName("Controllers").WithName("RabbitMq")
 }
 
+// requiresStorageWipe determines if a version change requires full storage wipe
+// Returns true for major/minor version changes, false for same version or patch changes.
+//
+// Storage wipe is required for:
+// - Major/minor version changes (e.g., 3.9 -> 4.2, 4.2 -> 3.9, 3.9 -> 3.13)
+// - Both upgrades and downgrades
+//
+// Storage wipe is NOT required for:
+// - Same version (e.g., 3.9 -> 3.9)
+// - Patch version changes (e.g., 3.9.0 -> 3.9.1, 4.2.0 -> 4.2.1)
+//
+// Based on https://www.rabbitmq.com/docs/upgrade#rabbitmq-version-upgradability
+func requiresStorageWipe(fromStr, toStr string) (bool, error) {
+	if fromStr == toStr {
+		return false, nil
+	}
+
+	from, err := rabbitmq.ParseRabbitMQVersion(fromStr)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse current version %q: %w", fromStr, err)
+	}
+
+	to, err := rabbitmq.ParseRabbitMQVersion(toStr)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse target version %q: %w", toStr, err)
+	}
+
+	// Same major.minor version (patch changes only) - no wipe needed
+	if from.Major == to.Major && from.Minor == to.Minor {
+		return false, nil
+	}
+
+	// Any major or minor version change requires storage wipe
+	// This includes both upgrades (3.9 -> 4.2) and downgrades (4.2 -> 3.9)
+	return true, nil
+}
+
 // fields to index to reconcile on CR change
 const (
 	serviceSecretNameField = ".spec.tls.SecretName"
@@ -78,6 +117,15 @@ const (
 	rabbitmqClusterFinalizer = "rabbitmq.openstack.org/cluster-finalizer"
 )
 
+// RabbitMQ version upgrade constants
+const (
+	// DefaultRabbitMQVersion is the default RabbitMQ version when the target-version annotation is not set
+	// This constant is used for Status.CurrentVersion initialization to maintain backwards compatibility
+	DefaultRabbitMQVersion = "4.2"
+	// UpgradeCheckInterval is how often to check upgrade progress
+	UpgradeCheckInterval = 2 * time.Second
+)
+
 var rmqAllWatchFields = []string{
 	serviceSecretNameField,
 	caSecretNameField,
@@ -87,9 +135,10 @@ var rmqAllWatchFields = []string{
 // Reconciler reconciles a RabbitMq object
 type Reconciler struct {
 	client.Client
-	Kclient kubernetes.Interface
-	config  *rest.Config
-	Scheme  *runtime.Scheme
+	Kclient  kubernetes.Interface
+	config   *rest.Config
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs,verbs=get;list;watch;create;update;patch;delete
@@ -108,6 +157,9 @@ type Reconciler struct {
 
 // Required to manage PodDisruptionBudgets for multi-replica deployments
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+
+// Required to delete StatefulSet during version upgrade storage wipe
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;delete
 
 // Required to create per-pod LoadBalancer services
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
@@ -141,11 +193,131 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, err
 	}
 
+	// Initialize RabbitMQ version in Status if it doesn't exist
+	// Status is controller-managed and can't be directly modified by users
+	// CRITICAL: We must detect existing clusters to properly trigger upgrades
+	if instance.Status.CurrentVersion == "" {
+		// Priority order for determining initial version:
+		// 1. Check if RabbitMQCluster exists (upgrade scenario - infer we're on 3.9 for backwards compat)
+		// 2. Use target-version annotation if set by openstack-operator (new deployment with explicit version)
+		// 3. Fall back to DefaultRabbitMQVersion for new deployments without annotation
+		initialVersion := DefaultRabbitMQVersion
+
+		// ALWAYS check if cluster exists first, regardless of annotation presence
+		// This ensures we detect upgrades from old deployments (3.9) to new versions (4.2)
+		existingCluster := &rabbitmqv2.RabbitmqCluster{}
+		clusterKey := types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}
+		err := r.Get(ctx, clusterKey, existingCluster)
+
+		if err == nil && !existingCluster.CreationTimestamp.IsZero() {
+			// RabbitMQCluster exists - this is an existing deployment being reconciled
+			// by a new operator version that tracks Status.CurrentVersion
+			// Assume 3.9 for backwards compatibility (old deployments defaulted to 3.9)
+			// This triggers proper storage wipe when target-version annotation is 4.2
+			initialVersion = "3.9"
+			Log.Info("Existing RabbitMQCluster found - initializing CurrentVersion for upgrade tracking",
+				"cluster", clusterKey,
+				"clusterCreated", existingCluster.CreationTimestamp,
+				"initialVersion", initialVersion)
+		} else if err != nil && !k8s_errors.IsNotFound(err) {
+			// Error checking for cluster (not NotFound) - log but continue with default
+			Log.Error(err, "Failed to check for existing RabbitMQCluster during version initialization")
+		} else {
+			// Cluster doesn't exist (NotFound) - this is a new deployment
+			// Check if target-version annotation is set to use explicit version
+			if instance.Annotations != nil {
+				if targetVersion, hasTarget := instance.Annotations[rabbitmqv1beta1.AnnotationTargetVersion]; hasTarget && targetVersion != "" {
+					initialVersion = targetVersion
+					Log.Info("New deployment with target-version annotation",
+						"initialVersion", initialVersion)
+				}
+			}
+			// Otherwise use DefaultRabbitMQVersion (4.2) for new deployments
+		}
+
+		instance.Status.CurrentVersion = initialVersion
+		Log.Info("Initialized RabbitMQ current version in status", "version", initialVersion)
+		// Persist the status update
+		if err := helper.PatchInstance(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Check if storage wipe is needed for:
+	// 1. Version upgrades (major/minor version changes)
+	// 2. Queue type migration from Mirrored to Quorum
+	var requiresWipe bool
+	var wipeReason string
+
+	// If wipe is already in progress, continue with it
+	switch instance.Status.UpgradePhase {
+	case "DeletingResources":
+		requiresWipe = true
+		// Determine wipe reason based on current state
+		if instance.Annotations != nil {
+			if _, hasTarget := instance.Annotations[rabbitmqv1beta1.AnnotationTargetVersion]; hasTarget {
+				wipeReason = "version upgrade"
+			}
+		}
+		if wipeReason == "" {
+			wipeReason = "queue type migration"
+		}
+	case "":
+		// Only check for new wipe if not already in an upgrade phase (prevents infinite loop)
+		// Check for version upgrade requiring wipe
+		// Current version comes from Status (controller-managed)
+		// Target version comes from annotation (set by openstack-operator)
+		currentVersion := instance.Status.CurrentVersion
+		if instance.Annotations != nil {
+			if targetVersion, hasTarget := instance.Annotations[rabbitmqv1beta1.AnnotationTargetVersion]; hasTarget && targetVersion != "" {
+				needsWipe, err := requiresStorageWipe(currentVersion, targetVersion)
+				if err != nil {
+					Log.Error(err, "Failed to determine upgrade compatibility",
+						"currentVersion", currentVersion,
+						"targetVersion", targetVersion)
+					return ctrl.Result{}, fmt.Errorf("failed to check upgrade compatibility: %w", err)
+				}
+				if needsWipe {
+					requiresWipe = true
+					wipeReason = "version upgrade"
+					Log.Info("RabbitMQ upgrade requires storage wipe (no direct upgrade path)",
+						"currentVersion", currentVersion,
+						"targetVersion", targetVersion)
+				}
+			}
+		}
+
+		// Check for manual queue type migration from Mirrored to Quorum
+		// This requires storage wipe as mirrored queues cannot be converted to quorum in-place
+		if !requiresWipe && instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
+			if instance.Status.QueueType == rabbitmqv1beta1.QueueTypeMirrored {
+				requiresWipe = true
+				wipeReason = "queue type migration"
+				Log.Info("Queue type change from Mirrored to Quorum requires storage wipe",
+					"oldQueueType", instance.Status.QueueType,
+					"newQueueType", *instance.Spec.QueueType)
+			}
+		}
+	}
+
 	// initialize status if Conditions is nil, but do not reset if it already
 	// exists
 	isNewInstance := instance.Status.Conditions == nil
 	if isNewInstance {
 		instance.Status.Conditions = condition.Conditions{}
+	}
+
+	// Add finalizer if not being deleted and finalizer doesn't exist
+	// This ensures reconcileDelete() is called when the CR is deleted
+	if instance.DeletionTimestamp.IsZero() && controllerutil.AddFinalizer(instance, helper.GetFinalizer()) {
+		Log.Info("Added finalizer to RabbitMq CR")
+		// Persist the finalizer addition
+		if err := helper.GetClient().Update(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+		// Requeue to continue reconciliation with finalizer in place
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Save a copy of the condtions so that we can restore the LastTransitionTime
@@ -198,14 +370,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	if instance.Spec.TopologyRef != nil {
 		c := condition.UnknownCondition(condition.TopologyReadyCondition, condition.InitReason, condition.TopologyReadyInitMessage)
 		cl.Set(c)
-	}
-
-	// If we're not deleting this and the service object doesn't have our finalizer, add it.
-	if instance.DeletionTimestamp.IsZero() {
-		if controllerutil.AddFinalizer(instance, helper.GetFinalizer()) {
-			// Finalizer was added, will be persisted by defer PatchInstance
-			return ctrl.Result{}, nil
-		}
 	}
 
 	// Handle service delete
@@ -269,16 +433,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, fmt.Errorf("error getting cluster FIPS config: %w", err)
 	}
 
-	// NOTE(dciabrin) OSPRH-20331 reported RabbitMQ partitionning during
-	// key update events, so until this can be resolved, revert to the
-	// same configuration scheme as OSP17 (see OSPRH-13633)
-	var tlsVersions string
-	if fipsEnabled {
-		tlsVersions = "['tlsv1.2','tlsv1.3']"
-	} else {
-		tlsVersions = "['tlsv1.2']"
+	tlsCurrentVersion := instance.Status.CurrentVersion
+	if tlsCurrentVersion == "" {
+		tlsCurrentVersion = DefaultRabbitMQVersion
 	}
+	tlsVersions := rabbitmq.TLSVersionsForRabbitMQ(tlsCurrentVersion, fipsEnabled)
 	// RabbitMq config maps
+	// Owner reference is set to RabbitMq CR (not RabbitMQCluster) so ConfigMaps persist
+	// during pod termination (while finalizer blocks CR deletion) and are garbage collected
+	// automatically when the CR is deleted (after finalizer removal)
 	cms := []util.Template{
 		{
 			Name:         fmt.Sprintf("%s-config-data", instance.Name),
@@ -328,6 +491,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			Namespace: instance.Namespace,
 		},
 	}
+
+	// Manage the temporary storage-wipe-needed annotation.
+	// Add it when UpgradePhase is "DeletingResources" or "WaitingForCluster" so the
+	// RabbitmqCluster spec includes the wipe init container BEFORE we delete the StatefulSet.
+	// The cluster operator will then recreate the StatefulSet with the updated spec.
+	if instance.Status.UpgradePhase == "DeletingResources" || instance.Status.UpgradePhase == "WaitingForCluster" {
+		if rabbitmqCluster.Annotations == nil {
+			rabbitmqCluster.Annotations = make(map[string]string)
+		}
+		rabbitmqCluster.Annotations["rabbitmq.openstack.org/storage-wipe-needed"] = "true"
+	}
+	// When UpgradePhase is empty, the annotation is not added above.
+	// CreateOrPatch syncs the desired state, effectively removing the annotation.
 
 	err = instance.Spec.MarshalInto(&rabbitmqCluster.Spec)
 	if err != nil {
@@ -382,7 +558,84 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		instance.Status.LastAppliedTopology = nil
 	}
 
-	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, instance.Spec.Override)
+	//
+	// Handle storage wipe scenarios (phase 1 of 2: set initial phase).
+	// The actual StatefulSet deletion happens AFTER CreateOrPatch so the
+	// RabbitmqCluster spec is updated with the wipe init container first.
+	// Phase flow: "" → "DeletingResources" → "WaitingForCluster" → ""
+	//
+	if requiresWipe && instance.Status.UpgradePhase == "" {
+		instance.Status.UpgradePhase = "DeletingResources"
+		Log.Info("Starting storage wipe", "reason", wipeReason, "phase", "DeletingResources")
+
+		if r.Recorder != nil {
+			if wipeReason == "version upgrade" && instance.Annotations != nil {
+				if targetVersion, hasTarget := instance.Annotations[rabbitmqv1beta1.AnnotationTargetVersion]; hasTarget && targetVersion != "" {
+					r.Recorder.Eventf(instance, corev1.EventTypeNormal, "UpgradeStarted",
+						"Starting RabbitMQ upgrade from %s to %s (requires storage wipe)",
+						instance.Status.CurrentVersion, targetVersion)
+				}
+			} else {
+				r.Recorder.Eventf(instance, corev1.EventTypeNormal, "MigrationStarted",
+					"Starting queue type migration (requires storage wipe)")
+			}
+		}
+
+		if err := helper.PatchInstance(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Get target version for configuration
+	// During upgrade, use target-version if set, otherwise use CurrentVersion
+	// This ensures we configure the cluster for the version we're upgrading TO,
+	// not the version we're upgrading FROM (which would cause config to change mid-upgrade)
+	configVersion := ""
+	if instance.Annotations != nil {
+		configVersion = instance.Annotations[rabbitmqv1beta1.AnnotationTargetVersion]
+	}
+	if configVersion == "" {
+		// No upgrade in progress - use current version
+		configVersion = instance.Status.CurrentVersion
+		if configVersion == "" {
+			configVersion = DefaultRabbitMQVersion
+		}
+	}
+
+	// Determine if we need to add data-wipe init container:
+	// 1. During storage wipe (temporary annotation set), OR
+	// 2. If cluster already has it (preserve to avoid pod restarts)
+	// Version-specific marker files prevent duplicate wipes across pod restarts
+	needsDataWipe := rabbitmqCluster.Annotations != nil &&
+		rabbitmqCluster.Annotations["rabbitmq.openstack.org/storage-wipe-needed"] == "true"
+
+	// Add during storage wipe when temporary annotation is set
+
+	// Preserve init container if it already exists (avoid pod restarts)
+	if !needsDataWipe {
+		existingCluster := &rabbitmqv2.RabbitmqCluster{}
+		if err := r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, existingCluster); err == nil {
+			// Check if init container already present
+			if existingCluster.Spec.Override.StatefulSet != nil &&
+				existingCluster.Spec.Override.StatefulSet.Spec != nil &&
+				existingCluster.Spec.Override.StatefulSet.Spec.Template != nil &&
+				existingCluster.Spec.Override.StatefulSet.Spec.Template.Spec != nil {
+				for _, container := range existingCluster.Spec.Override.StatefulSet.Spec.Template.Spec.InitContainers {
+					if container.Name == "wipe-data" {
+						needsDataWipe = true
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Use same version for wipe marker as for cluster configuration
+	// This ensures consistency throughout the upgrade
+	targetVersion := configVersion
+
+	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, instance.Spec.Override, instance.Spec.QueueType, configVersion, needsDataWipe, targetVersion)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -391,6 +644,55 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			condition.ServiceConfigReadyErrorMessage,
 			err.Error()))
 		return ctrl.Result{}, fmt.Errorf("error configuring RabbitmqCluster: %w", err)
+	}
+
+	// Manage ProxyRequired status flag
+	// Set to true when we detect a 3.x → 4.x upgrade with Quorum migration
+	// Clear when clients-reconfigured annotation is set
+	if instance.Annotations != nil {
+		if configured, ok := instance.Annotations["rabbitmq.openstack.org/clients-reconfigured"]; ok && configured == "true" {
+			// Clients have been reconfigured, clear proxy requirement
+			if instance.Status.ProxyRequired {
+				instance.Status.ProxyRequired = false
+				Log.Info("Clients reconfigured - clearing proxy requirement")
+			}
+		}
+	}
+
+	// Set ProxyRequired if we're in a 3.x → 4.x upgrade with Quorum migration
+	if !instance.Status.ProxyRequired && instance.Status.UpgradePhase != "" {
+		if instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
+			currentVersion := instance.Status.CurrentVersion
+			targetVersion := ""
+			if instance.Annotations != nil {
+				targetVersion = instance.Annotations[rabbitmqv1beta1.AnnotationTargetVersion]
+			}
+			// Only set ProxyRequired if upgrading FROM 3.x TO 4.x
+			if currentVersion != "" && targetVersion != "" && rabbitmq.Is3xTo4xUpgrade(currentVersion, targetVersion) {
+				instance.Status.ProxyRequired = true
+				Log.Info("Detected 3.x → 4.x upgrade with Quorum migration - enabling proxy requirement")
+			}
+		}
+	}
+
+	// Add AMQP proxy sidecar if needed for upgrade or queue migration
+	// Proxy allows non-durable clients to work with durable quorum queues
+	if r.shouldEnableProxy(instance) {
+		// IMPORTANT: Configure TLS for inter-node only
+		// We keep TLS enabled for secure inter-node communication, but allow non-TLS AMQP listeners
+		// The proxy will handle client TLS termination instead of RabbitMQ
+		// Set DisableNonTLSListeners=false AFTER ConfigureCluster() so it doesn't get overridden
+		rabbitmqCluster.Spec.TLS.DisableNonTLSListeners = false
+		Log.Info("Proxy enabled - configured TLS for inter-node only (proxy will handle client TLS)")
+
+		// Create ConfigMap with proxy script
+		if err := r.ensureProxyConfigMap(ctx, instance, helper); err != nil {
+			Log.Error(err, "Failed to create proxy ConfigMap")
+			return ctrl.Result{}, err
+		}
+
+		// Add proxy sidecar container and configure backend port
+		r.addProxySidecar(ctx, instance, rabbitmqCluster)
 	}
 
 	rabbitmqImplCluster := impl.NewRabbitMqCluster(rabbitmqCluster, 5)
@@ -412,6 +714,69 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	//
+	// Handle storage wipe scenarios (phase 2 of 2: delete StatefulSet).
+	// The RabbitmqCluster spec has been updated above (via CreateOrPatch) with
+	// the wipe init container. Now we delete the StatefulSet so the cluster
+	// operator recreates it with the new spec. The RabbitmqCluster CR and its
+	// default-user secret survive untouched.
+	//
+	if requiresWipe {
+		switch instance.Status.UpgradePhase {
+		case "DeletingResources":
+			Log.Info("Deleting StatefulSet for storage wipe", "reason", wipeReason)
+
+			// Delete ha-all policy if needed (for Mirrored queue migrations)
+			needsPolicyDeletion := wipeReason == "queue type migration" ||
+				(wipeReason == "version upgrade" && string(instance.Status.QueueType) == "Mirrored")
+			if needsPolicyDeletion {
+				if err := deleteMirroredPolicy(ctx, helper, instance); err != nil {
+					Log.Error(err, "Failed to delete ha-all policy during storage wipe")
+					return ctrl.Result{}, err
+				}
+			}
+
+			// Delete the StatefulSet — the cluster operator will recreate it
+			// from the updated RabbitmqCluster spec (which now includes the wipe init container)
+			sts := &appsv1.StatefulSet{}
+			stsName := types.NamespacedName{Name: instance.Name + "-server", Namespace: instance.Namespace}
+			if err := r.Get(ctx, stsName, sts); err != nil {
+				if !k8s_errors.IsNotFound(err) {
+					Log.Error(err, "Failed to get StatefulSet for deletion")
+					return ctrl.Result{}, err
+				}
+				Log.Info("StatefulSet already deleted", "name", stsName.Name)
+			} else {
+				if err := r.Delete(ctx, sts); err != nil && !k8s_errors.IsNotFound(err) {
+					Log.Error(err, "Failed to delete StatefulSet during storage wipe")
+					return ctrl.Result{}, err
+				}
+				Log.Info("Deleted StatefulSet for storage wipe", "name", stsName.Name)
+			}
+
+			// Update queue type status for queue migrations
+			if wipeReason == "queue type migration" && instance.Spec.QueueType != nil {
+				switch *instance.Spec.QueueType {
+				case rabbitmqv1beta1.QueueTypeQuorum:
+					instance.Status.QueueType = rabbitmqv1beta1.QueueTypeQuorum
+				case rabbitmqv1beta1.QueueTypeMirrored:
+					instance.Status.QueueType = rabbitmqv1beta1.QueueTypeMirrored
+				default:
+					instance.Status.QueueType = ""
+				}
+				Log.Info("Updated Status.QueueType after queue migration", "queueType", instance.Status.QueueType)
+			}
+
+			instance.Status.UpgradePhase = "WaitingForCluster"
+			if err := helper.PatchInstance(ctx, instance); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{Requeue: true}, nil
+
+		}
+		// UpgradePhase == "WaitingForCluster": fall through to clusterReady check below
+	}
+
 	clusterReady := false
 	if rabbitmqClusterInstance.Status.ObservedGeneration == rabbitmqClusterInstance.Generation {
 		for _, oldCond := range rabbitmqClusterInstance.Status.Conditions {
@@ -419,12 +784,31 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			// us to import "github.com/rabbitmq/cluster-operator/internal/status"
 			if string(oldCond.Type) == "ClusterAvailable" && oldCond.Status == corev1.ConditionTrue {
 				clusterReady = true
+				break
 			}
 		}
 	}
 
 	if clusterReady {
 		instance.Status.Conditions.MarkTrue(condition.DeploymentReadyCondition, condition.DeploymentReadyMessage)
+
+		// If we just completed a storage wipe, update CurrentVersion and clear UpgradePhase.
+		// The default-user secret survives because we only deleted the StatefulSet, not
+		// the RabbitmqCluster CR — no backup/restore dance needed.
+		if instance.Status.UpgradePhase == "WaitingForCluster" {
+			instance.Status.UpgradePhase = ""
+
+			if instance.Annotations != nil {
+				if targetVersion, hasTarget := instance.Annotations[rabbitmqv1beta1.AnnotationTargetVersion]; hasTarget && targetVersion != "" {
+					instance.Status.CurrentVersion = targetVersion
+					Log.Info("Version upgrade complete", "version", targetVersion)
+				}
+			}
+
+			if instance.Annotations == nil || instance.Annotations[rabbitmqv1beta1.AnnotationTargetVersion] == "" {
+				Log.Info("Queue migration complete - cluster recreated with new queue type")
+			}
+		}
 
 		labelMap := map[string]string{
 			labels.K8sAppName:      instance.Name,
@@ -491,20 +875,62 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		// Let's wait DeploymentReadyCondition=True to apply the policy
 		// QueueType should never be nil due to webhook defaulting, but add safety check
 		if instance.Spec.QueueType != nil {
-			if *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeMirrored && *instance.Spec.Replicas > 1 && instance.Status.QueueType != rabbitmqv1beta1.QueueTypeMirrored {
-				Log.Info("ha-all policy not present. Applying.")
-				err := ensureMirroredPolicy(ctx, helper, instance)
-				if err != nil {
-					Log.Error(err, "Could not apply ha-all policy")
-					instance.Status.Conditions.Set(condition.FalseCondition(
-						condition.DeploymentReadyCondition,
-						condition.ErrorReason,
-						condition.SeverityWarning,
-						condition.DeploymentReadyErrorMessage, err.Error()))
-					return ctrl.Result{}, err
+			switch *instance.Spec.QueueType {
+			case rabbitmqv1beta1.QueueTypeMirrored:
+				if instance.Spec.Replicas != nil && *instance.Spec.Replicas > 1 && instance.Status.QueueType != rabbitmqv1beta1.QueueTypeMirrored {
+					// Check RabbitMQ version before applying mirrored policy
+					// Use Status.CurrentVersion (controller-managed, can't be manipulated)
+					versionToCheck := instance.Status.CurrentVersion
+					if versionToCheck == "" {
+						versionToCheck = DefaultRabbitMQVersion
+					}
+					parsedVersion, err := rabbitmq.ParseRabbitMQVersion(versionToCheck)
+					if err != nil {
+						Log.Error(err, "Failed to parse RabbitMQ version for mirrored queue check", "version", versionToCheck)
+						instance.Status.Conditions.Set(condition.FalseCondition(
+							condition.DeploymentReadyCondition,
+							condition.ErrorReason,
+							condition.SeverityWarning,
+							condition.DeploymentReadyErrorMessage, err.Error()))
+						return ctrl.Result{}, err
+					}
+
+					// Mirrored queues are deprecated in RabbitMQ 4.2+
+					if parsedVersion.Major >= 4 {
+						Log.Info("Skipping mirrored queue policy - mirrored queues are deprecated in RabbitMQ 4.2 and later",
+							"currentVersion", versionToCheck)
+						// Clear the queue type status since we're not applying the policy
+						instance.Status.QueueType = ""
+					} else {
+						// RabbitMQ 3.x - apply mirrored policy
+						Log.Info("ha-all policy not present. Applying.")
+						err := ensureMirroredPolicy(ctx, helper, instance)
+						if err != nil {
+							Log.Error(err, "Could not apply ha-all policy")
+							instance.Status.Conditions.Set(condition.FalseCondition(
+								condition.DeploymentReadyCondition,
+								condition.ErrorReason,
+								condition.SeverityWarning,
+								condition.DeploymentReadyErrorMessage, err.Error()))
+							return ctrl.Result{}, err
+						}
+						instance.Status.QueueType = rabbitmqv1beta1.QueueTypeMirrored
+					}
 				}
-				instance.Status.QueueType = rabbitmqv1beta1.QueueTypeMirrored
-			} else if *instance.Spec.QueueType != rabbitmqv1beta1.QueueTypeMirrored && instance.Status.QueueType == rabbitmqv1beta1.QueueTypeMirrored {
+			case rabbitmqv1beta1.QueueTypeQuorum:
+				if instance.Status.QueueType != rabbitmqv1beta1.QueueTypeQuorum {
+					Log.Info("Setting queue type status to quorum")
+					instance.Status.QueueType = rabbitmqv1beta1.QueueTypeQuorum
+				}
+			case rabbitmqv1beta1.QueueTypeNone:
+				if instance.Status.QueueType != "" {
+					Log.Info("Setting queue type status to None (clearing)")
+					instance.Status.QueueType = ""
+				}
+			}
+
+			// Handle removal of Mirrored policy when switching away from Mirrored
+			if *instance.Spec.QueueType != rabbitmqv1beta1.QueueTypeMirrored && instance.Status.QueueType == rabbitmqv1beta1.QueueTypeMirrored {
 				Log.Info("QueueType changed from Mirrored. Removing ha-all policy")
 				err := deleteMirroredPolicy(ctx, helper, instance)
 				if err != nil {
@@ -519,18 +945,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 				instance.Status.QueueType = ""
 			}
 
-			// Update status for Quorum queue type
-			if *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum && instance.Status.QueueType != rabbitmqv1beta1.QueueTypeQuorum {
-				Log.Info("Setting queue type status to quorum")
-				instance.Status.QueueType = rabbitmqv1beta1.QueueTypeQuorum
-			} else if *instance.Spec.QueueType != rabbitmqv1beta1.QueueTypeQuorum && instance.Status.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
+			// Handle removal of Quorum status when switching away from Quorum
+			if *instance.Spec.QueueType != rabbitmqv1beta1.QueueTypeQuorum && instance.Status.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
 				Log.Info("Removing quorum queue type status")
-				instance.Status.QueueType = ""
-			}
-
-			// Update status for None queue type
-			if *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeNone && instance.Status.QueueType != "" {
-				Log.Info("Setting queue type status to None (clearing)")
 				instance.Status.QueueType = ""
 			}
 		}
@@ -729,6 +1146,32 @@ func deleteMirroredPolicy(ctx context.Context, helper *helper.Helper, instance *
 	return helper.GetClient().Delete(ctx, policy)
 }
 
+// waitForPodsTermination checks if all pods associated with the RabbitMQ instance
+// have been terminated. Returns a Result with requeue if pods are still terminating.
+//
+// This is a critical step before deleting ConfigMaps to ensure pods don't get stuck
+// trying to mount ConfigMaps during termination.
+func (r *Reconciler) waitForPodsTermination(ctx context.Context, namespace, instanceName string, log logr.Logger) (ctrl.Result, bool, error) {
+	// List pods belonging to this RabbitMQ cluster using the label selector
+	// set by the RabbitMQ cluster-operator on all pods it manages
+	podList := &corev1.PodList{}
+	labelSelector := client.MatchingLabels{"app.kubernetes.io/name": instanceName}
+	if err := r.List(ctx, podList, client.InNamespace(namespace), labelSelector); err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("failed to list pods during deletion: %w", err)
+	}
+
+	matchingPods := podList.Items
+
+	if len(matchingPods) > 0 {
+		log.Info("Waiting for pods to terminate before completing deletion",
+			"podCount", len(matchingPods),
+			"instance", instanceName)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, true, nil
+	}
+
+	return ctrl.Result{}, false, nil
+}
+
 func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, helper *helper.Helper) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info("Reconciling Service delete")
@@ -753,6 +1196,79 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1be
 		return ctrl.Result{}, err
 	}
 
+	// Delete the RabbitMQPolicy BEFORE deleting the cluster so the policy
+	// controller can clean up in RabbitMQ while the cluster is still reachable.
+	policy := &rabbitmqv1beta1.RabbitMQPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      instance.Name + "-ha-all",
+			Namespace: instance.Namespace,
+		},
+	}
+	if err := r.Delete(ctx, policy); err != nil && !k8s_errors.IsNotFound(err) {
+		Log.Error(err, "Failed to delete RabbitMQPolicy")
+		return ctrl.Result{}, err
+	}
+
+	// Wait for RabbitMQPolicy to be fully deleted before deleting the cluster.
+	// Track deletion attempts so we can force-remove the policy's finalizer if
+	// the policy controller cannot reach RabbitMQ (e.g. cluster already gone or
+	// unreachable).
+	const maxDeletionAttempts = 3
+	const deletionAttemptsKey = "rabbitmq.openstack.org/deletion-attempts"
+
+	deletionAttempts := 0
+	if val, ok := instance.Annotations[deletionAttemptsKey]; ok {
+		var atoiErr error
+		deletionAttempts, atoiErr = strconv.Atoi(val)
+		if atoiErr != nil {
+			Log.Error(atoiErr, "Failed to parse deletion-attempts annotation, resetting to 0", "value", val)
+			deletionAttempts = 0
+		}
+	}
+
+	policyStillExists := false
+	if err := r.Get(ctx, types.NamespacedName{Name: policy.Name, Namespace: policy.Namespace}, policy); err == nil {
+		policyStillExists = true
+
+		if deletionAttempts >= maxDeletionAttempts && len(policy.Finalizers) > 0 {
+			Log.Info("Max deletion attempts reached, force-removing finalizers from RabbitMQPolicy", "policy", policy.Name)
+			policy.Finalizers = []string{}
+			if err := r.Update(ctx, policy); err != nil {
+				Log.Error(err, "Failed to remove finalizers from RabbitMQPolicy")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
+	} else if !k8s_errors.IsNotFound(err) {
+		Log.Error(err, "Failed to check if RabbitMQPolicy still exists")
+		return ctrl.Result{}, err
+	}
+
+	if policyStillExists {
+		deletionAttempts++
+		if instance.Annotations == nil {
+			instance.Annotations = map[string]string{}
+		}
+		instance.Annotations[deletionAttemptsKey] = strconv.Itoa(deletionAttempts)
+		if err := r.Client.Update(ctx, instance); err != nil {
+			Log.Error(err, "Failed to update deletion attempts annotation")
+			return ctrl.Result{}, err
+		}
+		Log.Info("Waiting for RabbitMQPolicy to be fully deleted before deleting cluster",
+			"attempt", deletionAttempts, "maxAttempts", maxDeletionAttempts)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	// Policy is gone — clean up the attempts annotation if present.
+	if _, ok := instance.Annotations[deletionAttemptsKey]; ok {
+		delete(instance.Annotations, deletionAttemptsKey)
+		if err := r.Client.Update(ctx, instance); err != nil {
+			Log.Error(err, "Failed to clean up deletion attempts annotation")
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Delete the RabbitMQCluster
 	rabbitmqCluster := impl.NewRabbitMqCluster(
 		&rabbitmqv2.RabbitmqCluster{
 			ObjectMeta: metav1.ObjectMeta{
@@ -763,8 +1279,21 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1be
 		5,
 	)
 	err = rabbitmqCluster.Delete(ctx, helper)
-	if err != nil {
+	if err != nil && !k8s_errors.IsNotFound(err) {
 		return ctrl.Result{}, err
+	}
+
+	// Wait for all pods to terminate before removing finalizer.
+	// This ensures ConfigMaps (with owner references to RabbitMq CR) remain
+	// available during pod termination.
+	result, shouldReturn, err := r.waitForPodsTermination(ctx, instance.Namespace, instance.Name, Log)
+	if err != nil {
+		Log.Error(err, "Failed waiting for pod termination during deletion")
+		return ctrl.Result{}, err
+	}
+	if shouldReturn {
+		Log.Info("Waiting for pods to terminate before completing deletion")
+		return result, nil
 	}
 
 	// Remove finalizer on the Topology CR
@@ -777,7 +1306,6 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1be
 		return ctrlResult, err
 	}
 
-	// Service is deleted so remove the finalizer.
 	controllerutil.RemoveFinalizer(instance, helper.GetFinalizer())
 	Log.Info("Reconciled Service delete successfully")
 
@@ -843,7 +1371,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// findObjectsForSrc - returns a reconcile request if the object is referenced by a Redis CR
+// findObjectsForSrc - returns a reconcile request if the object is referenced by a RabbitMq CR
 func (r *Reconciler) findObjectsForSrc(ctx context.Context, src client.Object) []reconcile.Request {
 	requests := []reconcile.Request{}
 
