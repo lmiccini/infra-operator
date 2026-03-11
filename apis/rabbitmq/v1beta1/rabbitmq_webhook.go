@@ -215,7 +215,6 @@ func (spec *RabbitMqSpecCore) Default(shouldDefaultQueueType bool) {
 	}
 }
 
-
 var _ webhook.Validator = &RabbitMq{}
 
 // ValidateCreate implements webhook.Validator so a webhook will be registered for the type

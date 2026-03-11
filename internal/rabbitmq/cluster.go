@@ -60,7 +60,6 @@ func ConfigureCluster(
 	queueType *string,
 	rabbitmqVersion string,
 	needsDataWipe bool,
-	targetVersion string,
 ) error {
 	envVars := []corev1.EnvVar{
 		{
@@ -134,9 +133,9 @@ func ConfigureCluster(
 	// The init container runs BEFORE setup-container and wipes /var/lib/rabbitmq
 	// Controlled by annotation on RabbitMQCluster to ensure it only runs once
 	if needsDataWipe {
-		// Validate targetVersion before interpolating into shell script to prevent injection
-		if !validVersionPattern.MatchString(targetVersion) {
-			return fmt.Errorf("invalid target version format for data wipe: %q", targetVersion)
+		// Validate rabbitmqVersion before interpolating into shell script to prevent injection
+		if !validVersionPattern.MatchString(rabbitmqVersion) {
+			return fmt.Errorf("invalid version format for data wipe: %q", rabbitmqVersion)
 		}
 		// Use version-specific marker to ensure wipe happens only once per version
 		// Marker file prevents re-wiping on pod restarts
@@ -157,7 +156,7 @@ rm -rf "${WIPE_DIR:?}"/.[!.]*
 touch "$MARKER"
 echo "Data wipe complete for version %s (marker: $MARKER)"
 ls -la "$WIPE_DIR"
-`, targetVersion, targetVersion, targetVersion, targetVersion)
+`, rabbitmqVersion, rabbitmqVersion, rabbitmqVersion, rabbitmqVersion)
 
 		initContainers = append(initContainers, corev1.Container{
 			Name:       "wipe-data",

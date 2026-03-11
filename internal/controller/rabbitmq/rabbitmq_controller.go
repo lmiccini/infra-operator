@@ -610,10 +610,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		}
 	}
 
-	// Use same version for wipe marker as for cluster configuration (renamed to avoid shadowing)
-	wipeMarkerVersion := configVersion
-
-	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, instance.Spec.Override, instance.Spec.QueueType, configVersion, needsDataWipe, wipeMarkerVersion)
+	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, instance.Spec.Override, instance.Spec.QueueType, configVersion, needsDataWipe)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -626,13 +623,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 
 	// Manage ProxyRequired status flag
 	// Set to true when we detect a 3.x → 4.x upgrade with Quorum migration
-	// Clear when clients-reconfigured annotation is set
+	// Clear when clients-reconfigured annotation is set, then remove the annotation
+	// so it doesn't interfere with future upgrade cycles
 	if instance.Annotations != nil {
 		if configured, ok := instance.Annotations[rabbitmqv1beta1.AnnotationClientsReconfigured]; ok && configured == "true" {
-			if instance.Status.ProxyRequired {
-				instance.Status.ProxyRequired = false
-				Log.Info("Clients reconfigured - clearing proxy requirement")
-			}
+			instance.Status.ProxyRequired = false
+			delete(instance.Annotations, rabbitmqv1beta1.AnnotationClientsReconfigured)
+			Log.Info("Clients reconfigured - clearing proxy requirement and removing annotation")
 		}
 	}
 
