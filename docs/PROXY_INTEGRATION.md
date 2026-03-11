@@ -67,19 +67,15 @@ The `shouldEnableProxy()` function determines when the proxy should be active:
 
 ```go
 func shouldEnableProxy(instance *RabbitMq) bool {
-    // 1. Disable if clients are reconfigured
-    if annotations["clients-reconfigured"] == "true" {
-        return false
-    }
-
-    // 2. Enable if ProxyRequired status flag is set (persists after upgrade)
+    // ProxyRequired is set during 3.x → 4.x upgrades and cleared when
+    // the clients-reconfigured annotation is set (handled early in reconcile).
     return instance.Status.ProxyRequired
 }
 ```
 
-**Priority Order**:
-1. `clients-reconfigured=true` → **Always disable** (highest priority)
-2. `Status.ProxyRequired=true` → **Enable** (automatic, persists after upgrade)
+The `clients-reconfigured` annotation is handled early in the reconciler (before
+`shouldEnableProxy` is called), which sets `ProxyRequired=false` and removes the
+annotation. So `shouldEnableProxy` only needs to check `ProxyRequired`.
 
 ## Key Functions
 
@@ -192,8 +188,7 @@ kubectl get rabbitmq rabbitmq -o jsonpath='{.status.upgradePhase}'
    - Proxy sidecar is automatically added
    - Wait for cluster to become ready
    - Update `Status.CurrentVersion=4.2`
-   - Clear `UpgradePhase=""` (upgrade complete)
-   - Clear `UpgradePhase`
+   - Clear `UpgradePhase` (upgrade complete)
 4. **External services**: Continue using `amqp_durable_queues=false`
    - Proxy remains active because `Status.ProxyRequired=true`
 5. **Proxy rewrites**: Frames rewritten to use durable queues
