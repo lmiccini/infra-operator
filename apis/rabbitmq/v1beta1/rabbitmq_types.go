@@ -52,9 +52,36 @@ const (
 	// QueueTypeNone - no special queue type
 	QueueTypeNone = "None"
 
-	// Annotations
-	// AnnotationTargetVersion - annotation key for target RabbitMQ version (set by openstack-operator)
-	AnnotationTargetVersion = "rabbitmq.openstack.org/target-version"
+	// AnnotationClientsReconfigured - set to "true" when dataplane clients have been
+	// reconfigured to use durable queues, allowing the proxy sidecar to be removed.
+	AnnotationClientsReconfigured = "rabbitmq.openstack.org/clients-reconfigured"
+	// AnnotationStorageWipeNeeded - temporary annotation on RabbitmqCluster to signal
+	// that the wipe-data init container should be included in the StatefulSet spec.
+	AnnotationStorageWipeNeeded = "rabbitmq.openstack.org/storage-wipe-needed"
+)
+
+// UpgradePhase tracks the current phase of a version upgrade or queue migration.
+type UpgradePhase string
+
+const (
+	// UpgradePhaseNone - no upgrade in progress
+	UpgradePhaseNone UpgradePhase = ""
+	// UpgradePhaseDeletingResources - deleting ha-all policy and StatefulSet
+	UpgradePhaseDeletingResources UpgradePhase = "DeletingResources"
+	// UpgradePhaseWaitingForCluster - waiting for cluster to become ready with new version
+	UpgradePhaseWaitingForCluster UpgradePhase = "WaitingForCluster"
+)
+
+// WipeReason describes why a storage wipe was initiated.
+type WipeReason string
+
+const (
+	// WipeReasonNone - no wipe in progress
+	WipeReasonNone WipeReason = ""
+	// WipeReasonVersionUpgrade - storage wipe due to major/minor version change
+	WipeReasonVersionUpgrade WipeReason = "VersionUpgrade"
+	// WipeReasonQueueTypeMigration - storage wipe due to queue type migration
+	WipeReasonQueueTypeMigration WipeReason = "QueueTypeMigration"
 )
 
 // PodOverride defines per-pod service configurations
@@ -97,6 +124,14 @@ type RabbitMqSpecCore struct {
 	// services will be created for each pod with the provided configuration, and the transport URL will be
 	// configured to use these per-pod services.
 	PodOverride *PodOverride `json:"podOverride,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^\d+\.\d+(\.\d+)?$`
+	// +operator-sdk:csv:customresourcedefinitions:type=spec
+	// TargetVersion - the desired RabbitMQ version (e.g., "4.2", "3.13.1").
+	// When set to a version different from Status.CurrentVersion, the controller
+	// will initiate a storage wipe and version upgrade. The controller updates
+	// Status.CurrentVersion once the upgrade completes.
+	TargetVersion *string `json:"targetVersion,omitempty"`
 }
 
 // MarshalInto converts RabbitMqSpec to RabbitmqClusterSpec.
@@ -140,21 +175,21 @@ type RabbitMqStatus struct {
 
 	// CurrentVersion - the currently deployed RabbitMQ version (e.g., "3.9", "4.2")
 	// This is controller-managed and reflects the actual running version.
-	// openstack-operator should use the "rabbitmq.openstack.org/target-version" annotation to request version changes.
+	// Set Spec.TargetVersion to request a version change.
 	CurrentVersion string `json:"currentVersion,omitempty"`
 
-	// UpgradePhase - tracks the current phase of a version upgrade or migration
-	// Valid values:
-	//   "" (no upgrade in progress)
-	//   "DeletingResources" (deleting ha-all policy and StatefulSet)
-	//   "WaitingForCluster" (waiting for cluster to become ready with new version)
+	// UpgradePhase - tracks the current phase of a version upgrade or migration.
 	// This allows resuming upgrades that failed midway.
-	UpgradePhase string `json:"upgradePhase,omitempty"`
+	UpgradePhase UpgradePhase `json:"upgradePhase,omitempty"`
+
+	// WipeReason - tracks why the current storage wipe was initiated.
+	// Persisted so that resumed upgrades use the correct handling path.
+	WipeReason WipeReason `json:"wipeReason,omitempty"`
 
 	// ProxyRequired - tracks whether the AMQP proxy sidecar is required for this cluster.
 	// Set to true when upgrading from RabbitMQ 3.x to 4.x with Quorum queues.
 	// The proxy allows non-durable clients to work with quorum queues during the upgrade window.
-	// Only cleared when the "rabbitmq.openstack.org/clients-reconfigured" annotation is set.
+	// Only cleared when the AnnotationClientsReconfigured annotation is set to "true".
 	ProxyRequired bool `json:"proxyRequired,omitempty"`
 }
 

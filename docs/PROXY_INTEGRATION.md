@@ -37,7 +37,6 @@ When migrating from RabbitMQ 3.9 (mirrored queues) to 4.2 (quorum queues), exter
 1. **Automatic Activation**: Proxy sidecar is automatically added for **3.x → 4.x upgrades** when:
    - Upgrading from RabbitMQ 3.x to 4.x with Quorum queue migration
    - `Status.ProxyRequired=true` is set and persists after upgrade completes
-   - Manual override via annotation `rabbitmq.openstack.org/enable-proxy=true`
 
    The proxy is **disabled** when:
    - Annotation `rabbitmq.openstack.org/clients-reconfigured=true` is set
@@ -73,32 +72,14 @@ func shouldEnableProxy(instance *RabbitMq) bool {
         return false
     }
 
-    // 2. Enable if manual override is set
-    if annotations["enable-proxy"] == "true" {
-        return true
-    }
-
-    // 3. Enable if ProxyRequired status flag is set (persists after upgrade)
-    if instance.Status.ProxyRequired {
-        return true
-    }
-
-    // 4. Enable during 3.x → 4.x upgrade with Quorum migration
-    if instance.Status.UpgradePhase != "" &&
-       instance.Spec.QueueType == "Quorum" &&
-       Is3xTo4xUpgrade(currentVersion, targetVersion) {
-        return true
-    }
-
-    return false
+    // 2. Enable if ProxyRequired status flag is set (persists after upgrade)
+    return instance.Status.ProxyRequired
 }
 ```
 
 **Priority Order**:
 1. `clients-reconfigured=true` → **Always disable** (highest priority)
-2. `enable-proxy=true` → **Force enable** (manual override)
-3. `Status.ProxyRequired=true` → **Enable** (automatic, persists after upgrade)
-4. Active 3.x → 4.x upgrade → **Enable** (sets ProxyRequired=true)
+2. `Status.ProxyRequired=true` → **Enable** (automatic, persists after upgrade)
 
 ## Key Functions
 
@@ -137,9 +118,8 @@ apiVersion: rabbitmq.openstack.org/v1beta1
 kind: RabbitMq
 metadata:
   name: rabbitmq
-  annotations:
-    rabbitmq.openstack.org/target-version: "4.2"
 spec:
+  targetVersion: "4.2"
   queueType: Quorum
   tls:
     secretName: rabbitmq-tls
@@ -155,15 +135,6 @@ status:
   currentVersion: "4.2"
   proxyRequired: true    # Keeps proxy active until clients reconfigured
   upgradePhase: ""       # Upgrade complete
-```
-
-### Manual activation
-
-Force proxy activation with annotation:
-
-```bash
-kubectl annotate rabbitmq rabbitmq \
-  rabbitmq.openstack.org/enable-proxy=true
 ```
 
 ### Manual deactivation
@@ -210,7 +181,7 @@ kubectl get rabbitmq rabbitmq -o jsonpath='{.status.upgradePhase}'
 
 ### Complete 3.x → 4.x Upgrade Process
 
-1. **Start upgrade**: Set `target-version: "4.2"` annotation on RabbitMq CR
+1. **Start upgrade**: Set `spec.targetVersion: "4.2"` on RabbitMq CR
 2. **Storage wipe phase 1** (DeletingResources):
    - Delete ha-all mirrored queue policy
    - Update RabbitmqCluster spec (adds wipe-data init container)
@@ -285,7 +256,6 @@ Functional tests (`test/functional/rabbitmq_proxy_test.go`) verify that the oper
 - Backend port is configured (localhost:5673)
 - ConfigMap is created with proxy script
 - Proxy is removed when `clients-reconfigured` annotation is set
-- Manual activation via `enable-proxy` annotation
 
 ```bash
 # Run all tests

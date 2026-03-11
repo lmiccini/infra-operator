@@ -1388,13 +1388,17 @@ func UpdateRabbitMQAnnotation(name types.NamespacedName, key, value string) {
 	}, timeout, interval).Should(Succeed())
 }
 
-// SetRabbitMQTargetVersion sets the target-version annotation on a RabbitMQ CR.
+// SetRabbitMQTargetVersion sets the Spec.TargetVersion field on a RabbitMQ CR.
 func SetRabbitMQTargetVersion(name types.NamespacedName, version string) {
-	UpdateRabbitMQAnnotation(name, rabbitmqv1.AnnotationTargetVersion, version)
+	Eventually(func(g Gomega) {
+		instance := GetRabbitMQ(name)
+		instance.Spec.TargetVersion = ptr.To(version)
+		g.Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
+	}, timeout, interval).Should(Succeed())
 }
 
 // WaitForUpgradePhase waits for the RabbitMQ CR to reach the specified upgrade phase.
-func WaitForUpgradePhase(name types.NamespacedName, phase string) {
+func WaitForUpgradePhase(name types.NamespacedName, phase rabbitmqv1.UpgradePhase) {
 	Eventually(func(g Gomega) {
 		instance := GetRabbitMQ(name)
 		g.Expect(instance.Status.UpgradePhase).To(Equal(phase))
@@ -1409,12 +1413,12 @@ func CreateStatefulSetForCluster(clusterName types.NamespacedName) (types.Namesp
 	return stsName, sts
 }
 
-// TriggerUpgrade creates a StatefulSet, sets the target version annotation, and waits for
+// TriggerUpgrade creates a StatefulSet, sets the target version spec field, and waits for
 // the upgrade to reach WaitingForCluster phase. Returns the StatefulSet name.
 func TriggerUpgrade(name types.NamespacedName, targetVersion string) types.NamespacedName {
 	stsName, _ := CreateStatefulSetForCluster(name)
 	SetRabbitMQTargetVersion(name, targetVersion)
-	WaitForUpgradePhase(name, "WaitingForCluster")
+	WaitForUpgradePhase(name, rabbitmqv1.UpgradePhaseWaitingForCluster)
 	return stsName
 }
 
@@ -1437,7 +1441,7 @@ func HasProxySidecar(name types.NamespacedName) bool {
 
 // SetRabbitMQUpgradeStatus sets CurrentVersion, QueueType, and UpgradePhase on a RabbitMQ CR
 // status with retry to handle concurrent controller updates.
-func SetRabbitMQUpgradeStatus(name types.NamespacedName, currentVersion, queueType, upgradePhase string) {
+func SetRabbitMQUpgradeStatus(name types.NamespacedName, currentVersion, queueType string, upgradePhase rabbitmqv1.UpgradePhase) {
 	Eventually(func(g Gomega) {
 		instance := GetRabbitMQ(name)
 		instance.Status.CurrentVersion = currentVersion

@@ -36,11 +36,6 @@ func TestShouldEnableProxy(t *testing.T) {
 			name: "should enable proxy when ProxyRequired status is true",
 			instance: func() *rabbitmqv1beta1.RabbitMq {
 				return &rabbitmqv1beta1.RabbitMq{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							rabbitmqv1beta1.AnnotationTargetVersion: "4.2.0",
-						},
-					},
 					Spec: rabbitmqv1beta1.RabbitMqSpec{
 						RabbitMqSpecCore: rabbitmqv1beta1.RabbitMqSpecCore{
 							QueueType: ptr.To("Quorum"),
@@ -49,53 +44,42 @@ func TestShouldEnableProxy(t *testing.T) {
 					Status: rabbitmqv1beta1.RabbitMqStatus{
 						CurrentVersion: "4.2.0",
 						QueueType:      "Quorum",
-						ProxyRequired:  true, // Proxy requirement persisted
+						ProxyRequired:  true,
 					},
 				}
 			},
 			want: true,
 		},
 		{
-			name: "should enable proxy during 3.x to 4.x upgrade with Quorum",
+			name: "should enable proxy during 3.x to 4.x upgrade with Quorum (ProxyRequired set by controller)",
 			instance: func() *rabbitmqv1beta1.RabbitMq {
 				return &rabbitmqv1beta1.RabbitMq{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							rabbitmqv1beta1.AnnotationTargetVersion: "4.2.0",
-						},
-					},
 					Spec: rabbitmqv1beta1.RabbitMqSpec{
 						RabbitMqSpecCore: rabbitmqv1beta1.RabbitMqSpecCore{
 							QueueType: ptr.To("Quorum"),
 						},
 					},
 					Status: rabbitmqv1beta1.RabbitMqStatus{
-						UpgradePhase:   "WaitingForCluster",
-						CurrentVersion: "3.9.0", // On 3.x upgrading to 4.x
+						UpgradePhase:   rabbitmqv1beta1.UpgradePhaseWaitingForCluster,
+						CurrentVersion: "3.9.0",
 						QueueType:      "Mirrored",
-						ProxyRequired:  false, // Not yet set
+						ProxyRequired:  true, // Set by controller during 3.x → 4.x upgrade
 					},
 				}
 			},
 			want: true,
 		},
 		{
-			name: "should NOT enable proxy when upgrading 4.0 to 4.2 (within 4.x)",
+			name: "should NOT enable proxy when ProxyRequired is false",
 			instance: func() *rabbitmqv1beta1.RabbitMq {
 				return &rabbitmqv1beta1.RabbitMq{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							rabbitmqv1beta1.AnnotationTargetVersion: "4.2.0",
-						},
-					},
 					Spec: rabbitmqv1beta1.RabbitMqSpec{
 						RabbitMqSpecCore: rabbitmqv1beta1.RabbitMqSpecCore{
 							QueueType: ptr.To("Quorum"),
 						},
 					},
 					Status: rabbitmqv1beta1.RabbitMqStatus{
-						UpgradePhase:   "WaitingForCluster",
-						CurrentVersion: "4.0.0", // Already on 4.x
+						CurrentVersion: "4.0.0",
 						QueueType:      "Quorum",
 						ProxyRequired:  false,
 					},
@@ -104,98 +88,12 @@ func TestShouldEnableProxy(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "should NOT enable proxy when target is not Quorum (keeping Mirrored)",
-			instance: func() *rabbitmqv1beta1.RabbitMq {
-				return &rabbitmqv1beta1.RabbitMq{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							rabbitmqv1beta1.AnnotationTargetVersion: "4.2.0",
-						},
-					},
-					Spec: rabbitmqv1beta1.RabbitMqSpec{
-						RabbitMqSpecCore: rabbitmqv1beta1.RabbitMqSpecCore{
-							QueueType: ptr.To("Mirrored"), // Not targeting Quorum
-						},
-					},
-					Status: rabbitmqv1beta1.RabbitMqStatus{
-						CurrentVersion: "4.2.0",
-						QueueType:      "Mirrored",
-					},
-				}
-			},
-			want: false,
-		},
-		{
-			name: "should NOT enable proxy when target version is not 4.x",
-			instance: func() *rabbitmqv1beta1.RabbitMq {
-				return &rabbitmqv1beta1.RabbitMq{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							rabbitmqv1beta1.AnnotationTargetVersion: "3.12.0", // Not 4.x
-						},
-					},
-					Spec: rabbitmqv1beta1.RabbitMqSpec{
-						RabbitMqSpecCore: rabbitmqv1beta1.RabbitMqSpecCore{
-							QueueType: ptr.To("Quorum"),
-						},
-					},
-					Status: rabbitmqv1beta1.RabbitMqStatus{
-						CurrentVersion: "3.12.0",
-						QueueType:      "Quorum",
-					},
-				}
-			},
-			want: false,
-		},
-		{
-			name: "should NOT enable proxy when target-version annotation is not set",
-			instance: func() *rabbitmqv1beta1.RabbitMq {
-				return &rabbitmqv1beta1.RabbitMq{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{},
-					},
-					Spec: rabbitmqv1beta1.RabbitMqSpec{
-						RabbitMqSpecCore: rabbitmqv1beta1.RabbitMqSpecCore{
-							QueueType: ptr.To("Quorum"),
-						},
-					},
-					Status: rabbitmqv1beta1.RabbitMqStatus{
-						CurrentVersion: "4.2.0",
-						QueueType:      "Quorum",
-					},
-				}
-			},
-			want: false,
-		},
-		{
-			name: "should enable proxy with manual annotation",
-			instance: func() *rabbitmqv1beta1.RabbitMq {
-				return &rabbitmqv1beta1.RabbitMq{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							"rabbitmq.openstack.org/enable-proxy": "true",
-						},
-					},
-					Spec: rabbitmqv1beta1.RabbitMqSpec{
-						RabbitMqSpecCore: rabbitmqv1beta1.RabbitMqSpecCore{
-							QueueType: ptr.To("Quorum"),
-						},
-					},
-					Status: rabbitmqv1beta1.RabbitMqStatus{
-						QueueType: "Quorum",
-					},
-				}
-			},
-			want: true,
-		},
-		{
 			name: "should NOT enable proxy when clients-reconfigured annotation is set",
 			instance: func() *rabbitmqv1beta1.RabbitMq {
 				return &rabbitmqv1beta1.RabbitMq{
 					ObjectMeta: metav1.ObjectMeta{
 						Annotations: map[string]string{
-							"rabbitmq.openstack.org/clients-reconfigured": "true",
-							rabbitmqv1beta1.AnnotationTargetVersion:       "4.2.0",
+							rabbitmqv1beta1.AnnotationClientsReconfigured: "true",
 						},
 					},
 					Spec: rabbitmqv1beta1.RabbitMqSpec{
@@ -206,6 +104,7 @@ func TestShouldEnableProxy(t *testing.T) {
 					Status: rabbitmqv1beta1.RabbitMqStatus{
 						CurrentVersion: "4.2.0",
 						QueueType:      "Quorum",
+						ProxyRequired:  true, // Even with ProxyRequired, clients-reconfigured wins
 					},
 				}
 			},

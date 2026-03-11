@@ -76,22 +76,19 @@ var _ = Describe("RabbitMQ Proxy Sidecar", func() {
 			}, timeout, interval).Should(Succeed())
 
 			// Set status to simulate we're on 3.9 with Mirrored queues
-			SetRabbitMQUpgradeStatus(rabbitmqName, "3.9.0", "Mirrored", "")
+			SetRabbitMQUpgradeStatus(rabbitmqName, "3.9.0", "Mirrored", rabbitmqv1.UpgradePhaseNone)
 
 			// Set target version and QueueType together (webhook requires 4.x target
 			// before allowing Quorum migration on a 3.x cluster)
 			Eventually(func(g Gomega) {
 				instance = GetRabbitMQ(rabbitmqName)
-				if instance.Annotations == nil {
-					instance.Annotations = make(map[string]string)
-				}
-				instance.Annotations[rabbitmqv1.AnnotationTargetVersion] = "4.2.0"
+				instance.Spec.TargetVersion = ptr.To("4.2.0")
 				instance.Spec.QueueType = ptr.To(rabbitmqv1.QueueTypeQuorum)
 				g.Expect(k8sClient.Update(ctx, instance)).To(Succeed())
 			}, timeout, interval).Should(Succeed())
 
 			// Set upgrade phase (controller would do this, but we simulate it)
-			SetRabbitMQUpgradeStatus(rabbitmqName, "3.9.0", "Mirrored", "WaitingForCluster")
+			SetRabbitMQUpgradeStatus(rabbitmqName, "3.9.0", "Mirrored", rabbitmqv1.UpgradePhaseWaitingForCluster)
 
 			// Trigger reconciliation
 			SimulateRabbitMQClusterReady(rabbitmqName)
@@ -193,22 +190,19 @@ var _ = Describe("RabbitMQ Proxy Sidecar", func() {
 			}, timeout, interval).Should(Succeed())
 
 			// Set status to simulate 3.9 with Mirrored queues
-			SetRabbitMQUpgradeStatus(rabbitmqName, "3.9.0", "Mirrored", "")
+			SetRabbitMQUpgradeStatus(rabbitmqName, "3.9.0", "Mirrored", rabbitmqv1.UpgradePhaseNone)
 
 			// Set target version and QueueType together (webhook requires 4.x target
 			// before allowing Quorum migration on a 3.x cluster)
 			Eventually(func(g Gomega) {
 				instance = GetRabbitMQ(rabbitmqName)
-				if instance.Annotations == nil {
-					instance.Annotations = make(map[string]string)
-				}
-				instance.Annotations[rabbitmqv1.AnnotationTargetVersion] = "4.2.0"
+				instance.Spec.TargetVersion = ptr.To("4.2.0")
 				instance.Spec.QueueType = ptr.To(rabbitmqv1.QueueTypeQuorum)
 				g.Expect(k8sClient.Update(ctx, instance)).To(Succeed())
 			}, timeout, interval).Should(Succeed())
 
 			// Set upgrade phase
-			SetRabbitMQUpgradeStatus(rabbitmqName, "3.9.0", "Mirrored", "WaitingForCluster")
+			SetRabbitMQUpgradeStatus(rabbitmqName, "3.9.0", "Mirrored", rabbitmqv1.UpgradePhaseWaitingForCluster)
 
 			SimulateRabbitMQClusterReady(rabbitmqName)
 
@@ -232,26 +226,6 @@ var _ = Describe("RabbitMQ Proxy Sidecar", func() {
 		})
 	})
 
-	When("enable-proxy annotation is set", func() {
-		It("should enable proxy even without upgrade phase", func() {
-			spec := GetDefaultRabbitMQSpec()
-			spec["queueType"] = "Quorum"
-
-			rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
-			DeferCleanup(th.DeleteInstance, rabbitmq)
-
-			// Set enable-proxy annotation
-			UpdateRabbitMQAnnotation(rabbitmqName, "rabbitmq.openstack.org/enable-proxy", "true")
-
-			SimulateRabbitMQClusterReady(rabbitmqName)
-
-			// Verify proxy was added
-			Eventually(func(g Gomega) {
-				g.Expect(HasProxySidecar(rabbitmqName)).To(BeTrue(), "proxy should be enabled with enable-proxy annotation")
-			}, timeout, interval).Should(Succeed())
-		})
-	})
-
 	When("cluster is already using Quorum queues", func() {
 		It("should NOT add proxy sidecar during upgrade", func() {
 			spec := GetDefaultRabbitMQSpec()
@@ -261,7 +235,7 @@ var _ = Describe("RabbitMQ Proxy Sidecar", func() {
 			DeferCleanup(th.DeleteInstance, rabbitmq)
 
 			SetRabbitMQTargetVersion(rabbitmqName, "4.2.0")
-			SetRabbitMQUpgradeStatus(rabbitmqName, "4.0.0", "Quorum", "WaitingForCluster")
+			SetRabbitMQUpgradeStatus(rabbitmqName, "4.0.0", "Quorum", rabbitmqv1.UpgradePhaseWaitingForCluster)
 
 			SimulateRabbitMQClusterReady(rabbitmqName)
 
@@ -281,7 +255,7 @@ var _ = Describe("RabbitMQ Proxy Sidecar", func() {
 			DeferCleanup(th.DeleteInstance, rabbitmq)
 
 			SetRabbitMQTargetVersion(rabbitmqName, "4.2.0")
-			SetRabbitMQUpgradeStatus(rabbitmqName, "4.0.0", "Mirrored", "WaitingForCluster")
+			SetRabbitMQUpgradeStatus(rabbitmqName, "4.0.0", "Mirrored", rabbitmqv1.UpgradePhaseWaitingForCluster)
 
 			SimulateRabbitMQClusterReady(rabbitmqName)
 

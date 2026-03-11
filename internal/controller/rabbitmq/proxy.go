@@ -7,7 +7,6 @@ import (
 
 	instancehav1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/instanceha/v1beta1"
 	rabbitmqv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
-	"github.com/openstack-k8s-operators/infra-operator/internal/rabbitmq"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	rabbitmqv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 	corev1 "k8s.io/api/core/v1"
@@ -275,59 +274,21 @@ func (r *Reconciler) buildProxySidecarContainer(instance *rabbitmqv1beta1.Rabbit
 	return container
 }
 
-// shouldEnableProxy determines if the proxy sidecar should be enabled
+// shouldEnableProxy determines if the proxy sidecar should be enabled.
+//
+// The proxy is enabled when Status.ProxyRequired is true, which is set by
+// the main reconciler during 3.x → 4.x upgrades with Quorum migration.
+// It persists after the upgrade completes and is only cleared when
+// AnnotationClientsReconfigured is set to "true".
 func (r *Reconciler) shouldEnableProxy(instance *rabbitmqv1beta1.RabbitMq) bool {
-	// Enable proxy for the upgrade scenario from RabbitMQ 3.x to 4.x with Quorum queues.
-	// The proxy remains active until external clients are reconfigured to use durable queues.
-	//
-	// This allows non-durable clients (amqp_durable_queues=false) to work with
-	// quorum queues without reconfiguration during and after the upgrade.
-	//
-	// Proxy lifecycle:
-	// 1. Enabled during 3.x → 4.x upgrade when migrating to Quorum queues
-	// 2. Status.ProxyRequired set to true to track that proxy is needed
-	// 3. Remains active after upgrade completes (ProxyRequired still true)
-	// 4. Removed only when clients-reconfigured annotation is set (ProxyRequired cleared)
-
 	// Check if clients have been reconfigured - if so, no proxy needed
 	if instance.Annotations != nil {
-		if configured, ok := instance.Annotations["rabbitmq.openstack.org/clients-reconfigured"]; ok && configured == "true" {
+		if configured, ok := instance.Annotations[rabbitmqv1beta1.AnnotationClientsReconfigured]; ok && configured == "true" {
 			return false
 		}
 	}
 
-	// Explicit annotation to enable proxy (for manual control)
-	if instance.Annotations != nil {
-		if enabled, ok := instance.Annotations["rabbitmq.openstack.org/enable-proxy"]; ok && enabled == "true" {
-			return true
-		}
-	}
-
-	// If ProxyRequired status flag is set, enable the proxy
-	// This persists across reconciliations after the initial 3.x → 4.x upgrade
-	if instance.Status.ProxyRequired {
-		return true
-	}
-
-	// Check if we're currently in a 3.x → 4.x upgrade with Quorum migration
-	// If so, the main reconciler will set ProxyRequired=true
-	if instance.Status.UpgradePhase != "" {
-		// Check if we're using Quorum queues
-		if instance.Spec.QueueType != nil && *instance.Spec.QueueType == "Quorum" {
-			// Check if this is an upgrade FROM 3.x TO 4.x
-			currentVersion := instance.Status.CurrentVersion
-			targetVersion := ""
-			if instance.Annotations != nil {
-				targetVersion = instance.Annotations[rabbitmqv1beta1.AnnotationTargetVersion]
-			}
-
-			if currentVersion != "" && targetVersion != "" && rabbitmq.Is3xTo4xUpgrade(currentVersion, targetVersion) {
-				// This is a 3.x → 4.x upgrade with Quorum - enable proxy
-				// The reconciler will set ProxyRequired=true to persist this
-				return true
-			}
-		}
-	}
-
-	return false
+	// ProxyRequired is set by the main reconciler during 3.x → 4.x upgrades
+	// and persists across reconciliations until clients-reconfigured is set.
+	return instance.Status.ProxyRequired
 }

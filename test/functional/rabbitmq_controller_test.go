@@ -166,10 +166,8 @@ var _ = Describe("RabbitMQ Controller", func() {
 				spec["tls"] = map[string]any{
 					"secretName": certSecret.Name,
 				}
-				annotations := map[string]string{
-					"rabbitmq.openstack.org/target-version": "3.9",
-				}
-				rabbitmq := CreateRabbitMQWithAnnotations(rabbitmqName, spec, annotations)
+				spec["targetVersion"] = "3.9"
+				rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
 				DeferCleanup(th.DeleteInstance, rabbitmq)
 			})
 
@@ -810,10 +808,8 @@ var _ = Describe("RabbitMQ Controller", func() {
 			BeforeEach(func() {
 				spec := GetDefaultRabbitMQSpec()
 				spec["queueType"] = "Quorum"
-				annotations := map[string]string{
-					"rabbitmq.openstack.org/target-version": "3.9",
-				}
-				rabbitmq := CreateRabbitMQWithAnnotations(rabbitmqName, spec, annotations)
+				spec["targetVersion"] = "3.9"
+				rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
 				DeferCleanup(th.DeleteInstance, rabbitmq)
 
 				Eventually(func(g Gomega) {
@@ -846,7 +842,8 @@ var _ = Describe("RabbitMQ Controller", func() {
 				Eventually(func(g Gomega) {
 					updatedInstance := GetRabbitMQ(rabbitmqName)
 					g.Expect(updatedInstance.Status.CurrentVersion).To(Equal("4.2"))
-					g.Expect(updatedInstance.Annotations).To(HaveKeyWithValue("rabbitmq.openstack.org/target-version", "4.2"))
+					g.Expect(updatedInstance.Spec.TargetVersion).ToNot(BeNil())
+					g.Expect(*updatedInstance.Spec.TargetVersion).To(Equal("4.2"))
 				}, timeout, interval).Should(Succeed())
 			})
 
@@ -1009,7 +1006,7 @@ var _ = Describe("RabbitMQ Controller", func() {
 
 				// Trigger upgrade from 3.9 to 4.2 (deletes StatefulSet, not cluster)
 				SetRabbitMQTargetVersion(rabbitmqName, "4.2")
-				WaitForUpgradePhase(rabbitmqName, "WaitingForCluster")
+				WaitForUpgradePhase(rabbitmqName, rabbitmqv1.UpgradePhaseWaitingForCluster)
 
 				// Verify StatefulSet was deleted but cluster survived
 				Eventually(func(g Gomega) {
@@ -1060,10 +1057,8 @@ var _ = Describe("RabbitMQ Controller", func() {
 		When("RabbitMQ patch version changes (3.9.0 to 3.9.1)", func() {
 			BeforeEach(func() {
 				spec := GetDefaultRabbitMQSpec()
-				annotations := map[string]string{
-					"rabbitmq.openstack.org/target-version": "3.9",
-				}
-				rabbitmq := CreateRabbitMQWithAnnotations(rabbitmqName, spec, annotations)
+				spec["targetVersion"] = "3.9"
+				rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
 				DeferCleanup(th.DeleteInstance, rabbitmq)
 
 				Eventually(func(g Gomega) {
@@ -1074,12 +1069,7 @@ var _ = Describe("RabbitMQ Controller", func() {
 
 			It("should allow patch version changes without storage wipe", func() {
 				// Patch version changes don't require storage wipe
-				instance := GetRabbitMQ(rabbitmqName)
-				if instance.Annotations == nil {
-					instance.Annotations = make(map[string]string)
-				}
-				instance.Annotations["rabbitmq.openstack.org/target-version"] = "3.9.1"
-				Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
+				SetRabbitMQTargetVersion(rabbitmqName, "3.9.1")
 
 				// Should NOT trigger storage wipe - Status.CurrentVersion should remain 3.9
 				Consistently(func(g Gomega) {
@@ -1120,14 +1110,15 @@ var _ = Describe("RabbitMQ Controller", func() {
 				Eventually(func(g Gomega) {
 					updatedInstance := GetRabbitMQ(rabbitmqName)
 					g.Expect(updatedInstance.Status.CurrentVersion).To(Equal("3.9"))
-					g.Expect(updatedInstance.Annotations).To(HaveKeyWithValue("rabbitmq.openstack.org/target-version", "3.9"))
+					g.Expect(updatedInstance.Spec.TargetVersion).ToNot(BeNil())
+					g.Expect(*updatedInstance.Spec.TargetVersion).To(Equal("3.9"))
 				}, timeout, interval).Should(Succeed())
 			})
 		})
 
-		When("Existing RabbitMQCluster without CurrentVersion is reconciled with target-version annotation", func() {
+		When("Existing RabbitMQCluster without CurrentVersion is reconciled with targetVersion spec", func() {
 			// This test covers the bug where an existing 3.9 cluster is reconciled by a new operator
-			// that tracks CurrentVersion, and openstack-operator immediately sets target-version: "4.2"
+			// that tracks CurrentVersion, and openstack-operator immediately sets targetVersion: "4.2"
 			// The controller must detect the existing cluster and initialize CurrentVersion to "3.9"
 			// to trigger proper storage wipe, not skip it by initializing to "4.2"
 			It("should initialize CurrentVersion to 3.9 and trigger storage wipe for upgrade to 4.2", func() {
@@ -1152,13 +1143,11 @@ var _ = Describe("RabbitMQ Controller", func() {
 				stsName := types.NamespacedName{Name: rabbitmqName.Name + "-server", Namespace: namespace}
 				CreateStatefulSet(stsName)
 
-				// Step 2: Create RabbitMQ CR with target-version: "4.2" annotation
+				// Step 2: Create RabbitMQ CR with targetVersion: "4.2" spec field
 				spec := GetDefaultRabbitMQSpec()
 				spec["queueType"] = "Quorum"
-				annotations := map[string]string{
-					"rabbitmq.openstack.org/target-version": "4.2",
-				}
-				rabbitmq := CreateRabbitMQWithAnnotations(rabbitmqName, spec, annotations)
+				spec["targetVersion"] = "4.2"
+				rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
 				DeferCleanup(th.DeleteInstance, rabbitmq)
 
 				// Step 3: Verify CurrentVersion is initialized to "3.9"
@@ -1196,10 +1185,8 @@ var _ = Describe("RabbitMQ Controller", func() {
 				spec := GetDefaultRabbitMQSpec()
 				spec["queueType"] = "Mirrored"
 				spec["replicas"] = 2
-				annotations := map[string]string{
-					"rabbitmq.openstack.org/target-version": "3.9",
-				}
-				rabbitmq := CreateRabbitMQWithAnnotations(rabbitmqName, spec, annotations)
+				spec["targetVersion"] = "3.9"
+				rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
 				DeferCleanup(th.DeleteInstance, rabbitmq)
 			})
 
@@ -1232,10 +1219,8 @@ var _ = Describe("RabbitMQ Controller", func() {
 				spec := GetDefaultRabbitMQSpec()
 				spec["queueType"] = "Mirrored"
 				spec["replicas"] = 2
-				annotations := map[string]string{
-					"rabbitmq.openstack.org/target-version": "3.9",
-				}
-				rabbitmq := CreateRabbitMQWithAnnotations(rabbitmqName, spec, annotations)
+				spec["targetVersion"] = "3.9"
+				rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
 				DeferCleanup(th.DeleteInstance, rabbitmq)
 
 				// Wait for controller to initialize with version 3.9
@@ -1263,7 +1248,7 @@ var _ = Describe("RabbitMQ Controller", func() {
 					g.Expect(*instance.Spec.QueueType).To(Equal(rabbitmqv1.QueueTypeQuorum))
 				}, timeout, interval).Should(Succeed())
 
-				WaitForUpgradePhase(rabbitmqName, "WaitingForCluster")
+				WaitForUpgradePhase(rabbitmqName, rabbitmqv1.UpgradePhaseWaitingForCluster)
 
 				SimulateRabbitMQClusterReady(rabbitmqName)
 

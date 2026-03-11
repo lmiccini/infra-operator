@@ -77,8 +77,8 @@ func (r *RabbitMq) Default(k8sClient client.Client) {
 	// enforced regardless of user-specified or existing QueueType, so we can skip
 	// the preservation logic entirely.
 	enforcingQuorum := false
-	if targetVersion, hasTarget := r.Annotations[AnnotationTargetVersion]; hasTarget && targetVersion != "" {
-		if IsVersion4OrLater(targetVersion) {
+	if r.Spec.TargetVersion != nil && *r.Spec.TargetVersion != "" {
+		if IsVersion4OrLater(*r.Spec.TargetVersion) {
 			enforcingQuorum = true
 		}
 	}
@@ -190,7 +190,7 @@ func (r *RabbitMq) Default(k8sClient client.Client) {
 	if enforcingQuorum {
 		if r.Spec.QueueType == nil || *r.Spec.QueueType != QueueTypeQuorum {
 			rabbitmqlog.Info("enforcing Quorum queues for RabbitMQ 4.x target",
-				"name", r.Name, "targetVersion", r.Annotations[AnnotationTargetVersion])
+				"name", r.Name, "targetVersion", *r.Spec.TargetVersion)
 			queueType := QueueTypeQuorum
 			r.Spec.QueueType = &queueType
 		}
@@ -292,8 +292,8 @@ func (r *RabbitMq) ValidateUpdate(old runtime.Object) (admission.Warnings, error
 				if err == nil && currentParsed.Major == 3 {
 					// On 3.x: only allow migration to Quorum if concurrently upgrading to 4.x
 					targetVersion := ""
-					if r.Annotations != nil {
-						targetVersion = r.Annotations[AnnotationTargetVersion]
+					if r.Spec.TargetVersion != nil {
+						targetVersion = *r.Spec.TargetVersion
 					}
 					if !Is3xTo4xUpgrade(currentVersion, targetVersion) {
 						allErrs = append(allErrs, field.Forbidden(
