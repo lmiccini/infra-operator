@@ -183,11 +183,12 @@ type RabbitMqStatus struct {
 	// Persisted so that resumed upgrades use the correct handling path.
 	WipeReason WipeReason `json:"wipeReason,omitempty"`
 
+	// +kubebuilder:validation:Optional
 	// ProxyRequired - tracks whether the AMQP proxy sidecar is required for this cluster.
 	// Set to true when upgrading from RabbitMQ 3.x to 4.x with Quorum queues.
 	// The proxy allows non-durable clients to work with quorum queues during the upgrade window.
 	// Only cleared when the AnnotationClientsReconfigured annotation is set to "true".
-	ProxyRequired bool `json:"proxyRequired,omitempty"`
+	ProxyRequired bool `json:"proxyRequired"`
 }
 
 //+kubebuilder:object:root=true

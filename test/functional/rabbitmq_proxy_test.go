@@ -206,23 +206,33 @@ var _ = Describe("RabbitMQ Proxy Sidecar", func() {
 
 			SimulateRabbitMQClusterReady(rabbitmqName)
 
-			// Verify proxy was added
+			// Verify proxy was added and ProxyRequired is true
 			Eventually(func(g Gomega) {
 				g.Expect(HasProxySidecar(rabbitmqName)).To(BeTrue())
+				instance = GetRabbitMQ(rabbitmqName)
+				g.Expect(instance.Status.ProxyRequired).To(BeTrue(), "ProxyRequired should be true during upgrade")
 			}, timeout, interval).Should(Succeed())
 
 			// Mark clients as reconfigured
-			// This annotation takes precedence in shouldEnableProxy() logic,
-			// so proxy will be removed regardless of upgrade phase
+			// The reconciler handles the annotation early: clears ProxyRequired,
+			// removes the annotation, and continues to update the cluster spec
+			// without the proxy sidecar.
 			UpdateRabbitMQAnnotation(rabbitmqName, "rabbitmq.openstack.org/clients-reconfigured", "true")
 
 			// Trigger reconciliation
 			SimulateRabbitMQClusterReady(rabbitmqName)
 
-			// Verify proxy was removed
+			// Verify proxy was removed AND ProxyRequired is false
 			Eventually(func(g Gomega) {
 				g.Expect(HasProxySidecar(rabbitmqName)).To(BeFalse(), "proxy should be removed after clients-reconfigured")
+				instance = GetRabbitMQ(rabbitmqName)
+				g.Expect(instance.Status.ProxyRequired).To(BeFalse(), "ProxyRequired should be false after clients-reconfigured")
 			}, timeout, interval).Should(Succeed())
+
+			// Verify the annotation was also removed
+			instance = GetRabbitMQ(rabbitmqName)
+			Expect(instance.Annotations).ToNot(HaveKey("rabbitmq.openstack.org/clients-reconfigured"),
+				"clients-reconfigured annotation should be removed")
 		})
 	})
 

@@ -74,8 +74,11 @@ func shouldEnableProxy(instance *RabbitMq) bool {
 ```
 
 The `clients-reconfigured` annotation is handled early in the reconciler (before
-`shouldEnableProxy` is called), which sets `ProxyRequired=false` and removes the
-annotation. So `shouldEnableProxy` only needs to check `ProxyRequired`.
+the deferred `PatchInstance` is set up), using explicit `Status().Update()` and
+`Update()` API calls to persist `ProxyRequired=false` and remove the annotation
+atomically. The reconciler then returns with Requeue, and the next reconcile
+runs without the proxy. This avoids a `PatchInstance` issue where the metadata
+patch clobbers in-memory status changes.
 
 ## Key Functions
 

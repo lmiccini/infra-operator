@@ -302,6 +302,27 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// Handle clients-reconfigured annotation BEFORE the deferred PatchInstance
+	// is set up. PatchInstance uses MergeFrom which does the metadata patch first,
+	// and Patch() mutates the instance with the server response — this clobbers
+	// any in-memory status changes (like ProxyRequired=false) before the status
+	// patch runs. By handling it here with explicit API calls and returning early,
+	// we avoid this issue entirely.
+	if instance.DeletionTimestamp.IsZero() && instance.Annotations != nil {
+		if configured, ok := instance.Annotations[rabbitmqv1beta1.AnnotationClientsReconfigured]; ok && configured == "true" {
+			instance.Status.ProxyRequired = false
+			if err := r.Client.Status().Update(ctx, instance); err != nil {
+				return ctrl.Result{}, err
+			}
+			delete(instance.Annotations, rabbitmqv1beta1.AnnotationClientsReconfigured)
+			if err := r.Client.Update(ctx, instance); err != nil {
+				return ctrl.Result{}, err
+			}
+			Log.Info("Clients reconfigured - cleared ProxyRequired and removed annotation")
+			return ctrl.Result{Requeue: true}, nil
+		}
+	}
+
 	// Save a copy of the condtions so that we can restore the LastTransitionTime
 	// when a condition's state doesn't change.
 	savedConditions := instance.Status.Conditions.DeepCopy()
@@ -357,19 +378,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// Handle service delete
 	if !instance.DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, instance, helper)
-	}
-
-	// Handle clients-reconfigured annotation: clear ProxyRequired, remove proxy,
-	// and remove the annotation. The reconcile continues so CreateOrPatch updates
-	// the cluster spec without the proxy sidecar.
-	clientsReconfigured := false
-	if instance.Annotations != nil {
-		if configured, ok := instance.Annotations[rabbitmqv1beta1.AnnotationClientsReconfigured]; ok && configured == "true" {
-			instance.Status.ProxyRequired = false
-			delete(instance.Annotations, rabbitmqv1beta1.AnnotationClientsReconfigured)
-			clientsReconfigured = true
-			Log.Info("Clients reconfigured - removing proxy and clearing annotation")
-		}
 	}
 
 	//
@@ -621,8 +629,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 
 	// Set ProxyRequired if we're in a 3.x → 4.x upgrade with Quorum migration
-	// Skip if clients were just reconfigured (annotation was handled earlier)
-	if !clientsReconfigured && !instance.Status.ProxyRequired &&
+	// Note: clients-reconfigured annotation is handled early (before defer) and
+	// returns Requeue, so it never reaches here. This guard only checks if
+	// ProxyRequired hasn't already been set by a previous reconcile.
+	if !instance.Status.ProxyRequired &&
 		instance.Status.UpgradePhase != rabbitmqv1beta1.UpgradePhaseNone {
 		if instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
 			if instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" &&
