@@ -193,7 +193,7 @@ kubectl get rabbitmq rabbitmq -o jsonpath='{.status.upgradePhase}'
    - Wait for cluster to become ready
    - Update `Status.CurrentVersion=4.2`
    - Clear `UpgradePhase=""` (upgrade complete)
-   - Remove `storage-wipe-needed` annotation
+   - Clear `UpgradePhase`
 4. **External services**: Continue using `amqp_durable_queues=false`
    - Proxy remains active because `Status.ProxyRequired=true`
 5. **Proxy rewrites**: Frames rewritten to use durable queues

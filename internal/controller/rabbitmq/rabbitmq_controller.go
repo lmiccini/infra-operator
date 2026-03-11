@@ -359,6 +359,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return r.reconcileDelete(ctx, instance, helper)
 	}
 
+	// Handle clients-reconfigured annotation: clear ProxyRequired, remove proxy,
+	// and remove the annotation. The reconcile continues so CreateOrPatch updates
+	// the cluster spec without the proxy sidecar.
+	clientsReconfigured := false
+	if instance.Annotations != nil {
+		if configured, ok := instance.Annotations[rabbitmqv1beta1.AnnotationClientsReconfigured]; ok && configured == "true" {
+			instance.Status.ProxyRequired = false
+			delete(instance.Annotations, rabbitmqv1beta1.AnnotationClientsReconfigured)
+			clientsReconfigured = true
+			Log.Info("Clients reconfigured - removing proxy and clearing annotation")
+		}
+	}
+
 	//
 	// TLS input validation
 	//
@@ -474,20 +487,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		},
 	}
 
-	// Manage the temporary storage-wipe-needed annotation.
-	// Add it when UpgradePhase is DeletingResources or WaitingForCluster so the
-	// RabbitmqCluster spec includes the wipe init container BEFORE we delete the StatefulSet.
-	// The cluster operator will then recreate the StatefulSet with the updated spec.
-	if instance.Status.UpgradePhase == rabbitmqv1beta1.UpgradePhaseDeletingResources ||
-		instance.Status.UpgradePhase == rabbitmqv1beta1.UpgradePhaseWaitingForCluster {
-		if rabbitmqCluster.Annotations == nil {
-			rabbitmqCluster.Annotations = make(map[string]string)
-		}
-		rabbitmqCluster.Annotations[rabbitmqv1beta1.AnnotationStorageWipeNeeded] = "true"
-	}
-	// When UpgradePhase is empty, the annotation is not added above.
-	// CreateOrPatch syncs the desired state, effectively removing the annotation.
-
 	err = instance.Spec.MarshalInto(&rabbitmqCluster.Spec)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
@@ -585,11 +584,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 
 	// Determine if we need to add data-wipe init container:
-	// 1. During storage wipe (temporary annotation set), OR
+	// 1. During active upgrade phase (storage wipe in progress), OR
 	// 2. If cluster already has it (preserve to avoid pod restarts)
 	// Version-specific marker files prevent duplicate wipes across pod restarts
-	needsDataWipe := rabbitmqCluster.Annotations != nil &&
-		rabbitmqCluster.Annotations[rabbitmqv1beta1.AnnotationStorageWipeNeeded] == "true"
+	needsDataWipe := instance.Status.UpgradePhase == rabbitmqv1beta1.UpgradePhaseDeletingResources ||
+		instance.Status.UpgradePhase == rabbitmqv1beta1.UpgradePhaseWaitingForCluster
 
 	// Preserve init container if it already exists (avoid pod restarts)
 	if !needsDataWipe {
@@ -621,20 +620,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, fmt.Errorf("error configuring RabbitmqCluster: %w", err)
 	}
 
-	// Manage ProxyRequired status flag
-	// Set to true when we detect a 3.x → 4.x upgrade with Quorum migration
-	// Clear when clients-reconfigured annotation is set, then remove the annotation
-	// so it doesn't interfere with future upgrade cycles
-	if instance.Annotations != nil {
-		if configured, ok := instance.Annotations[rabbitmqv1beta1.AnnotationClientsReconfigured]; ok && configured == "true" {
-			instance.Status.ProxyRequired = false
-			delete(instance.Annotations, rabbitmqv1beta1.AnnotationClientsReconfigured)
-			Log.Info("Clients reconfigured - clearing proxy requirement and removing annotation")
-		}
-	}
-
 	// Set ProxyRequired if we're in a 3.x → 4.x upgrade with Quorum migration
-	if !instance.Status.ProxyRequired && instance.Status.UpgradePhase != rabbitmqv1beta1.UpgradePhaseNone {
+	// Skip if clients were just reconfigured (annotation was handled earlier)
+	if !clientsReconfigured && !instance.Status.ProxyRequired &&
+		instance.Status.UpgradePhase != rabbitmqv1beta1.UpgradePhaseNone {
 		if instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
 			if instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" &&
 				rabbitmq.Is3xTo4xUpgrade(instance.Status.CurrentVersion, *instance.Spec.TargetVersion) {

@@ -281,14 +281,7 @@ func (r *Reconciler) buildProxySidecarContainer(instance *rabbitmqv1beta1.Rabbit
 // It persists after the upgrade completes and is only cleared when
 // AnnotationClientsReconfigured is set to "true".
 func (r *Reconciler) shouldEnableProxy(instance *rabbitmqv1beta1.RabbitMq) bool {
-	// Check if clients have been reconfigured - if so, no proxy needed
-	if instance.Annotations != nil {
-		if configured, ok := instance.Annotations[rabbitmqv1beta1.AnnotationClientsReconfigured]; ok && configured == "true" {
-			return false
-		}
-	}
-
-	// ProxyRequired is set by the main reconciler during 3.x → 4.x upgrades
-	// and persists across reconciliations until clients-reconfigured is set.
+	// ProxyRequired is set during 3.x → 4.x upgrades and cleared when
+	// the clients-reconfigured annotation is set (handled early in reconcile).
 	return instance.Status.ProxyRequired
 }

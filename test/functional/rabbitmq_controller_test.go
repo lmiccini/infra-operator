@@ -847,40 +847,37 @@ var _ = Describe("RabbitMQ Controller", func() {
 				}, timeout, interval).Should(Succeed())
 			})
 
-			It("should add and remove storage-wipe-needed annotation during upgrade", func() {
+			It("should add wipe-data init container during upgrade phases", func() {
 				TriggerUpgrade(rabbitmqName, "4.2")
 
-				// Verify cluster has temporary storage-wipe-needed annotation
+				// Verify cluster has wipe-data init container during upgrade phase
 				Eventually(func(g Gomega) {
 					cluster := &rabbitmqclusterv2.RabbitmqCluster{}
 					err := k8sClient.Get(ctx, rabbitmqName, cluster)
 					g.Expect(err).ToNot(HaveOccurred())
-					g.Expect(cluster.Annotations).To(HaveKeyWithValue("rabbitmq.openstack.org/storage-wipe-needed", "true"))
-				}, timeout, interval).Should(Succeed())
-
-				// Simulate cluster ready
-				SimulateRabbitMQClusterReady(rabbitmqName)
-
-				// Verify annotation is removed after cluster is ready
-				Eventually(func(g Gomega) {
-					cluster := &rabbitmqclusterv2.RabbitmqCluster{}
-					err := k8sClient.Get(ctx, rabbitmqName, cluster)
-					g.Expect(err).ToNot(HaveOccurred())
-					g.Expect(cluster.Annotations).ToNot(HaveKey("rabbitmq.openstack.org/storage-wipe-needed"))
+					g.Expect(cluster.Spec.Override.StatefulSet).ToNot(BeNil())
+					g.Expect(cluster.Spec.Override.StatefulSet.Spec).ToNot(BeNil())
+					g.Expect(cluster.Spec.Override.StatefulSet.Spec.Template).ToNot(BeNil())
+					g.Expect(cluster.Spec.Override.StatefulSet.Spec.Template.Spec).ToNot(BeNil())
+					var foundWipeContainer bool
+					for _, container := range cluster.Spec.Override.StatefulSet.Spec.Template.Spec.InitContainers {
+						if container.Name == "wipe-data" {
+							foundWipeContainer = true
+							break
+						}
+					}
+					g.Expect(foundWipeContainer).To(BeTrue(), "wipe-data init container should be present during upgrade")
 				}, timeout, interval).Should(Succeed())
 			})
 
-			It("should add wipe-data init container when storage-wipe-needed annotation is set", func() {
+			It("should add wipe-data init container with correct spec during upgrade", func() {
 				TriggerUpgrade(rabbitmqName, "4.2")
 
-				// Verify cluster has wipe-data init container
+				// Verify cluster has wipe-data init container with correct spec
 				Eventually(func(g Gomega) {
 					cluster := &rabbitmqclusterv2.RabbitmqCluster{}
 					err := k8sClient.Get(ctx, rabbitmqName, cluster)
 					g.Expect(err).ToNot(HaveOccurred())
-
-					// Check that cluster has temporary storage-wipe-needed annotation
-					g.Expect(cluster.Annotations).To(HaveKeyWithValue("rabbitmq.openstack.org/storage-wipe-needed", "true"))
 
 					// Check that wipe-data init container is present
 					// The cluster spec should have Override.StatefulSet with init containers
@@ -921,18 +918,16 @@ var _ = Describe("RabbitMQ Controller", func() {
 				}, timeout, interval).Should(Succeed())
 			})
 
-			It("should keep wipe-data init container even after annotation is removed to avoid pod restarts", func() {
+			It("should keep wipe-data init container after upgrade completes to avoid pod restarts", func() {
 				TriggerUpgrade(rabbitmqName, "4.2")
 
 				// Simulate cluster ready
 				SimulateRabbitMQClusterReady(rabbitmqName)
 
-				// Wait for annotation to be removed
+				// Wait for upgrade to complete
 				Eventually(func(g Gomega) {
-					cluster := &rabbitmqclusterv2.RabbitmqCluster{}
-					err := k8sClient.Get(ctx, rabbitmqName, cluster)
-					g.Expect(err).ToNot(HaveOccurred())
-					g.Expect(cluster.Annotations).ToNot(HaveKey("rabbitmq.openstack.org/storage-wipe-needed"))
+					instance := GetRabbitMQ(rabbitmqName)
+					g.Expect(string(instance.Status.UpgradePhase)).To(BeEmpty())
 				}, timeout, interval).Should(Succeed())
 
 				// Trigger a reconcile by updating RabbitMq CR
@@ -951,9 +946,6 @@ var _ = Describe("RabbitMQ Controller", func() {
 					cluster := &rabbitmqclusterv2.RabbitmqCluster{}
 					err := k8sClient.Get(ctx, rabbitmqName, cluster)
 					g.Expect(err).ToNot(HaveOccurred())
-
-					// Annotation should have been removed to prevent user manipulation
-					g.Expect(cluster.Annotations).ToNot(HaveKey("rabbitmq.openstack.org/storage-wipe-needed"))
 
 					// Init container should STILL be present (to avoid spec changes and pod restarts)
 					g.Expect(cluster.Spec.Override.StatefulSet).ToNot(BeNil())
@@ -1160,7 +1152,7 @@ var _ = Describe("RabbitMQ Controller", func() {
 				// Step 4: Wait for storage wipe to reach WaitingForCluster phase
 				Eventually(func(g Gomega) {
 					instance := GetRabbitMQ(rabbitmqName)
-					g.Expect(instance.Status.UpgradePhase).To(Equal("WaitingForCluster"),
+					g.Expect(instance.Status.UpgradePhase).To(Equal(rabbitmqv1.UpgradePhaseWaitingForCluster),
 						"Storage wipe should reach WaitingForCluster phase for 3.9 -> 4.2 upgrade")
 				}, timeout*2, interval).Should(Succeed())
 
@@ -1304,14 +1296,11 @@ var _ = Describe("RabbitMQ Controller", func() {
 			It("should add wipe-data init container during queue migration", func() {
 				TriggerUpgrade(rabbitmqName, "4.2")
 
-				// Verify cluster has storage-wipe-needed annotation and wipe-data init container
+				// Verify cluster has wipe-data init container
 				Eventually(func(g Gomega) {
 					cluster := &rabbitmqclusterv2.RabbitmqCluster{}
 					err := k8sClient.Get(ctx, rabbitmqName, cluster)
 					g.Expect(err).ToNot(HaveOccurred())
-
-					// Annotation should be set to trigger wipe
-					g.Expect(cluster.Annotations).To(HaveKeyWithValue("rabbitmq.openstack.org/storage-wipe-needed", "true"))
 
 					// Init container should be present
 					g.Expect(cluster.Spec.Override.StatefulSet).ToNot(BeNil())

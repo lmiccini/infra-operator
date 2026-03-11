@@ -892,7 +892,9 @@ func (r *TransportURLReconciler) createTransportURLSecret(
 	}
 
 	// Ensure vhost has leading / (e.g., "/" or "/nova")
-	if vhost != "/" && vhost[0] != '/' {
+	if vhost == "" {
+		vhost = "/"
+	} else if vhost[0] != '/' {
 		vhost = "/" + vhost
 	}
 

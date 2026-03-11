@@ -20,7 +20,6 @@ import (
 	"testing"
 
 	rabbitmqv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 )
 
@@ -87,29 +86,9 @@ func TestShouldEnableProxy(t *testing.T) {
 			},
 			want: false,
 		},
-		{
-			name: "should NOT enable proxy when clients-reconfigured annotation is set",
-			instance: func() *rabbitmqv1beta1.RabbitMq {
-				return &rabbitmqv1beta1.RabbitMq{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							rabbitmqv1beta1.AnnotationClientsReconfigured: "true",
-						},
-					},
-					Spec: rabbitmqv1beta1.RabbitMqSpec{
-						RabbitMqSpecCore: rabbitmqv1beta1.RabbitMqSpecCore{
-							QueueType: ptr.To("Quorum"),
-						},
-					},
-					Status: rabbitmqv1beta1.RabbitMqStatus{
-						CurrentVersion: "4.2.0",
-						QueueType:      "Quorum",
-						ProxyRequired:  true, // Even with ProxyRequired, clients-reconfigured wins
-					},
-				}
-			},
-			want: false,
-		},
+		// Note: clients-reconfigured annotation is handled early in the reconciler
+		// (before shouldEnableProxy is called), which sets ProxyRequired=false.
+		// So shouldEnableProxy only needs to check ProxyRequired (tested above).
 	}
 
 	for _, tt := range tests {

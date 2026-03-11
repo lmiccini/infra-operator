@@ -55,9 +55,6 @@ const (
 	// AnnotationClientsReconfigured - set to "true" when dataplane clients have been
 	// reconfigured to use durable queues, allowing the proxy sidecar to be removed.
 	AnnotationClientsReconfigured = "rabbitmq.openstack.org/clients-reconfigured"
-	// AnnotationStorageWipeNeeded - temporary annotation on RabbitmqCluster to signal
-	// that the wipe-data init container should be included in the StatefulSet spec.
-	AnnotationStorageWipeNeeded = "rabbitmq.openstack.org/storage-wipe-needed"
 )
 
 // UpgradePhase tracks the current phase of a version upgrade or queue migration.
