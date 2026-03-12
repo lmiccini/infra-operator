@@ -4,6 +4,7 @@ metadata:
   name: instanceha
 spec:
   caBundleSecretName: combined-ca-bundle
+  #disabled: "False"
   #containerImage: "quay.io/podified-antelope-centos9/openstack-openstackclient:current-podified"
   #networkAttachments: ['internalapi']
   #openStackCloud: "default"
