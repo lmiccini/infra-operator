@@ -84,6 +84,13 @@ type InstanceHaSpec struct {
 	tls.Ca `json:",inline"`
 
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=True;False
+	// +kubebuilder:default=False
+	// Disabled allows disabling the InstanceHA process so that it does not
+	// fence and evacuate compute nodes
+	Disabled string `json:"disabled"`
+
+	// +kubebuilder:validation:Optional
 	// TopologyRef to apply the Topology defined by the associated CR referenced
 	// by name
 	TopologyRef *topologyv1.TopoRef `json:"topologyRef,omitempty"`
