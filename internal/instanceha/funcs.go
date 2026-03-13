@@ -40,6 +40,7 @@ func Deployment(
 	envVars := map[string]env.Setter{}
 	envVars["OS_CLOUD"] = env.SetValue(openstackcloud)
 	envVars["CONFIG_HASH"] = env.SetValue(configHash)
+	envVars["INSTANCEHA_DISABLED"] = env.SetValue(string(instance.Spec.Disabled))
 
 	// create Volume and VolumeMounts
 	volumes := instancehaPodVolumes(instance)

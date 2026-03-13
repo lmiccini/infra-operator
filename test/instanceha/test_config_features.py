@@ -57,6 +57,54 @@ sys.path.insert(0, os.path.abspath(instanceha_path))
 import instanceha
 
 
+class TestDisabledEnvVarOverride(unittest.TestCase):
+    """Test that the INSTANCEHA_DISABLED env var (set from the CR spec) overrides the config file."""
+
+    def test_env_var_true_overrides_config(self):
+        """Test that INSTANCEHA_DISABLED=True env var sets DISABLED=True in config."""
+        with patch.dict(os.environ, {'INSTANCEHA_DISABLED': 'True'}):
+            config = instanceha.ConfigManager.__new__(instanceha.ConfigManager)
+            config.config_path = '/nonexistent'
+            config.clouds_path = '/nonexistent'
+            config.secure_path = '/nonexistent'
+            config.fencing_path = '/nonexistent'
+
+            with patch.object(config, '_load_yaml_file', return_value={'config': {'DISABLED': False}}):
+                result = config._load_config()
+
+            self.assertTrue(result['DISABLED'])
+
+    def test_env_var_false_overrides_config(self):
+        """Test that INSTANCEHA_DISABLED=False env var sets DISABLED=False in config."""
+        with patch.dict(os.environ, {'INSTANCEHA_DISABLED': 'False'}):
+            config = instanceha.ConfigManager.__new__(instanceha.ConfigManager)
+            config.config_path = '/nonexistent'
+            config.clouds_path = '/nonexistent'
+            config.secure_path = '/nonexistent'
+            config.fencing_path = '/nonexistent'
+
+            with patch.object(config, '_load_yaml_file', return_value={'config': {'DISABLED': True}}):
+                result = config._load_config()
+
+            self.assertFalse(result['DISABLED'])
+
+    def test_env_var_absent_uses_config_file(self):
+        """Test that without INSTANCEHA_DISABLED env var, config file value is used."""
+        env = os.environ.copy()
+        env.pop('INSTANCEHA_DISABLED', None)
+        with patch.dict(os.environ, env, clear=True):
+            config = instanceha.ConfigManager.__new__(instanceha.ConfigManager)
+            config.config_path = '/nonexistent'
+            config.clouds_path = '/nonexistent'
+            config.secure_path = '/nonexistent'
+            config.fencing_path = '/nonexistent'
+
+            with patch.object(config, '_load_yaml_file', return_value={'config': {'DISABLED': True}}):
+                result = config._load_config()
+
+            self.assertTrue(result['DISABLED'])
+
+
 class TestDisabledConfig(unittest.TestCase):
     """Test DISABLED configuration parameter (line 478, used at line 2567-2568)."""
 

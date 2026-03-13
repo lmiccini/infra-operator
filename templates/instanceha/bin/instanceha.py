@@ -396,7 +396,13 @@ class ConfigManager:
 
     def _load_config(self) -> Dict[str, Any]:
         data = self._load_yaml_file(self.config_path, "configuration")
-        return data.get("config", {})
+        config = data.get("config", {})
+        # Allow the INSTANCEHA_DISABLED env var (set from the CR spec) to override
+        # the config file value
+        env_disabled = os.getenv('INSTANCEHA_DISABLED')
+        if env_disabled is not None:
+            config['DISABLED'] = env_disabled == 'True'
+        return config
 
     def _load_clouds_config(self) -> Dict[str, Any]:
         data = self._load_yaml_file(self.clouds_path, "clouds configuration")
