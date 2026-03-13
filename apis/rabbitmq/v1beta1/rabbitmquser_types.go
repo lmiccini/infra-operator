@@ -118,6 +118,9 @@ type RabbitMQUserStatus struct {
 //+kubebuilder:printcolumn:name="Vhost",type="string",JSONPath=".status.vhost"
 //+kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.conditions[0].status"
 //+kubebuilder:printcolumn:name="Message",type="string",JSONPath=".status.conditions[0].message"
+//+kubebuilder:metadata:labels=backup.openstack.org/restore=true
+//+kubebuilder:metadata:labels=backup.openstack.org/category=controlplane
+//+kubebuilder:metadata:labels=backup.openstack.org/restore-order=40
 
 // RabbitMQUser is the Schema for the rabbitmqusers API
 type RabbitMQUser struct {

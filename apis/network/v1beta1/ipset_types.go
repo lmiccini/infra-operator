@@ -108,6 +108,9 @@ type IPSetStatus struct {
 //+kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[0].status",description="Ready"
 //+kubebuilder:printcolumn:name="Message",type="string",JSONPath=".status.conditions[0].message",description="Message"
 //+kubebuilder:printcolumn:name="Reservation",type="string",JSONPath=".status.reservation",description="Reservation"
+//+kubebuilder:metadata:labels=backup.openstack.org/restore=true
+//+kubebuilder:metadata:labels=backup.openstack.org/category=dataplane
+//+kubebuilder:metadata:labels=backup.openstack.org/restore-order=40
 
 // IPSet is the Schema for the ipsets API
 type IPSet struct {

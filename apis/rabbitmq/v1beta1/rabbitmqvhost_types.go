@@ -50,6 +50,9 @@ type RabbitMQVhostStatus struct {
 //+kubebuilder:printcolumn:name="Vhost",type="string",JSONPath=".spec.name"
 //+kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.conditions[0].status"
 //+kubebuilder:printcolumn:name="Message",type="string",JSONPath=".status.conditions[0].message"
+//+kubebuilder:metadata:labels=backup.openstack.org/restore=true
+//+kubebuilder:metadata:labels=backup.openstack.org/category=controlplane
+//+kubebuilder:metadata:labels=backup.openstack.org/restore-order=40
 
 // RabbitMQVhost is the Schema for the rabbitmqvhosts API
 type RabbitMQVhost struct {

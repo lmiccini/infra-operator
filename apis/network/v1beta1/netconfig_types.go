@@ -136,6 +136,9 @@ type NetConfigStatus struct {
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
 //+kubebuilder:resource:shortName=netcfg;netscfg
+//+kubebuilder:metadata:labels=backup.openstack.org/restore=true
+//+kubebuilder:metadata:labels=backup.openstack.org/category=dataplane
+//+kubebuilder:metadata:labels=backup.openstack.org/restore-order=20
 
 // NetConfig is the Schema for the netconfigs API
 type NetConfig struct {
