@@ -1,0 +1,28 @@
+#
+# Check that old resources are created before deploying RabbitMq CR
+#
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq-migrate-server
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-migrate-nodes
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-migrate
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rabbitmq-migrate-default-user
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rabbitmq-migrate-erlang-cookie

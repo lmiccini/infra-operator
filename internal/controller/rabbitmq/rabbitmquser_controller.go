@@ -39,7 +39,6 @@ import (
 	helper "github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/object"
 	oko_secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
-	rabbitmqclusterv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -80,7 +79,6 @@ type RabbitMQUserReconciler struct {
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqvhosts,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqvhosts/finalizers,verbs=update
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs,verbs=get;list;watch
-//+kubebuilder:rbac:groups=rabbitmq.com,resources=rabbitmqclusters,verbs=get;list;watch
 //+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile reconciles a RabbitMQUser object
@@ -226,7 +224,7 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 	}
 
 	// Get RabbitMQ cluster
-	rabbit := &rabbitmqclusterv2.RabbitmqCluster{}
+	rabbit := &rabbitmqv1.RabbitMq{}
 	err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbit)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.RabbitMQUserReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.RabbitMQUserReadyErrorMessage, err.Error()))
@@ -526,7 +524,7 @@ func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *
 	}
 
 	// Get RabbitMQ cluster
-	rabbit := &rabbitmqclusterv2.RabbitmqCluster{}
+	rabbit := &rabbitmqv1.RabbitMq{}
 	err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbit)
 
 	// If cluster is being deleted or not found, skip cleanup and just remove finalizer
@@ -709,8 +707,6 @@ func (r *RabbitMQUserReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Secret{}).
 		Watches(&rabbitmqv1.RabbitMQVhost{},
 			handler.EnqueueRequestsFromMapFunc(r.vhostToUserMapFunc)).
-		Watches(&rabbitmqclusterv2.RabbitmqCluster{},
-			handler.EnqueueRequestsFromMapFunc(r.clusterToUserMapFunc)).
 		Watches(&rabbitmqv1.RabbitMq{},
 			handler.EnqueueRequestsFromMapFunc(r.clusterToUserMapFunc)).
 		Watches(

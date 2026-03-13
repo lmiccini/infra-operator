@@ -1,0 +1,81 @@
+#
+# Step 2: Validate migration details
+#
+# - Existing credentials are preserved in the default-user secret
+# - Erlang cookie value is preserved
+# - Old selector labels are preserved in StatefulSet template
+# - Host field in default-user secret is updated to new service DNS
+# - Services have correct ports and configuration
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+commands:
+  - script: |
+      set -e
+      # Verify existing credentials are preserved in default-user secret
+      USERNAME=$(oc get secret -n $NAMESPACE rabbitmq-migrate-default-user -o jsonpath='{.data.username}' | base64 -d)
+      PASSWORD=$(oc get secret -n $NAMESPACE rabbitmq-migrate-default-user -o jsonpath='{.data.password}' | base64 -d)
+      if [ "$USERNAME" != "existing-user" ]; then
+        echo "FAIL: Username was not preserved. Expected 'existing-user', got '$USERNAME'"
+        exit 1
+      fi
+      if [ "$PASSWORD" != "existing-password" ]; then
+        echo "FAIL: Password was not preserved. Expected 'existing-password', got '$PASSWORD'"
+        exit 1
+      fi
+      echo "PASS: Existing credentials preserved"
+  - script: |
+      set -e
+      # Verify the erlang cookie value is preserved
+      COOKIE=$(oc get secret -n $NAMESPACE rabbitmq-migrate-erlang-cookie -o jsonpath='{.data.\.erlang\.cookie}' | base64 -d)
+      if [ "$COOKIE" != "existing-erlang-cookie-value" ]; then
+        echo "FAIL: Erlang cookie was not preserved. Expected 'existing-erlang-cookie-value', got '$COOKIE'"
+        exit 1
+      fi
+      echo "PASS: Erlang cookie preserved"
+  - script: |
+      set -e
+      # Verify old selector labels are still present in StatefulSet template
+      TEMPLATE_LABELS=$(oc get statefulset -n $NAMESPACE rabbitmq-migrate-server -o jsonpath='{.spec.template.metadata.labels}')
+      echo "$TEMPLATE_LABELS" | grep -q 'app.kubernetes.io/name' || {
+        echo "FAIL: Old selector label app.kubernetes.io/name missing from template"
+        exit 1
+      }
+      echo "PASS: Old selector labels preserved in StatefulSet template"
+  - script: |
+      set -e
+      # Verify the host field in default-user secret has been updated to new service DNS
+      HOST=$(oc get secret -n $NAMESPACE rabbitmq-migrate-default-user -o jsonpath='{.data.host}' | base64 -d)
+      EXPECTED="rabbitmq-migrate.$NAMESPACE.svc"
+      if [ "$HOST" != "$EXPECTED" ]; then
+        echo "FAIL: Host should be updated to new service DNS. Expected '$EXPECTED', got '$HOST'"
+        exit 1
+      fi
+      echo "PASS: Host updated to new service DNS: $HOST"
+  - script: |
+      set -e
+      # Verify the headless service was updated with correct configuration
+      PNRA=$(oc get service -n $NAMESPACE rabbitmq-migrate-nodes -o jsonpath='{.spec.publishNotReadyAddresses}')
+      if [ "$PNRA" != "true" ]; then
+        echo "FAIL: Headless service should have publishNotReadyAddresses: true"
+        exit 1
+      fi
+      echo "PASS: Headless service has publishNotReadyAddresses: true"
+  - script: |
+      set -e
+      # Verify the client service has AMQP port
+      AMQP_PORT=$(oc get service -n $NAMESPACE rabbitmq-migrate -o jsonpath='{.spec.ports[?(@.name=="amqp")].port}')
+      if [ "$AMQP_PORT" != "5672" ]; then
+        echo "FAIL: Client service missing AMQP port 5672, got: $AMQP_PORT"
+        exit 1
+      fi
+      echo "PASS: Client service has AMQP port 5672"
+  - script: |
+      set -e
+      # Verify StatefulSet has config-hash annotation (config change triggers restart)
+      HASH=$(oc get statefulset -n $NAMESPACE rabbitmq-migrate-server -o jsonpath='{.spec.template.metadata.annotations.config-hash}')
+      if [ -z "$HASH" ]; then
+        echo "FAIL: StatefulSet pod template missing config-hash annotation"
+        exit 1
+      fi
+      echo "PASS: config-hash annotation is set: $HASH"

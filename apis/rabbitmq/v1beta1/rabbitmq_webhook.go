@@ -21,7 +21,6 @@ import (
 	"time"
 
 	common_webhook "github.com/openstack-k8s-operators/lib-common/modules/common/webhook"
-	rabbitmqv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -141,42 +140,12 @@ func (r *RabbitMq) Default(k8sClient client.Client) {
 						"reason", "preventing queue type change on existing deployment")
 					shouldDefaultQueueType = false
 				}
-				// If we get here with rabbitMqCRExists=true but no QueueType, fall through to check RabbitmqCluster
+				// If we get here with rabbitMqCRExists=true but no QueueType, it's an existing
+			// deployment without QueueType set - default to Quorum
 			}
 
-			// If we haven't set QueueType yet (either no RabbitMq CR, or it exists but has no QueueType),
-			// check if RabbitmqCluster exists (upgrade scenario)
 			if shouldDefaultQueueType {
-				rabbitmqlog.Info("checking for existing RabbitmqCluster to determine if this is an upgrade",
-					"name", r.Name, "namespace", r.Namespace, "rabbitMqCRExists", rabbitMqCRExists)
-				cluster := &rabbitmqv2.RabbitmqCluster{}
-				clusterErr := k8sClient.Get(ctx, types.NamespacedName{
-					Name: r.Name, Namespace: r.Namespace,
-				}, cluster)
-
-				if clusterErr != nil && !apierrors.IsNotFound(clusterErr) {
-					// Error fetching RabbitmqCluster (not a NotFound error)
-					// Fail safe: don't default QueueType to avoid breaking existing deployments
-					rabbitmqlog.Error(clusterErr, "error checking for existing RabbitMQCluster, not defaulting QueueType for safety",
-						"name", r.Name, "namespace", r.Namespace)
-					shouldDefaultQueueType = false
-				} else if clusterErr == nil && !cluster.CreationTimestamp.IsZero() {
-					// RabbitmqCluster exists - this is an existing deployment, don't default
-					shouldDefaultQueueType = false
-					rabbitmqlog.Info("found existing RabbitMQCluster, not defaulting QueueType",
-						"name", r.Name,
-						"clusterCreationTimestamp", cluster.CreationTimestamp.String(),
-						"reason", "existing rabbitmq clusters should never be touched")
-				} else {
-					// No existing RabbitmqCluster - this is truly a new deployment
-					// shouldDefaultQueueType stays true, will default to Quorum in spec.Default()
-					if clusterErr != nil {
-						rabbitmqlog.Info("no existing RabbitmqCluster found, will default QueueType to Quorum",
-							"name", r.Name, "namespace", r.Namespace, "error", clusterErr.Error())
-					} else {
-						rabbitmqlog.Info("new RabbitMq deployment, will default QueueType to Quorum", "name", r.Name)
-					}
-				}
+				rabbitmqlog.Info("new RabbitMq CR, will default QueueType to Quorum", "name", r.Name)
 			}
 		}
 	}
@@ -206,10 +175,54 @@ func (spec *RabbitMqSpec) Default(shouldDefaultQueueType bool) {
 	spec.RabbitMqSpecCore.Default(shouldDefaultQueueType)
 }
 
-// Default - set defaults for this RabbitMqSpecCore
-// shouldDefaultQueueType: if true, sets QueueType to "Quorum" when not already set
-func (spec *RabbitMqSpecCore) Default(shouldDefaultQueueType bool) {
-	if shouldDefaultQueueType && (spec.QueueType == nil || *spec.QueueType == "") {
+// Default - set defaults for this RabbitMqSpecCore and migrate from old format
+func (spec *RabbitMqSpecCore) Default(isNew bool) {
+	// Migrate from old embedded format (persistence, rabbitmq, override) to new explicit fields
+	// This handles backward compatibility for existing CRs using the old format
+
+	// Migrate from old persistence format
+	if spec.Storage.StorageClassName == nil && spec.Persistence.StorageClassName != nil {
+		spec.Storage.StorageClassName = spec.Persistence.StorageClassName
+	}
+	if spec.Storage.Storage == nil && spec.Persistence.Storage != nil {
+		spec.Storage.Storage = spec.Persistence.Storage
+	}
+
+	// Migrate from old rabbitmq config format
+	if spec.Config.AdditionalConfig == "" && spec.Rabbitmq.AdditionalConfig != "" {
+		spec.Config.AdditionalConfig = spec.Rabbitmq.AdditionalConfig
+	}
+	if spec.Config.AdvancedConfig == "" && spec.Rabbitmq.AdvancedConfig != "" {
+		spec.Config.AdvancedConfig = spec.Rabbitmq.AdvancedConfig
+	}
+
+	// Migrate from old override.service format to new service field
+	if spec.Override != nil && spec.Override.Service != nil {
+		// Migrate service type
+		if spec.Service.Type == "" && spec.Override.Service.Spec != nil && spec.Override.Service.Spec.Type != "" {
+			spec.Service.Type = spec.Override.Service.Spec.Type
+		}
+		// Migrate service annotations
+		if len(spec.Service.Annotations) == 0 && spec.Override.Service.Annotations != nil {
+			spec.Service.Annotations = make(map[string]string)
+			for k, v := range spec.Override.Service.Annotations {
+				spec.Service.Annotations[k] = v
+			}
+		}
+	}
+
+	// TLS defaulting - set CaSecretName to SecretName if not explicitly set
+	if spec.TLS.SecretName != "" && spec.TLS.CaSecretName == "" {
+		spec.TLS.CaSecretName = spec.TLS.SecretName
+	}
+
+	// TLS defaulting - set DisableNonTLSListeners to true when TLS is enabled
+	if spec.TLS.SecretName != "" {
+		spec.TLS.DisableNonTLSListeners = true
+	}
+
+	// QueueType defaulting
+	if isNew && (spec.QueueType == nil || *spec.QueueType == "") {
 		queueType := "Quorum"
 		spec.QueueType = &queueType
 	}

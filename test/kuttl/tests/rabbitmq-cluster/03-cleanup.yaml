@@ -1,0 +1,7 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+- script: |
+    # Force-delete pods first to avoid waiting for the 7-day terminationGracePeriodSeconds
+    kubectl delete pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq --grace-period=0 --force 2>/dev/null || true
+    kubectl delete rabbitmq.rabbitmq.openstack.org rabbitmq -n $NAMESPACE 2>/dev/null || true

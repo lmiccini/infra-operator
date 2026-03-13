@@ -1,0 +1,6 @@
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq
+spec:
+  replicas: 1

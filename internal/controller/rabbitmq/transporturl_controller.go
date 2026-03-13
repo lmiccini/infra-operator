@@ -42,7 +42,6 @@ import (
 	helper "github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	object "github.com/openstack-k8s-operators/lib-common/modules/common/object"
 	oko_secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
-	rabbitmqclusterv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -402,7 +401,6 @@ func hasExternalFinalizers(user *rabbitmqv1.RabbitMQUser) bool {
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs,verbs=get;list;watch
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqusers,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqvhosts,verbs=get;list;watch;create;update;patch
-//+kubebuilder:rbac:groups=rabbitmq.com,resources=rabbitmqclusters,verbs=get;list;watch
 //+kubebuilder:rbac:groups=cinder.openstack.org;glance.openstack.org;heat.openstack.org;horizon.openstack.org;ironic.openstack.org;keystone.openstack.org;manila.openstack.org;neutron.openstack.org;nova.openstack.org;octavia.openstack.org;ovn.openstack.org;placement.openstack.org;swift.openstack.org;telemetry.openstack.org;designate.openstack.org;barbican.openstack.org;watcher.openstack.org,resources=*,verbs=get;list
 //+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete;
 
@@ -510,14 +508,7 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 	}
 
 	// Wait for RabbitMQ cluster to be ready
-	rabbitReady := false
-	for _, condition := range rabbit.Status.Conditions {
-		if condition.Reason == "AllPodsAreReady" && condition.Status == "True" {
-			rabbitReady = true
-			break
-		}
-	}
-	if !rabbitReady {
+	if err := checkClusterReadiness(rabbit); err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			rabbitmqv1.TransportURLReadyCondition,
 			condition.RequestedReason,
@@ -583,13 +574,6 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		return ctrl.Result{}, err
 	}
 
-	// Get RabbitMq CR early to determine queue type for vhost selection
-	rabbitmqCR := &rabbitmqv1.RabbitMq{}
-	rabbitmqCRErr := r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbitmqCR)
-	if rabbitmqCRErr != nil {
-		Log.Info(fmt.Sprintf("Could not fetch RabbitMQ CR: %v", rabbitmqCRErr))
-	}
-
 	// Determine credentials and vhost
 	var finalUsername, finalPassword, vhostName string
 	var userRef, vhostRef string
@@ -597,7 +581,7 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 	if instance.Spec.UserRef != "" {
 		userRef = instance.Spec.UserRef
 	} else if instance.Spec.Username != "" {
-		// Determine vhost
+		// Create RabbitMQVhost if needed
 		vhostName = instance.Spec.Vhost
 		if vhostName == "" {
 			vhostName = "/"
@@ -758,6 +742,9 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		finalUsername = string(userSecret.Data["username"])
 		finalPassword = string(userSecret.Data["password"])
 		vhostName = rabbitUser.Status.Vhost
+		if vhostName == "" {
+			vhostName = "/"
+		}
 	} else {
 		// Use default cluster admin credentials
 		finalUsername = string(adminUsername)
@@ -768,9 +755,13 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 	tlsEnabled := rabbit.Spec.TLS.SecretName != ""
 	Log.Info(fmt.Sprintf("rabbitmq cluster %s has TLS enabled: %t", rabbit.Name, tlsEnabled))
 
+	// Get RabbitMq CR for both secret generation and status update
+	rabbitmqCR := &rabbitmqv1.RabbitMq{}
+	err = r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbitmqCR)
+
 	// Build list of hosts - use ServiceHostnames from status if available, otherwise use host from secret
 	var hosts []string
-	if rabbitmqCRErr == nil && len(rabbitmqCR.Status.ServiceHostnames) > 0 {
+	if err == nil && len(rabbitmqCR.Status.ServiceHostnames) > 0 {
 		hosts = rabbitmqCR.Status.ServiceHostnames
 		Log.Info(fmt.Sprintf("Using per-pod service hostnames: %v", hosts))
 	} else {
@@ -791,8 +782,8 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 
 	// Determine quorum setting for secret generation
 	quorum := false
-	if rabbitmqCRErr != nil {
-		Log.Info(fmt.Sprintf("Could not fetch RabbitMQ CR: %v", rabbitmqCRErr))
+	if err != nil {
+		Log.Info(fmt.Sprintf("Could not fetch RabbitMQ CR: %v", err))
 		// Default to false for quorum if we can't fetch the CR
 	} else {
 		Log.Info(fmt.Sprintf("Found RabbitMQ CR: %s", rabbitmqCR.Name))
@@ -800,8 +791,7 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		// Determine quorum setting - prefer Spec over Status
 		// Spec represents the configured queue type and is set immediately when the CR is created,
 		// while Status.QueueType is updated asynchronously after cluster initialization.
-		// This prevents a race condition where TransportURL reconciles before Status.QueueType is set
-		// after a RabbitMQ upgrade/recreation (e.g., during 3.9 -> 4.2 upgrade with storage wipe).
+		// This prevents a race condition where TransportURL reconciles before Status.QueueType is set.
 		if rabbitmqCR.Spec.QueueType != nil {
 			quorum = *rabbitmqCR.Spec.QueueType == rabbitmqv1.QueueTypeQuorum
 			Log.Info(fmt.Sprintf("Setting quorum to: %t based on spec QueueType", quorum))
@@ -894,7 +884,7 @@ func (r *TransportURLReconciler) createTransportURLSecret(
 	// Ensure vhost has leading / (e.g., "/" or "/nova")
 	if vhost == "" {
 		vhost = "/"
-	} else if vhost[0] != '/' {
+	} else if vhost != "/" && vhost[0] != '/' {
 		vhost = "/" + vhost
 	}
 
@@ -1002,11 +992,6 @@ func (r *TransportURLReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&rabbitmqv1.RabbitMQUser{}).
 		Owns(&rabbitmqv1.RabbitMQVhost{}).
 		Watches(
-			&rabbitmqclusterv2.RabbitmqCluster{},
-			handler.EnqueueRequestsFromMapFunc(r.findObjectsForSrc),
-			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
-		).
-		Watches(
 			&rabbitmqv1.RabbitMq{},
 			handler.EnqueueRequestsFromMapFunc(r.findObjectsForSrc),
 			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
@@ -1048,13 +1033,13 @@ func (r *TransportURLReconciler) findObjectsForSrc(ctx context.Context, src clie
 	return requests
 }
 
-// GetRabbitmqCluster - get RabbitmqCluster object in namespace
+// GetRabbitmqCluster - get RabbitMq object in namespace
 func getRabbitmqCluster(
 	ctx context.Context,
 	h *helper.Helper,
 	instance *rabbitmqv1.TransportURL,
-) (*rabbitmqclusterv2.RabbitmqCluster, error) {
-	rabbitMqCluster := &rabbitmqclusterv2.RabbitmqCluster{}
+) (*rabbitmqv1.RabbitMq, error) {
+	rabbitMqCluster := &rabbitmqv1.RabbitMq{}
 
 	err := h.GetClient().Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbitMqCluster)
 
