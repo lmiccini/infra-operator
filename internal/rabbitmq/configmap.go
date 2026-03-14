@@ -133,6 +133,12 @@ func buildOperatorDefaults(r *rabbitmqv1.RabbitMq, IPv6Enabled bool, configVersi
 		config = append(config, "prometheus.ssl.port                        = 15691")
 		if r.Spec.TLS.DisableNonTLSListeners {
 			config = append(config, "listeners.tcp                              = none")
+		} else {
+			// When TLS is enabled but non-TLS listeners are not disabled,
+			// explicitly set management/prometheus TCP ports so they remain
+			// accessible alongside the TLS ports (matches cluster-operator).
+			config = append(config, "management.tcp.port                        = 15672")
+			config = append(config, "prometheus.tcp.port                        = 15692")
 		}
 	}
 
