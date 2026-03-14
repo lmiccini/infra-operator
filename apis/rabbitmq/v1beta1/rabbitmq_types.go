@@ -47,12 +47,10 @@ const (
 	warnOverrideStatefulSet = "%s: is deprecated and will be removed in a future API version"
 
 	// Queue types
-	// QueueTypeMirrored - mirrored queue type
+	// QueueTypeMirrored - mirrored (classic HA) queue type
 	QueueTypeMirrored = "Mirrored"
 	// QueueTypeQuorum - quorum queue type
 	QueueTypeQuorum = "Quorum"
-	// QueueTypeNone - no special queue type
-	QueueTypeNone = "None"
 
 	// AnnotationClientsReconfigured - set to "true" when dataplane clients have been
 	// reconfigured for quorum queues, allowing the proxy sidecar to be removed
@@ -65,7 +63,7 @@ type UpgradePhase string
 const (
 	// UpgradePhaseNone - no upgrade in progress
 	UpgradePhaseNone UpgradePhase = ""
-	// UpgradePhaseDeletingResources - deleting ha-all policy and StatefulSet
+	// UpgradePhaseDeletingResources - deleting StatefulSet for storage wipe
 	UpgradePhaseDeletingResources UpgradePhase = "DeletingResources"
 	// UpgradePhaseWaitingForCluster - waiting for cluster to become ready with new version
 	UpgradePhaseWaitingForCluster UpgradePhase = "WaitingForCluster"
@@ -205,8 +203,9 @@ type RabbitMqSpecCore struct {
 
 	// +kubebuilder:validation:Optional
 	// +operator-sdk:csv:customresourcedefinitions:type=spec
-	// QueueType to eventually apply the ha-all policy or configure default queue type for the cluster.
-	// Allowed values are: None, Mirrored, Quorum. Defaults to Quorum if not specified.
+	// QueueType - the default queue type for the cluster.
+	// Allowed values: Mirrored, Quorum. New clusters default to Quorum.
+	// Existing clusters without a value default to Mirrored.
 	QueueType *string `json:"queueType,omitempty"`
 
 	// +kubebuilder:validation:Optional
@@ -292,7 +291,7 @@ type RabbitMqStatus struct {
 	// LastAppliedTopology - the last applied Topology
 	LastAppliedTopology *topologyv1.TopoRef `json:"lastAppliedTopology,omitempty"`
 
-	// QueueType - store whether default ha-all policy is present or not
+	// QueueType - the active queue type for this cluster
 	QueueType string `json:"queueType,omitempty"`
 
 	// ReadyCount tracks ready replicas

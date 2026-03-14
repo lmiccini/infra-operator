@@ -208,6 +208,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 					"targetVersion", *instance.Spec.TargetVersion)
 			}
 		}
+		// Check for Mirrored → Quorum queue type migration (without version change)
 		if !requiresWipe && instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
 			if instance.Status.QueueType == rabbitmqv1beta1.QueueTypeMirrored {
 				requiresWipe = true
@@ -714,10 +715,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	if requiresWipe && instance.Status.UpgradePhase == rabbitmqv1beta1.UpgradePhaseDeletingResources {
 		Log.Info("Deleting StatefulSet for storage wipe", "reason", instance.Status.WipeReason)
 
-		// Delete ha-all policy if needed (for Mirrored queue migrations)
-		needsPolicyDeletion := instance.Status.WipeReason == rabbitmqv1beta1.WipeReasonQueueTypeMigration ||
-			(instance.Status.WipeReason == rabbitmqv1beta1.WipeReasonVersionUpgrade && instance.Status.QueueType == rabbitmqv1beta1.QueueTypeMirrored)
-		if needsPolicyDeletion {
+		// Delete ha-all policy if migrating from Mirrored queues
+		if instance.Status.QueueType == rabbitmqv1beta1.QueueTypeMirrored {
 			if err := deleteMirroredPolicy(ctx, helper, instance); err != nil {
 				Log.Error(err, "Failed to delete ha-all policy during storage wipe")
 				return ctrl.Result{}, err
@@ -767,18 +766,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		// If we just completed a storage wipe, update CurrentVersion and clear UpgradePhase.
 		// The default-user secret survives because we only deleted the StatefulSet.
 		if instance.Status.UpgradePhase == rabbitmqv1beta1.UpgradePhaseWaitingForCluster {
-			instance.Status.UpgradePhase = rabbitmqv1beta1.UpgradePhaseNone
-			instance.Status.WipeReason = rabbitmqv1beta1.WipeReasonNone
-
-			// Set ProxyRequired for 3.x → 4.x upgrades with Quorum migration
-			// Must be checked BEFORE updating CurrentVersion (while it still reflects the old version).
+			// Set ProxyRequired for any Mirrored → Quorum migration (version upgrade or queue migration).
+			// Must be checked BEFORE clearing WipeReason and updating CurrentVersion.
 			if !instance.Status.ProxyRequired && instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
-				if instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" &&
-					rabbitmq.Is3xTo4xUpgrade(instance.Status.CurrentVersion, *instance.Spec.TargetVersion) {
+				// Proxy needed for: version upgrade from 3.x→4.x, or explicit queue type migration
+				isVersionUpgradeWithMigration := instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" &&
+					rabbitmq.Is3xTo4xUpgrade(instance.Status.CurrentVersion, *instance.Spec.TargetVersion)
+				isQueueTypeMigration := instance.Status.WipeReason == rabbitmqv1beta1.WipeReasonQueueTypeMigration
+
+				if isVersionUpgradeWithMigration || isQueueTypeMigration {
 					instance.Status.ProxyRequired = true
-					Log.Info("Detected 3.x to 4.x upgrade with Quorum migration - enabling proxy requirement")
+					Log.Info("Enabling proxy for Mirrored to Quorum migration",
+						"wipeReason", instance.Status.WipeReason)
 				}
 			}
+
+			instance.Status.UpgradePhase = rabbitmqv1beta1.UpgradePhaseNone
+			instance.Status.WipeReason = rabbitmqv1beta1.WipeReasonNone
 
 			if instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" {
 				instance.Status.CurrentVersion = *instance.Spec.TargetVersion
@@ -850,13 +854,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		}
 		instance.Status.Conditions.MarkTrue(condition.CreateServiceReadyCondition, condition.CreateServiceReadyMessage)
 
-		// Let's wait DeploymentReadyCondition=True to apply the policy
-		// QueueType should never be nil due to webhook defaulting, but add safety check
+		// Sync Status.QueueType with Spec.QueueType
 		if instance.Spec.QueueType != nil {
 			if *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeMirrored && *instance.Spec.Replicas > 1 && instance.Status.QueueType != rabbitmqv1beta1.QueueTypeMirrored {
-				Log.Info("ha-all policy not present. Applying.")
-				err := ensureMirroredPolicy(ctx, helper, instance)
-				if err != nil {
+				Log.Info("Applying ha-all policy for Mirrored queues")
+				if err := ensureMirroredPolicy(ctx, helper, instance); err != nil {
 					Log.Error(err, "Could not apply ha-all policy")
 					instance.Status.Conditions.Set(condition.FalseCondition(
 						condition.DeploymentReadyCondition,
@@ -867,9 +869,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 				}
 				instance.Status.QueueType = rabbitmqv1beta1.QueueTypeMirrored
 			} else if *instance.Spec.QueueType != rabbitmqv1beta1.QueueTypeMirrored && instance.Status.QueueType == rabbitmqv1beta1.QueueTypeMirrored {
-				Log.Info("QueueType changed from Mirrored. Removing ha-all policy")
-				err := deleteMirroredPolicy(ctx, helper, instance)
-				if err != nil {
+				Log.Info("QueueType changed from Mirrored, removing ha-all policy")
+				if err := deleteMirroredPolicy(ctx, helper, instance); err != nil {
 					Log.Error(err, "Could not remove ha-all policy")
 					instance.Status.Conditions.Set(condition.FalseCondition(
 						condition.DeploymentReadyCondition,
@@ -878,22 +879,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 						condition.DeploymentReadyErrorMessage, err.Error()))
 					return ctrl.Result{}, err
 				}
-				instance.Status.QueueType = ""
 			}
 
-			// Update status for Quorum queue type
 			if *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum && instance.Status.QueueType != rabbitmqv1beta1.QueueTypeQuorum {
-				Log.Info("Setting queue type status to quorum")
+				Log.Info("Setting queue type status to Quorum")
 				instance.Status.QueueType = rabbitmqv1beta1.QueueTypeQuorum
-			} else if *instance.Spec.QueueType != rabbitmqv1beta1.QueueTypeQuorum && instance.Status.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
-				Log.Info("Removing quorum queue type status")
-				instance.Status.QueueType = ""
-			}
-
-			// Update status for None queue type
-			if *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeNone && instance.Status.QueueType != "" {
-				Log.Info("Setting queue type status to None (clearing)")
-				instance.Status.QueueType = ""
 			}
 		}
 	}
@@ -1038,18 +1028,13 @@ func ensureMirroredPolicy(ctx context.Context, helper *helper.Helper, instance *
 
 	policy := &rabbitmqv1beta1.RabbitMQPolicy{}
 	err := helper.GetClient().Get(ctx, policyName, policy)
-
-	// Policy already exists
 	if err == nil {
-		return nil
+		return nil // already exists
 	}
-
-	// Return error if it's not NotFound
 	if !k8s_errors.IsNotFound(err) {
 		return err
 	}
 
-	// Create the policy CR
 	definition := map[string]interface{}{
 		"ha-mode":                "exactly",
 		"ha-params":              2,
@@ -1088,18 +1073,12 @@ func deleteMirroredPolicy(ctx context.Context, helper *helper.Helper, instance *
 
 	policy := &rabbitmqv1beta1.RabbitMQPolicy{}
 	err := helper.GetClient().Get(ctx, policyName, policy)
-
-	// Policy doesn't exist, nothing to delete
 	if k8s_errors.IsNotFound(err) {
 		return nil
 	}
-
-	// Return error if Get() failed for other reasons
 	if err != nil {
 		return err
 	}
-
-	// Delete the policy
 	return helper.GetClient().Delete(ctx, policy)
 }
 

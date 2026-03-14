@@ -17,19 +17,16 @@ limitations under the License.
 package v1beta1
 
 import (
-	"context"
-
 	. "github.com/onsi/ginkgo/v2" //revive:disable:dot-imports
 	. "github.com/onsi/gomega"    //revive:disable:dot-imports
 	rabbitmqv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var _ = Describe("RabbitMq webhook", func() {
 	Context("Default method", func() {
-		It("should set QueueType to Quorum for new clusters", func() {
+		It("should default QueueType to Quorum for a new cluster", func() {
 			rabbitmq := &rabbitmqv1beta1.RabbitMq{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-rabbitmq-new",
@@ -44,13 +41,17 @@ var _ = Describe("RabbitMq webhook", func() {
 			Expect(*rabbitmq.Spec.QueueType).To(Equal("Quorum"))
 		})
 
-		It("should default QueueType when no existing RabbitMq CR exists", func() {
+		It("should preserve explicitly set QueueType=Quorum", func() {
 			rabbitmq := &rabbitmqv1beta1.RabbitMq{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-rabbitmq-existing",
+					Name:      "test-rabbitmq-quorum",
 					Namespace: "default",
 				},
-				Spec: rabbitmqv1beta1.RabbitMqSpec{},
+				Spec: rabbitmqv1beta1.RabbitMqSpec{
+					RabbitMqSpecCore: rabbitmqv1beta1.RabbitMqSpecCore{
+						QueueType: ptr.To("Quorum"),
+					},
+				},
 			}
 
 			rabbitmq.Default(k8sClient)
@@ -59,16 +60,15 @@ var _ = Describe("RabbitMq webhook", func() {
 			Expect(*rabbitmq.Spec.QueueType).To(Equal("Quorum"))
 		})
 
-		It("should not override explicitly set QueueType for new clusters", func() {
-			mirrored := "Mirrored"
+		It("should preserve explicitly set QueueType=Mirrored", func() {
 			rabbitmq := &rabbitmqv1beta1.RabbitMq{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-rabbitmq-custom",
+					Name:      "test-rabbitmq-mirrored",
 					Namespace: "default",
 				},
 				Spec: rabbitmqv1beta1.RabbitMqSpec{
 					RabbitMqSpecCore: rabbitmqv1beta1.RabbitMqSpecCore{
-						QueueType: &mirrored,
+						QueueType: ptr.To("Mirrored"),
 					},
 				},
 			}
@@ -77,6 +77,26 @@ var _ = Describe("RabbitMq webhook", func() {
 
 			Expect(rabbitmq.Spec.QueueType).NotTo(BeNil())
 			Expect(*rabbitmq.Spec.QueueType).To(Equal("Mirrored"))
+		})
+
+		It("should enforce Quorum when TargetVersion is 4.x", func() {
+			rabbitmq := &rabbitmqv1beta1.RabbitMq{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-rabbitmq-4x",
+					Namespace: "default",
+				},
+				Spec: rabbitmqv1beta1.RabbitMqSpec{
+					RabbitMqSpecCore: rabbitmqv1beta1.RabbitMqSpecCore{
+						QueueType:     ptr.To("Mirrored"),
+						TargetVersion: ptr.To("4.2"),
+					},
+				},
+			}
+
+			rabbitmq.Default(k8sClient)
+
+			Expect(rabbitmq.Spec.QueueType).NotTo(BeNil())
+			Expect(*rabbitmq.Spec.QueueType).To(Equal("Quorum"))
 		})
 
 		It("should set ContainerImage default when not set", func() {
@@ -118,133 +138,31 @@ var _ = Describe("RabbitMq webhook", func() {
 
 			Expect(rabbitmq.Spec.ContainerImage).To(Equal("custom-image:v1"))
 		})
-
-		It("should preserve QueueType across updates from parent controller", func() {
-			ctx := context.Background()
-
-			// Create initial RabbitMq CR
-			rabbitmq := &rabbitmqv1beta1.RabbitMq{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-rabbitmq-preserve",
-					Namespace: "default",
-				},
-				Spec: rabbitmqv1beta1.RabbitMqSpec{},
-			}
-			Expect(k8sClient.Create(ctx, rabbitmq)).To(Succeed())
-			defer func() { _ = k8sClient.Delete(ctx, rabbitmq) }()
-
-			// Wait for it to be created
-			Eventually(func() bool {
-				err := k8sClient.Get(ctx, client.ObjectKey{Name: rabbitmq.Name, Namespace: rabbitmq.Namespace}, rabbitmq)
-				return err == nil
-			}).Should(BeTrue())
-
-			// First webhook call - should set QueueType to Quorum
-			rabbitmq.Default(k8sClient)
-			Expect(rabbitmq.Spec.QueueType).NotTo(BeNil())
-			Expect(*rabbitmq.Spec.QueueType).To(Equal("Quorum"))
-
-			// Update the CR to persist QueueType
-			Expect(k8sClient.Update(ctx, rabbitmq)).To(Succeed())
-
-			// Simulate parent controller updating the CR without QueueType (like OpenStackControlPlane does)
-			freshRabbitMq := &rabbitmqv1beta1.RabbitMq{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-rabbitmq-preserve",
-					Namespace: "default",
-				},
-				Spec: rabbitmqv1beta1.RabbitMqSpec{
-					// Parent controller updates spec without QueueType
-					ContainerImage: "new-image:latest",
-				},
-			}
-
-			// Webhook should preserve QueueType from existing CR
-			freshRabbitMq.Default(k8sClient)
-			Expect(freshRabbitMq.Spec.QueueType).NotTo(BeNil())
-			Expect(*freshRabbitMq.Spec.QueueType).To(Equal("Quorum"), "QueueType should be preserved from existing CR")
-		})
-
-		It("should default QueueType for existing CR when QueueType was never set", func() {
-			ctx := context.Background()
-
-			// Create RabbitMq CR WITHOUT QueueType to simulate a CR that was created
-			// before the webhook had defaulting logic, or when the webhook was bypassed
-			existingRabbitMq := &rabbitmqv1beta1.RabbitMq{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-rabbitmq-no-queuetype",
-					Namespace: "default",
-				},
-				Spec: rabbitmqv1beta1.RabbitMqSpec{
-					ContainerImage: "old-image:v1",
-				},
-			}
-			Expect(k8sClient.Create(ctx, existingRabbitMq)).To(Succeed())
-			defer func() { _ = k8sClient.Delete(ctx, existingRabbitMq) }()
-
-			// Wait for it to be created
-			Eventually(func() bool {
-				err := k8sClient.Get(ctx, client.ObjectKey{Name: existingRabbitMq.Name, Namespace: existingRabbitMq.Namespace}, existingRabbitMq)
-				return err == nil
-			}).Should(BeTrue())
-
-			// Verify the CR HAS QueueType defaulted by the webhook during creation
-			// (webhooks are active in the test environment, so this will be defaulted)
-			Expect(existingRabbitMq.Spec.QueueType).NotTo(BeNil())
-			Expect(*existingRabbitMq.Spec.QueueType).To(Equal("Quorum"))
-
-			// Simulate an update (e.g., from OpenStackControlPlane)
-			// The webhook should preserve the existing QueueType value
-			updatedRabbitMq := &rabbitmqv1beta1.RabbitMq{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-rabbitmq-no-queuetype",
-					Namespace: "default",
-				},
-				Spec: rabbitmqv1beta1.RabbitMqSpec{
-					ContainerImage: "new-image:v2",
-				},
-			}
-
-			// Webhook should preserve QueueType from existing CR
-			updatedRabbitMq.Default(k8sClient)
-			Expect(updatedRabbitMq.Spec.QueueType).NotTo(BeNil())
-			Expect(*updatedRabbitMq.Spec.QueueType).To(Equal("Quorum"), "QueueType should be preserved from existing CR")
-		})
 	})
 
 	Context("Validation method", func() {
-		It("should block migrating to Quorum on RabbitMQ 3.x", func() {
-			// Create existing RabbitMq with Mirrored queue type on 3.x
-			existingRabbitMq := &rabbitmqv1beta1.RabbitMq{
+		It("should allow creating new cluster with Quorum", func() {
+			newRabbitMq := &rabbitmqv1beta1.RabbitMq{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-rabbitmq",
 					Namespace: "default",
 				},
 				Spec: rabbitmqv1beta1.RabbitMqSpec{
 					RabbitMqSpecCore: rabbitmqv1beta1.RabbitMqSpecCore{
-						QueueType: ptr.To("Mirrored"),
+						QueueType: ptr.To("Quorum"),
 					},
-				},
-				Status: rabbitmqv1beta1.RabbitMqStatus{
-					CurrentVersion: "3.13",
 				},
 			}
 
-			// Try to update to Quorum without upgrading to 4.x
-			updatedRabbitMq := existingRabbitMq.DeepCopy()
-			updatedRabbitMq.Spec.QueueType = ptr.To("Quorum")
-
-			warnings, err := updatedRabbitMq.ValidateUpdate(existingRabbitMq)
+			warnings, err := newRabbitMq.ValidateCreate()
 			Expect(warnings).To(BeEmpty())
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("Migrating to Quorum queues on RabbitMQ 3.x is not supported"))
+			Expect(err).ToNot(HaveOccurred())
 		})
 
-		It("should allow migrating to Quorum on RabbitMQ 4.x", func() {
-			// Create existing RabbitMq with Mirrored queue type on 4.x
-			existingRabbitMq := &rabbitmqv1beta1.RabbitMq{
+		It("should allow creating new cluster with Mirrored", func() {
+			newRabbitMq := &rabbitmqv1beta1.RabbitMq{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-rabbitmq",
+					Name:      "test-rabbitmq-mirrored",
 					Namespace: "default",
 				},
 				Spec: rabbitmqv1beta1.RabbitMqSpec{
@@ -252,12 +170,43 @@ var _ = Describe("RabbitMq webhook", func() {
 						QueueType: ptr.To("Mirrored"),
 					},
 				},
-				Status: rabbitmqv1beta1.RabbitMqStatus{
-					CurrentVersion: "4.2",
+			}
+
+			warnings, err := newRabbitMq.ValidateCreate()
+			Expect(warnings).To(BeEmpty())
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("should reject creating new cluster with invalid QueueType", func() {
+			newRabbitMq := &rabbitmqv1beta1.RabbitMq{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-rabbitmq-invalid",
+					Namespace: "default",
+				},
+				Spec: rabbitmqv1beta1.RabbitMqSpec{
+					RabbitMqSpecCore: rabbitmqv1beta1.RabbitMqSpecCore{
+						QueueType: ptr.To("Invalid"),
+					},
 				},
 			}
 
-			// Try to update to Quorum - should be allowed on 4.x
+			_, err := newRabbitMq.ValidateCreate()
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should allow updating cluster with Quorum", func() {
+			existingRabbitMq := &rabbitmqv1beta1.RabbitMq{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-rabbitmq",
+					Namespace: "default",
+				},
+				Spec: rabbitmqv1beta1.RabbitMqSpec{
+					RabbitMqSpecCore: rabbitmqv1beta1.RabbitMqSpecCore{
+						QueueType: ptr.To("Quorum"),
+					},
+				},
+			}
+
 			updatedRabbitMq := existingRabbitMq.DeepCopy()
 			updatedRabbitMq.Spec.QueueType = ptr.To("Quorum")
 
@@ -266,23 +215,23 @@ var _ = Describe("RabbitMq webhook", func() {
 			Expect(err).ToNot(HaveOccurred())
 		})
 
-		It("should allow creating new cluster with Quorum on RabbitMQ 3.x", func() {
-			// Create new RabbitMq with Quorum queue type on 3.x (not a migration)
-			newRabbitMq := &rabbitmqv1beta1.RabbitMq{
+		It("should allow updating cluster from Mirrored to Quorum", func() {
+			existingRabbitMq := &rabbitmqv1beta1.RabbitMq{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-rabbitmq",
 					Namespace: "default",
 				},
 				Spec: rabbitmqv1beta1.RabbitMqSpec{
 					RabbitMqSpecCore: rabbitmqv1beta1.RabbitMqSpecCore{
-						QueueType:     ptr.To("Quorum"),
-						TargetVersion: ptr.To("3.13"),
+						QueueType: ptr.To("Mirrored"),
 					},
 				},
 			}
 
-			// ValidateCreate should allow it
-			warnings, err := newRabbitMq.ValidateCreate()
+			updatedRabbitMq := existingRabbitMq.DeepCopy()
+			updatedRabbitMq.Spec.QueueType = ptr.To("Quorum")
+
+			warnings, err := updatedRabbitMq.ValidateUpdate(existingRabbitMq)
 			Expect(warnings).To(BeEmpty())
 			Expect(err).ToNot(HaveOccurred())
 		})

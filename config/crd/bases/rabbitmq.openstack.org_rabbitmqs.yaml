@@ -1547,8 +1547,9 @@ spec:
                 type: object
               queueType:
                 description: |-
-                  QueueType to eventually apply the ha-all policy or configure default queue type for the cluster.
-                  Allowed values are: None, Mirrored, Quorum. Defaults to Quorum if not specified.
+                  QueueType - the default queue type for the cluster.
+                  Allowed values: Mirrored, Quorum. New clusters default to Quorum.
+                  Existing clusters without a value default to Mirrored.
                 type: string
               rabbitmq:
                 description: |-
@@ -1873,8 +1874,7 @@ spec:
                   Only cleared when the AnnotationClientsReconfigured annotation is set to "true".
                 type: boolean
               queueType:
-                description: QueueType - store whether default ha-all policy is present
-                  or not
+                description: QueueType - the active queue type for this cluster
                 type: string
               readyCount:
                 description: ReadyCount tracks ready replicas

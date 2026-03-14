@@ -59,104 +59,61 @@ func SetupRabbitMqDefaults(defaults RabbitMqDefaults) {
 func (r *RabbitMq) Default(k8sClient client.Client) {
 	rabbitmqlog.Info("default", "name", r.Name, "namespace", r.Namespace)
 
-	// Defensive checks - these should be guaranteed by the API server
 	if r.Name == "" || r.Namespace == "" {
-		rabbitmqlog.Error(nil, "invalid RabbitMq resource: name or namespace is empty",
-			"name", r.Name, "namespace", r.Namespace)
-		// Apply other defaults without QueueType logic
-		r.Spec.Default(false)
+		r.Spec.Default(true)
 		return
 	}
 
-	// shouldDefaultQueueType determines whether we should set QueueType to the default value (Quorum)
-	// false means: either the user set it explicitly, or we found an existing deployment and must preserve its state
-	shouldDefaultQueueType := true
-
-	// Check early if we're targeting RabbitMQ 4.x+. If so, Quorum queues will be
-	// enforced regardless of user-specified or existing QueueType, so we can skip
-	// the preservation logic entirely.
-	enforcingQuorum := false
-	if r.Spec.TargetVersion != nil && *r.Spec.TargetVersion != "" {
-		if IsVersion4OrLater(*r.Spec.TargetVersion) {
-			enforcingQuorum = true
-		}
-	}
+	// Determine if this is a new or existing CR to choose the right QueueType default
+	isNew := true
 
 	if k8sClient != nil {
-		// Create a context with timeout to prevent hanging on slow API servers
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		// First, check if the user has explicitly set QueueType in the incoming request
-		// If so, preserve it and don't override with any default value.
-		// Skip this when targeting RabbitMQ 4.x+ since Quorum will be enforced anyway.
-		if !enforcingQuorum && r.Spec.QueueType != nil && *r.Spec.QueueType != "" {
+		// If user explicitly set QueueType, preserve it
+		if r.Spec.QueueType != nil && *r.Spec.QueueType != "" {
 			rabbitmqlog.Info("preserving user-specified QueueType", "name", r.Name, "queueType", *r.Spec.QueueType)
-			shouldDefaultQueueType = false
-		} else if enforcingQuorum {
-			// Will be set to Quorum below, no need to check existing state
-			shouldDefaultQueueType = false
+			isNew = false // skip defaulting
 		} else {
-			// User didn't set QueueType - check if existing RabbitMq CR has it set
+			// Look up existing CR to determine if this is adoption or new creation
 			existingRabbitMq := &RabbitMq{}
 			err := k8sClient.Get(ctx, types.NamespacedName{
 				Name: r.Name, Namespace: r.Namespace,
 			}, existingRabbitMq)
 
 			if err != nil && !apierrors.IsNotFound(err) {
-				// Error fetching existing RabbitMq CR (not a NotFound error)
-				// Fail safe: don't default QueueType to avoid breaking existing deployments
-				rabbitmqlog.Error(err, "failed to get existing RabbitMq CR, not defaulting QueueType for safety",
+				rabbitmqlog.Error(err, "failed to get existing RabbitMq CR, defaulting QueueType to Mirrored for safety",
 					"name", r.Name, "namespace", r.Namespace)
-				shouldDefaultQueueType = false
-				r.Spec.Default(shouldDefaultQueueType)
-				return
-			}
-
-			// Check if we found an existing RabbitMq CR
-			rabbitMqCRExists := (err == nil)
-
-			if rabbitMqCRExists {
-				// Existing RabbitMq CR found - check if it has QueueType set
+				queueType := QueueTypeMirrored
+				r.Spec.QueueType = &queueType
+				isNew = false
+			} else if err == nil {
+				// Existing CR found - preserve its QueueType
+				isNew = false
 				if existingRabbitMq.Spec.QueueType != nil && *existingRabbitMq.Spec.QueueType != "" {
-					// Existing CR has QueueType set in Spec - preserve it
-					// Create a new pointer to avoid aliasing
 					queueType := *existingRabbitMq.Spec.QueueType
 					r.Spec.QueueType = &queueType
-					rabbitmqlog.Info("preserving QueueType from existing CR spec", "name", r.Name, "queueType", queueType)
-					shouldDefaultQueueType = false
+					rabbitmqlog.Info("preserving QueueType from existing CR", "name", r.Name, "queueType", queueType)
 				} else if existingRabbitMq.Status.QueueType != "" {
-					// Existing CR has QueueType set in Status but not in Spec
-					// This can happen when:
-					// - Old deployment where Spec.QueueType was never set (webhook didn't exist)
-					// - Status.QueueType was set by controller based on actual cluster state
-					// Preserve the Status.QueueType to avoid breaking existing deployments
-					// by changing queue type (which would cause PRECONDITION_FAILED errors)
 					statusQueueType := existingRabbitMq.Status.QueueType
 					r.Spec.QueueType = &statusQueueType
-					rabbitmqlog.Info("preserving QueueType from existing CR status (spec was empty)",
-						"name", r.Name,
-						"queueType", statusQueueType,
-						"reason", "preventing queue type change on existing deployment")
-					shouldDefaultQueueType = false
+					rabbitmqlog.Info("preserving QueueType from existing CR status", "name", r.Name, "queueType", statusQueueType)
+				} else {
+					// Existing deployment without QueueType: assume Mirrored
+					queueType := QueueTypeMirrored
+					r.Spec.QueueType = &queueType
+					rabbitmqlog.Info("existing CR without QueueType, defaulting to Mirrored", "name", r.Name)
 				}
-				// If we get here with rabbitMqCRExists=true but no QueueType, it's an existing
-				// deployment without QueueType set - default to Quorum
 			}
-
-			if shouldDefaultQueueType {
-				rabbitmqlog.Info("new RabbitMq CR, will default QueueType to Quorum", "name", r.Name)
-			}
+			// err is NotFound → isNew stays true, will default to Quorum
 		}
 	}
 
-	// Apply other defaults (ContainerImage, etc.)
-	r.Spec.Default(shouldDefaultQueueType)
+	r.Spec.Default(isNew)
 
-	// Enforce Quorum queues when targeting RabbitMQ 4.x+
-	// Mirrored queues are not supported on RabbitMQ 4.x, so regardless of what
-	// any controller sets, we enforce Quorum here in the webhook as the final gate.
-	if enforcingQuorum {
+	// Enforce Quorum when targeting RabbitMQ 4.x+ (mirrored queues not supported)
+	if r.Spec.TargetVersion != nil && *r.Spec.TargetVersion != "" && IsVersion4OrLater(*r.Spec.TargetVersion) {
 		if r.Spec.QueueType == nil || *r.Spec.QueueType != QueueTypeQuorum {
 			rabbitmqlog.Info("enforcing Quorum queues for RabbitMQ 4.x target",
 				"name", r.Name, "targetVersion", *r.Spec.TargetVersion)
@@ -167,12 +124,11 @@ func (r *RabbitMq) Default(k8sClient client.Client) {
 }
 
 // Default - set defaults for this RabbitMq spec
-// shouldDefaultQueueType: if true, sets QueueType to "Quorum" when not already set
-func (spec *RabbitMqSpec) Default(shouldDefaultQueueType bool) {
+func (spec *RabbitMqSpec) Default(isNew bool) {
 	if spec.ContainerImage == "" {
 		spec.ContainerImage = rabbitMqDefaults.ContainerImageURL
 	}
-	spec.RabbitMqSpecCore.Default(shouldDefaultQueueType)
+	spec.RabbitMqSpecCore.Default(isNew)
 }
 
 // Default - set defaults for this RabbitMqSpecCore and migrate from old format
@@ -221,9 +177,9 @@ func (spec *RabbitMqSpecCore) Default(isNew bool) {
 		spec.TLS.DisableNonTLSListeners = true
 	}
 
-	// QueueType defaulting
+	// QueueType defaulting: Quorum for new clusters, preserved for existing
 	if isNew && (spec.QueueType == nil || *spec.QueueType == "") {
-		queueType := "Quorum"
+		queueType := QueueTypeQuorum
 		spec.QueueType = &queueType
 	}
 }
@@ -251,7 +207,6 @@ func (r *RabbitMq) ValidateCreate() (admission.Warnings, error) {
 		CrMaxLengthCorrection,
 	)...) // omit issue with  statefulset pod label "controller-revision-hash": "<statefulset_name>-<hash>"
 
-	// Validate QueueType if specified
 	allErrs = append(allErrs, r.Spec.ValidateQueueType(basePath)...)
 
 	if len(allErrs) != 0 {
@@ -266,7 +221,7 @@ func (r *RabbitMq) ValidateCreate() (admission.Warnings, error) {
 }
 
 // ValidateUpdate implements webhook.Validator so a webhook will be registered for the type
-func (r *RabbitMq) ValidateUpdate(old runtime.Object) (admission.Warnings, error) {
+func (r *RabbitMq) ValidateUpdate(_ runtime.Object) (admission.Warnings, error) {
 	rabbitmqlog.Info("validate update", "name", r.Name)
 
 	var allErrs field.ErrorList
@@ -281,42 +236,7 @@ func (r *RabbitMq) ValidateUpdate(old runtime.Object) (admission.Warnings, error
 	allWarn = append(allWarn, warn...)
 	allErrs = append(allErrs, errs...)
 
-	// Validate QueueType if specified
 	allErrs = append(allErrs, r.Spec.ValidateQueueType(basePath)...)
-
-	// Note: We don't block queueType: Mirrored on RabbitMQ 4.x here because:
-	// 1. Controller enforces Quorum queues on RabbitMQ 4.x upgrades
-	// 2. RabbitMQ server will reject mirrored queues on 4.2+ if they somehow get through
-	oldRabbitMq := old.(*RabbitMq)
-
-	// Block migrating TO Quorum on RabbitMQ 3.x (no server-side enforcement available)
-	// Allow creating new clusters with Quorum on 3.x, only block migrations
-	// UNLESS there's a concurrent version upgrade to 4.x (which will wipe storage)
-	if r.Spec.QueueType != nil && *r.Spec.QueueType == "Quorum" {
-		// Check if queueType is being changed TO Quorum (wasn't Quorum before)
-		queueTypeChanged := oldRabbitMq.Spec.QueueType != nil && *oldRabbitMq.Spec.QueueType != "Quorum"
-
-		if queueTypeChanged {
-			// Check current running version from Status (controller-managed)
-			currentVersion := oldRabbitMq.Status.CurrentVersion
-			if currentVersion != "" {
-				currentParsed, err := ParseRabbitMQVersion(currentVersion)
-				if err == nil && currentParsed.Major == 3 {
-					// On 3.x: only allow migration to Quorum if concurrently upgrading to 4.x
-					targetVersion := ""
-					if r.Spec.TargetVersion != nil {
-						targetVersion = *r.Spec.TargetVersion
-					}
-					if !Is3xTo4xUpgrade(currentVersion, targetVersion) {
-						allErrs = append(allErrs, field.Forbidden(
-							basePath.Child("queueType"),
-							"Migrating to Quorum queues on RabbitMQ 3.x is not supported due to lack of server-side enforcement. "+
-								"Upgrade to RabbitMQ 4.x first to enable automatic Quorum queue migration."))
-					}
-				}
-			}
-		}
-	}
 
 	if len(allErrs) != 0 {
 		return allWarn, apierrors.NewInvalid(
@@ -333,13 +253,10 @@ func (spec *RabbitMqSpecCore) ValidateCreate(basePath *field.Path, namespace str
 	var allErrs field.ErrorList
 	var allWarn []string
 
-	// When a TopologyRef CR is referenced, fail if a different Namespace is
-	// referenced because is not supported
 	allErrs = append(allErrs, spec.ValidateTopology(basePath, namespace)...)
 	warn, errs := spec.ValidateOverride(basePath, namespace)
 	allWarn = append(allWarn, warn...)
 	allErrs = append(allErrs, errs...)
-
 	allErrs = append(allErrs, spec.ValidateQueueType(basePath)...)
 
 	return allWarn, allErrs
@@ -350,16 +267,28 @@ func (spec *RabbitMqSpecCore) ValidateUpdate(_ RabbitMqSpecCore, basePath *field
 	var allErrs field.ErrorList
 	var allWarn []string
 
-	// When a TopologyRef CR is referenced, fail if a different Namespace is
-	// referenced because is not supported
 	allErrs = append(allErrs, spec.ValidateTopology(basePath, namespace)...)
 	warn, errs := spec.ValidateOverride(basePath, namespace)
 	allWarn = append(allWarn, warn...)
 	allErrs = append(allErrs, errs...)
-
 	allErrs = append(allErrs, spec.ValidateQueueType(basePath)...)
 
 	return allWarn, allErrs
+}
+
+// ValidateQueueType validates that QueueType is one of the allowed values
+func (spec *RabbitMqSpecCore) ValidateQueueType(basePath *field.Path) field.ErrorList {
+	var allErrs field.ErrorList
+	if spec.QueueType != nil {
+		if *spec.QueueType != QueueTypeMirrored && *spec.QueueType != QueueTypeQuorum {
+			allErrs = append(allErrs, field.NotSupported(
+				basePath.Child("queueType"),
+				*spec.QueueType,
+				[]string{QueueTypeMirrored, QueueTypeQuorum},
+			))
+		}
+	}
+	return allErrs
 }
 
 // ValidateDelete implements webhook.Validator so a webhook will be registered for the type
@@ -368,29 +297,4 @@ func (r *RabbitMq) ValidateDelete() (admission.Warnings, error) {
 
 	// TODO(user): fill in your validation logic upon object deletion.
 	return nil, nil
-}
-
-// ValidateQueueType validates that QueueType is one of the allowed values
-func (spec *RabbitMqSpecCore) ValidateQueueType(basePath *field.Path) field.ErrorList {
-	var allErrs field.ErrorList
-
-	if spec.QueueType != nil {
-		allowedValues := []string{QueueTypeNone, QueueTypeMirrored, QueueTypeQuorum}
-		isValid := false
-		for _, allowed := range allowedValues {
-			if *spec.QueueType == allowed {
-				isValid = true
-				break
-			}
-		}
-		if !isValid {
-			allErrs = append(allErrs, field.NotSupported(
-				basePath.Child("queueType"),
-				*spec.QueueType,
-				allowedValues,
-			))
-		}
-	}
-
-	return allErrs
 }

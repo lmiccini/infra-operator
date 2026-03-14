@@ -75,7 +75,7 @@ var _ = Describe("RabbitMQ Controller", func() {
 			}, timeout, interval).Should(Succeed())
 		})
 
-		It("preserves explicitly set QueueType", func() {
+		It("preserves explicitly set QueueType=Mirrored", func() {
 			spec := GetDefaultRabbitMQSpec()
 			spec["queueType"] = "Mirrored"
 			rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
@@ -87,6 +87,7 @@ var _ = Describe("RabbitMQ Controller", func() {
 				g.Expect(*instance.Spec.QueueType).To(Equal("Mirrored"))
 			}, timeout, interval).Should(Succeed())
 		})
+
 	})
 
 	When("a default RabbitMQ gets created", func() {
@@ -527,7 +528,6 @@ var _ = Describe("RabbitMQ Controller", func() {
 		BeforeEach(func() {
 			spec := GetDefaultRabbitMQSpec()
 			spec["replicas"] = 3
-			spec["queueType"] = "None"
 			spec["podOverride"] = map[string]any{
 				"services": []map[string]any{
 					{
@@ -594,7 +594,6 @@ var _ = Describe("RabbitMQ Controller", func() {
 		BeforeEach(func() {
 			spec := GetDefaultRabbitMQSpec()
 			spec["replicas"] = 3
-			spec["queueType"] = "None"
 			spec["podOverride"] = map[string]any{
 				"services": []map[string]any{
 					{
@@ -647,7 +646,6 @@ var _ = Describe("RabbitMQ Controller", func() {
 		BeforeEach(func() {
 			spec := GetDefaultRabbitMQSpec()
 			spec["replicas"] = 3
-			spec["queueType"] = "None"
 			spec["podOverride"] = map[string]any{
 				"services": []map[string]any{
 					{
@@ -713,7 +711,6 @@ var _ = Describe("RabbitMQ Controller", func() {
 		BeforeEach(func() {
 			spec := GetDefaultRabbitMQSpec()
 			spec["replicas"] = 2
-			spec["queueType"] = "None"
 			spec["podOverride"] = map[string]any{
 				"services": []map[string]any{
 					{
@@ -1281,52 +1278,6 @@ var _ = Describe("RabbitMQ Controller", func() {
 		})
 	})
 
-	When("a RabbitMQ cluster migrates from Mirrored to Quorum queue type", func() {
-		BeforeEach(func() {
-			spec := GetDefaultRabbitMQSpec()
-			spec["queueType"] = "Mirrored"
-			rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
-			DeferCleanup(th.DeleteInstance, rabbitmq)
-
-			SimulateRabbitMQClusterReady(rabbitmqName)
-
-			// Set Status.QueueType to Mirrored to simulate existing cluster
-			Eventually(func(g Gomega) {
-				instance := &rabbitmqv1.RabbitMq{}
-				g.Expect(k8sClient.Get(ctx, rabbitmqName, instance)).Should(Succeed())
-				instance.Status.QueueType = rabbitmqv1.QueueTypeMirrored
-				g.Expect(th.K8sClient.Status().Update(ctx, instance)).Should(Succeed())
-			}, timeout, interval).Should(Succeed())
-		})
-
-		It("should trigger storage wipe with QueueTypeMigration reason", func() {
-			// Change QueueType from Mirrored to Quorum
-			Eventually(func(g Gomega) {
-				instance := &rabbitmqv1.RabbitMq{}
-				g.Expect(k8sClient.Get(ctx, rabbitmqName, instance)).Should(Succeed())
-				instance.Spec.QueueType = ptr.To(rabbitmqv1.QueueTypeQuorum)
-				g.Expect(th.K8sClient.Update(ctx, instance)).Should(Succeed())
-			}, timeout, interval).Should(Succeed())
-
-			// Should reach WaitingForCluster phase with QueueTypeMigration reason
-			Eventually(func(g Gomega) {
-				instance := GetRabbitMQ(rabbitmqName)
-				g.Expect(string(instance.Status.UpgradePhase)).To(Equal(string(rabbitmqv1.UpgradePhaseWaitingForCluster)))
-				g.Expect(string(instance.Status.WipeReason)).To(Equal(string(rabbitmqv1.WipeReasonQueueTypeMigration)))
-			}, timeout, interval).Should(Succeed())
-
-			// Simulate ready after migration
-			SimulateRabbitMQClusterReady(rabbitmqName)
-
-			// Should complete: phases cleared and QueueType updated
-			Eventually(func(g Gomega) {
-				instance := GetRabbitMQ(rabbitmqName)
-				g.Expect(string(instance.Status.UpgradePhase)).To(Equal(""))
-				g.Expect(string(instance.Status.WipeReason)).To(Equal(""))
-			}, timeout, interval).Should(Succeed())
-		})
-	})
-
 	When("a 3.x to 4.x upgrade with Quorum queue type", func() {
 		BeforeEach(func() {
 			spec := GetDefaultRabbitMQSpec()
@@ -1456,6 +1407,78 @@ var _ = Describe("RabbitMQ Controller", func() {
 				g.Expect(len(sts.Spec.Template.Spec.InitContainers)).To(BeNumerically(">=", 2))
 				g.Expect(sts.Spec.Template.Spec.InitContainers[0].Name).To(Equal("wipe-data"))
 				g.Expect(sts.Spec.Template.Spec.InitContainers[1].Name).To(Equal("setup-container"))
+			}, timeout, interval).Should(Succeed())
+		})
+	})
+
+	When("a Mirrored cluster migrates to Quorum without version change", func() {
+		BeforeEach(func() {
+			spec := GetDefaultRabbitMQSpec()
+			spec["queueType"] = "Mirrored"
+			rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+			DeferCleanup(th.DeleteInstance, rabbitmq)
+
+			SimulateRabbitMQClusterReady(rabbitmqName)
+
+			// Set Status.QueueType to Mirrored to simulate existing mirrored cluster
+			Eventually(func(g Gomega) {
+				instance := &rabbitmqv1.RabbitMq{}
+				g.Expect(k8sClient.Get(ctx, rabbitmqName, instance)).Should(Succeed())
+				instance.Status.QueueType = rabbitmqv1.QueueTypeMirrored
+				g.Expect(th.K8sClient.Status().Update(ctx, instance)).Should(Succeed())
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should trigger storage wipe and set ProxyRequired when changing to Quorum", func() {
+			// Change QueueType to Quorum
+			Eventually(func(g Gomega) {
+				instance := &rabbitmqv1.RabbitMq{}
+				g.Expect(k8sClient.Get(ctx, rabbitmqName, instance)).Should(Succeed())
+				instance.Spec.QueueType = ptr.To(rabbitmqv1.QueueTypeQuorum)
+				g.Expect(th.K8sClient.Update(ctx, instance)).Should(Succeed())
+			}, timeout, interval).Should(Succeed())
+
+			// Should reach WaitingForCluster phase with QueueTypeMigration wipe reason
+			Eventually(func(g Gomega) {
+				instance := GetRabbitMQ(rabbitmqName)
+				g.Expect(string(instance.Status.UpgradePhase)).To(Equal(string(rabbitmqv1.UpgradePhaseWaitingForCluster)))
+				g.Expect(string(instance.Status.WipeReason)).To(Equal(string(rabbitmqv1.WipeReasonQueueTypeMigration)))
+			}, timeout, interval).Should(Succeed())
+
+			// Simulate the new StatefulSet becoming ready
+			SimulateRabbitMQClusterReady(rabbitmqName)
+
+			// Migration should complete with ProxyRequired set
+			Eventually(func(g Gomega) {
+				instance := GetRabbitMQ(rabbitmqName)
+				g.Expect(string(instance.Status.UpgradePhase)).To(Equal(""))
+				g.Expect(string(instance.Status.WipeReason)).To(Equal(""))
+				g.Expect(instance.Status.QueueType).To(Equal(rabbitmqv1.QueueTypeQuorum))
+				g.Expect(instance.Status.ProxyRequired).To(BeTrue())
+			}, timeout, interval).Should(Succeed())
+		})
+	})
+
+	When("RabbitMQ is created with Mirrored queue type", func() {
+		BeforeEach(func() {
+			spec := GetDefaultRabbitMQSpec()
+			spec["queueType"] = "Mirrored"
+			rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+			DeferCleanup(th.DeleteInstance, rabbitmq)
+		})
+
+		It("should include mirrored queue defaults in server config", func() {
+			SimulateRabbitMQClusterReady(rabbitmqName)
+			Eventually(func(g Gomega) {
+				serverCfgMapName := types.NamespacedName{
+					Name:      fmt.Sprintf("%s-server-conf", rabbitmqName.Name),
+					Namespace: rabbitmqName.Namespace,
+				}
+				serverCm := th.GetConfigMap(serverCfgMapName)
+				defaults := serverCm.Data["operatorDefaults.conf"]
+
+				// Mirrored queues should NOT set quorum defaults
+				g.Expect(defaults).NotTo(ContainSubstring("default_queue_type                         = quorum"))
 			}, timeout, interval).Should(Succeed())
 		})
 	})

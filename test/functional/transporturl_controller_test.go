@@ -209,7 +209,7 @@ var _ = Describe("TransportURL controller", func() {
 			spec := GetDefaultRabbitMQSpec()
 			spec["containerImage"] = "quay.io/podified-antelope-centos9/openstack-rabbitmq:current-podified"
 			spec["replicas"] = 3
-			spec["queueType"] = "None"
+			spec["queueType"] = "Quorum"
 			spec["podOverride"] = map[string]any{
 				"services": []map[string]any{
 					{
@@ -304,7 +304,7 @@ var _ = Describe("TransportURL controller", func() {
 			spec := GetDefaultRabbitMQSpec()
 			spec["containerImage"] = "quay.io/podified-antelope-centos9/openstack-rabbitmq:current-podified"
 			spec["replicas"] = 3
-			spec["queueType"] = "None"
+			spec["queueType"] = "Quorum"
 			spec["podOverride"] = map[string]any{
 				"services": []map[string]any{
 					{
