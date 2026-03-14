@@ -68,7 +68,7 @@ func StatefulSet(
 		},
 		Env:            containerEnv,
 		Ports:          buildContainerPorts(r),
-		VolumeMounts:   getVolumeMounts(r),
+		VolumeMounts:   getVolumeMounts(r, proxy.IPv6Enabled),
 		ReadinessProbe: readinessProbe,
 		Lifecycle:      buildLifecycle(),
 	}

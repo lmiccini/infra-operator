@@ -4,6 +4,7 @@ package rabbitmq
 import (
 	"fmt"
 	"regexp"
+	"strings"
 
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	corev1 "k8s.io/api/core/v1"
@@ -72,10 +73,14 @@ func BuildRabbitMQConfig(
 
 	inetFamily := "inet"
 	inetProtocol := "tcp"
+	inetrcArg := ""
 	tlsArgs := ""
 	fipsArgs := ""
 	if IPv6Enabled {
 		inetFamily = "inet6"
+		// Only reference the inetrc file when IPv6 is enabled (it has content).
+		// An empty inetrc file breaks Erlang DNS resolution (matching cluster-operator).
+		inetrcArg = "-kernel inetrc '/etc/rabbitmq/erl_inetrc'"
 	}
 
 	if r.Spec.TLS.SecretName != "" {
@@ -88,16 +93,17 @@ func BuildRabbitMQConfig(
 
 	envVars = append(envVars, corev1.EnvVar{
 		Name: "RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS",
-		Value: fmt.Sprintf(
-			"-kernel inetrc '/etc/rabbitmq/erl_inetrc' -proto_dist %s_%s %s %s",
+		Value: strings.TrimSpace(fmt.Sprintf(
+			"%s -proto_dist %s_%s %s %s",
+			inetrcArg,
 			inetFamily,
 			inetProtocol,
 			tlsArgs,
 			fipsArgs,
-		),
+		)),
 	}, corev1.EnvVar{
 		Name:  "RABBITMQ_CTL_ERL_ARGS",
-		Value: fmt.Sprintf("-proto_dist %s_%s %s", inetFamily, inetProtocol, tlsArgs),
+		Value: strings.TrimSpace(fmt.Sprintf("-proto_dist %s_%s %s", inetFamily, inetProtocol, tlsArgs)),
 	})
 
 	return envVars, nil

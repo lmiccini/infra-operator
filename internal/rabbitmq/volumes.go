@@ -162,7 +162,7 @@ func getVolumes(r *rabbitmqv1.RabbitMq) []corev1.Volume {
 	return vols
 }
 
-func getVolumeMounts(r *rabbitmqv1.RabbitMq) []corev1.VolumeMount {
+func getVolumeMounts(r *rabbitmqv1.RabbitMq, IPv6Enabled bool) []corev1.VolumeMount {
 	vm := []corev1.VolumeMount{
 		{
 			Name:      "rabbitmq-erlang-cookie",
@@ -200,11 +200,16 @@ func getVolumeMounts(r *rabbitmqv1.RabbitMq) []corev1.VolumeMount {
 			MountPath: "/etc/rabbitmq/advanced.config",
 			SubPath:   "advanced.config",
 		},
-		{
+	}
+
+	// Only mount erl_inetrc when IPv6 is enabled (matching cluster-operator).
+	// An empty inetrc file breaks Erlang DNS resolution.
+	if IPv6Enabled {
+		vm = append(vm, corev1.VolumeMount{
 			Name:      "server-conf",
 			MountPath: "/etc/rabbitmq/erl_inetrc",
 			SubPath:   "erl_inetrc",
-		},
+		})
 	}
 
 	// Add TLS volume mounts if TLS is enabled

@@ -35,9 +35,16 @@ func GenerateServerConfigMap(
 	userConfig := r.Spec.Config.AdditionalConfig
 	advancedConfig := buildAdvancedConfig(r, IPv6Enabled, fipsEnabled, configVersion)
 
-	erlInetrc := ""
+	data := map[string]string{
+		"operatorDefaults.conf":         operatorDefaults,
+		"userDefinedConfiguration.conf": userConfig,
+		"advanced.config":               advancedConfig,
+	}
+
+	// Only include erl_inetrc when IPv6 is enabled (matching cluster-operator).
+	// An empty inetrc file breaks Erlang DNS resolution.
 	if IPv6Enabled {
-		erlInetrc = "{inet6,true}.\n"
+		data["erl_inetrc"] = "{inet6,true}.\n"
 	}
 
 	return &corev1.ConfigMap{
@@ -45,12 +52,7 @@ func GenerateServerConfigMap(
 			Name:      fmt.Sprintf("%s-server-conf", r.Name),
 			Namespace: r.Namespace,
 		},
-		Data: map[string]string{
-			"operatorDefaults.conf":         operatorDefaults,
-			"userDefinedConfiguration.conf": userConfig,
-			"advanced.config":               advancedConfig,
-			"erl_inetrc":                    erlInetrc,
-		},
+		Data: data,
 	}
 }
 
