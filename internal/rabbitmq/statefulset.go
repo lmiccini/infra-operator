@@ -15,12 +15,16 @@ import (
 )
 
 // StatefulSet returns a StatefulSet resource for the RabbitMQ CR
-// matching the old rabbitmq-cluster-operator's resource layout
+// matching the old rabbitmq-cluster-operator's resource layout.
+// If targetVersion is non-empty and needsDataWipe is true, a wipe-data init container
+// is prepended to clear persistent data before the main setup container runs.
 func StatefulSet(
 	r *rabbitmqv1.RabbitMq,
 	configHash string,
 	topology *topologyv1.Topology,
 	envVars []corev1.EnvVar,
+	targetVersion string,
+	needsDataWipe bool,
 ) *appsv1.StatefulSet {
 	matchls := map[string]string{
 		labels.K8sAppName: r.Name,
@@ -62,8 +66,17 @@ func StatefulSet(
 		rabbitmqContainer.Resources = *r.Spec.Resources
 	}
 
-	// Build init container
-	initContainer := buildInitContainer(r)
+	// Build init containers
+	var initContainers []corev1.Container
+
+	// Add data-wipe init container for storage upgrades.
+	// Runs BEFORE setup-container and clears /var/lib/rabbitmq.
+	// Version-specific marker files prevent duplicate wipes across pod restarts.
+	if needsDataWipe && targetVersion != "" && ValidVersionPattern(targetVersion) {
+		initContainers = append(initContainers, buildWipeDataInitContainer(r, targetVersion))
+	}
+
+	initContainers = append(initContainers, buildInitContainer(r))
 
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -93,7 +106,7 @@ func StatefulSet(
 					ServiceAccountName:            r.RbacResourceName(),
 					AutomountServiceAccountToken:  ptr.To(true),
 					TerminationGracePeriodSeconds: ptr.To(int64(604800)),
-					InitContainers:                []corev1.Container{initContainer},
+					InitContainers:                initContainers,
 					Containers:                    []corev1.Container{rabbitmqContainer},
 					Volumes:                       getVolumes(r),
 					SecurityContext: &corev1.PodSecurityContext{
@@ -336,5 +349,41 @@ func buildInitContainer(r *rabbitmqv1.RabbitMq) corev1.Container {
 			},
 		},
 		VolumeMounts: getInitContainerVolumeMounts(r),
+	}
+}
+
+// buildWipeDataInitContainer builds the init container that wipes persistent data
+// during version upgrades. Uses a version-specific marker file to prevent
+// re-wiping on pod restarts.
+func buildWipeDataInitContainer(r *rabbitmqv1.RabbitMq, targetVersion string) corev1.Container {
+	wipeScript := fmt.Sprintf(`set -ex
+WIPE_DIR="/var/lib/rabbitmq"
+MARKER="${WIPE_DIR}/.operator-wipe-%s"
+
+if [ -f "$MARKER" ]; then
+  echo "Data already wiped for version %s, skipping..."
+  exit 0
+fi
+
+echo "Wiping RabbitMQ data in $WIPE_DIR for upgrade to version %s..."
+rm -rf "${WIPE_DIR:?}"/*
+rm -rf "${WIPE_DIR:?}"/.[!.]*
+touch "$MARKER"
+echo "Data wipe complete for version %s (marker: $MARKER)"
+ls -la "$WIPE_DIR"
+`, targetVersion, targetVersion, targetVersion, targetVersion)
+
+	return corev1.Container{
+		Name:       "wipe-data",
+		Image:      r.Spec.ContainerImage,
+		WorkingDir: "/var/lib/rabbitmq",
+		Command:    []string{"/bin/sh"},
+		Args:       []string{"-c", wipeScript},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      "persistence",
+				MountPath: "/var/lib/rabbitmq",
+			},
+		},
 	}
 }

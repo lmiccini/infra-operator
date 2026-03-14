@@ -22,15 +22,17 @@ func GeneratePluginsConfigMap(r *rabbitmqv1.RabbitMq) *corev1.ConfigMap {
 	}
 }
 
-// GenerateServerConfigMap generates the server configuration ConfigMap (rabbitmq-server-conf)
+// GenerateServerConfigMap generates the server configuration ConfigMap (rabbitmq-server-conf).
+// configVersion determines version-specific settings (TLS, quorum defaults).
 func GenerateServerConfigMap(
 	r *rabbitmqv1.RabbitMq,
 	IPv6Enabled bool,
 	fipsEnabled bool,
+	configVersion string,
 ) *corev1.ConfigMap {
-	operatorDefaults := buildOperatorDefaults(r, IPv6Enabled)
+	operatorDefaults := buildOperatorDefaults(r, IPv6Enabled, configVersion)
 	userConfig := r.Spec.Config.AdditionalConfig
-	advancedConfig := buildAdvancedConfig(r, IPv6Enabled, fipsEnabled)
+	advancedConfig := buildAdvancedConfig(r, IPv6Enabled, fipsEnabled, configVersion)
 
 	erlInetrc := ""
 	if IPv6Enabled {
@@ -51,11 +53,12 @@ func GenerateServerConfigMap(
 	}
 }
 
-// GenerateConfigDataConfigMap generates the config-data ConfigMap for inter-node TLS
-// This is only needed when TLS is enabled
+// GenerateConfigDataConfigMap generates the config-data ConfigMap for inter-node TLS.
+// configVersion determines version-specific TLS settings.
 func GenerateConfigDataConfigMap(
 	r *rabbitmqv1.RabbitMq,
 	fipsEnabled bool,
+	configVersion string,
 ) *corev1.ConfigMap {
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -66,13 +69,13 @@ func GenerateConfigDataConfigMap(
 	}
 
 	if r.Spec.TLS.SecretName != "" {
-		cm.Data["inter_node_tls.config"] = buildInterNodeTLSConfig(fipsEnabled)
+		cm.Data["inter_node_tls.config"] = buildInterNodeTLSConfig(fipsEnabled, configVersion)
 	}
 
 	return cm
 }
 
-func buildOperatorDefaults(r *rabbitmqv1.RabbitMq, IPv6Enabled bool) string {
+func buildOperatorDefaults(r *rabbitmqv1.RabbitMq, IPv6Enabled bool, configVersion string) string {
 	var config []string
 
 	config = append(config, "queue_master_locator                       = min-masters")
@@ -87,6 +90,20 @@ func buildOperatorDefaults(r *rabbitmqv1.RabbitMq, IPv6Enabled bool) string {
 	config = append(config, "auth_mechanisms.2                          = AMQPLAIN")
 	config = append(config, "log.console                                = true")
 	config = append(config, "log.console.level                          = info")
+
+	// Configure node-wide default queue type and migration settings (RabbitMQ 4.x only)
+	if r.Spec.QueueType != nil && *r.Spec.QueueType == rabbitmqv1.QueueTypeQuorum && IsVersion4OrLater(configVersion) {
+		config = append(config,
+			"default_queue_type                         = quorum",
+			"deprecated_features.permit.classic_queue_mirroring = false",
+			"quorum_queue.property_equivalence.relaxed_checks_on_redeclaration = true",
+		)
+	}
+
+	// Prometheus and management bind address
+	config = append(config, "prometheus.tcp.ip                          = ::")
+	config = append(config, "management.tcp.ip                          = ::")
+	config = append(config, "vm_memory_high_watermark.relative           = 0.8")
 
 	// TLS listener configuration
 	if r.Spec.TLS.SecretName != "" {
@@ -108,7 +125,7 @@ func getReplicaCount(r *rabbitmqv1.RabbitMq) int32 {
 	return 1
 }
 
-func buildAdvancedConfig(r *rabbitmqv1.RabbitMq, IPv6Enabled bool, fipsEnabled bool) string {
+func buildAdvancedConfig(r *rabbitmqv1.RabbitMq, IPv6Enabled bool, fipsEnabled bool, configVersion string) string {
 	// If user provided advanced config, use it
 	if r.Spec.Config.AdvancedConfig != "" {
 		return r.Spec.Config.AdvancedConfig
@@ -120,10 +137,7 @@ func buildAdvancedConfig(r *rabbitmqv1.RabbitMq, IPv6Enabled bool, fipsEnabled b
 		return "[].\n"
 	}
 
-	tlsVersions := "['tlsv1.2']"
-	if fipsEnabled {
-		tlsVersions = "['tlsv1.2','tlsv1.3']"
-	}
+	tlsVersions := TLSVersionsForRabbitMQ(configVersion, fipsEnabled)
 
 	return fmt.Sprintf(`[
 {ssl, [{protocol_version, %s}]},
@@ -168,11 +182,8 @@ func buildAdvancedConfig(r *rabbitmqv1.RabbitMq, IPv6Enabled bool, fipsEnabled b
 `, tlsVersions, tlsVersions, tlsVersions, tlsVersions)
 }
 
-func buildInterNodeTLSConfig(fipsEnabled bool) string {
-	tlsVersions := "['tlsv1.2']"
-	if fipsEnabled {
-		tlsVersions = "['tlsv1.2','tlsv1.3']"
-	}
+func buildInterNodeTLSConfig(fipsEnabled bool, configVersion string) string {
+	tlsVersions := TLSVersionsForRabbitMQ(configVersion, fipsEnabled)
 
 	return fmt.Sprintf(`[
   {server, [

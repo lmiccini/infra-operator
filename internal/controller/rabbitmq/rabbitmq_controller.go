@@ -75,6 +75,12 @@ const (
 	topologyField          = ".spec.topologyRef.Name"
 )
 
+// RabbitMQ version upgrade constants
+const (
+	// DefaultRabbitMQVersion is the default RabbitMQ version when Spec.TargetVersion is not set
+	DefaultRabbitMQVersion = "4.2"
+)
+
 var rmqAllWatchFields = []string{
 	serviceSecretNameField,
 	caSecretNameField,
@@ -155,11 +161,83 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, err
 	}
 
+	// Initialize RabbitMQ version in Status if not set.
+	// For existing StatefulSets, infer version from the running cluster;
+	// for new deployments, use TargetVersion or the default.
+	if instance.Status.CurrentVersion == "" {
+		initialVersion := DefaultRabbitMQVersion
+		existingSts := &appsv1.StatefulSet{}
+		stsKey := types.NamespacedName{Name: fmt.Sprintf("%s-server", instance.Name), Namespace: instance.Namespace}
+		err := r.Get(ctx, stsKey, existingSts)
+		if err == nil && !existingSts.CreationTimestamp.IsZero() {
+			initialVersion = "3.9"
+			Log.Info("Existing StatefulSet found - initializing CurrentVersion for upgrade tracking",
+				"statefulset", stsKey, "initialVersion", initialVersion)
+		} else if err == nil || k8s_errors.IsNotFound(err) {
+			if instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" {
+				initialVersion = *instance.Spec.TargetVersion
+			}
+		} else {
+			Log.Error(err, "Failed to check for existing StatefulSet during version initialization")
+		}
+		instance.Status.CurrentVersion = initialVersion
+		Log.Info("Initialized RabbitMQ current version in status", "version", initialVersion)
+		if err := helper.PatchInstance(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Check if storage wipe is needed for version upgrades or queue type migration
+	var requiresWipe bool
+	switch instance.Status.UpgradePhase {
+	case rabbitmqv1beta1.UpgradePhaseDeletingResources, rabbitmqv1beta1.UpgradePhaseWaitingForCluster:
+		requiresWipe = true
+	case rabbitmqv1beta1.UpgradePhaseNone:
+		if instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" {
+			needsWipe, wipeErr := rabbitmq.RequiresStorageWipe(instance.Status.CurrentVersion, *instance.Spec.TargetVersion)
+			if wipeErr != nil {
+				Log.Error(wipeErr, "Failed to determine upgrade compatibility")
+				return ctrl.Result{}, fmt.Errorf("failed to check upgrade compatibility: %w", wipeErr)
+			}
+			if needsWipe {
+				requiresWipe = true
+				instance.Status.WipeReason = rabbitmqv1beta1.WipeReasonVersionUpgrade
+				Log.Info("RabbitMQ upgrade requires storage wipe",
+					"currentVersion", instance.Status.CurrentVersion,
+					"targetVersion", *instance.Spec.TargetVersion)
+			}
+		}
+		if !requiresWipe && instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
+			if instance.Status.QueueType == rabbitmqv1beta1.QueueTypeMirrored {
+				requiresWipe = true
+				instance.Status.WipeReason = rabbitmqv1beta1.WipeReasonQueueTypeMigration
+				Log.Info("Queue type change from Mirrored to Quorum requires storage wipe")
+			}
+		}
+	}
+
 	// initialize status if Conditions is nil, but do not reset if it already
 	// exists
 	isNewInstance := instance.Status.Conditions == nil
 	if isNewInstance {
 		instance.Status.Conditions = condition.Conditions{}
+	}
+
+	// Handle clients-reconfigured annotation BEFORE the deferred PatchInstance.
+	if instance.DeletionTimestamp.IsZero() && instance.Annotations != nil {
+		if configured, ok := instance.Annotations[rabbitmqv1beta1.AnnotationClientsReconfigured]; ok && configured == "true" {
+			instance.Status.ProxyRequired = false
+			if err := r.Client.Status().Update(ctx, instance); err != nil {
+				return ctrl.Result{}, err
+			}
+			delete(instance.Annotations, rabbitmqv1beta1.AnnotationClientsReconfigured)
+			if err := r.Client.Update(ctx, instance); err != nil {
+				return ctrl.Result{}, err
+			}
+			Log.Info("Clients reconfigured - cleared ProxyRequired and removed annotation")
+			return ctrl.Result{Requeue: true}, nil
+		}
 	}
 
 	// Save a copy of the condtions so that we can restore the LastTransitionTime
@@ -349,6 +427,50 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		instance.Status.LastAppliedTopology = nil
 	}
 
+	//
+	// Handle storage wipe phase 1: set initial phase.
+	// Phase flow: None → DeletingResources → WaitingForCluster → None
+	//
+	if requiresWipe && instance.Status.UpgradePhase == rabbitmqv1beta1.UpgradePhaseNone {
+		instance.Status.UpgradePhase = rabbitmqv1beta1.UpgradePhaseDeletingResources
+		Log.Info("Starting storage wipe", "reason", instance.Status.WipeReason)
+		if err := helper.PatchInstance(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Determine the config version: use TargetVersion during upgrade,
+	// otherwise use CurrentVersion.
+	configVersion := ""
+	if instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" {
+		configVersion = *instance.Spec.TargetVersion
+	}
+	if configVersion == "" {
+		configVersion = instance.Status.CurrentVersion
+		if configVersion == "" {
+			configVersion = DefaultRabbitMQVersion
+		}
+	}
+
+	// Determine if we need to add data-wipe init container
+	needsDataWipe := instance.Status.UpgradePhase == rabbitmqv1beta1.UpgradePhaseDeletingResources ||
+		instance.Status.UpgradePhase == rabbitmqv1beta1.UpgradePhaseWaitingForCluster
+
+	// Preserve wipe-data init container if it already exists (avoid unnecessary pod restarts)
+	if !needsDataWipe {
+		existingSts := &appsv1.StatefulSet{}
+		stsKey := types.NamespacedName{Name: fmt.Sprintf("%s-server", instance.Name), Namespace: instance.Namespace}
+		if err := r.Get(ctx, stsKey, existingSts); err == nil {
+			for _, c := range existingSts.Spec.Template.Spec.InitContainers {
+				if c.Name == "wipe-data" {
+					needsDataWipe = true
+					break
+				}
+			}
+		}
+	}
+
 	// Build RabbitMQ configuration environment variables
 	envVars, err := rabbitmq.BuildRabbitMQConfig(instance, IPv6Enabled, fipsEnabled)
 	if err != nil {
@@ -435,9 +557,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 
 	// Generate server configuration ConfigMap
-	serverCm := rabbitmq.GenerateServerConfigMap(instance, IPv6Enabled, fipsEnabled)
+	serverCm := rabbitmq.GenerateServerConfigMap(instance, IPv6Enabled, fipsEnabled, configVersion)
 	scmop, err := controllerutil.CreateOrPatch(ctx, r.Client, serverCm, func() error {
-		serverCm.Data = rabbitmq.GenerateServerConfigMap(instance, IPv6Enabled, fipsEnabled).Data
+		serverCm.Data = rabbitmq.GenerateServerConfigMap(instance, IPv6Enabled, fipsEnabled, configVersion).Data
 		adoptResource(serverCm, instance.UID)
 		return controllerutil.SetControllerReference(instance, serverCm, r.Scheme)
 	})
@@ -449,9 +571,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 
 	// Generate config-data ConfigMap (for inter-node TLS config)
-	configDataCm := rabbitmq.GenerateConfigDataConfigMap(instance, fipsEnabled)
+	configDataCm := rabbitmq.GenerateConfigDataConfigMap(instance, fipsEnabled, configVersion)
 	cdcmop, err := controllerutil.CreateOrPatch(ctx, r.Client, configDataCm, func() error {
-		configDataCm.Data = rabbitmq.GenerateConfigDataConfigMap(instance, fipsEnabled).Data
+		configDataCm.Data = rabbitmq.GenerateConfigDataConfigMap(instance, fipsEnabled, configVersion).Data
 		adoptResource(configDataCm, instance.UID)
 		return controllerutil.SetControllerReference(instance, configDataCm, r.Scheme)
 	})
@@ -525,7 +647,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			return err
 		}
 
-		desired := rabbitmq.StatefulSet(instance, configMapHash, topology, envVars)
+		desired := rabbitmq.StatefulSet(instance, configMapHash, topology, envVars, configVersion, needsDataWipe)
 		isCreate := sts.CreationTimestamp.IsZero()
 
 		if isCreate {
@@ -583,6 +705,53 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		Log.Info(fmt.Sprintf("StatefulSet %s - %s", sts.Name, stsop))
 	}
 
+	//
+	// Handle storage wipe phase 2: delete StatefulSet.
+	// The StatefulSet spec has been updated above (via CreateOrPatch) with the
+	// wipe init container. Now we delete the StatefulSet so it is recreated
+	// with the new spec including the wipe init container.
+	//
+	if requiresWipe && instance.Status.UpgradePhase == rabbitmqv1beta1.UpgradePhaseDeletingResources {
+		Log.Info("Deleting StatefulSet for storage wipe", "reason", instance.Status.WipeReason)
+
+		// Delete ha-all policy if needed (for Mirrored queue migrations)
+		needsPolicyDeletion := instance.Status.WipeReason == rabbitmqv1beta1.WipeReasonQueueTypeMigration ||
+			(instance.Status.WipeReason == rabbitmqv1beta1.WipeReasonVersionUpgrade && instance.Status.QueueType == rabbitmqv1beta1.QueueTypeMirrored)
+		if needsPolicyDeletion {
+			if err := deleteMirroredPolicy(ctx, helper, instance); err != nil {
+				Log.Error(err, "Failed to delete ha-all policy during storage wipe")
+				return ctrl.Result{}, err
+			}
+		}
+
+		// Delete the StatefulSet so it is recreated with the wipe init container
+		stsToDelete := &appsv1.StatefulSet{}
+		stsDeleteName := types.NamespacedName{Name: fmt.Sprintf("%s-server", instance.Name), Namespace: instance.Namespace}
+		if err := r.Get(ctx, stsDeleteName, stsToDelete); err != nil {
+			if !k8s_errors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+			Log.Info("StatefulSet already deleted", "name", stsDeleteName.Name)
+		} else {
+			if err := r.Delete(ctx, stsToDelete); err != nil && !k8s_errors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+			Log.Info("Deleted StatefulSet for storage wipe", "name", stsDeleteName.Name)
+		}
+
+		// Update queue type status for queue migrations
+		if instance.Status.WipeReason == rabbitmqv1beta1.WipeReasonQueueTypeMigration && instance.Spec.QueueType != nil {
+			instance.Status.QueueType = *instance.Spec.QueueType
+			Log.Info("Updated Status.QueueType after queue migration", "queueType", instance.Status.QueueType)
+		}
+
+		instance.Status.UpgradePhase = rabbitmqv1beta1.UpgradePhaseWaitingForCluster
+		if err := helper.PatchInstance(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	// Check StatefulSet readiness
 	clusterReady := false
 	if sts.Status.ObservedGeneration == sts.Generation &&
@@ -594,6 +763,30 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	if clusterReady {
 		instance.Status.Conditions.MarkTrue(condition.DeploymentReadyCondition, condition.DeploymentReadyMessage)
 		instance.Status.ReadyCount = *sts.Spec.Replicas
+
+		// If we just completed a storage wipe, update CurrentVersion and clear UpgradePhase.
+		// The default-user secret survives because we only deleted the StatefulSet.
+		if instance.Status.UpgradePhase == rabbitmqv1beta1.UpgradePhaseWaitingForCluster {
+			instance.Status.UpgradePhase = rabbitmqv1beta1.UpgradePhaseNone
+			instance.Status.WipeReason = rabbitmqv1beta1.WipeReasonNone
+
+			// Set ProxyRequired for 3.x → 4.x upgrades with Quorum migration
+			// Must be checked BEFORE updating CurrentVersion (while it still reflects the old version).
+			if !instance.Status.ProxyRequired && instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
+				if instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" &&
+					rabbitmq.Is3xTo4xUpgrade(instance.Status.CurrentVersion, *instance.Spec.TargetVersion) {
+					instance.Status.ProxyRequired = true
+					Log.Info("Detected 3.x to 4.x upgrade with Quorum migration - enabling proxy requirement")
+				}
+			}
+
+			if instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" {
+				instance.Status.CurrentVersion = *instance.Spec.TargetVersion
+				Log.Info("Version upgrade complete", "version", *instance.Spec.TargetVersion)
+			} else {
+				Log.Info("Queue migration complete - cluster recreated with new queue type")
+			}
+		}
 
 		labelMap := map[string]string{
 			labels.K8sAppName:      instance.Name,

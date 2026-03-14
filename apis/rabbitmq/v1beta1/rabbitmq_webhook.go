@@ -141,7 +141,7 @@ func (r *RabbitMq) Default(k8sClient client.Client) {
 					shouldDefaultQueueType = false
 				}
 				// If we get here with rabbitMqCRExists=true but no QueueType, it's an existing
-			// deployment without QueueType set - default to Quorum
+				// deployment without QueueType set - default to Quorum
 			}
 
 			if shouldDefaultQueueType {

@@ -53,6 +53,10 @@ const (
 	QueueTypeQuorum = "Quorum"
 	// QueueTypeNone - no special queue type
 	QueueTypeNone = "None"
+
+	// AnnotationClientsReconfigured - set to "true" when dataplane clients have been
+	// reconfigured for quorum queues, allowing the proxy sidecar to be removed
+	AnnotationClientsReconfigured = "rabbitmq.openstack.org/clients-reconfigured"
 )
 
 // UpgradePhase tracks the current phase of a version upgrade or queue migration.
