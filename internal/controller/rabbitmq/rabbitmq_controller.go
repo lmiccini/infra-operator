@@ -558,9 +558,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 
 	// Generate server configuration ConfigMap
-	serverCm := rabbitmq.GenerateServerConfigMap(instance, IPv6Enabled, fipsEnabled, configVersion)
+	proxyEnabled := r.shouldEnableProxy(instance)
+	serverCm := rabbitmq.GenerateServerConfigMap(instance, IPv6Enabled, fipsEnabled, configVersion, proxyEnabled)
 	scmop, err := controllerutil.CreateOrPatch(ctx, r.Client, serverCm, func() error {
-		serverCm.Data = rabbitmq.GenerateServerConfigMap(instance, IPv6Enabled, fipsEnabled, configVersion).Data
+		serverCm.Data = rabbitmq.GenerateServerConfigMap(instance, IPv6Enabled, fipsEnabled, configVersion, proxyEnabled).Data
 		adoptResource(serverCm, instance.UID)
 		return controllerutil.SetControllerReference(instance, serverCm, r.Scheme)
 	})
@@ -630,6 +631,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		Log.Info(fmt.Sprintf("Client Service %s - %s", clientSvc.Name, csop))
 	}
 
+	// Manage AMQP proxy sidecar for Mirrored → Quorum migrations
+	if r.shouldEnableProxy(instance) {
+		if err := r.ensureProxyConfigMap(ctx, instance, helper); err != nil {
+			return ctrl.Result{}, err
+		}
+		Log.Info("Proxy sidecar enabled for queue migration")
+	}
+
 	// Create/Update StatefulSet
 	// Use a minimal object for CreateOrPatch to avoid pre-populated fields
 	// interfering with the JSON merge patch computation.
@@ -648,7 +657,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			return err
 		}
 
-		desired := rabbitmq.StatefulSet(instance, configMapHash, topology, envVars, configVersion, needsDataWipe)
+		proxyCfg := rabbitmq.ProxyConfig{
+			Enabled:     proxyEnabled,
+			IPv6Enabled: IPv6Enabled,
+			BuildContainer: func(inst *rabbitmqv1beta1.RabbitMq, ipv6 bool) corev1.Container {
+				return BuildProxySidecarContainer(inst, ipv6)
+			},
+		}
+		desired := rabbitmq.StatefulSet(instance, configMapHash, topology, envVars, configVersion, needsDataWipe, proxyCfg)
 		isCreate := sts.CreationTimestamp.IsZero()
 
 		if isCreate {
@@ -738,6 +754,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			Log.Info("Deleted StatefulSet for storage wipe", "name", stsDeleteName.Name)
 		}
 
+		// Set ProxyRequired NOW so the recreated StatefulSet includes the proxy
+		// sidecar from the start. This avoids a double restart and ensures clients
+		// never connect to quorum queues without the durability proxy.
+		if !instance.Status.ProxyRequired && instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
+			isVersionUpgradeWithMigration := instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" &&
+				rabbitmq.Is3xTo4xUpgrade(instance.Status.CurrentVersion, *instance.Spec.TargetVersion)
+			isQueueTypeMigration := instance.Status.WipeReason == rabbitmqv1beta1.WipeReasonQueueTypeMigration
+
+			if isVersionUpgradeWithMigration || isQueueTypeMigration {
+				instance.Status.ProxyRequired = true
+				Log.Info("Enabling proxy for Mirrored to Quorum migration",
+					"wipeReason", instance.Status.WipeReason)
+			}
+		}
+
 		// Update queue type status for queue migrations
 		if instance.Status.WipeReason == rabbitmqv1beta1.WipeReasonQueueTypeMigration && instance.Spec.QueueType != nil {
 			instance.Status.QueueType = *instance.Spec.QueueType
@@ -766,21 +797,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		// If we just completed a storage wipe, update CurrentVersion and clear UpgradePhase.
 		// The default-user secret survives because we only deleted the StatefulSet.
 		if instance.Status.UpgradePhase == rabbitmqv1beta1.UpgradePhaseWaitingForCluster {
-			// Set ProxyRequired for any Mirrored → Quorum migration (version upgrade or queue migration).
-			// Must be checked BEFORE clearing WipeReason and updating CurrentVersion.
-			if !instance.Status.ProxyRequired && instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
-				// Proxy needed for: version upgrade from 3.x→4.x, or explicit queue type migration
-				isVersionUpgradeWithMigration := instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" &&
-					rabbitmq.Is3xTo4xUpgrade(instance.Status.CurrentVersion, *instance.Spec.TargetVersion)
-				isQueueTypeMigration := instance.Status.WipeReason == rabbitmqv1beta1.WipeReasonQueueTypeMigration
-
-				if isVersionUpgradeWithMigration || isQueueTypeMigration {
-					instance.Status.ProxyRequired = true
-					Log.Info("Enabling proxy for Mirrored to Quorum migration",
-						"wipeReason", instance.Status.WipeReason)
-				}
-			}
-
 			instance.Status.UpgradePhase = rabbitmqv1beta1.UpgradePhaseNone
 			instance.Status.WipeReason = rabbitmqv1beta1.WipeReasonNone
 

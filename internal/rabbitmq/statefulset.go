@@ -14,10 +14,21 @@ import (
 	"k8s.io/utils/ptr"
 )
 
+// ProxyConfig holds configuration for the AMQP proxy sidecar
+type ProxyConfig struct {
+	Enabled     bool
+	IPv6Enabled bool
+	// BuildContainer is a function that builds the proxy sidecar container.
+	// Injected by the controller to avoid circular dependencies.
+	BuildContainer func(instance *rabbitmqv1.RabbitMq, ipv6 bool) corev1.Container
+}
+
 // StatefulSet returns a StatefulSet resource for the RabbitMQ CR
 // matching the old rabbitmq-cluster-operator's resource layout.
 // If targetVersion is non-empty and needsDataWipe is true, a wipe-data init container
 // is prepended to clear persistent data before the main setup container runs.
+// If proxy is enabled, a proxy sidecar container is added and RabbitMQ's readiness
+// probe is adjusted to check the backend port on localhost.
 func StatefulSet(
 	r *rabbitmqv1.RabbitMq,
 	configHash string,
@@ -25,6 +36,7 @@ func StatefulSet(
 	envVars []corev1.EnvVar,
 	targetVersion string,
 	needsDataWipe bool,
+	proxy ProxyConfig,
 ) *appsv1.StatefulSet {
 	matchls := map[string]string{
 		labels.K8sAppName: r.Name,
@@ -61,6 +73,33 @@ func StatefulSet(
 		Lifecycle:      buildLifecycle(),
 	}
 
+	// When proxy is enabled, RabbitMQ listens on localhost only (backend port).
+	// The proxy handles client connections on the standard ports.
+	// Update the readiness probe to check backend port via exec (since RabbitMQ
+	// listens on loopback, TCPSocket probes from kubelet won't reach it).
+	if proxy.Enabled {
+		loopbackAddr := "127.0.0.1"
+		if proxy.IPv6Enabled {
+			loopbackAddr = "::1"
+		}
+		rabbitmqContainer.ReadinessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				Exec: &corev1.ExecAction{
+					Command: []string{
+						"/bin/sh",
+						"-c",
+						fmt.Sprintf("timeout 1 bash -c '</dev/tcp/%s/%d'", loopbackAddr, BackendPort),
+					},
+				},
+			},
+			InitialDelaySeconds: 10,
+			TimeoutSeconds:      5,
+			PeriodSeconds:       10,
+			SuccessThreshold:    1,
+			FailureThreshold:    3,
+		}
+	}
+
 	// Set resources if specified
 	if r.Spec.Resources != nil {
 		rabbitmqContainer.Resources = *r.Spec.Resources
@@ -77,6 +116,30 @@ func StatefulSet(
 	}
 
 	initContainers = append(initContainers, buildInitContainer(r))
+
+	// Build containers list
+	containers := []corev1.Container{rabbitmqContainer}
+
+	// Build volumes
+	volumes := getVolumes(r)
+
+	// Add proxy sidecar if enabled
+	if proxy.Enabled && proxy.BuildContainer != nil {
+		containers = append(containers, proxy.BuildContainer(r, proxy.IPv6Enabled))
+
+		// Add proxy script volume
+		volumes = append(volumes, corev1.Volume{
+			Name: "proxy-script",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: r.Name + "-proxy-script",
+					},
+					DefaultMode: ptr.To[int32](0555),
+				},
+			},
+		})
+	}
 
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -107,8 +170,8 @@ func StatefulSet(
 					AutomountServiceAccountToken:  ptr.To(true),
 					TerminationGracePeriodSeconds: ptr.To(int64(604800)),
 					InitContainers:                initContainers,
-					Containers:                    []corev1.Container{rabbitmqContainer},
-					Volumes:                       getVolumes(r),
+					Containers:                    containers,
+					Volumes:                       volumes,
 					SecurityContext: &corev1.PodSecurityContext{
 						FSGroup: ptr.To(int64(0)),
 					},

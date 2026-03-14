@@ -29,8 +29,9 @@ func GenerateServerConfigMap(
 	IPv6Enabled bool,
 	fipsEnabled bool,
 	configVersion string,
+	proxyEnabled bool,
 ) *corev1.ConfigMap {
-	operatorDefaults := buildOperatorDefaults(r, IPv6Enabled, configVersion)
+	operatorDefaults := buildOperatorDefaults(r, IPv6Enabled, configVersion, proxyEnabled)
 	userConfig := r.Spec.Config.AdditionalConfig
 	advancedConfig := buildAdvancedConfig(r, IPv6Enabled, fipsEnabled, configVersion)
 
@@ -75,15 +76,23 @@ func GenerateConfigDataConfigMap(
 	return cm
 }
 
-func buildOperatorDefaults(r *rabbitmqv1.RabbitMq, IPv6Enabled bool, configVersion string) string {
+func buildOperatorDefaults(r *rabbitmqv1.RabbitMq, IPv6Enabled bool, configVersion string, proxyEnabled bool) string {
 	var config []string
 
-	config = append(config, "queue_master_locator                       = min-masters")
 	config = append(config, "disk_free_limit.absolute                   = 2GB")
 	config = append(config, "cluster_partition_handling                 = pause_minority")
 	config = append(config, "cluster_formation.peer_discovery_backend   = rabbit_peer_discovery_k8s")
-	config = append(config, "cluster_formation.k8s.host                 = kubernetes.default")
+
+	// RabbitMQ 4.x renamed queue_master_locator to queue_leader_locator.
+	// k8s.address_type is still valid; only k8s.host is auto-detected.
+	if IsVersion4OrLater(configVersion) {
+		config = append(config, "queue_leader_locator                       = balanced")
+	} else {
+		config = append(config, "queue_master_locator                       = min-masters")
+		config = append(config, "cluster_formation.k8s.host                 = kubernetes.default")
+	}
 	config = append(config, "cluster_formation.k8s.address_type         = hostname")
+
 	config = append(config, fmt.Sprintf("cluster_formation.target_cluster_size_hint = %d", getReplicaCount(r)))
 	config = append(config, fmt.Sprintf("cluster_name                               = %s", r.Name))
 	config = append(config, "auth_mechanisms.1                          = PLAIN")
@@ -105,14 +114,31 @@ func buildOperatorDefaults(r *rabbitmqv1.RabbitMq, IPv6Enabled bool, configVersi
 	config = append(config, "management.tcp.ip                          = ::")
 	config = append(config, "vm_memory_high_watermark.relative           = 0.8")
 
-	// TLS listener configuration
-	if r.Spec.TLS.SecretName != "" {
+	// Proxy mode: RabbitMQ listens on localhost only, proxy handles client connections
+	if proxyEnabled {
+		loopbackAddr := "127.0.0.1"
+		if IPv6Enabled {
+			loopbackAddr = "::1"
+		}
+		config = append(config, fmt.Sprintf("listeners.tcp.1                            = %s:%d", loopbackAddr, BackendPort))
+		if r.Spec.TLS.SecretName != "" {
+			config = append(config, fmt.Sprintf("listeners.ssl.1                            = %s:5674", loopbackAddr))
+			config = append(config, fmt.Sprintf("listeners.ssl.default                      = %s:5674", loopbackAddr))
+		}
+	} else if r.Spec.TLS.SecretName != "" {
+		// TLS listener configuration (normal mode)
 		config = append(config, "listeners.ssl.default                      = 5671")
 		config = append(config, "management.ssl.port                        = 15671")
 		config = append(config, "prometheus.ssl.port                        = 15691")
 		if r.Spec.TLS.DisableNonTLSListeners {
 			config = append(config, "listeners.tcp                              = none")
 		}
+	}
+
+	// Management/Prometheus TLS ports (needed in both proxy and non-proxy modes)
+	if proxyEnabled && r.Spec.TLS.SecretName != "" {
+		config = append(config, "management.ssl.port                        = 15671")
+		config = append(config, "prometheus.ssl.port                        = 15691")
 	}
 
 	return strings.Join(config, "\n") + "\n"

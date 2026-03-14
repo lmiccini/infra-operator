@@ -20,12 +20,15 @@ const (
 	PrometheusPort    = 15692
 	PrometheusTLSPort = 15691
 	ClusterRPCPort    = 25672
-	MQTTPort          = 1883
-	MQTTTLSPort       = 8883
-	STOMPPort         = 61613
-	STOMPTLSPort      = 61614
-	StreamPort        = 5552
-	StreamTLSPort     = 5551
+	// BackendPort is the port RabbitMQ listens on when proxy is enabled.
+	// The proxy forwards to this port on localhost.
+	BackendPort   = 5673
+	MQTTPort      = 1883
+	MQTTTLSPort   = 8883
+	STOMPPort     = 61613
+	STOMPTLSPort  = 61614
+	StreamPort    = 5552
+	StreamTLSPort = 5551
 )
 
 // HeadlessService creates the headless service for StatefulSet pod DNS

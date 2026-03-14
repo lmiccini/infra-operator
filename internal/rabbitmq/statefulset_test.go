@@ -42,7 +42,7 @@ func newTestRabbitMq(name string) *rabbitmqv1.RabbitMq {
 
 func TestStatefulSet_WithoutDataWipe(t *testing.T) {
 	r := newTestRabbitMq("test-mq")
-	sts := StatefulSet(r, "hash123", nil, nil, "4.2", false)
+	sts := StatefulSet(r, "hash123", nil, nil, "4.2", false, ProxyConfig{})
 
 	if sts.Name != "test-mq-server" {
 		t.Errorf("StatefulSet name = %q, want %q", sts.Name, "test-mq-server")
@@ -66,7 +66,7 @@ func TestStatefulSet_WithoutDataWipe(t *testing.T) {
 
 func TestStatefulSet_WithDataWipe(t *testing.T) {
 	r := newTestRabbitMq("test-mq")
-	sts := StatefulSet(r, "hash123", nil, nil, "4.2", true)
+	sts := StatefulSet(r, "hash123", nil, nil, "4.2", true, ProxyConfig{})
 
 	initContainers := sts.Spec.Template.Spec.InitContainers
 	if len(initContainers) != 2 {
@@ -85,7 +85,7 @@ func TestStatefulSet_WithDataWipe(t *testing.T) {
 func TestStatefulSet_WipeDataNotAddedForInvalidVersion(t *testing.T) {
 	r := newTestRabbitMq("test-mq")
 	// Invalid version pattern should prevent wipe-data init container
-	sts := StatefulSet(r, "hash123", nil, nil, "bad-version", true)
+	sts := StatefulSet(r, "hash123", nil, nil, "bad-version", true, ProxyConfig{})
 
 	initContainers := sts.Spec.Template.Spec.InitContainers
 	if len(initContainers) != 1 {
@@ -161,7 +161,7 @@ func TestStatefulSet_ReplicaCount(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			r := newTestRabbitMq("test-mq")
 			r.Spec.Replicas = tt.replicas
-			sts := StatefulSet(r, "hash", nil, nil, "4.2", false)
+			sts := StatefulSet(r, "hash", nil, nil, "4.2", false, ProxyConfig{})
 			if *sts.Spec.Replicas != tt.want {
 				t.Errorf("replicas = %d, want %d", *sts.Spec.Replicas, tt.want)
 			}

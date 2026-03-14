@@ -36,7 +36,7 @@ func TestGenerateServerConfigMap_QuorumSettings_4x(t *testing.T) {
 		},
 	}
 
-	cm := GenerateServerConfigMap(r, false, false, "4.2")
+	cm := GenerateServerConfigMap(r, false, false, "4.2", false)
 	defaults := cm.Data["operatorDefaults.conf"]
 
 	if !strings.Contains(defaults, "default_queue_type                         = quorum") {
@@ -61,7 +61,7 @@ func TestGenerateServerConfigMap_QuorumSettings_3x(t *testing.T) {
 		},
 	}
 
-	cm := GenerateServerConfigMap(r, false, false, "3.9")
+	cm := GenerateServerConfigMap(r, false, false, "3.9", false)
 	defaults := cm.Data["operatorDefaults.conf"]
 
 	// 3.x should NOT include quorum queue defaults even if QueueType is Quorum
@@ -87,7 +87,7 @@ func TestGenerateServerConfigMap_TLS_VersionAware(t *testing.T) {
 	}
 
 	// 3.x non-FIPS: TLS 1.2 only
-	cm3x := GenerateServerConfigMap(r, false, false, "3.9")
+	cm3x := GenerateServerConfigMap(r, false, false, "3.9", false)
 	adv3x := cm3x.Data["advanced.config"]
 	if !strings.Contains(adv3x, "['tlsv1.2']") {
 		t.Error("3.x non-FIPS advanced.config should use TLS 1.2 only")
@@ -97,14 +97,14 @@ func TestGenerateServerConfigMap_TLS_VersionAware(t *testing.T) {
 	}
 
 	// 4.x non-FIPS: TLS 1.2+1.3
-	cm4x := GenerateServerConfigMap(r, false, false, "4.2")
+	cm4x := GenerateServerConfigMap(r, false, false, "4.2", false)
 	adv4x := cm4x.Data["advanced.config"]
 	if !strings.Contains(adv4x, "['tlsv1.2','tlsv1.3']") {
 		t.Error("4.x advanced.config should use TLS 1.2+1.3")
 	}
 
 	// 3.x FIPS: TLS 1.2+1.3
-	cm3xFips := GenerateServerConfigMap(r, false, true, "3.9")
+	cm3xFips := GenerateServerConfigMap(r, false, true, "3.9", false)
 	adv3xFips := cm3xFips.Data["advanced.config"]
 	if !strings.Contains(adv3xFips, "['tlsv1.2','tlsv1.3']") {
 		t.Error("3.x FIPS advanced.config should use TLS 1.2+1.3")
@@ -162,7 +162,7 @@ func TestGenerateServerConfigMap_NoTLS_AdvancedConfig(t *testing.T) {
 		},
 	}
 
-	cm := GenerateServerConfigMap(r, false, false, "4.2")
+	cm := GenerateServerConfigMap(r, false, false, "4.2", false)
 	adv := cm.Data["advanced.config"]
 	if adv != "[].\n" {
 		t.Errorf("no-TLS advanced.config should be empty Erlang config, got %q", adv)
