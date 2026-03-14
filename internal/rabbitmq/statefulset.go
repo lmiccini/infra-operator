@@ -173,7 +173,8 @@ func StatefulSet(
 					Containers:                    containers,
 					Volumes:                       volumes,
 					SecurityContext: &corev1.PodSecurityContext{
-						FSGroup: ptr.To(int64(0)),
+						FSGroup:   ptr.To(int64(0)),
+						RunAsUser: ptr.To(int64(999)),
 					},
 				},
 			},

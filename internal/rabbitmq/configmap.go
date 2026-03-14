@@ -84,21 +84,19 @@ func buildOperatorDefaults(r *rabbitmqv1.RabbitMq, IPv6Enabled bool, configVersi
 	config = append(config, "disk_free_limit.absolute                   = 2GB")
 	config = append(config, "cluster_partition_handling                 = pause_minority")
 	config = append(config, "cluster_formation.peer_discovery_backend   = rabbit_peer_discovery_k8s")
+	config = append(config, "cluster_formation.k8s.host                 = kubernetes.default")
+	config = append(config, "cluster_formation.k8s.address_type         = hostname")
 
-	// RabbitMQ 4.x completely rewrote the peer discovery k8s plugin:
-	// - It uses StatefulSet ordinal-based discovery (seed node) instead of K8s API
-	// - k8s.host, k8s.address_type, k8s.service_name are deprecated and IGNORED
-	// - target_cluster_size_hint must NOT be set: the new plugin returns only 1 seed
-	//   node, but target_cluster_size_hint > 1 requires ≥2 reachable peers, causing
-	//   infinite retry loops
+	// RabbitMQ 4.x renamed queue_master_locator to queue_leader_locator.
+	// The k8s.host and k8s.address_type options emit deprecation warnings on 4.x
+	// but are still functional in 4.2.x (same approach used by cluster-operator).
 	if IsVersion4OrLater(configVersion) {
 		config = append(config, "queue_leader_locator                       = balanced")
 	} else {
 		config = append(config, "queue_master_locator                       = min-masters")
-		config = append(config, "cluster_formation.k8s.host                 = kubernetes.default")
-		config = append(config, "cluster_formation.k8s.address_type         = hostname")
-		config = append(config, fmt.Sprintf("cluster_formation.target_cluster_size_hint = %d", getReplicaCount(r)))
 	}
+
+	config = append(config, fmt.Sprintf("cluster_formation.target_cluster_size_hint = %d", getReplicaCount(r)))
 	config = append(config, fmt.Sprintf("cluster_name                               = %s", r.Name))
 	config = append(config, "auth_mechanisms.1                          = PLAIN")
 	config = append(config, "auth_mechanisms.2                          = AMQPLAIN")
