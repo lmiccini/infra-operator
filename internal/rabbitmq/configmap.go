@@ -88,20 +88,18 @@ func buildOperatorDefaults(r *rabbitmqv1.RabbitMq, IPv6Enabled bool, configVersi
 	config = append(config, "cluster_partition_handling                 = pause_minority")
 	config = append(config, "cluster_formation.peer_discovery_backend   = rabbit_peer_discovery_k8s")
 
-	// RabbitMQ 4.x deprecated k8s_host, k8s_service_name, and k8s_address_type
-	// config options (they are silently ignored). For 3.x compatibility, keep
-	// them in config. The env vars K8S_SERVICE_NAME, K8S_ADDRESS_TYPE, and
-	// K8S_HOSTNAME_SUFFIX (set in statefulset.go) are the primary mechanism
-	// and work across all versions.
-	if !IsVersion4OrLater(configVersion) {
-		config = append(config, "cluster_formation.k8s.host                 = kubernetes.default")
-		config = append(config, "cluster_formation.k8s.address_type         = hostname")
-		config = append(config, fmt.Sprintf("cluster_formation.k8s.service_name         = %s-nodes", r.Name))
-	}
+	// RabbitMQ 4.1+ rewrote rabbit_peer_discovery_k8s to use a seed-node
+	// approach (parsing the StatefulSet node name) instead of querying the
+	// K8s API for endpoints. The k8s.host, k8s.address_type, and
+	// k8s.service_name config options are silently ignored in 4.x.
+	// We include them for all versions to match the current cluster-operator
+	// behavior (see rabbitmq/cluster-operator#1865) and because they are
+	// harmless on 4.x (just emit deprecation warnings).
+	config = append(config, "cluster_formation.k8s.host                 = kubernetes.default")
+	config = append(config, "cluster_formation.k8s.address_type         = hostname")
+	config = append(config, fmt.Sprintf("cluster_formation.k8s.service_name         = %s-nodes", r.Name))
 
 	// RabbitMQ 4.x renamed queue_master_locator to queue_leader_locator.
-	// The k8s.host and k8s.address_type options emit deprecation warnings on 4.x
-	// but are still functional in 4.2.x (same approach used by cluster-operator).
 	if IsVersion4OrLater(configVersion) {
 		config = append(config, "queue_leader_locator                       = balanced")
 	} else {
@@ -232,14 +230,21 @@ func buildAdvancedConfig(r *rabbitmqv1.RabbitMq, IPv6Enabled bool, fipsEnabled b
 func buildInterNodeTLSConfig(fipsEnabled bool, configVersion string) string {
 	tlsVersions := TLSVersionsForRabbitMQ(configVersion, fipsEnabled)
 
+	// Use verify_none for inter-node TLS distribution. OTP 26 changed
+	// verify_peer to enforce strict hostname verification, which breaks
+	// RabbitMQ 4.x peer discovery: the plugin spawns a hidden Erlang peer
+	// that connects back via TLS distribution, and the ephemeral peer's
+	// node name doesn't match the certificate's SAN entries.
+	// Certificate chain validation against the CA is still performed;
+	// only SNI-based hostname matching is skipped.
 	return fmt.Sprintf(`[
   {server, [
     {cacertfile, "/etc/rabbitmq-tls/ca.crt"},
     {certfile, "/etc/rabbitmq-tls/tls.crt"},
     {keyfile, "/etc/rabbitmq-tls/tls.key"},
     {secure_renegotiate, true},
-    {verify, verify_peer},
-    {fail_if_no_peer_cert, true},
+    {verify, verify_none},
+    {fail_if_no_peer_cert, false},
     {versions, %s}
   ]},
   {client, [
@@ -247,8 +252,7 @@ func buildInterNodeTLSConfig(fipsEnabled bool, configVersion string) string {
     {certfile, "/etc/rabbitmq-tls/tls.crt"},
     {keyfile, "/etc/rabbitmq-tls/tls.key"},
     {secure_renegotiate, true},
-    {verify, verify_peer},
-    {fail_if_no_peer_cert, true},
+    {verify, verify_none},
     {versions, %s}
   ]}
 ].
