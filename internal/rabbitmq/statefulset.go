@@ -170,7 +170,7 @@ func StatefulSet(
 				Spec: corev1.PodSpec{
 					ServiceAccountName:            r.RbacResourceName(),
 					AutomountServiceAccountToken:  ptr.To(true),
-					TerminationGracePeriodSeconds: ptr.To(int64(604800)),
+					TerminationGracePeriodSeconds: ptr.To(int64(600)),
 					InitContainers:                initContainers,
 					Containers:                    containers,
 					Volumes:                       volumes,
@@ -398,7 +398,7 @@ func buildLifecycle() *corev1.Lifecycle {
 				Command: []string{
 					"/bin/bash",
 					"-c",
-					`if [ ! -z "$(cat /etc/pod-info/skipPreStopChecks)" ]; then exit 0; fi; rabbitmq-upgrade await_online_quorum_plus_one -t 604800 && rabbitmq-upgrade await_online_synchronized_mirror -t 604800 || true && rabbitmq-upgrade drain -t 604800`,
+					`if [ ! -z "$(cat /etc/pod-info/skipPreStopChecks)" ]; then exit 0; fi; rabbitmq-upgrade await_online_quorum_plus_one -t 600 && rabbitmq-upgrade await_online_synchronized_mirror -t 600 || true && rabbitmq-upgrade drain -t 600`,
 				},
 			},
 		},
