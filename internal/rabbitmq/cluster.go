@@ -77,10 +77,16 @@ func BuildRabbitMQConfig(
 
 	inetFamily := "inet"
 	inetProtocol := "tcp"
+	inetrcArg := ""
 	tlsArgs := ""
 	fipsArgs := ""
 	if IPv6Enabled {
 		inetFamily = "inet6"
+		// IPv6 requires an inetrc file with {inet6,true} to tell Erlang
+		// to prefer IPv6. The file also includes {resolv_conf,...} and
+		// {hosts_file,...} to ensure system DNS config is loaded (specifying
+		// -kernel inetrc overrides default DNS loading).
+		inetrcArg = "-kernel inetrc '/etc/rabbitmq/erl_inetrc'"
 	}
 
 	if r.Spec.TLS.SecretName != "" {
@@ -94,7 +100,8 @@ func BuildRabbitMQConfig(
 	envVars = append(envVars, corev1.EnvVar{
 		Name: "RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS",
 		Value: strings.TrimSpace(fmt.Sprintf(
-			"-kernel inetrc '/etc/rabbitmq/erl_inetrc' -proto_dist %s_%s %s %s",
+			"%s -proto_dist %s_%s %s %s",
+			inetrcArg,
 			inetFamily,
 			inetProtocol,
 			tlsArgs,

@@ -41,14 +41,13 @@ func GenerateServerConfigMap(
 		"advanced.config":               advancedConfig,
 	}
 
-	// Always include erl_inetrc for Erlang DNS resolution.
-	// {inet6,true} is needed for IPv6; for IPv4 the file is empty
-	// since IPv4 is the Erlang default ({inet,true} is not a valid
-	// inetrc directive and causes a syntax error).
+	// Include erl_inetrc only when IPv6 is enabled.
+	// The -kernel inetrc flag (set in cluster.go) overrides Erlang's default
+	// DNS loading, so the inetrc must explicitly include {resolv_conf,...}
+	// and {hosts_file,...} to restore system DNS resolution.
+	// For IPv4, no inetrc is needed (Erlang defaults are correct).
 	if IPv6Enabled {
-		data["erl_inetrc"] = "{inet6,true}.\n"
-	} else {
-		data["erl_inetrc"] = "\n"
+		data["erl_inetrc"] = "{inet6,true}.\n{resolv_conf, \"/etc/resolv.conf\"}.\n{hosts_file, \"/etc/hosts\"}.\n"
 	}
 
 	return &corev1.ConfigMap{

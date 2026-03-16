@@ -121,7 +121,7 @@ var _ = Describe("RabbitMQ Controller", func() {
 					}
 				}
 				g.Expect(erlArgs).To(ContainSubstring("-proto_dist inet_tcp"))
-				g.Expect(erlArgs).To(ContainSubstring("-kernel inetrc"))
+				g.Expect(erlArgs).ToNot(ContainSubstring("-kernel inetrc"))
 			}, timeout, interval).Should(Succeed())
 
 		})

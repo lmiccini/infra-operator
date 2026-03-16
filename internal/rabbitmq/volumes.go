@@ -162,7 +162,7 @@ func getVolumes(r *rabbitmqv1.RabbitMq) []corev1.Volume {
 	return vols
 }
 
-func getVolumeMounts(r *rabbitmqv1.RabbitMq) []corev1.VolumeMount {
+func getVolumeMounts(r *rabbitmqv1.RabbitMq, IPv6Enabled bool) []corev1.VolumeMount {
 	vm := []corev1.VolumeMount{
 		{
 			Name:      "rabbitmq-erlang-cookie",
@@ -209,14 +209,17 @@ func getVolumeMounts(r *rabbitmqv1.RabbitMq) []corev1.VolumeMount {
 		})
 	}
 
-	// Always mount erl_inetrc to control Erlang DNS resolution.
-	// The RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS references this file via
-	// -kernel inetrc, matching the original infra-operator behavior.
-	vm = append(vm, corev1.VolumeMount{
-		Name:      "server-conf",
-		MountPath: "/etc/rabbitmq/erl_inetrc",
-		SubPath:   "erl_inetrc",
-	})
+	// Mount erl_inetrc only when IPv6 is enabled.
+	// The -kernel inetrc flag overrides Erlang's default DNS loading,
+	// so we only use it when we need {inet6,true}. For IPv4, Erlang's
+	// default DNS config (loading /etc/resolv.conf) works correctly.
+	if IPv6Enabled {
+		vm = append(vm, corev1.VolumeMount{
+			Name:      "server-conf",
+			MountPath: "/etc/rabbitmq/erl_inetrc",
+			SubPath:   "erl_inetrc",
+		})
+	}
 
 	// Add TLS volume mounts if TLS is enabled
 	if r.Spec.TLS.SecretName != "" {
