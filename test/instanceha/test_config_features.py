@@ -74,8 +74,8 @@ class TestDisabledEnvVarOverride(unittest.TestCase):
 
             self.assertTrue(result['DISABLED'])
 
-    def test_env_var_false_overrides_config(self):
-        """Test that INSTANCEHA_DISABLED=False env var sets DISABLED=False in config."""
+    def test_env_var_false_preserves_config(self):
+        """Test that INSTANCEHA_DISABLED=False preserves the config file value."""
         with patch.dict(os.environ, {'INSTANCEHA_DISABLED': 'False'}):
             config = instanceha.ConfigManager.__new__(instanceha.ConfigManager)
             config.config_path = '/nonexistent'
@@ -86,7 +86,7 @@ class TestDisabledEnvVarOverride(unittest.TestCase):
             with patch.object(config, '_load_yaml_file', return_value={'config': {'DISABLED': True}}):
                 result = config._load_config()
 
-            self.assertFalse(result['DISABLED'])
+            self.assertTrue(result['DISABLED'])
 
     def test_env_var_absent_uses_config_file(self):
         """Test that without INSTANCEHA_DISABLED env var, config file value is used."""
