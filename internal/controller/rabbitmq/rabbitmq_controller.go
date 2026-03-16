@@ -516,7 +516,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		{
 			APIGroups: []string{""},
 			Resources: []string{"endpoints"},
-			Verbs:     []string{"get", "list", "watch"},
+			Verbs:     []string{"get"},
 		},
 		{
 			APIGroups: []string{""},

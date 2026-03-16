@@ -59,13 +59,15 @@ func StatefulSet(
 	// Build the readiness probe (no liveness probe, matching old operator)
 	readinessProbe := buildReadinessProbe(r)
 
-	// Build the main RabbitMQ container
+	// Build the main RabbitMQ container.
+	// Explicitly set Command to bypass the kolla entrypoint (kolla_start tries
+	// sudo which fails as UID 999). The cluster-operator uses the official
+	// RabbitMQ image where the default entrypoint works, but OpenStack uses
+	// kolla-based images that require this override.
 	rabbitmqContainer := corev1.Container{
-		Name:  "rabbitmq",
-		Image: r.Spec.ContainerImage,
-		Args: []string{
-			"/usr/lib/rabbitmq/bin/rabbitmq-server",
-		},
+		Name:    "rabbitmq",
+		Image:   r.Spec.ContainerImage,
+		Command: []string{"rabbitmq-server"},
 		Env:            containerEnv,
 		Ports:          buildContainerPorts(r),
 		VolumeMounts:   getVolumeMounts(r, proxy.IPv6Enabled),

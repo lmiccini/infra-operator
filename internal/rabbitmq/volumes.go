@@ -195,11 +195,18 @@ func getVolumeMounts(r *rabbitmqv1.RabbitMq, IPv6Enabled bool) []corev1.VolumeMo
 			MountPath: "/etc/rabbitmq/conf.d/11-default_user.conf",
 			SubPath:   "default_user.conf",
 		},
-		{
+	}
+
+	// Only mount advanced.config when it has meaningful content (TLS enabled
+	// or user provided advanced config), matching cluster-operator behavior.
+	// An always-present file (even with valid empty content "[].\n") can
+	// interfere with the image's default configuration handling.
+	if r.Spec.TLS.SecretName != "" || r.Spec.Config.AdvancedConfig != "" {
+		vm = append(vm, corev1.VolumeMount{
 			Name:      "server-conf",
 			MountPath: "/etc/rabbitmq/advanced.config",
 			SubPath:   "advanced.config",
-		},
+		})
 	}
 
 	// Only mount erl_inetrc when IPv6 is enabled (matching cluster-operator).

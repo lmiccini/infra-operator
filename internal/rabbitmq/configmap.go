@@ -86,6 +86,7 @@ func buildOperatorDefaults(r *rabbitmqv1.RabbitMq, IPv6Enabled bool, configVersi
 	config = append(config, "cluster_formation.peer_discovery_backend   = rabbit_peer_discovery_k8s")
 	config = append(config, "cluster_formation.k8s.host                 = kubernetes.default")
 	config = append(config, "cluster_formation.k8s.address_type         = hostname")
+	config = append(config, fmt.Sprintf("cluster_formation.k8s.service_name         = %s-nodes", r.Name))
 
 	// RabbitMQ 4.x renamed queue_master_locator to queue_leader_locator.
 	// The k8s.host and k8s.address_type options emit deprecation warnings on 4.x

@@ -111,14 +111,17 @@ var _ = Describe("RabbitMQ Controller", func() {
 				g.Expect(*sts.Spec.Replicas).To(Equal(int32(1)))
 
 				container := sts.Spec.Template.Spec.Containers[0]
-				var rabbitmqServerAdditionalErlArgs string
+				// For the default (non-TLS, non-IPv6) case, RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS
+				// should NOT be set (matching cluster-operator behavior — the Erlang default
+				// -proto_dist inet_tcp is already correct).
+				var hasErlArgs bool
 				for _, env := range container.Env {
 					if env.Name == "RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS" {
-						rabbitmqServerAdditionalErlArgs = env.Value
+						hasErlArgs = true
 						break
 					}
 				}
-				g.Expect(rabbitmqServerAdditionalErlArgs).To(ContainSubstring("-proto_dist inet_tcp"))
+				g.Expect(hasErlArgs).To(BeFalse())
 			}, timeout, interval).Should(Succeed())
 
 		})

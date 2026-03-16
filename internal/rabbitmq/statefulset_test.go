@@ -73,7 +73,7 @@ func TestStatefulSet_WithDataWipe(t *testing.T) {
 		t.Fatalf("expected 2 init containers, got %d", len(initContainers))
 	}
 
-	// wipe-data should come first
+	// wipe-data first, then setup-container
 	if initContainers[0].Name != "wipe-data" {
 		t.Errorf("first init container = %q, want %q", initContainers[0].Name, "wipe-data")
 	}
