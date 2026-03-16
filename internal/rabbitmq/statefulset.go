@@ -65,12 +65,12 @@ func StatefulSet(
 	// RabbitMQ image where the default entrypoint works, but OpenStack uses
 	// kolla-based images that require this override.
 	rabbitmqContainer := corev1.Container{
-		Name:    "rabbitmq",
-		Image:   r.Spec.ContainerImage,
-		Command: []string{"rabbitmq-server"},
+		Name:           "rabbitmq",
+		Image:          r.Spec.ContainerImage,
+		Command:        []string{"rabbitmq-server"},
 		Env:            containerEnv,
 		Ports:          buildContainerPorts(r),
-		VolumeMounts:   getVolumeMounts(r, proxy.IPv6Enabled),
+		VolumeMounts:   getVolumeMounts(r),
 		ReadinessProbe: readinessProbe,
 		Lifecycle:      buildLifecycle(),
 	}

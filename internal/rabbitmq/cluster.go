@@ -64,9 +64,10 @@ func ValidVersionPattern(s string) bool {
 }
 
 // BuildRabbitMQConfig builds the RabbitMQ configuration environment variables.
-// Only sets RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS and RABBITMQ_CTL_ERL_ARGS when
-// IPv6 or TLS is enabled (matching the cluster-operator, which doesn't set
-// these at all for the default IPv4/non-TLS case).
+// Always sets RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS and RABBITMQ_CTL_ERL_ARGS
+// to match the original infra-operator behavior with the cluster-operator.
+// The inetrc file ensures Erlang uses the correct IP family for DNS resolution,
+// and -proto_dist sets the inter-node communication protocol.
 func BuildRabbitMQConfig(
 	r *rabbitmqv1.RabbitMq,
 	IPv6Enabled bool,
@@ -74,45 +75,35 @@ func BuildRabbitMQConfig(
 ) ([]corev1.EnvVar, error) {
 	var envVars []corev1.EnvVar
 
-	// Only set ERL_ARGS when we need non-default Erlang distribution settings.
-	// The default (-proto_dist inet_tcp) is already the Erlang default, so
-	// setting it explicitly is unnecessary and may conflict with image defaults.
-	if IPv6Enabled || r.Spec.TLS.SecretName != "" {
-		inetFamily := "inet"
-		inetProtocol := "tcp"
-		inetrcArg := ""
-		tlsArgs := ""
-		fipsArgs := ""
-		if IPv6Enabled {
-			inetFamily = "inet6"
-			// Only reference the inetrc file when IPv6 is enabled (it has content).
-			// An empty inetrc file breaks Erlang DNS resolution (matching cluster-operator).
-			inetrcArg = "-kernel inetrc '/etc/rabbitmq/erl_inetrc'"
-		}
-
-		if r.Spec.TLS.SecretName != "" {
-			inetProtocol = "tls"
-			tlsArgs = "-ssl_dist_optfile /etc/rabbitmq/inter-node-tls.config"
-			if fipsEnabled {
-				fipsArgs = "-crypto fips_mode true"
-			}
-		}
-
-		envVars = append(envVars, corev1.EnvVar{
-			Name: "RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS",
-			Value: strings.TrimSpace(fmt.Sprintf(
-				"%s -proto_dist %s_%s %s %s",
-				inetrcArg,
-				inetFamily,
-				inetProtocol,
-				tlsArgs,
-				fipsArgs,
-			)),
-		}, corev1.EnvVar{
-			Name:  "RABBITMQ_CTL_ERL_ARGS",
-			Value: strings.TrimSpace(fmt.Sprintf("-proto_dist %s_%s %s", inetFamily, inetProtocol, tlsArgs)),
-		})
+	inetFamily := "inet"
+	inetProtocol := "tcp"
+	tlsArgs := ""
+	fipsArgs := ""
+	if IPv6Enabled {
+		inetFamily = "inet6"
 	}
+
+	if r.Spec.TLS.SecretName != "" {
+		inetProtocol = "tls"
+		tlsArgs = "-ssl_dist_optfile /etc/rabbitmq/inter-node-tls.config"
+		if fipsEnabled {
+			fipsArgs = "-crypto fips_mode true"
+		}
+	}
+
+	envVars = append(envVars, corev1.EnvVar{
+		Name: "RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS",
+		Value: strings.TrimSpace(fmt.Sprintf(
+			"-kernel inetrc '/etc/rabbitmq/erl_inetrc' -proto_dist %s_%s %s %s",
+			inetFamily,
+			inetProtocol,
+			tlsArgs,
+			fipsArgs,
+		)),
+	}, corev1.EnvVar{
+		Name:  "RABBITMQ_CTL_ERL_ARGS",
+		Value: strings.TrimSpace(fmt.Sprintf("-proto_dist %s_%s %s", inetFamily, inetProtocol, tlsArgs)),
+	})
 
 	return envVars, nil
 }

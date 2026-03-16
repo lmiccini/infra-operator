@@ -111,17 +111,17 @@ var _ = Describe("RabbitMQ Controller", func() {
 				g.Expect(*sts.Spec.Replicas).To(Equal(int32(1)))
 
 				container := sts.Spec.Template.Spec.Containers[0]
-				// For the default (non-TLS, non-IPv6) case, RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS
-				// should NOT be set (matching cluster-operator behavior — the Erlang default
-				// -proto_dist inet_tcp is already correct).
-				var hasErlArgs bool
+				// RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS is always set to configure
+				// Erlang DNS resolution and inter-node communication protocol.
+				var erlArgs string
 				for _, env := range container.Env {
 					if env.Name == "RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS" {
-						hasErlArgs = true
+						erlArgs = env.Value
 						break
 					}
 				}
-				g.Expect(hasErlArgs).To(BeFalse())
+				g.Expect(erlArgs).To(ContainSubstring("-proto_dist inet_tcp"))
+				g.Expect(erlArgs).To(ContainSubstring("-kernel inetrc"))
 			}, timeout, interval).Should(Succeed())
 
 		})
