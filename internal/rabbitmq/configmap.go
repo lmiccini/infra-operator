@@ -41,14 +41,15 @@ func GenerateServerConfigMap(
 		"advanced.config":               advancedConfig,
 	}
 
-	// Always include erl_inetrc to control Erlang DNS resolution.
-	// Matching the original infra-operator behavior: {inet,true} for IPv4,
-	// {inet6,true} for IPv6.
-	inetFamily := "inet"
+	// Always include erl_inetrc for Erlang DNS resolution.
+	// {inet6,true} is needed for IPv6; for IPv4 the file is empty
+	// since IPv4 is the Erlang default ({inet,true} is not a valid
+	// inetrc directive and causes a syntax error).
 	if IPv6Enabled {
-		inetFamily = "inet6"
+		data["erl_inetrc"] = "{inet6,true}.\n"
+	} else {
+		data["erl_inetrc"] = "\n"
 	}
-	data["erl_inetrc"] = fmt.Sprintf("{%s,true}.\n", inetFamily)
 
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{

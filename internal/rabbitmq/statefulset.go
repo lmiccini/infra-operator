@@ -262,6 +262,13 @@ func buildContainerEnv(r *rabbitmqv1.RabbitMq, additionalEnv []corev1.EnvVar) []
 
 	env = append(env,
 		corev1.EnvVar{
+			// Tell RabbitMQ to scan our conf.d directory for .conf files.
+			// Without this, conf.d/operatorDefaults.conf (peer discovery,
+			// cluster settings, etc.) is not loaded.
+			Name:  "RABBITMQ_CONFIG_FILES",
+			Value: "/etc/rabbitmq/conf.d",
+		},
+		corev1.EnvVar{
 			Name:  "RABBITMQ_UPGRADE_LOG",
 			Value: "/var/lib/rabbitmq/rabbitmq_upgrade.log",
 		},
