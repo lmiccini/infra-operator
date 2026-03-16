@@ -88,9 +88,17 @@ func buildOperatorDefaults(r *rabbitmqv1.RabbitMq, IPv6Enabled bool, configVersi
 	config = append(config, "disk_free_limit.absolute                   = 2GB")
 	config = append(config, "cluster_partition_handling                 = pause_minority")
 	config = append(config, "cluster_formation.peer_discovery_backend   = rabbit_peer_discovery_k8s")
-	config = append(config, "cluster_formation.k8s.host                 = kubernetes.default")
-	config = append(config, "cluster_formation.k8s.address_type         = hostname")
-	config = append(config, fmt.Sprintf("cluster_formation.k8s.service_name         = %s-nodes", r.Name))
+
+	// RabbitMQ 4.x deprecated k8s_host, k8s_service_name, and k8s_address_type
+	// config options (they are silently ignored). For 3.x compatibility, keep
+	// them in config. The env vars K8S_SERVICE_NAME, K8S_ADDRESS_TYPE, and
+	// K8S_HOSTNAME_SUFFIX (set in statefulset.go) are the primary mechanism
+	// and work across all versions.
+	if !IsVersion4OrLater(configVersion) {
+		config = append(config, "cluster_formation.k8s.host                 = kubernetes.default")
+		config = append(config, "cluster_formation.k8s.address_type         = hostname")
+		config = append(config, fmt.Sprintf("cluster_formation.k8s.service_name         = %s-nodes", r.Name))
+	}
 
 	// RabbitMQ 4.x renamed queue_master_locator to queue_leader_locator.
 	// The k8s.host and k8s.address_type options emit deprecation warnings on 4.x

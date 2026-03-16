@@ -293,6 +293,10 @@ func buildContainerEnv(r *rabbitmqv1.RabbitMq, additionalEnv []corev1.EnvVar) []
 			Value: "rabbit@$(MY_POD_NAME).$(K8S_SERVICE_NAME).$(MY_POD_NAMESPACE)",
 		},
 		corev1.EnvVar{
+			Name:  "K8S_ADDRESS_TYPE",
+			Value: "hostname",
+		},
+		corev1.EnvVar{
 			Name:  "K8S_HOSTNAME_SUFFIX",
 			Value: ".$(K8S_SERVICE_NAME).$(MY_POD_NAMESPACE)",
 		},
