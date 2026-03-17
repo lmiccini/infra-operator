@@ -1,0 +1,35 @@
+#
+# Step 1: Assert that the upgrade state machine is triggered and the
+# defaulting webhook forced queueType from Mirrored to Quorum.
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 60
+commands:
+  - script: |
+      set -e
+      # Verify the defaulting webhook changed queueType from Mirrored to Quorum
+      QT=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upmir -o jsonpath='{.spec.queueType}')
+      if [ "$QT" != "Quorum" ]; then
+        echo "FAIL: Expected spec.queueType 'Quorum' (forced by webhook), got: '$QT'"
+        exit 1
+      fi
+      echo "PASS: Webhook forced spec.queueType to $QT"
+  - script: |
+      set -e
+      # The upgrade phase should be set (either DeletingResources or WaitingForCluster)
+      PHASE=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upmir -o jsonpath='{.status.upgradePhase}')
+      if [ -z "$PHASE" ]; then
+        echo "FAIL: upgradePhase not set after version change"
+        exit 1
+      fi
+      echo "PASS: Upgrade phase is: $PHASE"
+  - script: |
+      set -e
+      # Verify wipeReason is set to VersionUpgrade
+      REASON=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upmir -o jsonpath='{.status.wipeReason}')
+      if [ "$REASON" != "VersionUpgrade" ]; then
+        echo "FAIL: Expected wipeReason 'VersionUpgrade', got: '$REASON'"
+        exit 1
+      fi
+      echo "PASS: wipeReason is $REASON"

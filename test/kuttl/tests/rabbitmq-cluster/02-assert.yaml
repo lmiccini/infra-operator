@@ -1,0 +1,64 @@
+#
+# Step 2: Validate resource details
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+commands:
+  - script: |
+      set -e
+      # Verify default-user secret has all required keys
+      SECRET=$(oc get secret -n $NAMESPACE rabbitmq-basic-default-user -o jsonpath='{.data}')
+      for key in username password host port; do
+        value=$(echo "$SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin).get('$key',''))")
+        if [ -z "$value" ]; then
+          echo "FAIL: default-user secret missing key: $key"
+          exit 1
+        fi
+      done
+      echo "PASS: default-user secret has all required keys"
+  - script: |
+      set -e
+      # Verify host in default-user secret matches expected DNS name
+      HOST=$(oc get secret -n $NAMESPACE rabbitmq-basic-default-user -o jsonpath='{.data.host}' | base64 -d)
+      EXPECTED="rabbitmq-basic.$NAMESPACE.svc"
+      if [ "$HOST" != "$EXPECTED" ]; then
+        echo "FAIL: Expected host '$EXPECTED', got '$HOST'"
+        exit 1
+      fi
+      echo "PASS: default-user host is $HOST"
+  - script: |
+      set -e
+      # Verify StatefulSet has the correct selector labels
+      SELECTOR=$(oc get statefulset -n $NAMESPACE rabbitmq-basic-server -o jsonpath='{.spec.selector.matchLabels}')
+      echo "$SELECTOR" | grep -q '"app.kubernetes.io/name":"rabbitmq-basic"' || {
+        echo "FAIL: Missing app.kubernetes.io/name label in selector"
+        exit 1
+      }
+      echo "PASS: StatefulSet has correct selector labels"
+  - script: |
+      set -e
+      # Verify headless service has publishNotReadyAddresses: true
+      PNRA=$(oc get service -n $NAMESPACE rabbitmq-basic-nodes -o jsonpath='{.spec.publishNotReadyAddresses}')
+      if [ "$PNRA" != "true" ]; then
+        echo "FAIL: Headless service should have publishNotReadyAddresses: true"
+        exit 1
+      fi
+      echo "PASS: Headless service has publishNotReadyAddresses: true"
+  - script: |
+      set -e
+      # Verify StatefulSet pod template has config-hash annotation
+      HASH=$(oc get statefulset -n $NAMESPACE rabbitmq-basic-server -o jsonpath='{.spec.template.metadata.annotations.config-hash}')
+      if [ -z "$HASH" ]; then
+        echo "FAIL: StatefulSet pod template missing config-hash annotation"
+        exit 1
+      fi
+      echo "PASS: config-hash annotation is set: $HASH"
+  - script: |
+      set -e
+      # Verify config-data ConfigMap exists and is owned by RabbitMq
+      OWNER=$(oc get configmap -n $NAMESPACE rabbitmq-basic-config-data -o jsonpath='{.metadata.ownerReferences[0].kind}')
+      if [ "$OWNER" != "RabbitMq" ]; then
+        echo "FAIL: config-data ConfigMap not owned by RabbitMq, got: $OWNER"
+        exit 1
+      fi
+      echo "PASS: config-data ConfigMap exists and is owned by RabbitMq"

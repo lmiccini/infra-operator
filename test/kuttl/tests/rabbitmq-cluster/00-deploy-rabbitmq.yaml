@@ -1,0 +1,8 @@
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq-basic
+spec:
+  replicas: 1
+  containerImage: quay.io/lmiccini/openstack-rabbitmq:r42p
+  terminationGracePeriodSeconds: 30

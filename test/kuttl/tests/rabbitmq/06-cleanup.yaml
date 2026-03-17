@@ -13,3 +13,6 @@ delete:
 - apiVersion: rabbitmq.openstack.org/v1beta1
   kind: TransportURL
   name: transporturl
+- apiVersion: rabbitmq.openstack.org/v1beta1
+  kind: RabbitMq
+  name: rabbitmq

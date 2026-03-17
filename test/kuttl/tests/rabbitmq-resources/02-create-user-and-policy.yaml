@@ -1,0 +1,30 @@
+#
+# Step 2: Create a user and a policy on the vhost
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMQUser
+metadata:
+  name: test-user
+spec:
+  rabbitmqClusterName: rabbitmq-res
+  vhostRef: test-vhost
+  username: testuser
+  tags:
+    - management
+  permissions:
+    configure: ".*"
+    write: ".*"
+    read: ".*"
+---
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMQPolicy
+metadata:
+  name: test-policy
+spec:
+  rabbitmqClusterName: rabbitmq-res
+  vhostRef: test-vhost
+  pattern: ".*"
+  applyTo: queues
+  priority: 1
+  definition:
+    max-length: 1000

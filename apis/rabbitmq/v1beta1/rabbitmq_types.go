@@ -21,14 +21,16 @@ import (
 	"encoding/json"
 	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/service"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
-	rabbitmqv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/validation/field"
-	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
 const (
@@ -44,13 +46,43 @@ const (
 	errInvalidOverride      = "invalid spec override (%s)"
 	warnOverrideStatefulSet = "%s: is deprecated and will be removed in a future API version"
 
-	// Queue types
-	// QueueTypeMirrored - mirrored queue type
-	QueueTypeMirrored = "Mirrored"
+	// AnnotationClientsReconfigured - set to "true" when dataplane clients have been
+	// reconfigured for quorum queues, allowing the proxy sidecar to be removed
+	AnnotationClientsReconfigured = "rabbitmq.openstack.org/clients-reconfigured"
+)
+
+// QueueType represents a RabbitMQ queue type
+type QueueType string
+
+const (
+	// QueueTypeMirrored - mirrored (classic HA) queue type
+	QueueTypeMirrored QueueType = "Mirrored"
 	// QueueTypeQuorum - quorum queue type
-	QueueTypeQuorum = "Quorum"
-	// QueueTypeNone - no special queue type
-	QueueTypeNone = "None"
+	QueueTypeQuorum QueueType = "Quorum"
+)
+
+// UpgradePhase tracks the current phase of a version upgrade or queue migration.
+type UpgradePhase string
+
+const (
+	// UpgradePhaseNone - no upgrade in progress
+	UpgradePhaseNone UpgradePhase = ""
+	// UpgradePhaseDeletingResources - deleting StatefulSet for storage wipe
+	UpgradePhaseDeletingResources UpgradePhase = "DeletingResources"
+	// UpgradePhaseWaitingForCluster - waiting for cluster to become ready with new version
+	UpgradePhaseWaitingForCluster UpgradePhase = "WaitingForCluster"
+)
+
+// WipeReason describes why a storage wipe was initiated.
+type WipeReason string
+
+const (
+	// WipeReasonNone - no wipe in progress
+	WipeReasonNone WipeReason = ""
+	// WipeReasonVersionUpgrade - storage wipe due to major/minor version change
+	WipeReasonVersionUpgrade WipeReason = "VersionUpgrade"
+	// WipeReasonQueueTypeMigration - storage wipe due to queue type migration
+	WipeReasonQueueTypeMigration WipeReason = "QueueTypeMigration"
 )
 
 // PodOverride defines per-pod service configurations
@@ -69,47 +101,208 @@ type RabbitMqSpec struct {
 	ContainerImage string `json:"containerImage"`
 }
 
+// RabbitMQStorageSpec defines storage configuration for RabbitMQ
+type RabbitMQStorageSpec struct {
+	// +kubebuilder:validation:Optional
+	// StorageClassName - Storage class name for the persistent volume claim
+	StorageClassName *string `json:"storageClassName,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default:="10Gi"
+	// Storage - Size of the persistent volume claim
+	Storage *resource.Quantity `json:"storage"`
+}
+
+// RabbitMQConfigSpec defines RabbitMQ configuration options
+type RabbitMQConfigSpec struct {
+	// +kubebuilder:validation:Optional
+	// +listType=atomic
+	// AdditionalPlugins - Additional RabbitMQ plugins to enable
+	AdditionalPlugins []string `json:"additionalPlugins,omitempty"`
+	// +kubebuilder:validation:Optional
+	// AdditionalConfig - Additional RabbitMQ configuration
+	AdditionalConfig string `json:"additionalConfig,omitempty"`
+	// +kubebuilder:validation:Optional
+	// AdvancedConfig - Erlang advanced configuration
+	AdvancedConfig string `json:"advancedConfig,omitempty"`
+	// +kubebuilder:validation:Optional
+	// EnvConfig - Additional environment variables for RabbitMQ (rabbitmq-env.conf format).
+	// These are shell variables sourced by rabbitmq-server at startup.
+	EnvConfig string `json:"envConfig,omitempty"`
+	// +kubebuilder:validation:Optional
+	// ErlangInetConfig - Erlang inet configuration (erl_inetrc format).
+	// When set, overrides the default IPv6 inet configuration.
+	ErlangInetConfig string `json:"erlangInetConfig,omitempty"`
+}
+
+// RabbitMQTLSSpec defines TLS configuration for RabbitMQ
+type RabbitMQTLSSpec struct {
+	// +kubebuilder:validation:Optional
+	// SecretName - Name of the secret containing TLS certificates (tls.crt and tls.key)
+	SecretName string `json:"secretName,omitempty"`
+	// +kubebuilder:validation:Optional
+	// CaSecretName - Name of the secret containing CA certificate (ca.crt)
+	CaSecretName string `json:"caSecretName,omitempty"`
+	// +kubebuilder:validation:Optional
+	// DisableNonTLSListeners - Disable non-TLS listeners
+	DisableNonTLSListeners bool `json:"disableNonTLSListeners,omitempty"`
+}
+
+// RabbitMQServiceSpec defines service configuration for RabbitMQ
+type RabbitMQServiceSpec struct {
+	// +kubebuilder:validation:Optional
+	// Type - Service type (ClusterIP, LoadBalancer, etc.)
+	Type corev1.ServiceType `json:"type,omitempty"`
+	// +kubebuilder:validation:Optional
+	// Annotations - Service annotations
+	Annotations map[string]string `json:"annotations,omitempty"`
+	// +kubebuilder:validation:Optional
+	// IPFamilyPolicy - IP family policy for the service
+	IPFamilyPolicy *corev1.IPFamilyPolicy `json:"ipFamilyPolicy,omitempty"`
+
+	// DEPRECATED: For backward compatibility with old format. Use override.service.metadata.labels instead.
+	// +kubebuilder:validation:Optional
+	Labels map[string]string `json:"labels,omitempty"`
+}
+
 // RabbitMqSpecCore - this version is used by the OpenStackControlplane CR (no container images)
 type RabbitMqSpecCore struct {
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum:=0
+	// +kubebuilder:default:=1
 	// +operator-sdk:csv:customresourcedefinitions:type=spec
-	// Overrides to use when creating the Rabbitmq clusters
-	rabbitmqv2.RabbitmqClusterSpecCore `json:",inline"`
+	// Replicas - Number of RabbitMQ nodes in the cluster
+	Replicas *int32 `json:"replicas"`
+
+	// +kubebuilder:validation:Optional
+	// +operator-sdk:csv:customresourcedefinitions:type=spec
+	// Resources - Resource requirements for RabbitMQ containers
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +operator-sdk:csv:customresourcedefinitions:type=spec
+	// Storage - Persistent storage configuration
+	Storage RabbitMQStorageSpec `json:"storage,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +operator-sdk:csv:customresourcedefinitions:type=spec
+	// Config - RabbitMQ configuration options
+	Config RabbitMQConfigSpec `json:"config,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +operator-sdk:csv:customresourcedefinitions:type=spec
+	// TLS - TLS configuration
+	TLS RabbitMQTLSSpec `json:"tls,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +operator-sdk:csv:customresourcedefinitions:type=spec
+	// Service - Service configuration
+	Service RabbitMQServiceSpec `json:"service,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +operator-sdk:csv:customresourcedefinitions:type=spec
+	// Affinity - Pod affinity/anti-affinity rules
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +listType=atomic
+	// +operator-sdk:csv:customresourcedefinitions:type=spec
+	// Tolerations - Pod tolerations
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+
 	// +kubebuilder:validation:Optional
 	// +operator-sdk:csv:customresourcedefinitions:type=spec
 	// NodeSelector to target subset of worker nodes running this service
 	NodeSelector *map[string]string `json:"nodeSelector,omitempty"`
+
 	// +kubebuilder:validation:Optional
-	// TopologyRef to apply the Topology defined by the associated CR referenced
-	// by name
+	// TopologyRef to apply the Topology defined by the associated CR referenced by name
 	TopologyRef *topologyv1.TopoRef `json:"topologyRef,omitempty"`
+
 	// +kubebuilder:validation:Optional
 	// +operator-sdk:csv:customresourcedefinitions:type=spec
-	// QueueType to eventually apply the ha-all policy or configure default queue type for the cluster.
-	// Allowed values are: None, Mirrored, Quorum. Defaults to Quorum if not specified.
-	QueueType *string `json:"queueType,omitempty"`
+	// QueueType - the default queue type for the cluster.
+	// Allowed values: Mirrored, Quorum. New clusters default to Quorum.
+	// Existing clusters without a value default to Mirrored.
+	QueueType *QueueType `json:"queueType,omitempty"`
+
 	// +kubebuilder:validation:Optional
 	// +operator-sdk:csv:customresourcedefinitions:type=spec
-	// PodOverride - Override configuration for per-pod services. When specified, individual LoadBalancer
-	// services will be created for each pod with the provided configuration, and the transport URL will be
-	// configured to use these per-pod services.
+	// PodOverride - Override configuration for per-pod services
 	PodOverride *PodOverride `json:"podOverride,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum:=0
+	// +kubebuilder:default:=604800
+	// +operator-sdk:csv:customresourcedefinitions:type=spec
+	// TerminationGracePeriodSeconds - Timeout for graceful pod termination
+	TerminationGracePeriodSeconds *int64 `json:"terminationGracePeriodSeconds"`
+
+	// +kubebuilder:validation:Optional
+	// +operator-sdk:csv:customresourcedefinitions:type=spec
+	// SkipPostDeploySteps - Skip post-deploy queue rebalancing
+	SkipPostDeploySteps bool `json:"skipPostDeploySteps,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^\d+\.\d+(\.\d+)?$`
+	// +operator-sdk:csv:customresourcedefinitions:type=spec
+	// TargetVersion - the desired RabbitMQ version (e.g., "4.2", "3.13.1").
+	// When set to a version different from Status.CurrentVersion, the controller
+	// will initiate a storage wipe and version upgrade. The controller updates
+	// Status.CurrentVersion once the upgrade completes.
+	TargetVersion *string `json:"targetVersion,omitempty"`
+
+	// DEPRECATED: For backward compatibility with old RabbitmqClusterSpecCore format.
+	// Use explicit fields above instead. This will be removed in a future release.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:pruning:PreserveUnknownFields
+	Override *DeprecatedOverride `json:"override,omitempty"`
+
+	// DEPRECATED: For backward compatibility with old format.
+	// Use Storage field instead.
+	// +kubebuilder:validation:Optional
+	Persistence DeprecatedPersistenceSpec `json:"persistence,omitempty"`
+
+	// DEPRECATED: For backward compatibility with old format.
+	// Use Config field instead.
+	// +kubebuilder:validation:Optional
+	Rabbitmq DeprecatedRabbitmqConfigSpec `json:"rabbitmq,omitempty"`
+
+	// DEPRECATED: For backward compatibility with old rabbitmq-cluster-operator format.
+	// This field is no longer used and will be removed in a future release.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default:=30
+	DelayStartSeconds *int32 `json:"delayStartSeconds"`
+
+	// DEPRECATED: For backward compatibility with old rabbitmq-cluster-operator format.
+	// This field is no longer used and will be removed in a future release.
+	// +kubebuilder:validation:Optional
+	SecretBackend *DeprecatedSecretBackendSpec `json:"secretBackend,omitempty"`
 }
 
-// MarshalInto converts RabbitMqSpec to RabbitmqClusterSpec.
-// Need to Marshal/Unmarshal to convert rabbitmqv2.RabbitmqClusterSpecCore to rabbitmqv2.RabbitmqClusterSpec
-// as they are distinct types instead of inlined.
-// NOTE(owalsh): override.statefulset will be ignored by json.Unmarshal
-func (in *RabbitMqSpec) MarshalInto(out *rabbitmqv2.RabbitmqClusterSpec) error {
-	tmp, err := json.Marshal(*in)
-	if err != nil {
-		return err
-	}
-	err = json.Unmarshal(tmp, out)
-	if err != nil {
-		return err
-	}
-	out.Image = in.ContainerImage
-	return nil
+// RabbitmqClusterSecretReference contains reference to a secret
+type RabbitmqClusterSecretReference struct {
+	// Name of the secret
+	Name string `json:"name,omitempty"`
+	// Namespace of the secret
+	Namespace string `json:"namespace,omitempty"`
+	// Keys in the secret
+	Keys map[string]string `json:"keys,omitempty"`
+}
+
+// RabbitmqClusterServiceReference contains reference to a service
+type RabbitmqClusterServiceReference struct {
+	// Name of the service
+	Name string `json:"name,omitempty"`
+	// Namespace of the service
+	Namespace string `json:"namespace,omitempty"`
+}
+
+// RabbitmqClusterDefaultUser contains default user information
+type RabbitmqClusterDefaultUser struct {
+	// SecretReference - reference to the secret containing credentials
+	SecretReference *RabbitmqClusterSecretReference `json:"secretReference,omitempty"`
+	// ServiceReference - reference to the service
+	ServiceReference *RabbitmqClusterServiceReference `json:"serviceReference,omitempty"`
 }
 
 // RabbitMqStatus defines the observed state of RabbitMq
@@ -126,13 +319,50 @@ type RabbitMqStatus struct {
 	// LastAppliedTopology - the last applied Topology
 	LastAppliedTopology *topologyv1.TopoRef `json:"lastAppliedTopology,omitempty"`
 
-	// QueueType - store whether default ha-all policy is present or not
-	QueueType string `json:"queueType,omitempty"`
+	// QueueType - the active queue type for this cluster
+	QueueType QueueType `json:"queueType,omitempty"`
+
+	// ReadyCount tracks ready replicas
+	ReadyCount int32 `json:"readyCount,omitempty"`
+
+	// DefaultUser - Identifying information on default user secret
+	DefaultUser *RabbitmqClusterDefaultUser `json:"defaultUser,omitempty"`
 
 	// ServiceHostnames - list of per-pod service hostnames for RabbitMQ cluster.
 	// When populated, transport URLs use these hostnames instead of pod names.
 	// +listType=atomic
 	ServiceHostnames []string `json:"serviceHostnames,omitempty"`
+
+	// +kubebuilder:validation:Enum=True;False;""
+	// OldCRCleaned - set to "True" when the old rabbitmq.com RabbitmqCluster CR has been
+	// cleaned up during migration from rabbitmq-cluster-operator.
+	OldCRCleaned string `json:"oldCRCleaned,omitempty"`
+
+	// +kubebuilder:validation:Enum=True;False;""
+	// VCTCleaned - set to "True" when stale ownerReferences in the StatefulSet's
+	// volumeClaimTemplates have been cleaned up during migration.
+	VCTCleaned string `json:"vctCleaned,omitempty"`
+
+	// CurrentVersion - the currently deployed RabbitMQ version (e.g., "3.9", "4.2")
+	// This is controller-managed and reflects the actual running version.
+	// Set Spec.TargetVersion to request a version change.
+	CurrentVersion string `json:"currentVersion,omitempty"`
+
+	// UpgradePhase - tracks the current phase of a version upgrade or migration.
+	// This allows resuming upgrades that failed midway.
+	UpgradePhase UpgradePhase `json:"upgradePhase,omitempty"`
+
+	// WipeReason - tracks why the current storage wipe was initiated.
+	// Persisted so that resumed upgrades use the correct handling path.
+	WipeReason WipeReason `json:"wipeReason,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=True;False;""
+	// ProxyRequired - set to "True" when the AMQP proxy sidecar is required for this cluster.
+	// Set when upgrading from RabbitMQ 3.x to 4.x with Quorum queues.
+	// The proxy allows non-durable clients to work with quorum queues during the upgrade window.
+	// Only cleared when the AnnotationClientsReconfigured annotation is set to "true".
+	ProxyRequired string `json:"proxyRequired,omitempty"`
 }
 
 //+kubebuilder:object:root=true
@@ -180,12 +410,12 @@ func (instance RabbitMq) RbacNamespace() string {
 
 // RbacResourceName - return the name to be used for rbac objects (serviceaccount, role, rolebinding)
 func (instance RabbitMq) RbacResourceName() string {
-	return "redis-" + instance.Name
+	return instance.Name + "-server"
 }
 
 // SetupDefaults - initializes any CRD field defaults based on environment variables (the defaulting mechanism itself is implemented via webhooks)
 func SetupDefaults() {
-	// Acquire environmental defaults and initialize Redis defaults with them
+	// Acquire environmental defaults and initialize RabbitMQ defaults with them
 	rabbitMqDefaults := RabbitMqDefaults{
 		ContainerImageURL: util.GetEnvVar("RELATED_IMAGE_RABBITMQ_IMAGE_URL_DEFAULT", RabbitMqContainerImage),
 	}
@@ -213,7 +443,7 @@ func (instance *RabbitMqSpecCore) ValidateOverride(
 	var allErrs field.ErrorList
 	var allWarn admission.Warnings
 	if instance.Override != nil && instance.Override.StatefulSet != nil {
-		var overrideObj rabbitmqv2.StatefulSet
+		var overrideObj DeprecatedStatefulSetOverride
 		dec := json.NewDecoder(bytes.NewReader(instance.Override.StatefulSet.Raw))
 		dec.DisallowUnknownFields()
 		err := dec.Decode(&overrideObj)
@@ -222,5 +452,5 @@ func (instance *RabbitMqSpecCore) ValidateOverride(
 		}
 		allWarn = append(allWarn, fmt.Sprintf(warnOverrideStatefulSet, basePath.Child("override").Child("statefulset").String()))
 	}
-	return allWarn, nil
+	return allWarn, allErrs
 }

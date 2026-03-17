@@ -46,7 +46,6 @@ import (
 	memcachedv1 "github.com/openstack-k8s-operators/infra-operator/apis/memcached/v1beta1"
 	networkv1 "github.com/openstack-k8s-operators/infra-operator/apis/network/v1beta1"
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
-	rabbitmqclusterv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 
 	memcached_ctrl "github.com/openstack-k8s-operators/infra-operator/internal/controller/memcached"
 	network_ctrl "github.com/openstack-k8s-operators/infra-operator/internal/controller/network"
@@ -59,6 +58,7 @@ import (
 	ocp_configv1 "github.com/openshift/api/config/v1"
 	infra_test "github.com/openstack-k8s-operators/infra-operator/apis/test/helpers"
 	test "github.com/openstack-k8s-operators/lib-common/modules/test"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -90,10 +90,6 @@ var _ = BeforeSuite(func() {
 
 	ctx, cancel = context.WithCancel(context.TODO())
 
-	rabbitmqv2CRDs, err := test.GetCRDDirFromModule(
-		"github.com/rabbitmq/cluster-operator/v2", "../../go.mod", "config/crd/bases")
-	Expect(err).ShouldNot(HaveOccurred())
-
 	ocpconfigv1CRDs, err := test.GetOpenShiftCRDDir("config/v1", "../../go.mod")
 	Expect(err).ShouldNot(HaveOccurred())
 
@@ -114,7 +110,6 @@ var _ = BeforeSuite(func() {
 		CRDDirectoryPaths: []string{
 			filepath.Join("..", "..", "config", "crd", "bases"),
 			ocpconfigv1CRDs,
-			rabbitmqv2CRDs,
 			frrCRDs,
 		},
 		CRDInstallOptions: envtest.CRDInstallOptions{
@@ -153,8 +148,6 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	err = rabbitmqv1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
-	err = rabbitmqclusterv2.AddToScheme(scheme.Scheme)
-	Expect(err).NotTo(HaveOccurred())
 	err = memcachedv1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 	err = k8s_networkv1.AddToScheme(scheme.Scheme)
@@ -164,6 +157,8 @@ var _ = BeforeSuite(func() {
 	err = topologyv1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 	err = ocp_configv1.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
+	err = apiextensionsv1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 	err = rabbitmqv1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())

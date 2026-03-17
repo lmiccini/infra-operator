@@ -5,6 +5,7 @@
 # - No RabbitMQUser CR
 # - No RabbitMQVhost CR
 # - No TransportURL CR
+# - No RabbitMq CR
 # - No Secrets for these CRs
 #
 
@@ -32,6 +33,11 @@ apiVersion: rabbitmq.openstack.org/v1beta1
 kind: TransportURL
 metadata:
   name: transporturl
+---
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq
 ---
 apiVersion: v1
 kind: Secret

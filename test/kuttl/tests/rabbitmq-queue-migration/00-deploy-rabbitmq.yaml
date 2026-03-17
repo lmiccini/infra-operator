@@ -1,0 +1,12 @@
+#
+# Step 0: Deploy RabbitMq with Mirrored queue type
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq-qmigrate
+spec:
+  replicas: 3
+  containerImage: quay.io/lmiccini/openstack-rabbitmq:r42p
+  terminationGracePeriodSeconds: 30
+  queueType: Mirrored

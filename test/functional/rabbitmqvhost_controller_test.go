@@ -21,7 +21,6 @@ import (
 	. "github.com/onsi/gomega"    //nolint:revive
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
-	rabbitmqclusterv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -40,7 +39,7 @@ var _ = Describe("RabbitMQVhost controller", func() {
 
 	// Mark cluster for deletion before cleanup phase to trigger skip-cleanup logic
 	AfterEach(func() {
-		cluster := &rabbitmqclusterv2.RabbitmqCluster{}
+		cluster := &rabbitmqv1.RabbitMq{}
 		err := th.K8sClient.Get(th.Ctx, rabbitmqClusterName, cluster)
 		if err == nil && cluster.DeletionTimestamp.IsZero() {
 			// Cluster exists and not being deleted - mark for deletion
@@ -462,7 +461,7 @@ var _ = Describe("RabbitMQVhost controller", func() {
 
 		AfterEach(func() {
 			// Mark cluster for deletion to allow cleanup without RabbitMQ API calls
-			cluster := &rabbitmqclusterv2.RabbitmqCluster{}
+			cluster := &rabbitmqv1.RabbitMq{}
 			err := th.K8sClient.Get(th.Ctx, recreateClusterName, cluster)
 			if err == nil && cluster.DeletionTimestamp.IsZero() {
 				Expect(th.K8sClient.Delete(th.Ctx, cluster)).To(Succeed())
@@ -482,7 +481,7 @@ var _ = Describe("RabbitMQVhost controller", func() {
 
 			// Wait for cluster to be deleted
 			Eventually(func(g Gomega) {
-				c := &rabbitmqclusterv2.RabbitmqCluster{}
+				c := &rabbitmqv1.RabbitMq{}
 				err := th.K8sClient.Get(th.Ctx, recreateClusterName, c)
 				g.Expect(err).To(HaveOccurred())
 			}, timeout, interval).Should(Succeed())
@@ -494,7 +493,7 @@ var _ = Describe("RabbitMQVhost controller", func() {
 
 			// Wait for cluster to be deleted
 			Eventually(func(g Gomega) {
-				cluster := &rabbitmqclusterv2.RabbitmqCluster{}
+				cluster := &rabbitmqv1.RabbitMq{}
 				err := th.K8sClient.Get(th.Ctx, recreateClusterName, cluster)
 				g.Expect(err).To(HaveOccurred())
 			}, timeout, interval).Should(Succeed())

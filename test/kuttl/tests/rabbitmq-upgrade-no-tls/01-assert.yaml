@@ -1,0 +1,23 @@
+#
+# Step 1: Assert that the upgrade state machine is triggered
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 60
+commands:
+  - script: |
+      set -e
+      PHASE=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upgrade-notls -o jsonpath='{.status.upgradePhase}')
+      if [ -z "$PHASE" ]; then
+        echo "FAIL: upgradePhase not set after version change"
+        exit 1
+      fi
+      echo "PASS: Upgrade phase is: $PHASE"
+  - script: |
+      set -e
+      REASON=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upgrade-notls -o jsonpath='{.status.wipeReason}')
+      if [ "$REASON" != "VersionUpgrade" ]; then
+        echo "FAIL: Expected wipeReason 'VersionUpgrade', got: '$REASON'"
+        exit 1
+      fi
+      echo "PASS: wipeReason is $REASON"

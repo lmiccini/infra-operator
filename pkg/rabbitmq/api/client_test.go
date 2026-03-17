@@ -28,6 +28,7 @@ func TestNewClient(t *testing.T) {
 	client := NewClient("http://localhost:15672", "user", "pass", false, nil)
 	if client == nil {
 		t.Fatal("Expected client to be created")
+		return
 	}
 	if client.baseURL != "http://localhost:15672" {
 		t.Errorf("Expected baseURL http://localhost:15672, got %s", client.baseURL)

@@ -1,0 +1,12 @@
+#
+# Step 4: After cleanup, all resources should be gone
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq-qmigrate
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq-qmigrate-server

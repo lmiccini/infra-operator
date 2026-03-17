@@ -1,0 +1,16 @@
+#
+# Step 1: Assert vhost is ready
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 120
+commands:
+  - script: |
+      set -e
+      READY=$(oc get rabbitmqvhost -n $NAMESPACE test-vhost -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: RabbitMQVhost not ready, status: $READY"
+        oc get rabbitmqvhost -n $NAMESPACE test-vhost -o yaml
+        exit 1
+      fi
+      echo "PASS: RabbitMQVhost is ready"

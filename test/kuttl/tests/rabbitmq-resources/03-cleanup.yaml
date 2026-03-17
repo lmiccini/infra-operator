@@ -1,0 +1,9 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+- script: |
+    oc delete rabbitmqpolicy test-policy -n $NAMESPACE --ignore-not-found
+    oc delete rabbitmquser test-user -n $NAMESPACE --ignore-not-found
+    oc delete rabbitmqvhost test-vhost -n $NAMESPACE --ignore-not-found
+    oc delete rabbitmq.rabbitmq.openstack.org rabbitmq-res -n $NAMESPACE --ignore-not-found
+    oc delete pvc -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-res --ignore-not-found

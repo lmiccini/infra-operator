@@ -93,8 +93,9 @@ var _ = Describe("TransportURL controller", func() {
 
 			Eventually(func(g Gomega) {
 				s := th.GetSecret(transportURLSecretName)
-				g.Expect(s.Data).To(HaveLen(1))
-				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@host.%s.svc:5672/?ssl=0", namespace)))
+				g.Expect(s.Data).To(HaveLen(2))
+				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@rabbitmq.%s.svc:5672/?ssl=0", namespace)))
+				g.Expect(s.Data).To(HaveKeyWithValue("quorumqueues", []byte("true")))
 
 			}, timeout, interval).Should(Succeed())
 
@@ -113,6 +114,10 @@ var _ = Describe("TransportURL controller", func() {
 
 	When("a TLS TransportURL gets created", func() {
 		BeforeEach(func() {
+			certSecretName := types.NamespacedName{Name: "cert-rabbitmq-svc", Namespace: namespace}
+			CreateCertSecret(certSecretName)
+			DeferCleanup(th.DeleteSecret, certSecretName)
+
 			CreateRabbitMQCluster(rabbitmqClusterName, GetDefaultRabbitMQClusterSpec(true))
 			DeferCleanup(DeleteRabbitMQCluster, rabbitmqClusterName)
 
@@ -127,8 +132,8 @@ var _ = Describe("TransportURL controller", func() {
 
 			Eventually(func(g Gomega) {
 				s := th.GetSecret(transportURLSecretName)
-				g.Expect(s.Data).To(HaveLen(1))
-				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@host.%s.svc:5671/?ssl=1", namespace)))
+				g.Expect(s.Data).To(HaveLen(2))
+				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@rabbitmq.%s.svc:5671/?ssl=1", namespace)))
 
 			}, timeout, interval).Should(Succeed())
 
@@ -162,19 +167,23 @@ var _ = Describe("TransportURL controller", func() {
 			// validate non tls transport_url
 			Eventually(func(g Gomega) {
 				s := th.GetSecret(transportURLSecretName)
-				g.Expect(s.Data).To(HaveLen(1))
-				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@host.%s.svc:5672/?ssl=0", namespace)))
+				g.Expect(s.Data).To(HaveLen(2))
+				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@rabbitmq.%s.svc:5672/?ssl=0", namespace)))
+				g.Expect(s.Data).To(HaveKeyWithValue("quorumqueues", []byte("true")))
 
 			}, timeout, interval).Should(Succeed())
 
 			// update rabbitmq to be tls
+			certSecretName := types.NamespacedName{Name: "cert-rabbitmq-svc", Namespace: namespace}
+			CreateCertSecret(certSecretName)
+			DeferCleanup(th.DeleteSecret, certSecretName)
 			UpdateRabbitMQClusterToTLS(rabbitmqClusterName)
 			SimulateRabbitMQClusterReady(rabbitmqClusterName)
 
 			Eventually(func(g Gomega) {
 				s := th.GetSecret(transportURLSecretName)
-				g.Expect(s.Data).To(HaveLen(1))
-				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@host.%s.svc:5671/?ssl=1", namespace)))
+				g.Expect(s.Data).To(HaveLen(2))
+				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@rabbitmq.%s.svc:5671/?ssl=1", namespace)))
 
 			}, timeout, interval).Should(Succeed())
 
@@ -196,14 +205,11 @@ var _ = Describe("TransportURL controller", func() {
 				Namespace: namespace,
 			}
 
-			// Create RabbitMQCluster first
-			CreateRabbitMQCluster(rabbitmqName, GetDefaultRabbitMQClusterSpec(false))
-			DeferCleanup(DeleteRabbitMQCluster, rabbitmqName)
-
 			// Create RabbitMq CR with podOverride
 			spec := GetDefaultRabbitMQSpec()
+			spec["containerImage"] = "quay.io/podified-antelope-centos9/openstack-rabbitmq:current-podified"
 			spec["replicas"] = 3
-			spec["queueType"] = "None"
+			spec["queueType"] = "Quorum"
 			spec["podOverride"] = map[string]any{
 				"services": []map[string]any{
 					{
@@ -254,18 +260,10 @@ var _ = Describe("TransportURL controller", func() {
 		It("should create a secret with multi-host transport URL", func() {
 			SimulateRabbitMQClusterReady(rabbitmqName)
 
-			// Simulate RabbitMq CR being ready with ServiceHostnames
+			// Wait for controller to populate ServiceHostnames from per-pod services
 			Eventually(func(g Gomega) {
 				rabbitmq := GetRabbitMQ(rabbitmqName)
-				g.Expect(rabbitmq).ToNot(BeNil())
-
-				// Populate ServiceHostnames in status
-				rabbitmq.Status.ServiceHostnames = []string{
-					fmt.Sprintf("%s-server-0.%s.svc", rabbitmqName.Name, namespace),
-					fmt.Sprintf("%s-server-1.%s.svc", rabbitmqName.Name, namespace),
-					fmt.Sprintf("%s-server-2.%s.svc", rabbitmqName.Name, namespace),
-				}
-				g.Expect(k8sClient.Status().Update(ctx, rabbitmq)).Should(Succeed())
+				g.Expect(rabbitmq.Status.ServiceHostnames).To(HaveLen(3))
 			}, timeout, interval).Should(Succeed())
 
 			// Verify transport URL contains all three hosts
@@ -302,14 +300,11 @@ var _ = Describe("TransportURL controller", func() {
 			}
 			vhostName = "nova"
 
-			// Create RabbitMQCluster first
-			CreateRabbitMQCluster(rabbitmqName, GetDefaultRabbitMQClusterSpec(false))
-			DeferCleanup(DeleteRabbitMQCluster, rabbitmqName)
-
 			// Create RabbitMq CR with podOverride
 			spec := GetDefaultRabbitMQSpec()
+			spec["containerImage"] = "quay.io/podified-antelope-centos9/openstack-rabbitmq:current-podified"
 			spec["replicas"] = 3
-			spec["queueType"] = "None"
+			spec["queueType"] = "Quorum"
 			spec["podOverride"] = map[string]any{
 				"services": []map[string]any{
 					{
@@ -388,18 +383,10 @@ var _ = Describe("TransportURL controller", func() {
 			// Simulate RabbitMQUser being ready with the custom vhost
 			SimulateRabbitMQUserReady(userCRName, vhostName)
 
-			// Simulate RabbitMq CR being ready with ServiceHostnames
+			// Wait for controller to populate ServiceHostnames from per-pod services
 			Eventually(func(g Gomega) {
 				rabbitmq := GetRabbitMQ(rabbitmqName)
-				g.Expect(rabbitmq).ToNot(BeNil())
-
-				// Populate ServiceHostnames in status
-				rabbitmq.Status.ServiceHostnames = []string{
-					fmt.Sprintf("%s-server-0.%s.svc", rabbitmqName.Name, namespace),
-					fmt.Sprintf("%s-server-1.%s.svc", rabbitmqName.Name, namespace),
-					fmt.Sprintf("%s-server-2.%s.svc", rabbitmqName.Name, namespace),
-				}
-				g.Expect(k8sClient.Status().Update(ctx, rabbitmq)).Should(Succeed())
+				g.Expect(rabbitmq.Status.ServiceHostnames).To(HaveLen(3))
 			}, timeout, interval).Should(Succeed())
 
 			// Verify RabbitMQUser permissions are set to ".*"

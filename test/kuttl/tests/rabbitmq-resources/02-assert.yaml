@@ -1,0 +1,47 @@
+#
+# Step 2: Assert user and policy are ready
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 120
+commands:
+  - script: |
+      set -e
+      READY=$(oc get rabbitmquser -n $NAMESPACE test-user -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: RabbitMQUser not ready, status: $READY"
+        oc get rabbitmquser -n $NAMESPACE test-user -o yaml
+        exit 1
+      fi
+      echo "PASS: RabbitMQUser is ready"
+  - script: |
+      set -e
+      USERNAME=$(oc get rabbitmquser -n $NAMESPACE test-user -o jsonpath='{.status.username}')
+      if [ "$USERNAME" != "testuser" ]; then
+        echo "FAIL: Expected username 'testuser', got: '$USERNAME'"
+        exit 1
+      fi
+      VHOST=$(oc get rabbitmquser -n $NAMESPACE test-user -o jsonpath='{.status.vhost}')
+      if [ "$VHOST" != "test" ]; then
+        echo "FAIL: Expected vhost 'test', got: '$VHOST'"
+        exit 1
+      fi
+      echo "PASS: RabbitMQUser status: username=$USERNAME, vhost=$VHOST"
+  - script: |
+      set -e
+      SECRET=$(oc get rabbitmquser -n $NAMESPACE test-user -o jsonpath='{.status.secretName}')
+      if [ -z "$SECRET" ]; then
+        echo "FAIL: No credentials secret created for user"
+        exit 1
+      fi
+      oc get secret -n $NAMESPACE "$SECRET" > /dev/null
+      echo "PASS: User credentials secret exists: $SECRET"
+  - script: |
+      set -e
+      READY=$(oc get rabbitmqpolicy -n $NAMESPACE test-policy -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: RabbitMQPolicy not ready, status: $READY"
+        oc get rabbitmqpolicy -n $NAMESPACE test-policy -o yaml
+        exit 1
+      fi
+      echo "PASS: RabbitMQPolicy is ready"

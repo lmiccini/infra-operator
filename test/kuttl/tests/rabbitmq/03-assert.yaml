@@ -1,29 +1,19 @@
 #
 # Check for:
 #
-# - 1 RabbitMQUser CR
-# - 1 Secret for RabbitMQUser CR
+# - 1 RabbitMQVhost CR
 #
 
 apiVersion: rabbitmq.openstack.org/v1beta1
-kind: RabbitMQUser
+kind: RabbitMQVhost
 metadata:
-  name: rabbitmquser-sample
+  name: rabbitmqvhost-sample
 spec:
   rabbitmqClusterName: rabbitmq
-  vhostRef: rabbitmqvhost-sample
+  name: "openstack"
 status:
   conditions:
   - status: "True"
     type: Ready
   - status: "True"
-    type: RabbitMQUserReady
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: rabbitmq-user-rabbitmquser-sample
-  ownerReferences:
-  - apiVersion: rabbitmq.openstack.org/v1beta1
-    kind: RabbitMQUser
-    name: rabbitmquser-sample
+    type: RabbitMQVhostReady

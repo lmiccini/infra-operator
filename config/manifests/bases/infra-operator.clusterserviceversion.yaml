@@ -80,8 +80,9 @@ spec:
         displayName: Node Selector
         path: nodeSelector
       - description: |-
-          QueueType to eventually apply the ha-all policy or configure default queue type for the cluster.
-          Allowed values are: None, Mirrored, Quorum. Defaults to Quorum if not specified.
+          QueueType - the default queue type for the cluster.
+          Allowed values: Mirrored, Quorum. New clusters default to Quorum.
+          Existing clusters without a value default to Mirrored.
         displayName: Queue Type
         path: queueType
       version: v1beta1

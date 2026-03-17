@@ -1,0 +1,11 @@
+#
+# Step 1: Trigger version upgrade from 3.9 to 4.2
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+- script: |
+    set -e
+    oc patch rabbitmq.rabbitmq.openstack.org rabbitmq-upgrade-notls -n $NAMESPACE \
+      --type merge -p '{"spec":{"targetVersion":"4.2","containerImage":"quay.io/lmiccini/openstack-rabbitmq:r42p"}}'
+    echo "PASS: Patched targetVersion to 4.2 and containerImage to r42p"

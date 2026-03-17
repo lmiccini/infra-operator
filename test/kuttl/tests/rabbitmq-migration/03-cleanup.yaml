@@ -1,0 +1,6 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+- script: |
+    oc delete rabbitmq.rabbitmq.openstack.org rabbitmq-migrate -n $NAMESPACE --ignore-not-found
+    oc delete pvc -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-migrate --ignore-not-found

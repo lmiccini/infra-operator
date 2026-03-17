@@ -1,0 +1,11 @@
+#
+# Step 1: Scale up from 1 to 3 replicas
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+- script: |
+    set -e
+    oc patch rabbitmq.rabbitmq.openstack.org rabbitmq-scale -n $NAMESPACE \
+      --type merge -p '{"spec":{"replicas":3}}'
+    echo "PASS: Patched replicas to 3"

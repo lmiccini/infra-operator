@@ -24,12 +24,14 @@ import (
 	"strings"
 	"time"
 
-	rabbitmqv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	uns "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -47,18 +49,19 @@ import (
 	rabbitmqv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	"github.com/openstack-k8s-operators/infra-operator/internal/rabbitmq"
-	"github.com/openstack-k8s-operators/infra-operator/internal/rabbitmq/impl"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
-	"github.com/openstack-k8s-operators/lib-common/modules/common/configmap"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/ocp"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/pdb"
+	common_rbac "github.com/openstack-k8s-operators/lib-common/modules/common/rbac"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/service"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
@@ -72,10 +75,15 @@ const (
 	serviceSecretNameField = ".spec.tls.SecretName"
 	caSecretNameField      = ".spec.tls.CASecretName"
 	topologyField          = ".spec.topologyRef.Name"
+)
 
-	// rabbitmqClusterFinalizer is added to RabbitmqCluster to prevent direct deletion
-	// Only removed when parent RabbitMq CR is being deleted
-	rabbitmqClusterFinalizer = "rabbitmq.openstack.org/cluster-finalizer"
+// RabbitMQ version upgrade constants
+const (
+	// DefaultRabbitMQVersion is the default RabbitMQ version when Spec.TargetVersion is not set
+	DefaultRabbitMQVersion = "4.2"
+	// pauseReconciliationLabel is checked on the RabbitMq CR; when set to
+	// "true" the controller skips reconciliation entirely.
+	pauseReconciliationLabel = "rabbitmq.openstack.org/pauseReconciliation"
 )
 
 var rmqAllWatchFields = []string{
@@ -96,8 +104,25 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs/finalizers,verbs=update
 
-// +kubebuilder:rbac:groups=rabbitmq.com,resources=rabbitmqclusters,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=rabbitmq.com,resources=rabbitmqclusters/finalizers,verbs=update
+// Required to cleanup old rabbitmq-cluster-operator RabbitmqCluster CRs during migration
+// +kubebuilder:rbac:groups=rabbitmq.com,resources=rabbitmqclusters,verbs=get;list;watch;update;patch;delete
+
+// Required for direct StatefulSet management
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+
+// Required for RBAC resources (ServiceAccount, Role, RoleBinding)
+// +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
+
+// Required for Secrets and ConfigMaps
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch
+
+// Required to grant endpoints/events permissions to RabbitMQ pods via Role
+// +kubebuilder:rbac:groups=core,resources=endpoints,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=events,verbs=create
 
 // Required to determine IPv6 and FIPS
 // +kubebuilder:rbac:groups=config.openshift.io,resources=networks,verbs=get;list;watch;
@@ -130,6 +155,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, err
 	}
 
+	// Allow pausing reconciliation via label, matching cluster-operator behavior.
+	if v, ok := instance.Labels[pauseReconciliationLabel]; ok && v == "true" {
+		Log.Info("Reconciliation paused", "label", pauseReconciliationLabel)
+		return ctrl.Result{}, nil
+	}
+
 	helper, err := helper.NewHelper(
 		instance,
 		r.Client,
@@ -141,11 +172,93 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, err
 	}
 
+	// Initialize RabbitMQ version in Status if not set.
+	// For existing StatefulSets, infer version from the running cluster;
+	// for new deployments, use TargetVersion or the default.
+	if instance.Status.CurrentVersion == "" {
+		initialVersion := DefaultRabbitMQVersion
+		existingSts := &appsv1.StatefulSet{}
+		stsKey := types.NamespacedName{Name: fmt.Sprintf("%s-server", instance.Name), Namespace: instance.Namespace}
+		err := r.Get(ctx, stsKey, existingSts)
+		if err == nil && !existingSts.CreationTimestamp.IsZero() {
+			// All pre-migration clusters run 3.9; this is the only supported
+			// upgrade source version before this operator takes over.
+			initialVersion = "3.9"
+			Log.Info("Existing StatefulSet found - initializing CurrentVersion for upgrade tracking",
+				"statefulset", stsKey, "initialVersion", initialVersion)
+		} else if err == nil || k8s_errors.IsNotFound(err) {
+			if instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" {
+				initialVersion = *instance.Spec.TargetVersion
+			}
+		} else {
+			return ctrl.Result{}, fmt.Errorf("cannot initialize version, failed to check for existing StatefulSet: %w", err)
+		}
+		instance.Status.CurrentVersion = initialVersion
+		Log.Info("Initialized RabbitMQ current version in status", "version", initialVersion)
+		if err := helper.PatchInstance(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Check if storage wipe is needed for version upgrades or queue type migration
+	var requiresWipe bool
+	switch instance.Status.UpgradePhase {
+	case rabbitmqv1beta1.UpgradePhaseDeletingResources, rabbitmqv1beta1.UpgradePhaseWaitingForCluster:
+		requiresWipe = true
+	case rabbitmqv1beta1.UpgradePhaseNone:
+		if instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" {
+			needsWipe, wipeErr := rabbitmq.RequiresStorageWipe(instance.Status.CurrentVersion, *instance.Spec.TargetVersion)
+			if wipeErr != nil {
+				Log.Error(wipeErr, "Failed to determine upgrade compatibility")
+				return ctrl.Result{}, fmt.Errorf("failed to check upgrade compatibility: %w", wipeErr)
+			}
+			if needsWipe {
+				requiresWipe = true
+				instance.Status.WipeReason = rabbitmqv1beta1.WipeReasonVersionUpgrade
+				Log.Info("RabbitMQ upgrade requires storage wipe",
+					"currentVersion", instance.Status.CurrentVersion,
+					"targetVersion", *instance.Spec.TargetVersion)
+			}
+		}
+		// Check for Mirrored → Quorum queue type migration (without version change)
+		if !requiresWipe && instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
+			if instance.Status.QueueType == rabbitmqv1beta1.QueueTypeMirrored {
+				requiresWipe = true
+				instance.Status.WipeReason = rabbitmqv1beta1.WipeReasonQueueTypeMigration
+				Log.Info("Queue type change from Mirrored to Quorum requires storage wipe")
+			}
+		}
+	}
+
 	// initialize status if Conditions is nil, but do not reset if it already
 	// exists
 	isNewInstance := instance.Status.Conditions == nil
 	if isNewInstance {
 		instance.Status.Conditions = condition.Conditions{}
+	}
+
+	// Handle clients-reconfigured annotation BEFORE the deferred PatchInstance.
+	// Use MergeFrom patches instead of full Updates to avoid conflicts with
+	// concurrent reconcile loops modifying the same object.
+	if instance.DeletionTimestamp.IsZero() && instance.Annotations != nil {
+		if configured, ok := instance.Annotations[rabbitmqv1beta1.AnnotationClientsReconfigured]; ok && configured == "true" {
+			// Patch status to clear ProxyRequired
+			statusBase := client.MergeFrom(instance.DeepCopy())
+			instance.Status.ProxyRequired = "False"
+			if err := r.Client.Status().Patch(ctx, instance, statusBase); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			// Patch metadata to remove the annotation
+			metaBase := client.MergeFrom(instance.DeepCopy())
+			delete(instance.Annotations, rabbitmqv1beta1.AnnotationClientsReconfigured)
+			if err := r.Patch(ctx, instance, metaBase); err != nil {
+				return ctrl.Result{}, err
+			}
+			Log.Info("Clients reconfigured - cleared ProxyRequired and removed annotation")
+			return ctrl.Result{Requeue: true}, nil
+		}
 	}
 
 	// Save a copy of the condtions so that we can restore the LastTransitionTime
@@ -156,9 +269,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// persist any changes.
 	defer func() {
 		// Don't update the status, if reconciler Panics
-		if r := recover(); r != nil {
-			Log.Info(fmt.Sprintf("panic during reconcile %v\n", r))
-			panic(r)
+		if panicVal := recover(); panicVal != nil {
+			Log.Error(fmt.Errorf("panic: %v", panicVal), "panic during reconcile")
+			panic(panicVal)
 		}
 		condition.RestoreLastTransitionTimes(
 			&instance.Status.Conditions, savedConditions)
@@ -191,13 +304,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		condition.UnknownCondition(condition.CreateServiceReadyCondition, condition.InitReason, condition.CreateServiceReadyInitMessage),
 	)
 
-	instance.Status.Conditions.Init(&cl)
+	// Only init conditions if they haven't been initialized yet
+	// Otherwise Init() would reset all conditions to Unknown on every reconciliation
+	if len(instance.Status.Conditions) == 0 {
+		instance.Status.Conditions.Init(&cl)
+	}
 	instance.Status.ObservedGeneration = instance.Generation
 
 	// Init Topology condition if there's a reference
 	if instance.Spec.TopologyRef != nil {
 		c := condition.UnknownCondition(condition.TopologyReadyCondition, condition.InitReason, condition.TopologyReadyInitMessage)
-		cl.Set(c)
+		instance.Status.Conditions.Set(c)
 	}
 
 	// If we're not deleting this and the service object doesn't have our finalizer, add it.
@@ -269,49 +386,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, fmt.Errorf("error getting cluster FIPS config: %w", err)
 	}
 
-	// NOTE(dciabrin) OSPRH-20331 reported RabbitMQ partitionning during
-	// key update events, so until this can be resolved, revert to the
-	// same configuration scheme as OSP17 (see OSPRH-13633)
-	var tlsVersions string
-	if fipsEnabled {
-		tlsVersions = "['tlsv1.2','tlsv1.3']"
-	} else {
-		tlsVersions = "['tlsv1.2']"
-	}
-	// RabbitMq config maps
-	cms := []util.Template{
-		{
-			Name:         fmt.Sprintf("%s-config-data", instance.Name),
-			Namespace:    instance.Namespace,
-			Type:         util.TemplateTypeConfig,
-			InstanceType: "rabbitmq",
-			Labels:       map[string]string{},
-			CustomData: map[string]string{
-				"inter_node_tls.config": fmt.Sprintf(`[
-  {server, [
-    {cacertfile,"/etc/rabbitmq-tls/ca.crt"},
-    {certfile,"/etc/rabbitmq-tls/tls.crt"},
-    {keyfile,"/etc/rabbitmq-tls/tls.key"},
-    {secure_renegotiate, true},
-    {fail_if_no_peer_cert, true},
-    {verify, verify_peer},
-    {versions, %s}
-  ]},
-  {client, [
-    {cacertfile,"/etc/rabbitmq-tls/ca.crt"},
-    {certfile,"/etc/rabbitmq-tls/tls.crt"},
-    {keyfile,"/etc/rabbitmq-tls/tls.key"},
-    {secure_renegotiate, true},
-    {verify, verify_peer},
-    {versions, %s}
-  ]}
-].
-`, tlsVersions, tlsVersions),
-			},
-		},
-	}
-
-	err = configmap.EnsureConfigMaps(ctx, helper, instance, cms, nil)
+	// Calculate hash for config tracking
+	// We'll use a simple hash of the config parameters
+	configMapHash, err := util.ObjectHash(map[string]interface{}{
+		"ipv6Enabled":       IPv6Enabled,
+		"fipsEnabled":       fipsEnabled,
+		"tlsSecret":         instance.Spec.TLS.SecretName,
+		"additionalConfig":  instance.Spec.Config.AdditionalConfig,
+		"advancedConfig":    instance.Spec.Config.AdvancedConfig,
+		"envConfig":         instance.Spec.Config.EnvConfig,
+		"erlangInetConfig":  instance.Spec.Config.ErlangInetConfig,
+		"additionalPlugins": instance.Spec.Config.AdditionalPlugins,
+		"containerImage":    instance.Spec.ContainerImage,
+		"replicas":          instance.Spec.Replicas,
+	})
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -319,25 +407,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			condition.SeverityWarning,
 			condition.ServiceConfigReadyErrorMessage,
 			err.Error()))
-		return ctrl.Result{}, fmt.Errorf("error calculating configmap hash: %w", err)
-	}
-
-	rabbitmqCluster := &rabbitmqv2.RabbitmqCluster{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      instance.Name,
-			Namespace: instance.Namespace,
-		},
-	}
-
-	err = instance.Spec.MarshalInto(&rabbitmqCluster.Spec)
-	if err != nil {
-		instance.Status.Conditions.Set(condition.FalseCondition(
-			condition.ServiceConfigReadyCondition,
-			condition.ErrorReason,
-			condition.SeverityWarning,
-			condition.ServiceConfigReadyErrorMessage,
-			err.Error()))
-		return ctrl.Result{}, fmt.Errorf("error creating RabbitmqCluster Spec: %w", err)
+		return ctrl.Result{}, fmt.Errorf("error calculating config hash: %w", err)
 	}
 
 	instance.Status.Conditions.MarkTrue(condition.ServiceConfigReadyCondition, condition.ServiceConfigReadyMessage)
@@ -382,49 +452,445 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		instance.Status.LastAppliedTopology = nil
 	}
 
-	err = rabbitmq.ConfigureCluster(rabbitmqCluster, IPv6Enabled, fipsEnabled, topology, instance.Spec.NodeSelector, instance.Spec.Override)
-	if err != nil {
-		instance.Status.Conditions.Set(condition.FalseCondition(
-			condition.ServiceConfigReadyCondition,
-			condition.ErrorReason,
-			condition.SeverityWarning,
-			condition.ServiceConfigReadyErrorMessage,
-			err.Error()))
-		return ctrl.Result{}, fmt.Errorf("error configuring RabbitmqCluster: %w", err)
-	}
-
-	rabbitmqImplCluster := impl.NewRabbitMqCluster(rabbitmqCluster, 5)
-	rmqres, rmqerr := rabbitmqImplCluster.CreateOrPatch(ctx, helper)
-	if rmqerr != nil {
-		return rmqres, rmqerr
-	}
-	rabbitmqClusterInstance := rabbitmqImplCluster.GetRabbitMqCluster()
-
-	// Add finalizer to RabbitmqCluster to prevent direct deletion
-	if controllerutil.AddFinalizer(&rabbitmqClusterInstance, rabbitmqClusterFinalizer) {
-		if err := r.Update(ctx, &rabbitmqClusterInstance); err != nil {
-			if k8s_errors.IsConflict(err) {
-				Log.Info("Conflict while adding cluster finalizer, will retry", "cluster", instance.Name)
-				return ctrl.Result{Requeue: true}, nil
-			}
+	//
+	// Handle storage wipe phase 1: set initial phase.
+	// Phase flow: None → DeletingResources → WaitingForCluster → None
+	//
+	if requiresWipe && instance.Status.UpgradePhase == rabbitmqv1beta1.UpgradePhaseNone {
+		instance.Status.UpgradePhase = rabbitmqv1beta1.UpgradePhaseDeletingResources
+		Log.Info("Starting storage wipe", "reason", instance.Status.WipeReason)
+		if err := helper.PatchInstance(ctx, instance); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	clusterReady := false
-	if rabbitmqClusterInstance.Status.ObservedGeneration == rabbitmqClusterInstance.Generation {
-		for _, oldCond := range rabbitmqClusterInstance.Status.Conditions {
-			// Forced to hardcode "ClusterAvailable" here because linter will not allow
-			// us to import "github.com/rabbitmq/cluster-operator/internal/status"
-			if string(oldCond.Type) == "ClusterAvailable" && oldCond.Status == corev1.ConditionTrue {
-				clusterReady = true
+	// Determine the config version: use TargetVersion during upgrade,
+	// otherwise use CurrentVersion.
+	configVersion := ""
+	if instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" {
+		configVersion = *instance.Spec.TargetVersion
+	}
+	if configVersion == "" {
+		configVersion = instance.Status.CurrentVersion
+		if configVersion == "" {
+			configVersion = DefaultRabbitMQVersion
+		}
+	}
+
+	// Determine if we need to add data-wipe init container
+	needsDataWipe := instance.Status.UpgradePhase == rabbitmqv1beta1.UpgradePhaseDeletingResources ||
+		instance.Status.UpgradePhase == rabbitmqv1beta1.UpgradePhaseWaitingForCluster
+
+	// Preserve wipe-data init container if it already exists to avoid
+	// unnecessary pod restarts. The wipe script's marker file prevents
+	// re-wipes, so the init container is a harmless no-op on restarts.
+	if !needsDataWipe {
+		existingSts := &appsv1.StatefulSet{}
+		stsKey := types.NamespacedName{Name: fmt.Sprintf("%s-server", instance.Name), Namespace: instance.Namespace}
+		if err := r.Get(ctx, stsKey, existingSts); err == nil {
+			for _, c := range existingSts.Spec.Template.Spec.InitContainers {
+				if c.Name == "wipe-data" {
+					needsDataWipe = true
+					break
+				}
 			}
 		}
 	}
 
+	// Build RabbitMQ configuration environment variables
+	envVars := rabbitmq.BuildRabbitMQConfig(instance, IPv6Enabled, fipsEnabled)
+
+	// Delete RBAC resources owned by old rabbitmq-cluster-operator so
+	// ReconcileRbac can recreate them with the correct ownership.
+	rbacName := instance.RbacResourceName()
+	for _, obj := range []client.Object{
+		&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: rbacName, Namespace: instance.Namespace}},
+		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: rbacName, Namespace: instance.Namespace}},
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: rbacName, Namespace: instance.Namespace}},
+	} {
+		if err := r.Get(ctx, types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}, obj); err == nil {
+			for _, ref := range obj.GetOwnerReferences() {
+				if ref.Controller != nil && *ref.Controller && ref.UID != instance.UID {
+					Log.Info("Deleting RBAC resource owned by old controller", "name", obj.GetName())
+					if err := r.Delete(ctx, obj); err != nil && !k8s_errors.IsNotFound(err) {
+						return ctrl.Result{}, fmt.Errorf("failed to delete old RBAC resource %s: %w", obj.GetName(), err)
+					}
+					break
+				}
+			}
+		}
+	}
+
+	// Reconcile RBAC for RabbitMQ pods
+	rbacRules := []rbacv1.PolicyRule{
+		{
+			APIGroups:     []string{"security.openshift.io"},
+			ResourceNames: []string{"anyuid"},
+			Resources:     []string{"securitycontextconstraints"},
+			Verbs:         []string{"use"},
+		},
+		{
+			APIGroups: []string{""},
+			Resources: []string{"endpoints"},
+			Verbs:     []string{"get"},
+		},
+		{
+			APIGroups: []string{""},
+			Resources: []string{"events"},
+			Verbs:     []string{"create"},
+		},
+	}
+	rbacResult, err := common_rbac.ReconcileRbac(ctx, helper, instance, rbacRules)
+	if err != nil {
+		return rbacResult, err
+	} else if (rbacResult != ctrl.Result{}) {
+		return rbacResult, nil
+	}
+
+	// Ensure Erlang cookie secret exists
+	err = r.ensureErlangCookie(ctx, helper, instance)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Ensure default user secret exists (optional, for initial setup)
+	err = r.ensureDefaultUser(ctx, helper, instance)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Generate plugins ConfigMap
+	pluginsCm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-plugins-conf", instance.Name),
+			Namespace: instance.Namespace,
+		},
+	}
+	pcmop, err := controllerutil.CreateOrPatch(ctx, r.Client, pluginsCm, func() error {
+		pluginsCm.Data = rabbitmq.GeneratePluginsConfigMap(instance).Data
+		adoptResource(pluginsCm, instance.UID)
+		return controllerutil.SetControllerReference(instance, pluginsCm, r.Scheme)
+	})
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if pcmop != controllerutil.OperationResultNone {
+		Log.Info(fmt.Sprintf("ConfigMap %s - %s", pluginsCm.Name, pcmop))
+	}
+
+	// Generate server configuration ConfigMap
+	proxyEnabled := r.shouldEnableProxy(instance)
+	serverCm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-server-conf", instance.Name),
+			Namespace: instance.Namespace,
+		},
+	}
+	scmop, err := controllerutil.CreateOrPatch(ctx, r.Client, serverCm, func() error {
+		serverCm.Data = rabbitmq.GenerateServerConfigMap(instance, IPv6Enabled, fipsEnabled, configVersion, proxyEnabled).Data
+		adoptResource(serverCm, instance.UID)
+		return controllerutil.SetControllerReference(instance, serverCm, r.Scheme)
+	})
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if scmop != controllerutil.OperationResultNone {
+		Log.Info(fmt.Sprintf("ConfigMap %s - %s", serverCm.Name, scmop))
+	}
+
+	// Generate config-data ConfigMap (for inter-node TLS config)
+	configDataCm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-config-data", instance.Name),
+			Namespace: instance.Namespace,
+		},
+	}
+	cdcmop, err := controllerutil.CreateOrPatch(ctx, r.Client, configDataCm, func() error {
+		configDataCm.Data = rabbitmq.GenerateConfigDataConfigMap(instance, fipsEnabled, configVersion).Data
+		adoptResource(configDataCm, instance.UID)
+		return controllerutil.SetControllerReference(instance, configDataCm, r.Scheme)
+	})
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if cdcmop != controllerutil.OperationResultNone {
+		Log.Info(fmt.Sprintf("ConfigMap %s - %s", configDataCm.Name, cdcmop))
+	}
+
+	// Create headless service for StatefulSet
+	headlessSvc := rabbitmq.HeadlessService(instance)
+
+	hsop, err := controllerutil.CreateOrPatch(ctx, r.Client, headlessSvc, func() error {
+		desired := rabbitmq.HeadlessService(instance)
+		headlessSvc.Spec.Ports = desired.Spec.Ports
+		headlessSvc.Spec.Selector = desired.Spec.Selector
+		headlessSvc.Labels = desired.Labels
+		adoptResource(headlessSvc, instance.UID)
+		return controllerutil.SetControllerReference(instance, headlessSvc, r.Scheme)
+	})
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if hsop != controllerutil.OperationResultNone {
+		Log.Info(fmt.Sprintf("Headless Service %s - %s", headlessSvc.Name, hsop))
+	}
+
+	// Create client service
+	clientSvc := rabbitmq.ClientService(instance)
+
+	csop, err := controllerutil.CreateOrPatch(ctx, r.Client, clientSvc, func() error {
+		desired := rabbitmq.ClientService(instance)
+		clientSvc.Spec.Ports = desired.Spec.Ports
+		clientSvc.Spec.Selector = desired.Spec.Selector
+		clientSvc.Spec.Type = desired.Spec.Type
+		// Merge annotations: set our desired ones without removing externally-added
+		// annotations (e.g. from MetalLB) to avoid reconcile loops
+		if clientSvc.Annotations == nil {
+			clientSvc.Annotations = map[string]string{}
+		}
+		for k, v := range desired.Annotations {
+			clientSvc.Annotations[k] = v
+		}
+		clientSvc.Labels = desired.Labels
+		adoptResource(clientSvc, instance.UID)
+		return controllerutil.SetControllerReference(instance, clientSvc, r.Scheme)
+	})
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if csop != controllerutil.OperationResultNone {
+		Log.Info(fmt.Sprintf("Client Service %s - %s", clientSvc.Name, csop))
+	}
+
+	// Manage AMQP proxy sidecar for Mirrored → Quorum migrations
+	if r.shouldEnableProxy(instance) {
+		if err := r.ensureProxyConfigMap(ctx, instance, helper); err != nil {
+			return ctrl.Result{}, err
+		}
+		Log.Info("Proxy sidecar enabled for queue migration")
+	}
+
+	//
+	// Handle storage wipe: delete StatefulSet before CreateOrPatch.
+	// We must NOT update the StatefulSet spec first — doing so would cause
+	// pods to start rolling with the wipe init container before the STS is
+	// deleted, potentially triggering partial data wipes on only some nodes.
+	// Instead, delete the STS now and let the next reconcile (WaitingForCluster)
+	// recreate it with the wipe init container via CreateOrPatch.
+	//
+	if requiresWipe && instance.Status.UpgradePhase == rabbitmqv1beta1.UpgradePhaseDeletingResources {
+		Log.Info("Deleting StatefulSet for storage wipe", "reason", instance.Status.WipeReason)
+
+		// Delete ha-all policy if migrating from Mirrored queues
+		if instance.Status.QueueType == rabbitmqv1beta1.QueueTypeMirrored {
+			if err := deleteMirroredPolicy(ctx, helper, instance); err != nil {
+				Log.Error(err, "Failed to delete ha-all policy during storage wipe")
+				return ctrl.Result{}, err
+			}
+		}
+
+		// Label all pods with skipPreStopChecks so the PreStop hook exits
+		// immediately instead of trying to drain the node for up to 600s.
+		// Without this, pods hang for the full terminationGracePeriodSeconds
+		// (default 604800s / 7 days) during storage wipe.
+		podList := &corev1.PodList{}
+		if err := r.List(ctx, podList,
+			client.InNamespace(instance.Namespace),
+			client.MatchingLabels{labels.K8sAppName: instance.Name},
+		); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to list pods for skipPreStopChecks: %w", err)
+		}
+		for i := range podList.Items {
+			pod := &podList.Items[i]
+			if pod.Labels["skipPreStopChecks"] != "true" {
+				if pod.Labels == nil {
+					pod.Labels = make(map[string]string)
+				}
+				pod.Labels["skipPreStopChecks"] = "true"
+				if err := r.Update(ctx, pod); err != nil {
+					Log.Error(err, "Failed to set skipPreStopChecks on pod", "pod", pod.Name)
+					// Non-fatal: continue with deletion, pod will just take longer to stop
+				} else {
+					Log.Info("Set skipPreStopChecks label on pod", "pod", pod.Name)
+				}
+			}
+		}
+
+		// Delete the StatefulSet
+		stsToDelete := &appsv1.StatefulSet{}
+		stsDeleteName := types.NamespacedName{Name: fmt.Sprintf("%s-server", instance.Name), Namespace: instance.Namespace}
+		if err := r.Get(ctx, stsDeleteName, stsToDelete); err != nil {
+			if !k8s_errors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+			Log.Info("StatefulSet already deleted", "name", stsDeleteName.Name)
+		} else {
+			if err := r.Delete(ctx, stsToDelete); err != nil && !k8s_errors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+			Log.Info("Deleted StatefulSet for storage wipe", "name", stsDeleteName.Name)
+		}
+
+		// Set ProxyRequired NOW so the recreated StatefulSet includes the proxy
+		// sidecar from the start. This avoids a double restart and ensures clients
+		// never connect to quorum queues without the durability proxy.
+		if instance.Status.ProxyRequired != "True" && instance.Spec.QueueType != nil && *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
+			isVersionUpgradeWithMigration := instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" &&
+				rabbitmq.Is3xTo4xUpgrade(instance.Status.CurrentVersion, *instance.Spec.TargetVersion)
+			isQueueTypeMigration := instance.Status.WipeReason == rabbitmqv1beta1.WipeReasonQueueTypeMigration
+
+			if isVersionUpgradeWithMigration || isQueueTypeMigration {
+				instance.Status.ProxyRequired = "True"
+				Log.Info("Enabling proxy for Mirrored to Quorum migration",
+					"wipeReason", instance.Status.WipeReason)
+			}
+		}
+
+		// Update queue type status when spec and status diverge (version upgrade
+		// with forced Mirrored→Quorum, or standalone queue migration)
+		if instance.Spec.QueueType != nil && instance.Status.QueueType != *instance.Spec.QueueType {
+			Log.Info("Updated Status.QueueType during storage wipe",
+				"from", instance.Status.QueueType,
+				"to", *instance.Spec.QueueType,
+				"wipeReason", instance.Status.WipeReason)
+			instance.Status.QueueType = *instance.Spec.QueueType
+		}
+
+		instance.Status.UpgradePhase = rabbitmqv1beta1.UpgradePhaseWaitingForCluster
+		if err := helper.PatchInstance(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Create/Update StatefulSet
+	// Use a minimal object for CreateOrPatch to avoid pre-populated fields
+	// interfering with the JSON merge patch computation.
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-server", instance.Name),
+			Namespace: instance.Namespace,
+		},
+	}
+
+	// Check for stale ownerReferences in volumeClaimTemplates (from old rabbitmq-cluster-operator).
+	// These cause new PVCs to be garbage-collected immediately because they reference a deleted owner.
+	// Since volumeClaimTemplates is immutable, we must delete and recreate the StatefulSet.
+	if instance.Status.VCTCleaned != "True" {
+		recreated, err := r.fixStaleVCTOwnerRefs(ctx, instance, sts)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if recreated {
+			Log.Info("Requeuing after StatefulSet orphan-delete for VCT fix")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+	}
+
+	stsop, err := controllerutil.CreateOrPatch(ctx, r.Client, sts, func() error {
+		// Adopt from old owner if needed (migration from rabbitmq-cluster-operator)
+		adoptResource(sts, instance.UID)
+		err := controllerutil.SetControllerReference(instance, sts, r.Scheme)
+		if err != nil {
+			return err
+		}
+
+		proxyCfg := rabbitmq.ProxyConfig{
+			Enabled:     proxyEnabled,
+			IPv6Enabled: IPv6Enabled,
+			BuildContainer: func(inst *rabbitmqv1beta1.RabbitMq, ipv6 bool) corev1.Container {
+				return BuildProxySidecarContainer(inst, ipv6)
+			},
+		}
+		desired := rabbitmq.StatefulSet(instance, configMapHash, topology, envVars, configVersion, needsDataWipe, proxyCfg)
+		isCreate := sts.CreationTimestamp.IsZero()
+
+		if isCreate {
+			// On create, set everything including immutable fields
+			sts.Spec = desired.Spec
+			sts.Labels = desired.Labels
+		} else {
+			// On update, preserve immutable fields (Selector, VolumeClaimTemplates, ServiceName)
+			existingSelectorLabels := map[string]string{}
+			if sts.Spec.Selector != nil {
+				for k, v := range sts.Spec.Selector.MatchLabels {
+					existingSelectorLabels[k] = v
+				}
+			}
+
+			sts.Labels = desired.Labels
+			sts.Spec.Replicas = desired.Spec.Replicas
+			sts.Spec.Template.Labels = desired.Spec.Template.Labels
+			sts.Spec.Template.Annotations = desired.Spec.Template.Annotations
+			sts.Spec.Template.Spec.ServiceAccountName = desired.Spec.Template.Spec.ServiceAccountName
+			sts.Spec.Template.Spec.Volumes = desired.Spec.Template.Spec.Volumes
+			sts.Spec.Template.Spec.SecurityContext = desired.Spec.Template.Spec.SecurityContext
+			sts.Spec.Template.Spec.Affinity = desired.Spec.Template.Spec.Affinity
+			sts.Spec.Template.Spec.NodeSelector = desired.Spec.Template.Spec.NodeSelector
+			sts.Spec.Template.Spec.Tolerations = desired.Spec.Template.Spec.Tolerations
+			sts.Spec.Template.Spec.TopologySpreadConstraints = desired.Spec.Template.Spec.TopologySpreadConstraints
+			sts.Spec.Template.Spec.AutomountServiceAccountToken = desired.Spec.Template.Spec.AutomountServiceAccountToken
+			if desired.Spec.Template.Spec.TerminationGracePeriodSeconds != nil {
+				sts.Spec.Template.Spec.TerminationGracePeriodSeconds = desired.Spec.Template.Spec.TerminationGracePeriodSeconds
+			}
+
+			// Update containers individually to preserve server-defaulted fields.
+			// Fall back to full replacement if counts differ or names don't match
+			// (e.g., proxy sidecar added/removed/renamed).
+			if len(sts.Spec.Template.Spec.Containers) != len(desired.Spec.Template.Spec.Containers) ||
+				!mergeContainers(sts.Spec.Template.Spec.Containers, desired.Spec.Template.Spec.Containers) {
+				sts.Spec.Template.Spec.Containers = desired.Spec.Template.Spec.Containers
+			}
+			sts.Spec.Template.Spec.InitContainers = mergeOrReplaceInitContainers(
+				sts.Spec.Template.Spec.InitContainers, desired.Spec.Template.Spec.InitContainers)
+
+			// Merge preserved selector labels into the new template labels
+			for k, v := range existingSelectorLabels {
+				sts.Spec.Template.Labels[k] = v
+			}
+			// Selector, ServiceName, VolumeClaimTemplates, PodManagementPolicy
+			// are NOT updated — they are immutable and preserved from the server state.
+		}
+
+		return nil
+	})
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if stsop != controllerutil.OperationResultNone {
+		Log.Info(fmt.Sprintf("StatefulSet %s - %s", sts.Name, stsop))
+	}
+
+	// Check StatefulSet readiness
+	clusterReady := false
+	stsReplicas := int32(1)
+	if sts.Spec.Replicas != nil {
+		stsReplicas = *sts.Spec.Replicas
+	}
+	instance.Status.ReadyCount = sts.Status.ReadyReplicas
+	if sts.Status.ObservedGeneration == sts.Generation &&
+		sts.Status.ReadyReplicas == stsReplicas &&
+		sts.Status.ReadyReplicas > 0 {
+		clusterReady = true
+	}
+
 	if clusterReady {
 		instance.Status.Conditions.MarkTrue(condition.DeploymentReadyCondition, condition.DeploymentReadyMessage)
+
+		// If we just completed a storage wipe, update CurrentVersion and clear UpgradePhase.
+		// The default-user secret survives because we only deleted the StatefulSet.
+		if instance.Status.UpgradePhase == rabbitmqv1beta1.UpgradePhaseWaitingForCluster {
+			instance.Status.UpgradePhase = rabbitmqv1beta1.UpgradePhaseNone
+			instance.Status.WipeReason = rabbitmqv1beta1.WipeReasonNone
+
+			if instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" {
+				instance.Status.CurrentVersion = *instance.Spec.TargetVersion
+				Log.Info("Version upgrade complete", "version", *instance.Spec.TargetVersion)
+			} else {
+				Log.Info("Queue migration complete - cluster recreated with new queue type")
+			}
+		}
 
 		labelMap := map[string]string{
 			labels.K8sAppName:      instance.Name,
@@ -451,6 +917,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 					condition.SeverityWarning,
 					condition.PDBReadyErrorMessage, err.Error()))
 				return ctrl.Result{}, err
+			}
+		} else {
+			// Clean up PDB when replicas <= 1 (PDB is not needed for single-replica)
+			pdbObj := &policyv1.PodDisruptionBudget{}
+			pdbObj.Name = instance.Name
+			pdbObj.Namespace = instance.Namespace
+			err := r.Delete(ctx, pdbObj)
+			if err != nil && !k8s_errors.IsNotFound(err) {
+				return ctrl.Result{}, fmt.Errorf("failed to delete PDB: %w", err)
 			}
 		}
 		instance.Status.Conditions.MarkTrue(condition.PDBReadyCondition, condition.PDBReadyMessage)
@@ -488,13 +963,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		}
 		instance.Status.Conditions.MarkTrue(condition.CreateServiceReadyCondition, condition.CreateServiceReadyMessage)
 
-		// Let's wait DeploymentReadyCondition=True to apply the policy
-		// QueueType should never be nil due to webhook defaulting, but add safety check
+		// Sync Status.QueueType with Spec.QueueType
 		if instance.Spec.QueueType != nil {
-			if *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeMirrored && *instance.Spec.Replicas > 1 && instance.Status.QueueType != rabbitmqv1beta1.QueueTypeMirrored {
-				Log.Info("ha-all policy not present. Applying.")
-				err := ensureMirroredPolicy(ctx, helper, instance)
-				if err != nil {
+			replicas := int32(1)
+			if instance.Spec.Replicas != nil {
+				replicas = *instance.Spec.Replicas
+			}
+
+			// Apply or remove ha-all policy based on queue type and replica count.
+			// The policy is only meaningful for multi-replica Mirrored clusters.
+			if *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeMirrored && replicas > 1 && instance.Status.QueueType != rabbitmqv1beta1.QueueTypeMirrored {
+				Log.Info("Applying ha-all policy for Mirrored queues")
+				if err := ensureMirroredPolicy(ctx, helper, instance); err != nil {
 					Log.Error(err, "Could not apply ha-all policy")
 					instance.Status.Conditions.Set(condition.FalseCondition(
 						condition.DeploymentReadyCondition,
@@ -504,10 +984,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 					return ctrl.Result{}, err
 				}
 				instance.Status.QueueType = rabbitmqv1beta1.QueueTypeMirrored
+			} else if *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeMirrored && replicas <= 1 && instance.Status.QueueType != rabbitmqv1beta1.QueueTypeMirrored {
+				// Single-replica Mirrored: no ha-all policy needed, but still
+				// track the queue type in status so upgrades detect Mirrored→Quorum.
+				instance.Status.QueueType = rabbitmqv1beta1.QueueTypeMirrored
 			} else if *instance.Spec.QueueType != rabbitmqv1beta1.QueueTypeMirrored && instance.Status.QueueType == rabbitmqv1beta1.QueueTypeMirrored {
-				Log.Info("QueueType changed from Mirrored. Removing ha-all policy")
-				err := deleteMirroredPolicy(ctx, helper, instance)
-				if err != nil {
+				Log.Info("QueueType changed from Mirrored, removing ha-all policy")
+				if err := deleteMirroredPolicy(ctx, helper, instance); err != nil {
 					Log.Error(err, "Could not remove ha-all policy")
 					instance.Status.Conditions.Set(condition.FalseCondition(
 						condition.DeploymentReadyCondition,
@@ -516,24 +999,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 						condition.DeploymentReadyErrorMessage, err.Error()))
 					return ctrl.Result{}, err
 				}
-				instance.Status.QueueType = ""
 			}
 
-			// Update status for Quorum queue type
 			if *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeQuorum && instance.Status.QueueType != rabbitmqv1beta1.QueueTypeQuorum {
-				Log.Info("Setting queue type status to quorum")
+				Log.Info("Setting queue type status to Quorum")
 				instance.Status.QueueType = rabbitmqv1beta1.QueueTypeQuorum
-			} else if *instance.Spec.QueueType != rabbitmqv1beta1.QueueTypeQuorum && instance.Status.QueueType == rabbitmqv1beta1.QueueTypeQuorum {
-				Log.Info("Removing quorum queue type status")
-				instance.Status.QueueType = ""
-			}
-
-			// Update status for None queue type
-			if *instance.Spec.QueueType == rabbitmqv1beta1.QueueTypeNone && instance.Status.QueueType != "" {
-				Log.Info("Setting queue type status to None (clearing)")
-				instance.Status.QueueType = ""
 			}
 		}
+	}
+
+	// After all resources are reparented, clean up the old RabbitmqCluster CR (once)
+	if instance.Status.OldCRCleaned != "True" {
+		if err := r.cleanupOldRabbitmqClusterCR(ctx, instance); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to cleanup old RabbitmqCluster CR: %w", err)
+		}
+		instance.Status.OldCRCleaned = "True"
 	}
 
 	if instance.Status.Conditions.AllSubConditionIsTrue() {
@@ -552,7 +1032,10 @@ func (r *Reconciler) reconcilePerPodServices(ctx context.Context, instance *rabb
 		return ctrl.Result{}, nil
 	}
 
-	replicas := int(*instance.Spec.Replicas)
+	replicas := 1
+	if instance.Spec.Replicas != nil {
+		replicas = int(*instance.Spec.Replicas)
+	}
 
 	if len(instance.Spec.PodOverride.Services) != replicas {
 		return ctrl.Result{}, fmt.Errorf("number of services in podOverride (%d) must match number of replicas (%d)", len(instance.Spec.PodOverride.Services), replicas)
@@ -632,18 +1115,25 @@ func (r *Reconciler) reconcilePerPodServices(ctx context.Context, instance *rabb
 }
 
 func (r *Reconciler) deletePerPodServices(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) error {
-	// List all services owned by this RabbitMq instance
+	// Only delete per-pod services (named <instance>-server-N), not the
+	// headless or client services which are also owned by this instance.
 	serviceList := &corev1.ServiceList{}
 	listOpts := []client.ListOption{
 		client.InNamespace(instance.Namespace),
+		client.MatchingLabels{
+			labels.K8sAppName: instance.Name,
+		},
 	}
 
 	if err := r.List(ctx, serviceList, listOpts...); err != nil {
 		return err
 	}
 
-	// Delete services that are owned by this RabbitMq instance
+	prefix := instance.Name + "-server-"
 	for _, svc := range serviceList.Items {
+		if !strings.HasPrefix(svc.Name, prefix) {
+			continue
+		}
 		for _, ownerRef := range svc.GetOwnerReferences() {
 			if ownerRef.UID == instance.UID {
 				if err := r.Delete(ctx, &svc); err != nil && !k8s_errors.IsNotFound(err) {
@@ -664,18 +1154,13 @@ func ensureMirroredPolicy(ctx context.Context, helper *helper.Helper, instance *
 
 	policy := &rabbitmqv1beta1.RabbitMQPolicy{}
 	err := helper.GetClient().Get(ctx, policyName, policy)
-
-	// Policy already exists
 	if err == nil {
-		return nil
+		return nil // already exists
 	}
-
-	// Return error if it's not NotFound
 	if !k8s_errors.IsNotFound(err) {
 		return err
 	}
 
-	// Create the policy CR
 	definition := map[string]interface{}{
 		"ha-mode":                "exactly",
 		"ha-params":              2,
@@ -714,18 +1199,12 @@ func deleteMirroredPolicy(ctx context.Context, helper *helper.Helper, instance *
 
 	policy := &rabbitmqv1beta1.RabbitMQPolicy{}
 	err := helper.GetClient().Get(ctx, policyName, policy)
-
-	// Policy doesn't exist, nothing to delete
 	if k8s_errors.IsNotFound(err) {
 		return nil
 	}
-
-	// Return error if Get() failed for other reasons
 	if err != nil {
 		return err
 	}
-
-	// Delete the policy
 	return helper.GetClient().Delete(ctx, policy)
 }
 
@@ -733,39 +1212,37 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1be
 	Log := r.GetLogger(ctx)
 	Log.Info("Reconciling Service delete")
 
+	// Label all pods with skipPreStopChecks so they terminate quickly.
+	// Without this, the PreStop hook tries to drain the node (up to 600s per step)
+	// and the 604800s terminationGracePeriodSeconds keeps pods alive for days.
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList,
+		client.InNamespace(instance.Namespace),
+		client.MatchingLabels{labels.K8sAppName: instance.Name},
+	); err == nil {
+		for i := range podList.Items {
+			pod := &podList.Items[i]
+			if pod.Labels["skipPreStopChecks"] != "true" {
+				if pod.Labels == nil {
+					pod.Labels = make(map[string]string)
+				}
+				pod.Labels["skipPreStopChecks"] = "true"
+				if err := r.Update(ctx, pod); err != nil {
+					Log.Error(err, "Failed to set skipPreStopChecks on pod", "pod", pod.Name)
+				} else {
+					Log.Info("Set skipPreStopChecks label on pod for clean shutdown", "pod", pod.Name)
+				}
+			}
+		}
+	}
+
 	// Delete per-pod services if they exist
 	if err := r.deletePerPodServices(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Remove finalizer from RabbitmqCluster so it can be deleted
-	clusterInstance := &rabbitmqv2.RabbitmqCluster{}
-	err := r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, clusterInstance)
-	if err == nil {
-		// Cluster exists - remove our finalizer
-		if controllerutil.RemoveFinalizer(clusterInstance, rabbitmqClusterFinalizer) {
-			if err := r.Update(ctx, clusterInstance); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-	} else if !k8s_errors.IsNotFound(err) {
-		// Error getting cluster (not NotFound) - return error
-		return ctrl.Result{}, err
-	}
-
-	rabbitmqCluster := impl.NewRabbitMqCluster(
-		&rabbitmqv2.RabbitmqCluster{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      instance.Name,
-				Namespace: instance.Namespace,
-			},
-		},
-		5,
-	)
-	err = rabbitmqCluster.Delete(ctx, helper)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
+	// Resources (StatefulSet, Services, Secrets, ConfigMaps) will be automatically
+	// garbage collected by Kubernetes due to owner references
 
 	// Remove finalizer on the Topology CR
 	if ctrlResult, err := topologyv1.EnsureDeletedTopologyRef(
@@ -782,6 +1259,393 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1be
 	Log.Info("Reconciled Service delete successfully")
 
 	return ctrl.Result{}, nil
+}
+
+// ensureErlangCookie ensures the Erlang cookie secret exists
+func (r *Reconciler) ensureErlangCookie(
+	ctx context.Context,
+	_ *helper.Helper,
+	instance *rabbitmqv1beta1.RabbitMq,
+) error {
+	Log := r.GetLogger(ctx)
+	secretName := fmt.Sprintf("%s-erlang-cookie", instance.Name)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: instance.Namespace,
+		},
+	}
+
+	op, err := controllerutil.CreateOrPatch(ctx, r.Client, secret, func() error {
+		adoptResource(secret, instance.UID)
+		if err := controllerutil.SetControllerReference(instance, secret, r.Scheme); err != nil {
+			return err
+		}
+
+		// Only generate the cookie on first creation
+		if len(secret.Data) == 0 {
+			generated, genErr := rabbitmq.GenerateErlangCookie(instance)
+			if genErr != nil {
+				return fmt.Errorf("failed to generate erlang cookie: %w", genErr)
+			}
+			secret.Type = corev1.SecretTypeOpaque
+			secret.Data = generated.Data
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to ensure erlang cookie secret: %w", err)
+	}
+	if op != controllerutil.OperationResultNone {
+		Log.Info(fmt.Sprintf("Erlang cookie secret %s - %s", secretName, op))
+	}
+
+	return nil
+}
+
+// ensureDefaultUser ensures the default user secret exists and keeps host/port up to date.
+// Credentials (username, password) are only generated on first creation.
+// Host and port are updated on every reconcile to reflect TLS config changes.
+func (r *Reconciler) ensureDefaultUser(
+	ctx context.Context,
+	_ *helper.Helper,
+	instance *rabbitmqv1beta1.RabbitMq,
+) error {
+	Log := r.GetLogger(ctx)
+	secretName := fmt.Sprintf("%s-default-user", instance.Name)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: instance.Namespace,
+		},
+	}
+
+	// Determine host and port based on current config
+	host := fmt.Sprintf("%s.%s.svc", instance.Name, instance.Namespace)
+	port := fmt.Sprintf("%d", 5672)
+	if instance.Spec.TLS.SecretName != "" {
+		port = fmt.Sprintf("%d", 5671)
+	}
+
+	op, err := controllerutil.CreateOrPatch(ctx, r.Client, secret, func() error {
+		adoptResource(secret, instance.UID)
+		if err := controllerutil.SetControllerReference(instance, secret, r.Scheme); err != nil {
+			return err
+		}
+
+		// Only generate credentials on first creation
+		if len(secret.Data) == 0 {
+			generated, genErr := rabbitmq.GenerateDefaultUser(instance)
+			if genErr != nil {
+				return fmt.Errorf("failed to generate default user: %w", genErr)
+			}
+			secret.Type = corev1.SecretTypeOpaque
+			secret.Data = generated.Data
+		}
+
+		// Ensure default_user.conf exists (may be missing when migrating from old operator)
+		if _, ok := secret.Data["default_user.conf"]; !ok {
+			username := string(secret.Data["username"])
+			password := string(secret.Data["password"])
+			defaultUserConf := fmt.Sprintf("default_user = %s\ndefault_pass = %s\ndefault_user_tags.administrator = true\n", username, password)
+			secret.Data["default_user.conf"] = []byte(defaultUserConf)
+		}
+
+		// Always update host and port (may change with TLS config)
+		secret.Data["host"] = []byte(host)
+		secret.Data["port"] = []byte(port)
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to ensure default user secret: %w", err)
+	}
+	if op != controllerutil.OperationResultNone {
+		Log.Info(fmt.Sprintf("Default user secret %s - %s", secretName, op))
+	}
+
+	// Update status with default user information
+	instance.Status.DefaultUser = &rabbitmqv1beta1.RabbitmqClusterDefaultUser{
+		SecretReference: &rabbitmqv1beta1.RabbitmqClusterSecretReference{
+			Name:      secretName,
+			Namespace: instance.Namespace,
+			Keys: map[string]string{
+				"username": "username",
+				"password": "password",
+			},
+		},
+		ServiceReference: &rabbitmqv1beta1.RabbitmqClusterServiceReference{
+			Name:      instance.Name,
+			Namespace: instance.Namespace,
+		},
+	}
+
+	return nil
+}
+
+// mergeContainers updates existing containers in-place with desired values,
+// preserving server-defaulted fields to avoid reconcile loops.
+// Matches containers by name to avoid index-order dependency.
+// Returns false if any desired container name is not found in existing
+// (caller should fall back to full replacement).
+func mergeContainers(existing []corev1.Container, desired []corev1.Container) bool {
+	existingByName := make(map[string]int, len(existing))
+	for i := range existing {
+		existingByName[existing[i].Name] = i
+	}
+	for _, d := range desired {
+		idx, ok := existingByName[d.Name]
+		if !ok {
+			return false
+		}
+		existing[idx].Image = d.Image
+		existing[idx].Command = d.Command
+		existing[idx].Args = d.Args
+		existing[idx].Env = d.Env
+		existing[idx].Ports = d.Ports
+		existing[idx].VolumeMounts = d.VolumeMounts
+		existing[idx].Resources = d.Resources
+		existing[idx].LivenessProbe = d.LivenessProbe
+		existing[idx].ReadinessProbe = d.ReadinessProbe
+		existing[idx].Lifecycle = d.Lifecycle
+		existing[idx].SecurityContext = d.SecurityContext
+	}
+	return true
+}
+
+// mergeOrReplaceInitContainers merges desired init containers into existing ones
+// by name, preserving server-defaulted fields. If names don't match, replaces
+// the list entirely.
+func mergeOrReplaceInitContainers(existing, desired []corev1.Container) []corev1.Container {
+	if len(existing) != len(desired) {
+		return desired
+	}
+	existingByName := make(map[string]int, len(existing))
+	for i := range existing {
+		existingByName[existing[i].Name] = i
+	}
+	for _, d := range desired {
+		idx, ok := existingByName[d.Name]
+		if !ok {
+			// Name mismatch — replace the entire list
+			return desired
+		}
+		existing[idx].Image = d.Image
+		existing[idx].Command = d.Command
+		existing[idx].Args = d.Args
+		existing[idx].Env = d.Env
+		existing[idx].VolumeMounts = d.VolumeMounts
+		existing[idx].Resources = d.Resources
+		existing[idx].SecurityContext = d.SecurityContext
+	}
+	return existing
+}
+
+// fixStaleVCTOwnerRefs detects ownerReferences from the old rabbitmq-cluster-operator
+// (rabbitmq.com/v1beta1) in the StatefulSet's volumeClaimTemplates. These stale references
+// cause new PVCs to be garbage-collected immediately because they point to a deleted owner.
+// Since volumeClaimTemplates is immutable, the StatefulSet must be orphan-deleted (keeping
+// pods running) and recreated with clean templates. This also preserves the storageClassName
+// and cleans stale ownerReferences from existing PVCs.
+// Returns true if the StatefulSet was deleted and a requeue is needed.
+func (r *Reconciler) fixStaleVCTOwnerRefs(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq, sts *appsv1.StatefulSet) (bool, error) {
+	Log := r.GetLogger(ctx)
+
+	// Fetch the existing StatefulSet
+	stsKey := types.NamespacedName{Name: sts.Name, Namespace: sts.Namespace}
+	if err := r.Get(ctx, stsKey, sts); err != nil {
+		if k8s_errors.IsNotFound(err) {
+			// StatefulSet doesn't exist — mark VCT as cleaned so we don't check again,
+			// and let CreateOrPatch create it fresh.
+			instance.Status.VCTCleaned = "True"
+			return false, nil
+		}
+		return false, err
+	}
+
+	// If the StatefulSet is already being deleted (from a previous run of this function),
+	// clear any finalizers to allow deletion to complete, then wait for it to be gone.
+	if sts.DeletionTimestamp != nil {
+		if len(sts.Finalizers) > 0 {
+			sts.Finalizers = nil
+			if err := r.Update(ctx, sts); err != nil && !k8s_errors.IsNotFound(err) {
+				return false, fmt.Errorf("failed to remove finalizers from terminating StatefulSet: %w", err)
+			}
+		}
+		Log.Info("StatefulSet is being deleted, waiting for deletion to complete", "statefulset", sts.Name)
+		return true, nil
+	}
+
+	// Check if any volumeClaimTemplate has ownerReferences from the old rabbitmq-cluster-operator
+	hasStaleRefs := false
+	var preservedStorageClass *string
+	for _, vct := range sts.Spec.VolumeClaimTemplates {
+		for _, ref := range vct.OwnerReferences {
+			if strings.HasPrefix(ref.APIVersion, "rabbitmq.com/") {
+				hasStaleRefs = true
+				break
+			}
+		}
+		if vct.Spec.StorageClassName != nil {
+			sc := *vct.Spec.StorageClassName
+			preservedStorageClass = &sc
+		}
+	}
+
+	if !hasStaleRefs {
+		// No stale refs found — mark as cleaned
+		instance.Status.VCTCleaned = "True"
+		return false, nil
+	}
+
+	Log.Info("Detected stale rabbitmq.com ownerReferences in StatefulSet volumeClaimTemplates",
+		"statefulset", sts.Name)
+
+	// Preserve the storageClassName from the old template via annotation.
+	// We use an annotation instead of modifying the spec (which would be an anti-pattern
+	// for a controller) so the storageClassName can be picked up when recreating the StatefulSet.
+	if preservedStorageClass != nil && instance.Spec.Storage.StorageClassName == nil {
+		if instance.Annotations == nil {
+			instance.Annotations = make(map[string]string)
+		}
+		instance.Annotations["rabbitmq.openstack.org/adopted-storage-class"] = *preservedStorageClass
+		Log.Info("Saved storageClassName from adopted StatefulSet to annotation",
+			"storageClassName", *preservedStorageClass)
+	}
+
+	// Clean up stale ownerReferences on existing PVCs.
+	// PVCs created by StatefulSets follow the naming convention: <vctName>-<stsName>-<ordinal>
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	if err := r.List(ctx, pvcList, client.InNamespace(instance.Namespace)); err != nil {
+		Log.Error(err, "Failed to list PVCs for ownerReference cleanup")
+	} else {
+		pvcPrefix := fmt.Sprintf("persistence-%s-", sts.Name)
+		for idx := range pvcList.Items {
+			pvc := &pvcList.Items[idx]
+			if !strings.HasPrefix(pvc.Name, pvcPrefix) {
+				continue
+			}
+			var cleanedRefs []metav1.OwnerReference
+			changed := false
+			for _, ref := range pvc.OwnerReferences {
+				if strings.HasPrefix(ref.APIVersion, "rabbitmq.com/") {
+					changed = true
+					continue
+				}
+				cleanedRefs = append(cleanedRefs, ref)
+			}
+			if changed {
+				pvc.SetOwnerReferences(cleanedRefs)
+				if err := r.Update(ctx, pvc); err != nil {
+					Log.Error(err, "Failed to clean ownerReference on PVC", "pvc", pvc.Name)
+				} else {
+					Log.Info("Cleaned stale rabbitmq.com ownerReference from PVC", "pvc", pvc.Name)
+				}
+			}
+		}
+	}
+
+	// Delete StatefulSet with orphan cascade to keep pods running
+	propagation := metav1.DeletePropagationOrphan
+	if err := r.Delete(ctx, sts, &client.DeleteOptions{
+		PropagationPolicy: &propagation,
+	}); err != nil && !k8s_errors.IsNotFound(err) {
+		return false, fmt.Errorf("failed to orphan-delete StatefulSet for VCT fix: %w", err)
+	}
+
+	Log.Info("Orphan-deleted StatefulSet to fix volumeClaimTemplates, will recreate on next reconcile",
+		"statefulset", sts.Name)
+	return true, nil
+}
+
+// adoptResource removes any foreign controller owner references from the object
+// so that SetControllerReference can set the new owner without conflict.
+// This is needed during migration from the old rabbitmq-cluster-operator, where
+// resources (StatefulSet, Service, Secret) may still be owned by the old RabbitmqCluster CR.
+func adoptResource(obj metav1.Object, newOwnerUID types.UID) {
+	var cleaned []metav1.OwnerReference
+	for _, ref := range obj.GetOwnerReferences() {
+		if ref.Controller != nil && *ref.Controller && ref.UID != newOwnerUID {
+			continue
+		}
+		cleaned = append(cleaned, ref)
+	}
+	obj.SetOwnerReferences(cleaned)
+}
+
+// cleanupOldRabbitmqClusterCR deletes the old rabbitmq.com/v1beta1 RabbitmqCluster CR
+// that is no longer needed after resources have been reparented to the new RabbitMq CR.
+func (r *Reconciler) cleanupOldRabbitmqClusterCR(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) error {
+	Log := r.GetLogger(ctx)
+
+	// Try to find a RabbitmqCluster CR with the same name in the same namespace
+	oldCR := &uns.Unstructured{}
+	oldCR.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "rabbitmq.com",
+		Version: "v1beta1",
+		Kind:    "RabbitmqCluster",
+	})
+	err := r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, oldCR)
+	if err != nil {
+		if k8s_errors.IsNotFound(err) || k8s_errors.IsForbidden(err) ||
+			apimeta.IsNoMatchError(err) {
+			// Not found, CRD doesn't exist, or no permission — nothing to clean up
+			return nil
+		}
+		return err
+	}
+
+	// Strip old owner references from PVCs before deleting the old CR,
+	// otherwise Kubernetes GC will cascade-delete the PVCs.
+	oldUID := oldCR.GetUID()
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	if err := r.List(ctx, pvcList,
+		client.InNamespace(instance.Namespace),
+		client.MatchingLabels{labels.K8sAppName: instance.Name},
+	); err != nil {
+		return fmt.Errorf("failed to list PVCs: %w", err)
+	}
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		needsUpdate := false
+		var cleaned []metav1.OwnerReference
+		for _, ref := range pvc.OwnerReferences {
+			if ref.UID == oldUID {
+				needsUpdate = true
+				continue
+			}
+			cleaned = append(cleaned, ref)
+		}
+		if needsUpdate {
+			pvc.OwnerReferences = cleaned
+			if err := r.Update(ctx, pvc); err != nil {
+				if k8s_errors.IsNotFound(err) {
+					continue
+				}
+				return fmt.Errorf("failed to strip old owner from PVC %s: %w", pvc.Name, err)
+			}
+			Log.Info("Stripped old RabbitmqCluster owner from PVC", "pvc", pvc.Name)
+		}
+	}
+
+	// Remove finalizers (the old operator that would handle them is gone)
+	if len(oldCR.GetFinalizers()) > 0 {
+		oldCR.SetFinalizers(nil)
+		if err := r.Update(ctx, oldCR); err != nil {
+			return fmt.Errorf("failed to remove finalizers from old RabbitmqCluster %s: %w", instance.Name, err)
+		}
+	}
+
+	if err := r.Delete(ctx, oldCR); err != nil {
+		if !k8s_errors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete old RabbitmqCluster %s: %w", instance.Name, err)
+		}
+	} else {
+		Log.Info("Deleted old RabbitmqCluster CR after reparenting", "name", instance.Name)
+	}
+
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -830,8 +1694,14 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&rabbitmqv1beta1.RabbitMq{}).
-		Owns(&rabbitmqv2.RabbitmqCluster{}).
+		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
+		Owns(&corev1.ServiceAccount{}).
+		Owns(&rbacv1.Role{}).
+		Owns(&rbacv1.RoleBinding{}).
+		Owns(&corev1.Secret{}).
+		Owns(&corev1.ConfigMap{}).
+		Owns(&policyv1.PodDisruptionBudget{}).
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.findObjectsForSrc),
@@ -843,7 +1713,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// findObjectsForSrc - returns a reconcile request if the object is referenced by a Redis CR
+// findObjectsForSrc - returns a reconcile request if the object is referenced by a RabbitMq CR
 func (r *Reconciler) findObjectsForSrc(ctx context.Context, src client.Object) []reconcile.Request {
 	requests := []reconcile.Request{}
 

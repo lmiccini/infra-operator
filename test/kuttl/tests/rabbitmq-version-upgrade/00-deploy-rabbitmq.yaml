@@ -1,0 +1,13 @@
+#
+# Step 0: Deploy RabbitMq with targetVersion 3.13
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq-upgrade
+spec:
+  replicas: 1
+  containerImage: quay.io/podified-antelope-centos9/openstack-rabbitmq:current-podified
+  terminationGracePeriodSeconds: 30
+  targetVersion: "3.13"
+  queueType: Quorum

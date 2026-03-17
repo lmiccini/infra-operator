@@ -1,0 +1,24 @@
+#
+# Step 0: Wait for cluster to become ready at version 3.13 with Mirrored queues
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+commands:
+  - script: |
+      set -e
+      READY=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upmir -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: RabbitMq CR not ready"
+        exit 1
+      fi
+      VERSION=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upmir -o jsonpath='{.status.currentVersion}')
+      if [ "$VERSION" != "3.13" ]; then
+        echo "FAIL: Expected currentVersion 3.13, got: $VERSION"
+        exit 1
+      fi
+      QT=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upmir -o jsonpath='{.status.queueType}')
+      if [ "$QT" != "Mirrored" ]; then
+        echo "FAIL: Expected queueType Mirrored, got: $QT"
+        exit 1
+      fi
+      echo "PASS: RabbitMq ready at version $VERSION with queueType=$QT"

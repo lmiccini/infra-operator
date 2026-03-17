@@ -45,7 +45,7 @@ import (
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
-	rabbitmqclusterv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
+	appsv1 "k8s.io/api/apps/v1"
 )
 
 const (
@@ -250,9 +250,28 @@ func CreateTransportURL(name types.NamespacedName, spec map[string]any) client.O
 }
 
 func CreateRabbitMQCluster(name types.NamespacedName, spec map[string]any) client.Object {
+	// Ensure the cluster-config-v1 ConfigMap exists in kube-system namespace
+	// so the RabbitMq controller can check FIPS configuration
+	clusterCm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cluster-config-v1",
+			Namespace: "kube-system",
+		},
+	}
+	_, err := controllerutil.CreateOrPatch(th.Ctx, th.K8sClient, clusterCm, func() error {
+		if clusterCm.Data == nil {
+			clusterCm.Data = map[string]string{}
+		}
+		if _, ok := clusterCm.Data["install-config"]; !ok {
+			clusterCm.Data["install-config"] = "fips: false"
+		}
+		return nil
+	})
+	Expect(err).ShouldNot(HaveOccurred())
+
 	raw := map[string]any{
-		"apiVersion": "rabbitmq.com/v1beta1",
-		"kind":       "RabbitmqCluster",
+		"apiVersion": "rabbitmq.openstack.org/v1beta1",
+		"kind":       "RabbitMq",
 		"metadata": map[string]any{
 			"name":      name.Name,
 			"namespace": name.Namespace,
@@ -270,7 +289,7 @@ func UpdateRabbitMQClusterToTLS(name types.NamespacedName) {
 
 		_, err := controllerutil.CreateOrPatch(
 			th.Ctx, th.K8sClient, mq, func() error {
-				mq.Spec.TLS = rabbitmqclusterv2.TLSSpec{
+				mq.Spec.TLS = rabbitmqv1.RabbitMQTLSSpec{
 					CaSecretName:           "rootca-internal",
 					DisableNonTLSListeners: true,
 					SecretName:             "cert-rabbitmq-svc",
@@ -283,8 +302,8 @@ func UpdateRabbitMQClusterToTLS(name types.NamespacedName) {
 
 func GetDefaultRabbitMQClusterSpec(tlsEnabled bool) map[string]any {
 	spec := make(map[string]any)
-	spec["delayStartSeconds"] = 30
-	spec["image"] = "quay.io/podified-antelope-centos9/openstack-rabbitmq:current-podified"
+	spec["containerImage"] = "quay.io/podified-antelope-centos9/openstack-rabbitmq:current-podified"
+	spec["replicas"] = 1
 	if tlsEnabled {
 		spec["tls"] = map[string]any{
 			"caSecretName":           "rootca-internal",
@@ -296,10 +315,11 @@ func GetDefaultRabbitMQClusterSpec(tlsEnabled bool) map[string]any {
 	return spec
 }
 
-// DeleteRabbitMQCluster deletes a RabbitMQCluster instance from the Kubernetes cluster.
+// DeleteRabbitMQCluster deletes a RabbitMq instance from the Kubernetes cluster.
+// It also cleans up the StatefulSet since envtest doesn't support garbage collection.
 func DeleteRabbitMQCluster(name types.NamespacedName) {
 	Eventually(func(g Gomega) {
-		mq := &rabbitmqclusterv2.RabbitmqCluster{}
+		mq := &rabbitmqv1.RabbitMq{}
 		err := th.K8sClient.Get(th.Ctx, name, mq)
 		// if it is already gone that is OK
 		if k8s_errors.IsNotFound(err) {
@@ -312,9 +332,18 @@ func DeleteRabbitMQCluster(name types.NamespacedName) {
 		err = th.K8sClient.Get(th.Ctx, name, mq)
 		g.Expect(k8s_errors.IsNotFound(err)).To(BeTrue())
 	}, th.Timeout, th.Interval).Should(Succeed())
+
+	// Clean up owned StatefulSet since envtest doesn't do garbage collection.
+	// Without this, a recreated cluster would adopt the old STS (still showing
+	// ready replicas) and skip the "waiting" state entirely.
+	sts := &appsv1.StatefulSet{}
+	stsName := types.NamespacedName{Name: name.Name + "-server", Namespace: name.Namespace}
+	if err := th.K8sClient.Get(th.Ctx, stsName, sts); err == nil {
+		th.K8sClient.Delete(th.Ctx, sts) //nolint:errcheck
+	}
 }
 
-func CreateOrUpdateRabbitMQClusterSecret(name types.NamespacedName, mq *rabbitmqclusterv2.RabbitmqCluster) {
+func CreateOrUpdateRabbitMQClusterSecret(name types.NamespacedName, mq *rabbitmqv1.RabbitMq) {
 	Eventually(func(g Gomega) {
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
@@ -323,7 +352,7 @@ func CreateOrUpdateRabbitMQClusterSecret(name types.NamespacedName, mq *rabbitmq
 			},
 		}
 
-		host := "host." + namespace + ".svc"
+		host := mq.Name + "." + namespace + ".svc"
 		port := "5672"
 		if mockRabbitMQHost != "" {
 			host = mockRabbitMQHost
@@ -337,6 +366,7 @@ func CreateOrUpdateRabbitMQClusterSecret(name types.NamespacedName, mq *rabbitmq
 		}
 
 		if mockRabbitMQHost != "" {
+			secretData["management-host"] = []byte(mockRabbitMQHost)
 			secretData["management-port"] = []byte(mockRabbitMQPort)
 		}
 
@@ -354,9 +384,8 @@ func CreateOrUpdateRabbitMQClusterSecret(name types.NamespacedName, mq *rabbitmq
 	}, th.Timeout, th.Interval).Should(Succeed())
 }
 
-// SimulateRabbitMQClusterReady function updates the RabbitMQCluster object
-// status to have AllReplicasReady condition, statusDefaultUser reference
-// and creates the secret referenced there containing host, password and user.
+// SimulateRabbitMQClusterReady simulates a ready RabbitMQ cluster by creating
+// the necessary resources (StatefulSet, Secret) and updating the RabbitMq CR status.
 //
 // Example usage:
 //
@@ -371,9 +400,33 @@ func SimulateRabbitMQClusterReady(name types.NamespacedName) {
 		// create/update rabbitmq secret
 		CreateOrUpdateRabbitMQClusterSecret(secretName, mq)
 
+		// Wait for the controller to create the StatefulSet, then mark it as ready
+		replicas := int32(1)
+		if mq.Spec.Replicas != nil {
+			replicas = *mq.Spec.Replicas
+		}
+
+		// Wait for StatefulSet to be created by the controller
+		sts := &appsv1.StatefulSet{}
+		stsName := types.NamespacedName{
+			Name:      name.Name + "-server",
+			Namespace: name.Namespace,
+		}
+		err := th.K8sClient.Get(th.Ctx, stsName, sts)
+		g.Expect(err).ShouldNot(HaveOccurred(), "StatefulSet should be created by controller")
+
+		// Update StatefulSet status to mark it as ready
+		sts.Status.ReadyReplicas = replicas
+		sts.Status.Replicas = replicas
+		sts.Status.CurrentReplicas = replicas
+		sts.Status.UpdatedReplicas = replicas
+		sts.Status.ObservedGeneration = sts.Generation
+		err = th.K8sClient.Status().Update(th.Ctx, sts)
+		g.Expect(err).ShouldNot(HaveOccurred())
+
 		raw := map[string]any{
-			"apiVersion": "rabbitmq.com/v1beta1",
-			"kind":       "RabbitmqCluster",
+			"apiVersion": "rabbitmq.openstack.org/v1beta1",
+			"kind":       "RabbitMq",
 			"metadata": map[string]any{
 				"name":      name.Name,
 				"namespace": name.Namespace,
@@ -381,20 +434,6 @@ func SimulateRabbitMQClusterReady(name types.NamespacedName) {
 		}
 
 		status := make(map[string]any)
-
-		// add AllReplicasReady condition
-		statusCondition := []map[string]any{
-			{
-				"reason": "AllPodsAreReady",
-				"status": "True",
-				"type":   "AllReplicasReady",
-			},
-			{
-				"reason": "ClusterAvailable",
-				"status": "True",
-				"type":   "ClusterAvailable",
-			},
-		}
 
 		// add status.defaultUser which is used to get the
 		// secret holding username/password/host
@@ -413,16 +452,16 @@ func SimulateRabbitMQClusterReady(name types.NamespacedName) {
 			},
 		}
 
-		status["conditions"] = statusCondition
 		status["defaultUser"] = statusDefaultUser
 		status["observedGeneration"] = mq.Generation
+		status["readyCount"] = replicas
 		raw["status"] = status
 
 		un := &unstructured.Unstructured{Object: raw}
 		deploymentRes := schema.GroupVersionResource{
-			Group:    "rabbitmq.com",
+			Group:    "rabbitmq.openstack.org",
 			Version:  "v1beta1",
-			Resource: "rabbitmqclusters",
+			Resource: "rabbitmqs",
 		}
 
 		// Patch status
@@ -432,11 +471,10 @@ func SimulateRabbitMQClusterReady(name types.NamespacedName) {
 		g.Expect(result).ToNot(BeNil())
 
 		mq = GetRabbitMQCluster(name)
-		g.Expect(mq.Status.Conditions).ToNot(BeNil())
 		g.Expect(mq.Status.DefaultUser).ToNot(BeNil())
 
 	}, th.Timeout, th.Interval).Should(Succeed())
-	th.Logger.Info("Simulated RabbitMQCluster ready", "on", name)
+	th.Logger.Info("Simulated RabbitMQ cluster ready", "on", name)
 }
 
 // SimulateRabbitMQVhostReady function updates the RabbitMQVhost object
@@ -536,12 +574,24 @@ func GetReservation(name types.NamespacedName) *networkv1.Reservation {
 	return instance
 }
 
-func GetRabbitMQCluster(name types.NamespacedName) *rabbitmqclusterv2.RabbitmqCluster {
-	mq := &rabbitmqclusterv2.RabbitmqCluster{}
+func GetRabbitMQCluster(name types.NamespacedName) *rabbitmqv1.RabbitMq {
+	mq := &rabbitmqv1.RabbitMq{}
 	Eventually(func(g Gomega) {
 		g.Expect(k8sClient.Get(ctx, name, mq)).Should(Succeed())
 	}, timeout, interval).Should(Succeed())
 	return mq
+}
+
+func GetRabbitMQStatefulSet(name types.NamespacedName) *appsv1.StatefulSet {
+	sts := &appsv1.StatefulSet{}
+	stsName := types.NamespacedName{
+		Name:      name.Name + "-server",
+		Namespace: name.Namespace,
+	}
+	Eventually(func(g Gomega) {
+		g.Expect(k8sClient.Get(ctx, stsName, sts)).Should(Succeed())
+	}, timeout, interval).Should(Succeed())
+	return sts
 }
 
 func DNSMasqConditionGetter(name types.NamespacedName) condition.Conditions {
@@ -1192,6 +1242,25 @@ func GetTopologyRef(name string, namespace string) []types.NamespacedName {
 }
 
 func CreateRabbitMQ(rabbitmq types.NamespacedName, spec map[string]any) client.Object {
+	// Ensure the cluster-config-v1 ConfigMap exists in kube-system namespace
+	// so the RabbitMq controller can check FIPS configuration
+	clusterCm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cluster-config-v1",
+			Namespace: "kube-system",
+		},
+	}
+	_, err := controllerutil.CreateOrPatch(th.Ctx, th.K8sClient, clusterCm, func() error {
+		if clusterCm.Data == nil {
+			clusterCm.Data = map[string]string{}
+		}
+		if _, ok := clusterCm.Data["install-config"]; !ok {
+			clusterCm.Data["install-config"] = "fips: false"
+		}
+		return nil
+	})
+	Expect(err).ShouldNot(HaveOccurred())
+
 	raw := map[string]any{
 		"apiVersion": "rabbitmq.openstack.org/v1beta1",
 		"kind":       "RabbitMq",
