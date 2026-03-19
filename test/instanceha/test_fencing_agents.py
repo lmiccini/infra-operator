@@ -685,8 +685,10 @@ class TestIPMIFencing(unittest.TestCase):
 
         # Should return False due to timeout
         self.assertFalse(result)
-        self.assertEqual(mock_get_power_state.call_count, 2)  # Called twice (timeout=2)
-        self.assertEqual(mock_sleep.call_count, 2)  # sleep called twice
+        # With deadline-based loop, exact call count depends on timing;
+        # verify it was called at least once and sleep was invoked
+        self.assertGreaterEqual(mock_get_power_state.call_count, 1)
+        self.assertGreaterEqual(mock_sleep.call_count, 1)
 
     @patch('instanceha.subprocess.run')
     def test_ipmi_power_on_no_wait(self, mock_run):

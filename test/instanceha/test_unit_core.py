@@ -2033,9 +2033,9 @@ class TestEvacuationStatusEdgeCases(unittest.TestCase):
             self.mock_nova, mock_server
         )
 
-        # Should return EvacuationStatus - uses first migration from list (old_migration)
+        # Should return EvacuationStatus - uses most recent migration (new_migration, status='running')
         self.assertIsInstance(result, instanceha.EvacuationStatus)
-        self.assertTrue(result.completed)
+        self.assertFalse(result.completed)
         self.assertFalse(result.error)
 
     def test_server_evacuation_status_old_migrations(self):
@@ -2063,15 +2063,19 @@ class TestEvacuationStatusEdgeCases(unittest.TestCase):
 
     def test_server_evacuation_status_migration_query_limit(self):
         """Test migration query with large number of results."""
+        from datetime import datetime, timedelta
         mock_server = Mock()
         mock_server.id = 'server-123'
 
-        # Create many migrations
+        # Create many migrations with created_at timestamps
+        # Most recent migration should be used (the last 'completed' one)
         migrations = []
+        base_time = datetime.now() - timedelta(hours=1)
         for i in range(150):  # More than typical limit
             mock_migration = Mock()
             mock_migration.instance_uuid = 'server-123'
             mock_migration.status = 'completed' if i < 100 else 'running'
+            mock_migration.created_at = (base_time + timedelta(seconds=i)).isoformat()
             migrations.append(mock_migration)
 
         self.mock_nova.migrations.list.return_value = migrations
@@ -2080,9 +2084,9 @@ class TestEvacuationStatusEdgeCases(unittest.TestCase):
             self.mock_nova, mock_server
         )
 
-        # Should handle large result sets - uses first migration (completed)
+        # Should handle large result sets - most recent migration (i=149, 'running') is used
         self.assertIsInstance(result, instanceha.EvacuationStatus)
-        self.assertTrue(result.completed)
+        self.assertFalse(result.completed)
         self.assertFalse(result.error)
 
     def test_server_evacuation_status_time_window_boundaries(self):
@@ -3478,7 +3482,7 @@ class TestMainFunction(unittest.TestCase):
 
             # Mock ConfigManager instance
             mock_cm = Mock()
-            mock_cm.get_log_level.return_value = 'INFO'
+            mock_cm.get_config_value.return_value = 'INFO'
             mock_cm_class.return_value = mock_cm
 
             # Mock service with proper attributes
@@ -3495,8 +3499,8 @@ class TestMainFunction(unittest.TestCase):
 
             # Verify ConfigManager was created
             mock_cm_class.assert_called_once()
-            # Verify _initialize_service was called
-            mock_init.assert_called_once()
+            # Verify _initialize_service was called with the config manager
+            mock_init.assert_called_once_with(mock_cm)
 
     def test_main_config_initialization_failure(self):
         """Test main() handles ConfigurationError with sys.exit(1)."""
@@ -3524,7 +3528,7 @@ class TestMainFunction(unittest.TestCase):
              patch('instanceha.logging.basicConfig'):
 
             mock_cm = Mock()
-            mock_cm.get_log_level.return_value = 'INFO'
+            mock_cm.get_config_value.return_value = 'INFO'
             mock_cm_class.return_value = mock_cm
 
             mock_service = Mock()
@@ -3538,8 +3542,8 @@ class TestMainFunction(unittest.TestCase):
                 except KeyboardInterrupt:
                     pass
 
-            # Verify _initialize_service was called (which uses global config_manager)
-            mock_init.assert_called_once()
+            # Verify _initialize_service was called with the config manager
+            mock_init.assert_called_once_with(mock_cm)
 
 
 if __name__ == '__main__':

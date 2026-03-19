@@ -308,26 +308,18 @@ class TestServiceInitialization(unittest.TestCase):
         config_manager.secure_path = secure_path
         config_manager.__init__(config_path)
 
-        # Set config_manager as module attribute for _initialize_service to use
-        instanceha.config_manager = config_manager
+        with patch('threading.Thread') as mock_thread:
+            mock_thread_instance = Mock()
+            mock_thread.return_value = mock_thread_instance
 
-        try:
-            with patch('threading.Thread') as mock_thread:
-                mock_thread_instance = Mock()
-                mock_thread.return_value = mock_thread_instance
+            service = instanceha._initialize_service(config_manager)
 
-                service = instanceha._initialize_service()
+            # Verify threads were created (health check + potentially kdump)
+            self.assertGreaterEqual(mock_thread.call_count, 1)
+            mock_thread_instance.start.assert_called()
 
-                # Verify threads were created (health check + potentially kdump)
-                self.assertGreaterEqual(mock_thread.call_count, 1)
-                mock_thread_instance.start.assert_called()
-
-                # Verify service was created
-                self.assertIsNotNone(service)
-        finally:
-            # Clean up module attribute
-            if hasattr(instanceha, 'config_manager'):
-                delattr(instanceha, 'config_manager')
+            # Verify service was created
+            self.assertIsNotNone(service)
 
 
 class TestServiceCategorization(unittest.TestCase):
