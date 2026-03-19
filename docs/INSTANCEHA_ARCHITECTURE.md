@@ -4,10 +4,9 @@
 
 InstanceHA is a high-availability service for OpenStack that automatically detects and evacuates instances from failed compute nodes.
 
-**Version**: 2.1
+**Version**: 2.2
 **Code Size**: 2,872 lines
-**Code Coverage**: 70%
-**Test Suite**: 401 tests, ~26 seconds execution time
+**Test Suite**: 401 tests across 11 test suites, ~26 seconds execution time
 
 ## Table of Contents
 
@@ -56,21 +55,6 @@ class EvacuationStatus:
     error: bool
 
 @dataclass
-class FencingCredentials:
-    """Credentials and connection info for fencing operations."""
-    agent: str
-    ipaddr: str
-    login: str
-    passwd: str
-    ipport: str = "443"
-    timeout: int = 30
-    uuid: str = "System.Embedded.1"
-    tls: str = "false"
-    token: Optional[str] = None
-    namespace: Optional[str] = None
-    host: Optional[str] = None
-
-@dataclass
 class NovaLoginCredentials:
     """Credentials for Nova API login."""
     username: str
@@ -105,7 +89,7 @@ class ReservedHostResult:
 - **Configuration Sources**: Main config, clouds.yaml, secure.yaml, fencing.yaml
 - **Validation**: Type checking, range validation (min/max), enum validation
 - **SSL Support**: CA bundle, client certificates, verification toggle
-- **Environment Overrides**: OS_CLOUD, UDP_PORT, SSL paths
+- **Environment Overrides**: OS_CLOUD, UDP_PORT (validated: 1-65535), SSL paths
 - **Direct Access**: Configuration accessed via `get_config_value()` method
 
 **Configuration Map**:
@@ -197,6 +181,7 @@ self.kdump_fenced_hosts = set()                 # Kdump-fenced host tracking
 ```python
 self.hosts_processing = defaultdict(float)      # Host -> processing start
 self.processing_lock = threading.Lock()         # Thread-safe tracking
+self.reserved_hosts_lock = threading.Lock()     # Thread-safe reserved host access
 ```
 
 *Threading* (`_initialize_threading()`):
@@ -290,7 +275,7 @@ def track_host_processing(service: 'InstanceHAService', hostname: str):
     finally:
         with service.processing_lock:
             service.hosts_processing.pop(hostname, None)
-            logging.debug(f'Cleaned up processing tracking for {hostname}')
+            logging.debug('Cleaned up processing tracking for %s', hostname)
 ```
 
 **UDP Socket Management**:
@@ -313,7 +298,7 @@ class UDPSocketManager:
 
 **Cache Access**:
 ```python
-# Pattern: read check → API call outside lock → write update
+# Pattern: read check → API call outside lock → write update → return local var
 # Lock held only for dictionary operations, not during API calls
 
 # 1. Check cache with lock (fast read)
@@ -325,9 +310,10 @@ with self._cache_lock:
 flavors = connection.flavors.list()
 cache_data = [f.id for f in flavors if self._is_flavor_evacuable(f)]
 
-# 3. Update cache with lock (fast write)
+# 3. Update cache with lock (fast write), return local variable
 with self._cache_lock:
     self._evacuable_flavors_cache = cache_data
+return cache_data  # Return local var, not self._evacuable_flavors_cache
 ```
 
 **Implementation**:
@@ -371,7 +357,7 @@ def _try_validate(validator_func: Callable[[], bool], error_msg: str, context: s
         return validator_func()
     except (ValueError, AttributeError, TypeError) as e:
         if log_error:
-            logging.error(f"{error_msg} for {context}: {e}")
+            logging.error("%s for %s: %s", error_msg, context, e)
         return False
 
 VALIDATION_PATTERNS = {
@@ -383,19 +369,33 @@ VALIDATION_PATTERNS = {
 }
 
 def validate_input(value: str, validation_type: str, context: str) -> bool:
-    # Special validation for URLs (block localhost, link-local)
+    # Special validation for URLs (block localhost, link-local via ipaddress module)
     if validation_type == 'url':
         def _validate_url():
             p = urlparse(value)
             if p.scheme not in ['http', 'https'] or not p.netloc:
                 return False
             h = p.hostname
-            if h and (h.lower() in ['localhost', '127.0.0.1', '::1', '0.0.0.0'] or h.startswith('169.254.')):
-                logging.error(f"Blocked localhost/link-local access in {context}")
+            if not h:
                 return False
+            h_lower = h.lower()
+            if h_lower in ['localhost', '0.0.0.0']:
+                return False
+            try:
+                addr = ipaddress.ip_address(h_lower.strip('[]'))
+                if addr.is_loopback or addr.is_link_local:
+                    return False
+            except ValueError:
+                pass  # Not an IP literal (hostname) - allow through
             return True
         return _try_validate(_validate_url, "Invalid URL", context, log_error=False)
-    # ... other validations using _try_validate helper
+
+    # Unknown validation types are rejected (fail-closed)
+    pattern_data = VALIDATION_PATTERNS.get(validation_type)
+    if not pattern_data:
+        logging.error("Unknown validation type '%s' - rejecting input", validation_type)
+        return False
+    # ... pattern-based and list-based validations using _try_validate helper
 ```
 
 ---
@@ -460,7 +460,15 @@ def validate_input(value: str, validation_type: str, context: str) -> bool:
                             │
                             ▼
     ┌──────────────────────────────────────────────────┐
-    │ 6. Sleep (POLL seconds)                          │
+    │ 6. Handle Stale Connections                      │
+    │    - Catch Unauthorized/DiscoveryFailure         │
+    │    - Reconnect via create_connection()           │
+    │    - Continue loop (no crash on token expiry)    │
+    └──────────────────────────────────────────────────┘
+                            │
+                            ▼
+    ┌──────────────────────────────────────────────────┐
+    │ 7. Sleep (POLL seconds)                          │
     └──────────────────────────────────────────────────┘
                             │
                             └──────────────┐
@@ -627,7 +635,7 @@ Checks if at least one `nova-scheduler` service has `state == 'up'`.
 ```python
 can_evacuate, error_msg = _check_critical_services(conn, services, compute_nodes)
 if not can_evacuate:
-    logging.error(f'Cannot evacuate: {error_msg}. Skipping evacuation.')
+    logging.error('Cannot evacuate: %s. Skipping evacuation.', error_msg)
     _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
     return
 ```
@@ -730,7 +738,7 @@ def get_int(self, key: str, default: int = 0,
     try:
         int_value = int(value)
     except (ValueError, TypeError):
-        logging.warning(f"Configuration {key} should be integer, got {type(value).__name__}, using default: {default}")
+        logging.warning("Configuration %s should be integer, got %s, using default: %s", key, type(value).__name__, default)
         return default
 
     # Clamp to min/max bounds
@@ -866,9 +874,9 @@ FENCING_AGENTS = {
 
 def _execute_fence_operation(host, action, fencing_data, service):
     agent = fencing_data.get("agent", "").lower()
-    for agent_key, agent_func in FENCING_AGENTS.items():
-        if agent_key in agent:
-            return agent_func(host, action, fencing_data, service)
+    agent_func = FENCING_AGENTS.get(agent)
+    if agent_func:
+        return agent_func(host, action, fencing_data, service)
     logging.error("Unknown fencing agent: %s", agent)
     return False
 ```
@@ -1041,7 +1049,7 @@ Reserved Hosts: reserved-01 (aggregate-A), reserved-02 (aggregate-B)
 ```python
 threshold_percent = (len(compute_nodes) / len(services)) * 100
 if threshold_percent > service.config.get_threshold():
-    logging.error(f'Impacted ({threshold_percent:.1f}%) exceeds threshold')
+    logging.error('Impacted (%.1f%%) exceeds threshold', threshold_percent)
     return  # Do not evacuate
 ```
 
@@ -1178,8 +1186,8 @@ clouds:
 ### 1. Input Validation
 
 **SSRF Prevention**:
-- URL validation (block localhost, link-local) with specific exception handling
-- IP address validation (IPv4/IPv6)
+- URL validation using `ipaddress` module to block loopback and link-local addresses
+- IP address validation (IPv4/IPv6) via `ipaddress.ip_address()`
 - Port range validation (1-65535)
 
 **Injection Prevention**:
@@ -1296,91 +1304,69 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
 
 ### Test Statistics
 
-- **Total Tests**: 401 (203 unit + 16 security + 29 critical error + 12 workflow + 32 config + 18 helper + 68 functional + 22 integration + 7 region)
-- **Code Coverage**: 71% (unit tests alone), 83% (with all tests)
-- **Execution Time**: ~13 seconds (unit tests), ~26 seconds (all tests)
+- **Total Tests**: 401 across 11 test suites
+- **Execution Time**: ~26 seconds (all tests)
 
 ### Test Categories
 
-**1. Unit Tests** (203 tests):
-The unit test suite in `test_instanceha.py` includes tests for:
+**1. Core Unit Tests** (`test_unit_core.py`):
+Core unit tests covering:
 - Configuration management and validation
 - Service initialization and caching
 - Main function initialization and error handling
 - Evacuation logic and tag checking
 - Smart evacuation with success, failure, and exception path testing
-- Kdump detection and UDP message processing
-- Redfish, IPMI, and BMH fencing operations
 - Thread safety and memory management
 - Security and secret sanitization
-- Input validation and SSRF prevention
 - Reserved host management (aggregate and zone matching)
 - FORCE_ENABLE configuration behavior
 
-**2. Security Validation Tests** (16 tests):
-The security validation test suite in `test_security_validation.py` covers:
-- SSRF prevention (6 tests): URL validation, localhost/link-local blocking
-- Injection prevention (7 tests): Port validation, power action whitelisting, username validation, Kubernetes resource validation
-- Fencing validation (3 tests): Power action validation, parameter validation
+**2. Fencing Agents Tests** (`test_fencing_agents.py`):
+- IPMI fencing operations (power on/off, status, timeouts)
+- Redfish fencing operations (SSL, retries, power state verification)
+- BMH/Metal3 fencing (Kubernetes API, bearer token auth, power-off wait)
+- Noop fencing agent
+- Fencing agent dispatch and validation
 
-**3. Critical Error Path Tests** (29 tests):
-The critical error path test suite in `test_critical_error_paths.py` covers:
-- Configuration errors (7 tests): YAML parsing, missing files, permissions, type validation
-- Nova API exceptions (8 tests): NotFound, Forbidden, Unauthorized, connection failures
-- Service disable validation (4 tests): Missing connection/service, attribute validation
-- Evacuation timeouts (3 tests): Smart evacuation timeout, retry exhaustion
-- Fencing failures (7 tests): Missing configuration, invalid parameters
+**3. Kdump Detection Tests** (`test_kdump_detection.py`):
+- UDP message processing and magic number validation
+- Kdump host timestamp tracking and cleanup
+- Reverse DNS lookup integration
+- Kdump timeout and delay behavior
 
-**4. Evacuation Workflow Tests** (12 tests):
-The evacuation workflow test suite in `test_evacuation_workflow.py` covers:
-- Kdump resume disable logic (3 tests): Already disabled service handling, kdump-fenced host handling, new evacuation handling
-- Post-evacuation recovery error paths (3 tests): Power-on failures, disable reason update failures, unexpected exceptions
-- Process service step failures (6 tests): Fencing, disable, reserved hosts, evacuation, recovery step failures
+**4. Security Validation Tests** (`test_security_validation.py`):
+- SSRF prevention: URL validation, loopback/link-local blocking via `ipaddress` module
+- Injection prevention: Port validation, power action whitelisting, username validation, Kubernetes resource validation
+- Fencing validation: Power action validation, parameter validation
 
-**5. Configuration Feature Tests** (32 tests):
-The configuration feature test suite in `test_config_features.py` covers:
-- DISABLED configuration (2 tests): Skip evacuations when enabled
-- Critical services check (8 tests): Scheduler and conductor validation
-- FORCE_ENABLE configuration (8 tests): Migration completion bypass, kdump delay respect, forced_down two-stage process
-- LEAVE_DISABLED configuration (2 tests): Service filtering for re-enable
-- TAGGED_AGGREGATES configuration (2 tests): Aggregate-based filtering
-- DELAY configuration (4 tests): Pre-evacuation delay validation
-- HASH_INTERVAL configuration (6 tests): Health hash update interval
+**5. Critical Error Path Tests** (`test_critical_error_paths.py`):
+- Configuration errors: YAML parsing, missing files, permissions, type validation
+- Nova API exceptions: NotFound, Forbidden, Unauthorized, connection failures
+- Evacuation timeouts and fencing failures
 
-**6. Helper Functions Tests** (18 tests):
-The helper functions test suite in `test_helper_functions.py` covers:
-- _cleanup_filtered_hosts (4 tests): Host cleanup logic
-- _filter_processing_hosts (5 tests): Processing state filtering
-- _prepare_evacuation_resources (5 tests): Resource preparation
-- _count_evacuable_hosts (4 tests): Evacuable host counting
+**6. Evacuation Workflow Tests** (`test_evacuation_workflow.py`):
+- Kdump resume disable logic and post-evacuation recovery error paths
+- Process service step failures: Fencing, disable, reserved hosts, evacuation, recovery
 
-**7. Functional Tests** (68 tests):
-The functional test suite in `functional_test.py` covers:
-- End-to-end evacuation workflows
-- Large-scale scenarios (100+ hosts)
-- Host state classification and filtering
+**7. Configuration Feature Tests** (`test_config_features.py`):
+- DISABLED, FORCE_ENABLE, LEAVE_DISABLED, TAGGED_AGGREGATES, DELAY, HASH_INTERVAL
+- Critical services check: Scheduler and conductor validation
+
+**8. Helper Functions Tests** (`test_helper_functions.py`):
+- `_cleanup_filtered_hosts`, `_filter_processing_hosts`, `_prepare_evacuation_resources`, `_count_evacuable_hosts`
+
+**9. Functional Tests** (`functional_test.py`):
+- End-to-end evacuation workflows and large-scale scenarios
 - Tagging logic combinations (flavors, images, aggregates)
-- Reserved host management (aggregate/zone matching and forced evacuation)
-- Performance testing
-- Kdump integration workflows
+- Reserved host management and kdump integration workflows
 
-**8. Integration Tests** (22 tests):
-The integration test suite in `integration_test.py` covers:
-- Service initialization workflows
-- Nova connection establishment
-- Service categorization and filtering pipelines
-- Full evacuation workflows with all components
-- Re-enabling workflows with migration checks
-- Performance and scaling under load
-- Error handling and recovery scenarios
+**10. Integration Tests** (`integration_test.py`):
+- Service initialization and Nova connection
+- Full evacuation and re-enabling workflows
+- Performance, scaling, and error recovery
 
-**9. Region Isolation Tests** (7 tests):
-The region isolation test suite in `test_region_isolation.py` covers:
-- Nova client region scoping verification
-- Service list filtering by region
-- Evacuation operation region boundaries
-- Multi-region deployment independence
-- Region name authentication chain validation
+**11. Region Isolation Tests** (`test_region_isolation.py`):
+- Nova client region scoping and multi-region independence
 - Configuration requirement validation
 
 ### Coverage by Component
@@ -2278,16 +2264,18 @@ config:
 ## References
 
 - **Code**: `instanceha.py` (2,872 lines)
-- **Tests**: 401 tests across 9 test files
-  - `test_instanceha.py` (203 unit tests)
-  - `test_security_validation.py` (16 security tests)
-  - `test_critical_error_paths.py` (29 critical error tests)
-  - `test_evacuation_workflow.py` (12 workflow tests)
-  - `test_config_features.py` (32 config tests)
-  - `test_helper_functions.py` (18 helper tests)
-  - `functional_test.py` (68 functional tests)
-  - `integration_test.py` (22 integration tests)
-  - `test_region_isolation.py` (7 region tests)
+- **Tests**: 401 tests across 11 test suites
+  - `test_unit_core.py` (core unit tests)
+  - `test_fencing_agents.py` (fencing agent tests)
+  - `test_kdump_detection.py` (kdump detection tests)
+  - `test_security_validation.py` (security tests)
+  - `test_critical_error_paths.py` (critical error tests)
+  - `test_evacuation_workflow.py` (workflow tests)
+  - `test_config_features.py` (config tests)
+  - `test_helper_functions.py` (helper tests)
+  - `functional_test.py` (functional tests)
+  - `integration_test.py` (integration tests)
+  - `test_region_isolation.py` (region tests)
 - **Documentation**: This file (INSTANCEHA_ARCHITECTURE.md)
 - **OpenStack API**: https://docs.openstack.org/api-ref/compute/
 - **Redfish**: https://www.dmtf.org/standards/redfish
