@@ -6,7 +6,7 @@ InstanceHA is a high-availability service for OpenStack that automatically detec
 
 **Version**: 2.2
 **Code Size**: 2,872 lines
-**Test Suite**: 401 tests across 11 test suites, ~26 seconds execution time
+**Test Suite**: 477 tests across 12 test suites, ~26 seconds execution time
 
 ## Table of Contents
 
@@ -1369,6 +1369,16 @@ Core unit tests covering:
 - Nova client region scoping and multi-region independence
 - Configuration requirement validation
 
+**12. Coverage Gaps Tests** (`test_coverage_gaps.py`):
+- Validation helpers: `_try_validate`, `_validate_fencing_params`, `_validate_fencing_inputs`
+- Fencing agent dispatchers: `_fence_noop`, `_fence_ipmi`, `_fence_redfish`, `_fence_bmh`
+- IPMI execution with retry logic: `_execute_ipmi_fence`
+- Service resume eligibility: `_is_service_resume_candidate`
+- Aggregate filtering: `_aggregate_ids`
+- Traditional evacuation logic: `_traditional_evacuate`
+- Step execution wrapper: `_execute_step`
+- Redfish URL construction edge cases: `_build_redfish_url`
+
 ### Coverage by Component
 
 | Component | Coverage |
@@ -2264,7 +2274,7 @@ config:
 ## References
 
 - **Code**: `instanceha.py` (2,872 lines)
-- **Tests**: 401 tests across 11 test suites
+- **Tests**: 477 tests across 12 test suites
   - `test_unit_core.py` (core unit tests)
   - `test_fencing_agents.py` (fencing agent tests)
   - `test_kdump_detection.py` (kdump detection tests)
@@ -2276,6 +2286,7 @@ config:
   - `functional_test.py` (functional tests)
   - `integration_test.py` (integration tests)
   - `test_region_isolation.py` (region tests)
+  - `test_coverage_gaps.py` (coverage gap tests)
 - **Documentation**: This file (INSTANCEHA_ARCHITECTURE.md)
 - **OpenStack API**: https://docs.openstack.org/api-ref/compute/
 - **Redfish**: https://www.dmtf.org/standards/redfish
