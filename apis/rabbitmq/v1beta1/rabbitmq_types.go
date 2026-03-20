@@ -174,9 +174,10 @@ type RabbitMqSpecCore struct {
 	Replicas *int32 `json:"replicas"`
 
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:default:={limits: {cpu: "2000m", memory: "2Gi"}, requests: {cpu: "1000m", memory: "2Gi"}}
 	// +operator-sdk:csv:customresourcedefinitions:type=spec
 	// Resources - Resource requirements for RabbitMQ containers
-	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+	Resources *corev1.ResourceRequirements `json:"resources"`
 
 	// +kubebuilder:validation:Optional
 	// +operator-sdk:csv:customresourcedefinitions:type=spec

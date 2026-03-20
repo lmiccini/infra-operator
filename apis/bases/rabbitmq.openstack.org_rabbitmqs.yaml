@@ -1593,6 +1593,13 @@ spec:
                 minimum: 0
                 type: integer
               resources:
+                default:
+                  limits:
+                    cpu: 2000m
+                    memory: 2Gi
+                  requests:
+                    cpu: 1000m
+                    memory: 2Gi
                 description: Resources - Resource requirements for RabbitMQ containers
                 properties:
                   claims:
