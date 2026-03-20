@@ -690,16 +690,32 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			}
 		}
 
-		// Label all pods with skipPreStopChecks so the PreStop hook exits
-		// immediately instead of trying to drain the node for up to 600s.
-		// Without this, pods hang for the full terminationGracePeriodSeconds
-		// (default 604800s / 7 days) during storage wipe.
+		// Delete the StatefulSet first to prevent it from recreating pods,
+		// then delete pods with a short grace period so they don't hang for
+		// the full terminationGracePeriodSeconds (default 604800s / 7 days).
+		stsToDelete := &appsv1.StatefulSet{}
+		stsDeleteName := types.NamespacedName{Name: fmt.Sprintf("%s-server", instance.Name), Namespace: instance.Namespace}
+		if err := r.Get(ctx, stsDeleteName, stsToDelete); err != nil {
+			if !k8s_errors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+			Log.Info("StatefulSet already deleted", "name", stsDeleteName.Name)
+		} else {
+			if err := r.Delete(ctx, stsToDelete); err != nil && !k8s_errors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+			Log.Info("Deleted StatefulSet for storage wipe", "name", stsDeleteName.Name)
+		}
+
+		// Label pods with skipPreStopChecks so the PreStop hook exits immediately,
+		// then re-delete them with a short grace period to override the long
+		// terminationGracePeriodSeconds inherited from the StatefulSet.
 		podList := &corev1.PodList{}
 		if err := r.List(ctx, podList,
 			client.InNamespace(instance.Namespace),
 			client.MatchingLabels{labels.K8sAppName: instance.Name},
 		); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to list pods for skipPreStopChecks: %w", err)
+			return ctrl.Result{}, fmt.Errorf("failed to list pods: %w", err)
 		}
 		for i := range podList.Items {
 			pod := &podList.Items[i]
@@ -715,21 +731,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 					Log.Info("Set skipPreStopChecks label on pod", "pod", pod.Name)
 				}
 			}
-		}
-
-		// Delete the StatefulSet
-		stsToDelete := &appsv1.StatefulSet{}
-		stsDeleteName := types.NamespacedName{Name: fmt.Sprintf("%s-server", instance.Name), Namespace: instance.Namespace}
-		if err := r.Get(ctx, stsDeleteName, stsToDelete); err != nil {
-			if !k8s_errors.IsNotFound(err) {
-				return ctrl.Result{}, err
+			// Re-delete the pod with a short grace period to override the
+			// original long terminationGracePeriodSeconds from the StatefulSet.
+			if err := r.Delete(ctx, pod, client.GracePeriodSeconds(30)); err != nil {
+				if !k8s_errors.IsNotFound(err) {
+					Log.Error(err, "Failed to delete pod with short grace period", "pod", pod.Name)
+				}
+			} else {
+				Log.Info("Deleted pod with 30s grace period", "pod", pod.Name)
 			}
-			Log.Info("StatefulSet already deleted", "name", stsDeleteName.Name)
-		} else {
-			if err := r.Delete(ctx, stsToDelete); err != nil && !k8s_errors.IsNotFound(err) {
-				return ctrl.Result{}, err
-			}
-			Log.Info("Deleted StatefulSet for storage wipe", "name", stsDeleteName.Name)
 		}
 
 		// Set ProxyRequired NOW so the recreated StatefulSet includes the proxy
@@ -1212,9 +1222,10 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1be
 	Log := r.GetLogger(ctx)
 	Log.Info("Reconciling Service delete")
 
-	// Label all pods with skipPreStopChecks so they terminate quickly.
-	// Without this, the PreStop hook tries to drain the node (up to 600s per step)
-	// and the 604800s terminationGracePeriodSeconds keeps pods alive for days.
+	// Delete all pods with a short grace period so they don't hang for the full
+	// terminationGracePeriodSeconds (default 604800s / 7 days) during deletion.
+	// We first label them with skipPreStopChecks so the PreStop hook exits
+	// immediately, then delete with a 30s grace period for a clean SIGTERM shutdown.
 	podList := &corev1.PodList{}
 	if err := r.List(ctx, podList,
 		client.InNamespace(instance.Namespace),
@@ -1232,6 +1243,15 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1be
 				} else {
 					Log.Info("Set skipPreStopChecks label on pod for clean shutdown", "pod", pod.Name)
 				}
+			}
+			// Re-delete the pod with a short grace period to override the
+			// original long terminationGracePeriodSeconds from the StatefulSet.
+			if err := r.Delete(ctx, pod, client.GracePeriodSeconds(30)); err != nil {
+				if !k8s_errors.IsNotFound(err) {
+					Log.Error(err, "Failed to delete pod with short grace period", "pod", pod.Name)
+				}
+			} else {
+				Log.Info("Deleted pod with 30s grace period", "pod", pod.Name)
 			}
 		}
 	}
