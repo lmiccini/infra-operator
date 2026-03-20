@@ -692,7 +692,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 
 		// Delete the StatefulSet first to prevent it from recreating pods,
 		// then delete pods with a short grace period so they don't hang for
-		// the full terminationGracePeriodSeconds (default 604800s / 7 days).
+		// the full terminationGracePeriodSeconds (default 60s).
 		stsToDelete := &appsv1.StatefulSet{}
 		stsDeleteName := types.NamespacedName{Name: fmt.Sprintf("%s-server", instance.Name), Namespace: instance.Namespace}
 		if err := r.Get(ctx, stsDeleteName, stsToDelete); err != nil {
@@ -1223,7 +1223,7 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1be
 	Log.Info("Reconciling Service delete")
 
 	// Delete all pods with a short grace period so they don't hang for the full
-	// terminationGracePeriodSeconds (default 604800s / 7 days) during deletion.
+	// terminationGracePeriodSeconds (default 60s) during deletion.
 	// We first label them with skipPreStopChecks so the PreStop hook exits
 	// immediately, then delete with a 30s grace period for a clean SIGTERM shutdown.
 	podList := &corev1.PodList{}

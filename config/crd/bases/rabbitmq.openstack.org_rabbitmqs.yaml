@@ -1752,7 +1752,7 @@ spec:
                 pattern: ^\d+\.\d+(\.\d+)?$
                 type: string
               terminationGracePeriodSeconds:
-                default: 604800
+                default: 60
                 description: TerminationGracePeriodSeconds - Timeout for graceful
                   pod termination
                 format: int64

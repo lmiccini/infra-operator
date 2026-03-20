@@ -232,7 +232,7 @@ type RabbitMqSpecCore struct {
 
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Minimum:=0
-	// +kubebuilder:default:=604800
+	// +kubebuilder:default:=60
 	// +operator-sdk:csv:customresourcedefinitions:type=spec
 	// TerminationGracePeriodSeconds - Timeout for graceful pod termination
 	TerminationGracePeriodSeconds *int64 `json:"terminationGracePeriodSeconds"`

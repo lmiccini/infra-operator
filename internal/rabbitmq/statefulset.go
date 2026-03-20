@@ -71,7 +71,7 @@ func StatefulSet(
 		Ports:          buildContainerPorts(r),
 		VolumeMounts:   getVolumeMounts(r, proxy.IPv6Enabled),
 		ReadinessProbe: readinessProbe,
-		Lifecycle:      buildLifecycle(),
+		Lifecycle:      buildLifecycle(r),
 	}
 
 	// When proxy is enabled, RabbitMQ listens on localhost only (backend port).
@@ -392,16 +392,22 @@ func buildReadinessProbe(r *rabbitmqv1.RabbitMq) *corev1.Probe {
 	}
 }
 
-// buildLifecycle builds the lifecycle hooks for graceful shutdown
-// matching the old rabbitmq-cluster-operator's preStop hook
-func buildLifecycle() *corev1.Lifecycle {
+// buildLifecycle builds the lifecycle hooks for graceful shutdown.
+// For multi-replica clusters, the PreStop hook waits for quorum safety
+// before draining. For single-replica clusters, quorum checks are
+// skipped since there are no other nodes to maintain quorum.
+func buildLifecycle(r *rabbitmqv1.RabbitMq) *corev1.Lifecycle {
+	preStopCmd := `if [ ! -z "$(cat /etc/pod-info/skipPreStopChecks)" ]; then exit 0; fi; rabbitmq-upgrade await_online_quorum_plus_one -t 600 && rabbitmq-upgrade await_online_synchronized_mirror -t 600 || true && rabbitmq-upgrade drain -t 600`
+	if r.Spec.Replicas != nil && *r.Spec.Replicas <= 1 {
+		preStopCmd = `if [ ! -z "$(cat /etc/pod-info/skipPreStopChecks)" ]; then exit 0; fi; rabbitmq-upgrade drain -t 600`
+	}
 	return &corev1.Lifecycle{
 		PreStop: &corev1.LifecycleHandler{
 			Exec: &corev1.ExecAction{
 				Command: []string{
 					"/bin/bash",
 					"-c",
-					`if [ ! -z "$(cat /etc/pod-info/skipPreStopChecks)" ]; then exit 0; fi; rabbitmq-upgrade await_online_quorum_plus_one -t 600 && rabbitmq-upgrade await_online_synchronized_mirror -t 600 || true && rabbitmq-upgrade drain -t 600`,
+					preStopCmd,
 				},
 			},
 		},
