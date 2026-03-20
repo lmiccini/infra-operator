@@ -127,11 +127,10 @@ func buildOperatorDefaults(r *rabbitmqv1.RabbitMq, IPv6Enabled bool, configVersi
 	config = append(config, "log.console                                = true")
 	config = append(config, "log.console.level                          = info")
 
-	// Configure node-wide default queue type and migration settings (RabbitMQ 4.x only)
-	if r.Spec.QueueType != nil && *r.Spec.QueueType == rabbitmqv1.QueueTypeQuorum && IsVersion4OrLater(configVersion) {
+	// During migration (proxy active), relax quorum queue redeclaration checks so
+	// clients that redeclare queues with classic-queue properties don't get errors.
+	if proxyEnabled && IsVersion4OrLater(configVersion) {
 		config = append(config,
-			"default_queue_type                         = quorum",
-			"deprecated_features.permit.classic_queue_mirroring = false",
 			"quorum_queue.property_equivalence.relaxed_checks_on_redeclaration = true",
 		)
 	}

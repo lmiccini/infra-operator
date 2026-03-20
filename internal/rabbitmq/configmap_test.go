@@ -25,7 +25,7 @@ import (
 	"k8s.io/utils/ptr"
 )
 
-func TestGenerateServerConfigMap_QuorumSettings_4x(t *testing.T) {
+func TestGenerateServerConfigMap_RelaxedChecks_DuringMigration(t *testing.T) {
 	r := &rabbitmqv1.RabbitMq{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-mq", Namespace: "test-ns"},
 		Spec: rabbitmqv1.RabbitMqSpec{
@@ -36,21 +36,24 @@ func TestGenerateServerConfigMap_QuorumSettings_4x(t *testing.T) {
 		},
 	}
 
-	cm := GenerateServerConfigMap(r, false, false, "4.2", false)
+	// With proxy enabled (migration in progress), relaxed checks should be set
+	cm := GenerateServerConfigMap(r, false, false, "4.2", true)
 	defaults := cm.Data["operatorDefaults.conf"]
 
-	if !strings.Contains(defaults, "default_queue_type                         = quorum") {
-		t.Error("4.x with Quorum should set default_queue_type = quorum")
-	}
-	if !strings.Contains(defaults, "deprecated_features.permit.classic_queue_mirroring = false") {
-		t.Error("4.x with Quorum should disable classic queue mirroring")
-	}
 	if !strings.Contains(defaults, "quorum_queue.property_equivalence.relaxed_checks_on_redeclaration = true") {
-		t.Error("4.x with Quorum should enable relaxed checks")
+		t.Error("4.x with proxy enabled should enable relaxed checks")
+	}
+
+	// Without proxy (no migration), relaxed checks should NOT be set
+	cmNoProxy := GenerateServerConfigMap(r, false, false, "4.2", false)
+	defaultsNoProxy := cmNoProxy.Data["operatorDefaults.conf"]
+
+	if strings.Contains(defaultsNoProxy, "relaxed_checks_on_redeclaration") {
+		t.Error("4.x without proxy should not set relaxed checks")
 	}
 }
 
-func TestGenerateServerConfigMap_QuorumSettings_3x(t *testing.T) {
+func TestGenerateServerConfigMap_RelaxedChecks_3x(t *testing.T) {
 	r := &rabbitmqv1.RabbitMq{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-mq", Namespace: "test-ns"},
 		Spec: rabbitmqv1.RabbitMqSpec{
@@ -61,15 +64,12 @@ func TestGenerateServerConfigMap_QuorumSettings_3x(t *testing.T) {
 		},
 	}
 
-	cm := GenerateServerConfigMap(r, false, false, "3.9", false)
+	// 3.x should NOT include relaxed checks even with proxy enabled
+	cm := GenerateServerConfigMap(r, false, false, "3.9", true)
 	defaults := cm.Data["operatorDefaults.conf"]
 
-	// 3.x should NOT include quorum queue defaults even if QueueType is Quorum
-	if strings.Contains(defaults, "default_queue_type") {
-		t.Error("3.x should not set default_queue_type")
-	}
-	if strings.Contains(defaults, "deprecated_features") {
-		t.Error("3.x should not set deprecated_features")
+	if strings.Contains(defaults, "relaxed_checks_on_redeclaration") {
+		t.Error("3.x should not set relaxed checks")
 	}
 }
 

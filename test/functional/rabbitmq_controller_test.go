@@ -1661,13 +1661,13 @@ var _ = Describe("RabbitMQ Controller", func() {
 				serverCm := th.GetConfigMap(serverCfgMapName)
 				defaults := serverCm.Data["operatorDefaults.conf"]
 
-				// Mirrored queues should NOT set quorum defaults
-				g.Expect(defaults).NotTo(ContainSubstring("default_queue_type                         = quorum"))
+				// Mirrored queues (no migration) should NOT set migration-only settings
+				g.Expect(defaults).NotTo(ContainSubstring("relaxed_checks_on_redeclaration"))
 			}, timeout, interval).Should(Succeed())
 		})
 	})
 
-	When("RabbitMQ 4.x is created with Quorum queue type", func() {
+	When("RabbitMQ 4.x is created with Quorum queue type (fresh cluster)", func() {
 		BeforeEach(func() {
 			spec := GetDefaultRabbitMQSpec()
 			spec["targetVersion"] = "4.2"
@@ -1675,7 +1675,7 @@ var _ = Describe("RabbitMQ Controller", func() {
 			DeferCleanup(th.DeleteInstance, rabbitmq)
 		})
 
-		It("should include quorum queue defaults in server config", func() {
+		It("should NOT include migration-only settings in server config", func() {
 			SimulateRabbitMQClusterReady(rabbitmqName)
 			Eventually(func(g Gomega) {
 				serverCfgMapName := types.NamespacedName{
@@ -1685,9 +1685,8 @@ var _ = Describe("RabbitMQ Controller", func() {
 				serverCm := th.GetConfigMap(serverCfgMapName)
 				defaults := serverCm.Data["operatorDefaults.conf"]
 
-				g.Expect(defaults).To(ContainSubstring("default_queue_type                         = quorum"))
-				g.Expect(defaults).To(ContainSubstring("deprecated_features.permit.classic_queue_mirroring = false"))
-				g.Expect(defaults).To(ContainSubstring("quorum_queue.property_equivalence.relaxed_checks_on_redeclaration = true"))
+				// Fresh 4.x cluster should not have migration-only relaxed checks
+				g.Expect(defaults).NotTo(ContainSubstring("relaxed_checks_on_redeclaration"))
 			}, timeout, interval).Should(Succeed())
 		})
 	})
