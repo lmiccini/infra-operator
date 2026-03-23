@@ -485,6 +485,49 @@ var _ = Describe("RabbitMQ Controller", func() {
 		})
 	})
 
+	When("RabbitMQ gets created with a service override and explicit ClusterIP service type", func() {
+		BeforeEach(func() {
+			spec := GetDefaultRabbitMQSpec()
+			// Simulate the real-world scenario where the managing operator sets
+			// service.type: ClusterIP explicitly while the old override still has LoadBalancer
+			spec["service"] = map[string]any{
+				"type": "ClusterIP",
+			}
+			spec["override"] = map[string]any{
+				"service": map[string]any{
+					"metadata": map[string]any{
+						"annotations": map[string]any{
+							"metallb.universe.tf/address-pool":    "internalapi",
+							"metallb.universe.tf/loadBalancerIPs": "192.0.2.1",
+						},
+					},
+					"spec": map[string]any{
+						"type": "LoadBalancer",
+					},
+				},
+			}
+			rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+			DeferCleanup(th.DeleteInstance, rabbitmq)
+		})
+
+		It("should migrate override service type to LoadBalancer even when service.type is ClusterIP", func() {
+			SimulateRabbitMQClusterReady(rabbitmqName)
+			Eventually(func(g Gomega) {
+				cluster := GetRabbitMQCluster(rabbitmqName)
+				g.Expect(cluster.Spec.Service.Type).To(Equal(corev1.ServiceTypeLoadBalancer))
+
+				svcName := types.NamespacedName{
+					Name:      rabbitmqDefaultName,
+					Namespace: namespace,
+				}
+				svc := &corev1.Service{}
+				err := th.K8sClient.Get(th.Ctx, svcName, svc)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeLoadBalancer))
+			}, timeout, interval).Should(Succeed())
+		})
+	})
+
 	When("RabbitMQ per-pod services with 1 IP specified", func() {
 		BeforeEach(func() {
 			spec := GetDefaultRabbitMQSpec()

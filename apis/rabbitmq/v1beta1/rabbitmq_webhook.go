@@ -154,8 +154,11 @@ func (spec *RabbitMqSpecCore) Default(isNew bool) {
 
 	// Migrate from old override.service format to new service field
 	if spec.Override != nil && spec.Override.Service != nil {
-		// Migrate service type
-		if spec.Service.Type == "" && spec.Override.Service.Spec != nil && spec.Override.Service.Spec.Type != "" {
+		// Migrate service type - always prefer the deprecated override value
+		// when it's set, since it represents the user's intent from the old API.
+		// The new service.type field may have been set to a default (e.g. ClusterIP)
+		// by the managing operator, which would incorrectly block migration.
+		if spec.Override.Service.Spec != nil && spec.Override.Service.Spec.Type != "" {
 			spec.Service.Type = spec.Override.Service.Spec.Type
 		}
 		// Migrate service annotations
