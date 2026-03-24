@@ -2021,4 +2021,157 @@ var _ = Describe("RabbitMQ Controller", func() {
 			}, timeout, interval).Should(BeTrue())
 		})
 	})
+
+	When("RabbitMQ gets created with custom config", func() {
+		BeforeEach(func() {
+			spec := GetDefaultRabbitMQSpec()
+			spec["config"] = map[string]any{
+				"additionalConfig": "vm_memory_high_watermark.relative = 0.4\nchannel_max = 2000\n",
+				"advancedConfig":   "[{rabbit, [{log, [{console, [{level, warning}]}]}]}].\n",
+				"envConfig":        "RABBITMQ_IO_THREAD_POOL_SIZE=128\n",
+				"additionalPlugins": []string{
+					"rabbitmq_shovel",
+					"rabbitmq_federation",
+				},
+			}
+			rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+			DeferCleanup(th.DeleteInstance, rabbitmq)
+		})
+
+		It("should include additionalConfig in the server-conf ConfigMap", func() {
+			SimulateRabbitMQClusterReady(rabbitmqName)
+			Eventually(func(g Gomega) {
+				serverCfgMapName := types.NamespacedName{
+					Name:      fmt.Sprintf("%s-server-conf", rabbitmqName.Name),
+					Namespace: rabbitmqName.Namespace,
+				}
+				serverCm := th.GetConfigMap(serverCfgMapName)
+				userConfig := serverCm.Data["userDefinedConfiguration.conf"]
+				g.Expect(userConfig).To(ContainSubstring("vm_memory_high_watermark.relative = 0.4"))
+				g.Expect(userConfig).To(ContainSubstring("channel_max = 2000"))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should use user-provided advancedConfig in the server-conf ConfigMap", func() {
+			SimulateRabbitMQClusterReady(rabbitmqName)
+			Eventually(func(g Gomega) {
+				serverCfgMapName := types.NamespacedName{
+					Name:      fmt.Sprintf("%s-server-conf", rabbitmqName.Name),
+					Namespace: rabbitmqName.Namespace,
+				}
+				serverCm := th.GetConfigMap(serverCfgMapName)
+				advancedConfig := serverCm.Data["advanced.config"]
+				g.Expect(advancedConfig).To(ContainSubstring("{rabbit, [{log, [{console, [{level, warning}]}]}]}"))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should include envConfig in the server-conf ConfigMap", func() {
+			SimulateRabbitMQClusterReady(rabbitmqName)
+			Eventually(func(g Gomega) {
+				serverCfgMapName := types.NamespacedName{
+					Name:      fmt.Sprintf("%s-server-conf", rabbitmqName.Name),
+					Namespace: rabbitmqName.Namespace,
+				}
+				serverCm := th.GetConfigMap(serverCfgMapName)
+				envConfig, ok := serverCm.Data["rabbitmq-env.conf"]
+				g.Expect(ok).To(BeTrue(), "rabbitmq-env.conf should be present")
+				g.Expect(envConfig).To(ContainSubstring("RABBITMQ_IO_THREAD_POOL_SIZE=128"))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should include additional plugins in the plugins-conf ConfigMap", func() {
+			SimulateRabbitMQClusterReady(rabbitmqName)
+			Eventually(func(g Gomega) {
+				pluginsCfgMapName := types.NamespacedName{
+					Name:      fmt.Sprintf("%s-plugins-conf", rabbitmqName.Name),
+					Namespace: rabbitmqName.Namespace,
+				}
+				pluginsCm := th.GetConfigMap(pluginsCfgMapName)
+				enabledPlugins := pluginsCm.Data["enabled_plugins"]
+				g.Expect(enabledPlugins).To(ContainSubstring("rabbitmq_shovel"))
+				g.Expect(enabledPlugins).To(ContainSubstring("rabbitmq_federation"))
+				// Default plugins should still be present
+				g.Expect(enabledPlugins).To(ContainSubstring("rabbitmq_management"))
+				g.Expect(enabledPlugins).To(ContainSubstring("rabbitmq_prometheus"))
+			}, timeout, interval).Should(Succeed())
+		})
+	})
+
+	When("RabbitMQ gets created with a pre-existing default user secret", func() {
+		BeforeEach(func() {
+			secretName := types.NamespacedName{
+				Name:      fmt.Sprintf("%s-default-user", rabbitmqName.Name),
+				Namespace: rabbitmqName.Namespace,
+			}
+			th.CreateSecret(secretName, map[string][]byte{
+				"username":          []byte("myuser"),
+				"password":          []byte("mypassword"),
+				"default_user.conf": []byte("default_user = myuser\ndefault_pass = mypassword\ndefault_user_tags.administrator = true\n"),
+			})
+			DeferCleanup(th.DeleteSecret, secretName)
+
+			spec := GetDefaultRabbitMQSpec()
+			rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+			DeferCleanup(th.DeleteInstance, rabbitmq)
+		})
+
+		// simulateSTSReady marks the StatefulSet as ready without touching the
+		// default-user secret (unlike SimulateRabbitMQClusterReady which overwrites it).
+		simulateSTSReady := func() {
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				stsName := types.NamespacedName{
+					Name:      rabbitmqName.Name + "-server",
+					Namespace: rabbitmqName.Namespace,
+				}
+				err := th.K8sClient.Get(th.Ctx, stsName, sts)
+				g.Expect(err).ShouldNot(HaveOccurred())
+				sts.Status.ReadyReplicas = 1
+				sts.Status.Replicas = 1
+				sts.Status.CurrentReplicas = 1
+				sts.Status.UpdatedReplicas = 1
+				sts.Status.ObservedGeneration = sts.Generation
+				g.Expect(th.K8sClient.Status().Update(th.Ctx, sts)).Should(Succeed())
+			}, timeout, interval).Should(Succeed())
+		}
+
+		It("should preserve the pre-created username and password", func() {
+			simulateSTSReady()
+			Eventually(func(g Gomega) {
+				secretName := types.NamespacedName{
+					Name:      fmt.Sprintf("%s-default-user", rabbitmqName.Name),
+					Namespace: rabbitmqName.Namespace,
+				}
+				secret := th.GetSecret(secretName)
+				g.Expect(string(secret.Data["username"])).To(Equal("myuser"))
+				g.Expect(string(secret.Data["password"])).To(Equal("mypassword"))
+				g.Expect(string(secret.Data["default_user.conf"])).To(ContainSubstring("default_user = myuser"))
+				g.Expect(string(secret.Data["default_user.conf"])).To(ContainSubstring("default_pass = mypassword"))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should update host and port in the pre-created secret", func() {
+			simulateSTSReady()
+			Eventually(func(g Gomega) {
+				secretName := types.NamespacedName{
+					Name:      fmt.Sprintf("%s-default-user", rabbitmqName.Name),
+					Namespace: rabbitmqName.Namespace,
+				}
+				secret := th.GetSecret(secretName)
+				g.Expect(string(secret.Data["host"])).To(ContainSubstring(rabbitmqName.Name))
+				g.Expect(string(secret.Data["port"])).To(Equal("5672"))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should reference the secret in the RabbitMq status", func() {
+			simulateSTSReady()
+			Eventually(func(g Gomega) {
+				instance := GetRabbitMQ(rabbitmqName)
+				g.Expect(instance.Status.DefaultUser).NotTo(BeNil())
+				g.Expect(instance.Status.DefaultUser.SecretReference).NotTo(BeNil())
+				g.Expect(instance.Status.DefaultUser.SecretReference.Name).To(
+					Equal(fmt.Sprintf("%s-default-user", rabbitmqName.Name)))
+			}, timeout, interval).Should(Succeed())
+		})
+	})
 })

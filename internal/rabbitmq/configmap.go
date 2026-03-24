@@ -138,7 +138,7 @@ func buildOperatorDefaults(r *rabbitmqv1.RabbitMq, IPv6Enabled bool, configVersi
 	// Prometheus and management bind address
 	config = append(config, "prometheus.tcp.ip                          = ::")
 	config = append(config, "management.tcp.ip                          = ::")
-	config = append(config, "vm_memory_high_watermark.relative           = 0.8")
+	config = append(config, "vm_memory_high_watermark.relative           = 0.6")
 
 	// Proxy mode: RabbitMQ listens on localhost only, proxy handles client connections.
 	// The plain TCP backend listener on localhost is always required so the proxy
