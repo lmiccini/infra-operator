@@ -1,5 +1,5 @@
 #
-# Step 2: Assert username rotation: nova removed, glance created
+# Step 2: Assert rotation started: glance user ready, nova user still exists but finalizer removed
 #
 apiVersion: kuttl.dev/v1beta1
 kind: TestAssert
@@ -40,12 +40,17 @@ commands:
       echo "PASS: User 'glance' exists in RabbitMQ"
   - script: |
       set -e
-      # Verify old user was deleted from RabbitMQ
-      POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-cred-rot -o jsonpath='{.items[0].metadata.name}')
-      USERS=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_users)
-      if echo "$USERS" | grep -q "nova"; then
-        echo "FAIL: Old user 'nova' still exists in RabbitMQ"
-        echo "Users: $USERS"
+      # Old user CR should still exist (blocked by cleanup-blocked finalizer)
+      # but TransportURL finalizer should have been removed by the controller
+      FINALIZERS=$(oc get rabbitmquser -n $NAMESPACE cred-rot-url-nova-user -o jsonpath='{.metadata.finalizers}')
+      if echo "$FINALIZERS" | grep -q "transporturl.rabbitmq.openstack.org/finalizer"; then
+        echo "FAIL: TransportURL finalizer still present on old user"
+        echo "Finalizers: $FINALIZERS"
         exit 1
       fi
-      echo "PASS: Old user 'nova' was deleted from RabbitMQ"
+      if ! echo "$FINALIZERS" | grep -q "rabbitmq.openstack.org/cleanup-blocked"; then
+        echo "FAIL: cleanup-blocked finalizer missing from old user"
+        echo "Finalizers: $FINALIZERS"
+        exit 1
+      fi
+      echo "PASS: Old user has cleanup-blocked finalizer, TransportURL finalizer removed"
