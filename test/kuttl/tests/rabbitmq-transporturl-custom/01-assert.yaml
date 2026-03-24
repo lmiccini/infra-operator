@@ -36,8 +36,8 @@ commands:
       set -e
       # Verify the user exists in RabbitMQ
       POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-url-custom -o jsonpath='{.items[0].metadata.name}')
-      USERS=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_users --formatter json)
-      if ! echo "$USERS" | grep -q '"nova"'; then
+      USERS=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_users)
+      if ! echo "$USERS" | grep -q "nova"; then
         echo "FAIL: User 'nova' not found in RabbitMQ"
         echo "Users: $USERS"
         exit 1
@@ -47,8 +47,8 @@ commands:
       set -e
       # Verify the vhost exists in RabbitMQ
       POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-url-custom -o jsonpath='{.items[0].metadata.name}')
-      VHOSTS=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_vhosts --formatter json)
-      if ! echo "$VHOSTS" | grep -q '"nova-vhost"'; then
+      VHOSTS=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_vhosts)
+      if ! echo "$VHOSTS" | grep -q "nova-vhost"; then
         echo "FAIL: Vhost 'nova-vhost' not found in RabbitMQ"
         echo "Vhosts: $VHOSTS"
         exit 1
@@ -58,8 +58,8 @@ commands:
       set -e
       # Verify the user has permissions on the vhost
       POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-url-custom -o jsonpath='{.items[0].metadata.name}')
-      PERMS=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_permissions -p nova-vhost --formatter json)
-      if ! echo "$PERMS" | grep -q '"nova"'; then
+      PERMS=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_permissions -p nova-vhost)
+      if ! echo "$PERMS" | grep -q "nova"; then
         echo "FAIL: User 'nova' has no permissions on vhost 'nova-vhost'"
         echo "Permissions: $PERMS"
         exit 1

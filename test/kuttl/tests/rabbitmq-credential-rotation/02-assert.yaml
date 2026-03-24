@@ -31,8 +31,8 @@ commands:
       set -e
       # Verify new user exists in RabbitMQ
       POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-cred-rot -o jsonpath='{.items[0].metadata.name}')
-      USERS=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_users --formatter json)
-      if ! echo "$USERS" | grep -q '"glance"'; then
+      USERS=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_users)
+      if ! echo "$USERS" | grep -q "glance"; then
         echo "FAIL: User 'glance' not found in RabbitMQ"
         echo "Users: $USERS"
         exit 1
@@ -42,8 +42,8 @@ commands:
       set -e
       # Verify old user was deleted from RabbitMQ
       POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-cred-rot -o jsonpath='{.items[0].metadata.name}')
-      USERS=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_users --formatter json)
-      if echo "$USERS" | grep -q '"nova"'; then
+      USERS=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_users)
+      if echo "$USERS" | grep -q "nova"; then
         echo "FAIL: Old user 'nova' still exists in RabbitMQ"
         echo "Users: $USERS"
         exit 1
