@@ -7,3 +7,7 @@ commands:
     oc delete rabbitmqvhost -n $NAMESPACE -l app.kubernetes.io/managed-by=transporturl --ignore-not-found
     oc delete rabbitmq.rabbitmq.openstack.org rabbitmq-cred-rot -n $NAMESPACE --ignore-not-found
     oc delete pvc -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-cred-rot --ignore-not-found
+    # Clean up Released PVs to avoid stale data on re-runs
+    for pv in $(oc get pv -o jsonpath='{range .items[?(@.spec.claimRef.namespace=="'$NAMESPACE'")]}{.metadata.name}{" "}{.spec.claimRef.name}{"\n"}{end}' | grep rabbitmq-cred-rot | awk '{print $1}'); do
+      oc delete pv "$pv" --ignore-not-found
+    done

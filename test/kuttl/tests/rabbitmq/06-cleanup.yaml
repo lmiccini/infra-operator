@@ -16,3 +16,10 @@ delete:
 - apiVersion: rabbitmq.openstack.org/v1beta1
   kind: RabbitMq
   name: rabbitmq
+commands:
+- script: |
+    oc delete pvc -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq --ignore-not-found
+    # Clean up Released PVs to avoid stale data on re-runs
+    for pv in $(oc get pv -o jsonpath='{range .items[?(@.spec.claimRef.namespace=="'$NAMESPACE'")]}{.metadata.name}{" "}{.spec.claimRef.name}{"\n"}{end}' | grep 'persistence-rabbitmq-server-' | awk '{print $1}'); do
+      oc delete pv "$pv" --ignore-not-found
+    done

@@ -5,4 +5,7 @@ commands:
     oc delete transporturl tls-transporturl -n $NAMESPACE --ignore-not-found
     oc delete rabbitmq.rabbitmq.openstack.org rabbitmq-tls-url -n $NAMESPACE --ignore-not-found
     oc delete pvc -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-tls-url --ignore-not-found
+    for pv in $(oc get pv -o jsonpath='{range .items[?(@.spec.claimRef.namespace=="'$NAMESPACE'")]}{.metadata.name}{" "}{.spec.claimRef.name}{"\n"}{end}' | grep rabbitmq-tls-url | awk '{print $1}'); do
+      oc delete pv "$pv" --ignore-not-found
+    done
     oc delete secret rabbitmq-tls-url-cert rabbitmq-tls-url-ca -n $NAMESPACE --ignore-not-found
