@@ -2097,6 +2097,50 @@ var _ = Describe("RabbitMQ Controller", func() {
 		})
 	})
 
+	When("TLS secret is rotated, config hash changes to trigger rolling restart", func() {
+		var certSecret *corev1.Secret
+
+		BeforeEach(func() {
+			certSecret = CreateCertSecret(rabbitmqName)
+			DeferCleanup(th.DeleteSecret, types.NamespacedName{Name: certSecret.Name, Namespace: namespace})
+			spec := GetDefaultRabbitMQSpec()
+			spec["tls"] = map[string]any{
+				"secretName": certSecret.Name,
+			}
+			rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+			DeferCleanup(th.DeleteInstance, rabbitmq)
+		})
+
+		It("should update the config-hash annotation on the StatefulSet when TLS secret changes", func() {
+			SimulateRabbitMQClusterReady(rabbitmqName)
+
+			// Get initial config-hash from the StatefulSet
+			var initialHash string
+			Eventually(func(g Gomega) {
+				sts := GetRabbitMQStatefulSet(rabbitmqName)
+				initialHash = sts.Spec.Template.Annotations["config-hash"]
+				g.Expect(initialHash).NotTo(BeEmpty(), "config-hash annotation should be set")
+			}, timeout, interval).Should(Succeed())
+
+			// Update TLS secret data to simulate certificate rotation
+			Eventually(func(g Gomega) {
+				secret := &corev1.Secret{}
+				secretName := types.NamespacedName{Name: certSecret.Name, Namespace: namespace}
+				g.Expect(th.K8sClient.Get(th.Ctx, secretName, secret)).Should(Succeed())
+				secret.Data["tls.crt"] = []byte("rotated-cert-data")
+				g.Expect(th.K8sClient.Update(th.Ctx, secret)).Should(Succeed())
+			}, timeout, interval).Should(Succeed())
+
+			// Verify config-hash changed on the StatefulSet (triggers rolling restart)
+			Eventually(func(g Gomega) {
+				sts := GetRabbitMQStatefulSet(rabbitmqName)
+				newHash := sts.Spec.Template.Annotations["config-hash"]
+				g.Expect(newHash).NotTo(BeEmpty())
+				g.Expect(newHash).NotTo(Equal(initialHash), "config-hash should change when TLS secret is rotated")
+			}, timeout, interval).Should(Succeed())
+		})
+	})
+
 	When("RabbitMQ gets created with a pre-existing default user secret", func() {
 		BeforeEach(func() {
 			secretName := types.NamespacedName{

@@ -1,0 +1,50 @@
+#
+# Step 1: Assert TransportURL is ready and user "nova" is created
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 120
+commands:
+  - script: |
+      set -e
+      READY=$(oc get transporturl -n $NAMESPACE cred-rot-url -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: TransportURL not ready, status: $READY"
+        oc get transporturl -n $NAMESPACE cred-rot-url -o yaml
+        exit 1
+      fi
+      echo "PASS: TransportURL is ready"
+  - script: |
+      set -e
+      # Verify the transport URL secret contains nova username
+      URL=$(oc get secret -n $NAMESPACE rabbitmq-transport-url-cred-rot-url -o jsonpath='{.data.transport_url}' | base64 -d)
+      if ! echo "$URL" | grep -q "nova:"; then
+        echo "FAIL: Transport URL does not contain 'nova' username: $URL"
+        exit 1
+      fi
+      echo "PASS: Transport URL contains nova username"
+  - script: |
+      set -e
+      # Verify the RabbitMQUser was created
+      READY=$(oc get rabbitmquser -n $NAMESPACE cred-rot-url-user -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: RabbitMQUser not ready"
+        exit 1
+      fi
+      USERNAME=$(oc get rabbitmquser -n $NAMESPACE cred-rot-url-user -o jsonpath='{.status.username}')
+      if [ "$USERNAME" != "nova" ]; then
+        echo "FAIL: Expected username 'nova', got: '$USERNAME'"
+        exit 1
+      fi
+      echo "PASS: RabbitMQUser nova is ready"
+  - script: |
+      set -e
+      # Verify user exists in RabbitMQ
+      POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-cred-rot -o jsonpath='{.items[0].metadata.name}')
+      USERS=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_users --formatter json)
+      if ! echo "$USERS" | grep -q '"nova"'; then
+        echo "FAIL: User 'nova' not found in RabbitMQ"
+        echo "Users: $USERS"
+        exit 1
+      fi
+      echo "PASS: User 'nova' exists in RabbitMQ"

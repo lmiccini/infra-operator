@@ -1,0 +1,18 @@
+#
+# Step 2: Delete the RabbitMq cluster while dependent resources still exist.
+# Then delete the dependent resources. All should clean up gracefully.
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+- script: |
+    set -e
+    # Delete dependent resources first (proper order)
+    oc delete rabbitmqpolicy del-deps-policy -n $NAMESPACE --ignore-not-found
+    oc delete rabbitmquser del-deps-user -n $NAMESPACE --ignore-not-found
+    oc delete transporturl del-deps-url -n $NAMESPACE --ignore-not-found
+    oc delete rabbitmqvhost del-deps-vhost -n $NAMESPACE --ignore-not-found
+
+    # Now delete the cluster
+    oc delete rabbitmq.rabbitmq.openstack.org rabbitmq-del-deps -n $NAMESPACE --ignore-not-found
+    oc delete pvc -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-del-deps --ignore-not-found

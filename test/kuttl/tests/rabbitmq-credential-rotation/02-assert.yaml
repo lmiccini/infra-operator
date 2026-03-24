@@ -1,0 +1,51 @@
+#
+# Step 2: Assert username rotation: nova removed, glance created
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 120
+commands:
+  - script: |
+      set -e
+      READY=$(oc get transporturl -n $NAMESPACE cred-rot-url -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: TransportURL not ready after rotation"
+        oc get transporturl -n $NAMESPACE cred-rot-url -o yaml
+        exit 1
+      fi
+      echo "PASS: TransportURL is ready after rotation"
+  - script: |
+      set -e
+      # Verify the transport URL secret now contains glance username
+      URL=$(oc get secret -n $NAMESPACE rabbitmq-transport-url-cred-rot-url -o jsonpath='{.data.transport_url}' | base64 -d)
+      if ! echo "$URL" | grep -q "glance:"; then
+        echo "FAIL: Transport URL does not contain 'glance' username: $URL"
+        exit 1
+      fi
+      if echo "$URL" | grep -q "nova:"; then
+        echo "FAIL: Transport URL still contains old 'nova' username: $URL"
+        exit 1
+      fi
+      echo "PASS: Transport URL updated to glance username"
+  - script: |
+      set -e
+      # Verify new user exists in RabbitMQ
+      POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-cred-rot -o jsonpath='{.items[0].metadata.name}')
+      USERS=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_users --formatter json)
+      if ! echo "$USERS" | grep -q '"glance"'; then
+        echo "FAIL: User 'glance' not found in RabbitMQ"
+        echo "Users: $USERS"
+        exit 1
+      fi
+      echo "PASS: User 'glance' exists in RabbitMQ"
+  - script: |
+      set -e
+      # Verify old user was deleted from RabbitMQ
+      POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-cred-rot -o jsonpath='{.items[0].metadata.name}')
+      USERS=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_users --formatter json)
+      if echo "$USERS" | grep -q '"nova"'; then
+        echo "FAIL: Old user 'nova' still exists in RabbitMQ"
+        echo "Users: $USERS"
+        exit 1
+      fi
+      echo "PASS: Old user 'nova' was deleted from RabbitMQ"

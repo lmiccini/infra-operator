@@ -191,6 +191,165 @@ var _ = Describe("RabbitMQPolicy controller", func() {
 		})
 	})
 
+	When("a RabbitMQPolicy definition is updated after creation", func() {
+		var mockClusterName types.NamespacedName
+		var updatePolicyName types.NamespacedName
+
+		BeforeEach(func() {
+			mockClusterName = types.NamespacedName{Name: "rabbitmq-policy-update", Namespace: namespace}
+			updatePolicyName = types.NamespacedName{Name: "policy-update-test", Namespace: namespace}
+
+			SetupMockRabbitMQAPI()
+			DeferCleanup(StopMockRabbitMQAPI)
+
+			CreateRabbitMQCluster(mockClusterName, GetDefaultRabbitMQClusterSpec(false))
+			SimulateRabbitMQClusterReady(mockClusterName)
+			DeferCleanup(DeleteRabbitMQCluster, mockClusterName)
+
+			policy := CreateRabbitMQPolicy(updatePolicyName, map[string]any{
+				"rabbitmqClusterName": mockClusterName.Name,
+				"pattern":             ".*",
+				"definition": map[string]interface{}{
+					"max-length": 10000,
+				},
+			})
+			DeferCleanup(th.DeleteInstance, policy)
+		})
+
+		It("should reconcile with updated definition and remain ready", func() {
+			// Wait for initial ready state
+			Eventually(func(g Gomega) {
+				p := GetRabbitMQPolicy(updatePolicyName)
+				g.Expect(p.Status.Conditions.IsTrue(condition.ReadyCondition)).To(BeTrue())
+			}, timeout, interval).Should(Succeed())
+
+			// Update the policy definition and pattern
+			Eventually(func(g Gomega) {
+				p := GetRabbitMQPolicy(updatePolicyName)
+				p.Spec.Pattern = "^updated-.*"
+				p.Spec.Priority = 5
+				p.Spec.Definition.Raw = []byte(`{"max-length":5000,"expires":60000}`)
+				g.Expect(th.K8sClient.Update(th.Ctx, p)).To(Succeed())
+			}, timeout, interval).Should(Succeed())
+
+			// Policy should remain ready after the update
+			Eventually(func(g Gomega) {
+				p := GetRabbitMQPolicy(updatePolicyName)
+				g.Expect(p.Status.Conditions.IsTrue(condition.ReadyCondition)).To(BeTrue())
+				g.Expect(p.Spec.Pattern).To(Equal("^updated-.*"))
+				g.Expect(p.Spec.Priority).To(Equal(5))
+				g.Expect(string(p.Spec.Definition.Raw)).To(ContainSubstring("5000"))
+			}, timeout, interval).Should(Succeed())
+		})
+	})
+
+	When("a RabbitMQPolicy targets a non-default vhost via vhostRef", func() {
+		var mockClusterName types.NamespacedName
+		var vhostName types.NamespacedName
+		var vhostPolicyName types.NamespacedName
+
+		BeforeEach(func() {
+			mockClusterName = types.NamespacedName{Name: "rabbitmq-policy-vhost", Namespace: namespace}
+			vhostName = types.NamespacedName{Name: "custom-vhost-for-policy", Namespace: namespace}
+			vhostPolicyName = types.NamespacedName{Name: "policy-custom-vhost", Namespace: namespace}
+
+			SetupMockRabbitMQAPI()
+			DeferCleanup(StopMockRabbitMQAPI)
+
+			CreateRabbitMQCluster(mockClusterName, GetDefaultRabbitMQClusterSpec(false))
+			SimulateRabbitMQClusterReady(mockClusterName)
+			DeferCleanup(DeleteRabbitMQCluster, mockClusterName)
+
+			// Create vhost with a custom name
+			vhost := CreateRabbitMQVhost(vhostName, map[string]any{
+				"rabbitmqClusterName": mockClusterName.Name,
+				"name":                "my-custom-vhost",
+			})
+			DeferCleanup(th.DeleteInstance, vhost)
+			SimulateRabbitMQVhostReady(vhostName)
+
+			// Create policy targeting this vhost
+			policy := CreateRabbitMQPolicy(vhostPolicyName, map[string]any{
+				"rabbitmqClusterName": mockClusterName.Name,
+				"vhostRef":            vhostName.Name,
+				"pattern":             "^queue-.*",
+				"applyTo":             "queues",
+				"definition": map[string]interface{}{
+					"max-length": 500,
+				},
+			})
+			DeferCleanup(th.DeleteInstance, policy)
+		})
+
+		It("should become ready using the vhost's actual name", func() {
+			Eventually(func(g Gomega) {
+				p := GetRabbitMQPolicy(vhostPolicyName)
+				g.Expect(p.Status.Conditions.IsTrue(rabbitmqv1.RabbitMQPolicyReadyCondition)).To(BeTrue())
+				g.Expect(p.Status.Conditions.IsTrue(condition.ReadyCondition)).To(BeTrue())
+			}, timeout, interval).Should(Succeed())
+
+			// Verify spec fields are correct
+			p := GetRabbitMQPolicy(vhostPolicyName)
+			Expect(p.Spec.VhostRef).To(Equal(vhostName.Name))
+			Expect(p.Spec.ApplyTo).To(Equal("queues"))
+			Expect(p.Spec.Pattern).To(Equal("^queue-.*"))
+		})
+	})
+
+	When("a RabbitMQPolicy is created before cluster is ready", func() {
+		var pendingClusterName types.NamespacedName
+		var pendingPolicyName types.NamespacedName
+
+		BeforeEach(func() {
+			pendingClusterName = types.NamespacedName{Name: "rabbitmq-policy-pending", Namespace: namespace}
+			pendingPolicyName = types.NamespacedName{Name: "policy-pending-cluster", Namespace: namespace}
+
+			// Create cluster but do NOT mark it ready
+			CreateRabbitMQCluster(pendingClusterName, GetDefaultRabbitMQClusterSpec(false))
+
+			policy := CreateRabbitMQPolicy(pendingPolicyName, map[string]any{
+				"rabbitmqClusterName": pendingClusterName.Name,
+				"pattern":             ".*",
+				"definition": map[string]any{
+					"max-length": 10000,
+				},
+			})
+			// During cleanup: delete cluster first (runs last in LIFO) so that
+			// policy finalizer removal sees cluster gone and skips API cleanup
+			DeferCleanup(DeleteRabbitMQCluster, pendingClusterName)
+			DeferCleanup(func() {
+				// Mark the cluster for deletion before deleting the policy
+				// so reconcileDelete sees cluster being deleted and skips cleanup
+				cluster := &rabbitmqv1.RabbitMq{}
+				err := th.K8sClient.Get(th.Ctx, pendingClusterName, cluster)
+				if err == nil && cluster.DeletionTimestamp.IsZero() {
+					_ = th.K8sClient.Delete(th.Ctx, cluster)
+				}
+				th.DeleteInstance(policy)
+			})
+		})
+
+		It("should wait for cluster readiness then become ready", func() {
+			// Policy should not be ready yet - cluster is not ready
+			Eventually(func(g Gomega) {
+				p := GetRabbitMQPolicy(pendingPolicyName)
+				g.Expect(p.Status.Conditions.IsTrue(condition.ReadyCondition)).To(BeFalse())
+			}, timeout, interval).Should(Succeed())
+
+			// Now set up mock API and mark cluster ready
+			SetupMockRabbitMQAPI()
+			DeferCleanup(StopMockRabbitMQAPI)
+			SimulateRabbitMQClusterReady(pendingClusterName)
+
+			// Policy should become ready
+			Eventually(func(g Gomega) {
+				p := GetRabbitMQPolicy(pendingPolicyName)
+				g.Expect(p.Status.Conditions.IsTrue(rabbitmqv1.RabbitMQPolicyReadyCondition)).To(BeTrue())
+				g.Expect(p.Status.Conditions.IsTrue(condition.ReadyCondition)).To(BeTrue())
+			}, timeout, interval).Should(Succeed())
+		})
+	})
+
 	When("a RabbitMQPolicy is deleted while cluster is being deleted", func() {
 		var policyWithDeletingCluster types.NamespacedName
 		var deletingClusterName types.NamespacedName

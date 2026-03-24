@@ -1,0 +1,67 @@
+#
+# Step 1: Assert TransportURL with custom user/vhost is ready
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 120
+commands:
+  - script: |
+      set -e
+      READY=$(oc get transporturl -n $NAMESPACE custom-url -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: TransportURL not ready"
+        oc get transporturl -n $NAMESPACE custom-url -o yaml
+        exit 1
+      fi
+      echo "PASS: TransportURL is ready"
+  - script: |
+      set -e
+      # Verify the transport URL contains the custom username
+      URL=$(oc get secret -n $NAMESPACE rabbitmq-transport-url-custom-url -o jsonpath='{.data.transport_url}' | base64 -d)
+      if ! echo "$URL" | grep -q "nova:"; then
+        echo "FAIL: Transport URL does not contain 'nova' username: $URL"
+        exit 1
+      fi
+      echo "PASS: Transport URL contains nova username"
+  - script: |
+      set -e
+      # Verify the transport URL contains the custom vhost
+      URL=$(oc get secret -n $NAMESPACE rabbitmq-transport-url-custom-url -o jsonpath='{.data.transport_url}' | base64 -d)
+      if ! echo "$URL" | grep -q "nova-vhost"; then
+        echo "FAIL: Transport URL does not contain 'nova-vhost': $URL"
+        exit 1
+      fi
+      echo "PASS: Transport URL contains nova-vhost"
+  - script: |
+      set -e
+      # Verify the user exists in RabbitMQ
+      POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-url-custom -o jsonpath='{.items[0].metadata.name}')
+      USERS=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_users --formatter json)
+      if ! echo "$USERS" | grep -q '"nova"'; then
+        echo "FAIL: User 'nova' not found in RabbitMQ"
+        echo "Users: $USERS"
+        exit 1
+      fi
+      echo "PASS: User 'nova' exists in RabbitMQ"
+  - script: |
+      set -e
+      # Verify the vhost exists in RabbitMQ
+      POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-url-custom -o jsonpath='{.items[0].metadata.name}')
+      VHOSTS=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_vhosts --formatter json)
+      if ! echo "$VHOSTS" | grep -q '"nova-vhost"'; then
+        echo "FAIL: Vhost 'nova-vhost' not found in RabbitMQ"
+        echo "Vhosts: $VHOSTS"
+        exit 1
+      fi
+      echo "PASS: Vhost 'nova-vhost' exists in RabbitMQ"
+  - script: |
+      set -e
+      # Verify the user has permissions on the vhost
+      POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-url-custom -o jsonpath='{.items[0].metadata.name}')
+      PERMS=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_permissions -p nova-vhost --formatter json)
+      if ! echo "$PERMS" | grep -q '"nova"'; then
+        echo "FAIL: User 'nova' has no permissions on vhost 'nova-vhost'"
+        echo "Permissions: $PERMS"
+        exit 1
+      fi
+      echo "PASS: User 'nova' has permissions on vhost 'nova-vhost'"

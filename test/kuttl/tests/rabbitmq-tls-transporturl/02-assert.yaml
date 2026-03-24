@@ -1,0 +1,39 @@
+#
+# Step 2: Assert TransportURL is ready and uses TLS (ssl=1, port 5671)
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 120
+commands:
+  - script: |
+      set -e
+      READY=$(oc get transporturl -n $NAMESPACE tls-transporturl -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: TransportURL not ready"
+        oc get transporturl -n $NAMESPACE tls-transporturl -o yaml
+        exit 1
+      fi
+      echo "PASS: TransportURL is ready"
+  - script: |
+      set -e
+      # Verify the transport URL secret exists
+      oc get secret -n $NAMESPACE rabbitmq-transport-url-tls-transporturl > /dev/null
+      echo "PASS: Transport URL secret exists"
+  - script: |
+      set -e
+      # Verify transport URL contains ssl=1 for TLS
+      URL=$(oc get secret -n $NAMESPACE rabbitmq-transport-url-tls-transporturl -o jsonpath='{.data.transport_url}' | base64 -d)
+      if ! echo "$URL" | grep -q "ssl=1"; then
+        echo "FAIL: Transport URL missing ssl=1 parameter: $URL"
+        exit 1
+      fi
+      echo "PASS: Transport URL has ssl=1"
+  - script: |
+      set -e
+      # Verify transport URL uses AMQPS port 5671
+      URL=$(oc get secret -n $NAMESPACE rabbitmq-transport-url-tls-transporturl -o jsonpath='{.data.transport_url}' | base64 -d)
+      if ! echo "$URL" | grep -q ":5671"; then
+        echo "FAIL: Transport URL not using port 5671: $URL"
+        exit 1
+      fi
+      echo "PASS: Transport URL uses port 5671"

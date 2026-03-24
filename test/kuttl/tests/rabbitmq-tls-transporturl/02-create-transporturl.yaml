@@ -1,0 +1,9 @@
+#
+# Step 2: Create a TransportURL against the TLS-enabled cluster
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: TransportURL
+metadata:
+  name: tls-transporturl
+spec:
+  rabbitmqClusterName: rabbitmq-tls-url

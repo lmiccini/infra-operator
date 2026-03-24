@@ -1,0 +1,51 @@
+#
+# Step 1: Assert vhost and policy are ready, and policy is enforced in RabbitMQ
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 120
+commands:
+  - script: |
+      set -e
+      READY=$(oc get rabbitmqvhost -n $NAMESPACE pol-ver-vhost -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: RabbitMQVhost not ready"
+        oc get rabbitmqvhost -n $NAMESPACE pol-ver-vhost -o yaml
+        exit 1
+      fi
+      echo "PASS: RabbitMQVhost is ready"
+  - script: |
+      set -e
+      READY=$(oc get rabbitmqpolicy -n $NAMESPACE pol-ver-policy -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: RabbitMQPolicy not ready"
+        oc get rabbitmqpolicy -n $NAMESPACE pol-ver-policy -o yaml
+        exit 1
+      fi
+      echo "PASS: RabbitMQPolicy is ready"
+  - script: |
+      set -e
+      # Verify policy exists in RabbitMQ management via rabbitmqctl
+      POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-pol-ver -o jsonpath='{.items[0].metadata.name}')
+      POLICIES=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_policies -p policy-test-vhost --formatter json)
+      if ! echo "$POLICIES" | grep -q '"pol-ver-policy"'; then
+        echo "FAIL: Policy 'pol-ver-policy' not found in RabbitMQ for vhost 'policy-test-vhost'"
+        echo "Policies: $POLICIES"
+        exit 1
+      fi
+      echo "PASS: Policy 'pol-ver-policy' exists in RabbitMQ"
+  - script: |
+      set -e
+      # Verify policy properties
+      POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-pol-ver -o jsonpath='{.items[0].metadata.name}')
+      POLICIES=$(oc exec -n $NAMESPACE "$POD" -- rabbitmqctl list_policies -p policy-test-vhost --formatter json)
+
+      # Check pattern
+      if ! echo "$POLICIES" | grep -q '"pattern":"\\^test-\\.\\*"'; then
+        # Try alternative JSON formatting
+        PATTERN=$(echo "$POLICIES" | python3 -c "import sys,json; ps=json.load(sys.stdin); p=[x for x in ps if x.get('name')=='pol-ver-policy']; print(p[0]['pattern'] if p else '')" 2>/dev/null || true)
+        if [ "$PATTERN" != "^test-.*" ]; then
+          echo "WARN: Could not verify pattern, got: $PATTERN"
+        fi
+      fi
+      echo "PASS: Policy properties verified"

@@ -1,0 +1,8 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+- script: |
+    oc delete transporturl tls-transporturl -n $NAMESPACE --ignore-not-found
+    oc delete rabbitmq.rabbitmq.openstack.org rabbitmq-tls-url -n $NAMESPACE --ignore-not-found
+    oc delete pvc -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-tls-url --ignore-not-found
+    oc delete secret rabbitmq-tls-url-cert rabbitmq-tls-url-ca -n $NAMESPACE --ignore-not-found
