@@ -19,6 +19,7 @@ package rabbitmq
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -170,7 +171,10 @@ func (r *RabbitMQPolicyReconciler) reconcileNormal(ctx context.Context, instance
 		instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.RabbitMQPolicyReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.RabbitMQPolicyReadyErrorMessage, err.Error()))
 		return ctrl.Result{}, err
 	}
-	apiClient := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled, caCert)
+	apiClient, err := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled, caCert)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to create RabbitMQ API client: %w", err)
+	}
 
 	// Create or update policy
 	var definition map[string]interface{}
@@ -242,7 +246,10 @@ func (r *RabbitMQPolicyReconciler) reconcileDelete(ctx context.Context, instance
 		instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.RabbitMQPolicyReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.RabbitMQPolicyReadyErrorMessage, err.Error()))
 		return ctrl.Result{}, err
 	}
-	apiClient := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled, caCert)
+	apiClient, err := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled, caCert)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to create RabbitMQ API client: %w", err)
+	}
 
 	// Delete policy from RabbitMQ
 	// Note: DeletePolicy already treats 404 as success

@@ -406,7 +406,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		if err := r.Get(ctx, types.NamespacedName{
 			Name:      instance.Spec.TLS.SecretName,
 			Namespace: instance.Namespace,
-		}, tlsSecret); err == nil {
+		}, tlsSecret); err != nil {
+			if !k8s_errors.IsNotFound(err) {
+				return ctrl.Result{}, fmt.Errorf("failed to get TLS secret %s: %w", instance.Spec.TLS.SecretName, err)
+			}
+		} else {
 			hashInput["tlsSecretData"] = tlsSecret.Data
 		}
 		if instance.Spec.TLS.CaSecretName != "" && instance.Spec.TLS.CaSecretName != instance.Spec.TLS.SecretName {
@@ -414,7 +418,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			if err := r.Get(ctx, types.NamespacedName{
 				Name:      instance.Spec.TLS.CaSecretName,
 				Namespace: instance.Namespace,
-			}, caSecret); err == nil {
+			}, caSecret); err != nil {
+				if !k8s_errors.IsNotFound(err) {
+					return ctrl.Result{}, fmt.Errorf("failed to get CA secret %s: %w", instance.Spec.TLS.CaSecretName, err)
+				}
+			} else {
 				hashInput["caSecretData"] = caSecret.Data
 			}
 		}

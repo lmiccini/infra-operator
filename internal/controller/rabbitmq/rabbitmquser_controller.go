@@ -356,7 +356,10 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 		instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.RabbitMQUserReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.RabbitMQUserReadyErrorMessage, err.Error()))
 		return ctrl.Result{}, err
 	}
-	apiClient := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled, caCert)
+	apiClient, err := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled, caCert)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to create RabbitMQ API client: %w", err)
+	}
 
 	// If vhost changed and there was a previous vhost, delete permissions from old vhost first
 	vhostChanged := instance.Status.Vhost != vhostName
@@ -570,7 +573,10 @@ func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	apiClient := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled, caCert)
+	apiClient, err := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled, caCert)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to create RabbitMQ API client: %w", err)
+	}
 
 	// Delete permissions and user from RabbitMQ
 	// The Delete methods already treat 404 as success

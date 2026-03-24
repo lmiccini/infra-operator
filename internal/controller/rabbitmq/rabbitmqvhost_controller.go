@@ -163,7 +163,10 @@ func (r *RabbitMQVhostReconciler) reconcileNormal(ctx context.Context, instance 
 		instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.RabbitMQVhostReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.RabbitMQVhostReadyErrorMessage, err.Error()))
 		return ctrl.Result{}, err
 	}
-	apiClient := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled, caCert)
+	apiClient, err := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled, caCert)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to create RabbitMQ API client: %w", err)
+	}
 
 	// Create vhost
 	vhostName := instance.Spec.Name
@@ -314,7 +317,10 @@ func (r *RabbitMQVhostReconciler) reconcileDelete(ctx context.Context, instance 
 		instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.RabbitMQVhostReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.RabbitMQVhostReadyErrorMessage, err.Error()))
 		return ctrl.Result{}, err
 	}
-	apiClient := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled, caCert)
+	apiClient, err := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled, caCert)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to create RabbitMQ API client: %w", err)
+	}
 
 	// Delete vhost (skip default)
 	vhostName := instance.Spec.Name
