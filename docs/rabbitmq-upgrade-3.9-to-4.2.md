@@ -221,7 +221,7 @@ The `reconcileRabbitMQ()` function in openstack-operator also handles migration:
 |---------|-------------|-------------|
 | Queue locator | `queue_master_locator = min-masters` | `queue_leader_locator = balanced` |
 | TLS versions (non-FIPS) | `['tlsv1.2']` | `['tlsv1.2','tlsv1.3']` |
-| Inter-node TLS verify | `verify_none` | `verify_none` (OTP 26 breaks verify_peer) |
+| Inter-node TLS verify | `verify_none` | `verify_none` (OTP 26 static config lacks wildcard match support) |
 | Peer discovery | K8s API-based | Seed-node approach (k8s config silently ignored) |
 | Mirrored queues | Supported via `ha-all` policy | Not supported (removed) |
 | Relaxed quorum checks | N/A | Enabled during migration (proxy active) |

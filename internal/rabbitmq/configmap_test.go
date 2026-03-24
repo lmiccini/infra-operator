@@ -138,6 +138,32 @@ func TestGenerateConfigDataConfigMap_InterNodeTLS_VersionAware(t *testing.T) {
 	}
 }
 
+func TestGenerateConfigDataConfigMap_InterNodeTLS_VerifyNone(t *testing.T) {
+	r := &rabbitmqv1.RabbitMq{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-mq", Namespace: "test-ns"},
+		Spec: rabbitmqv1.RabbitMqSpec{
+			RabbitMqSpecCore: rabbitmqv1.RabbitMqSpecCore{
+				TLS: rabbitmqv1.RabbitMQTLSSpec{
+					SecretName: "tls-secret",
+				},
+			},
+		},
+	}
+
+	cm := GenerateConfigDataConfigMap(r, false, "4.2")
+	interNode := cm.Data["inter_node_tls.config"]
+
+	// Inter-node TLS must use verify_none because OTP 26's static
+	// ssl_dist_optfile cannot enable wildcard SAN matching (requires
+	// a function call that file:consult cannot evaluate).
+	if count := strings.Count(interNode, "verify_none"); count != 2 {
+		t.Errorf("inter-node TLS should have 2 occurrences of verify_none (server+client), got %d", count)
+	}
+	if strings.Contains(interNode, "verify_peer") {
+		t.Error("inter-node TLS config should not contain verify_peer")
+	}
+}
+
 func TestGenerateConfigDataConfigMap_NoTLS(t *testing.T) {
 	r := &rabbitmqv1.RabbitMq{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-mq", Namespace: "test-ns"},

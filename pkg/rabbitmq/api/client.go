@@ -84,21 +84,15 @@ func NewClient(baseURL, username, password string, tlsEnabled bool, caCert []byt
 		Timeout: DefaultAPITimeout,
 	}
 
-	if tlsEnabled {
-		tlsConfig := &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		}
-
-		if len(caCert) > 0 {
-			caCertPool := x509.NewCertPool()
-			caCertPool.AppendCertsFromPEM(caCert)
-			tlsConfig.RootCAs = caCertPool
-		} else {
-			tlsConfig.InsecureSkipVerify = true
-		}
+	if tlsEnabled && len(caCert) > 0 {
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
 
 		httpClient.Transport = &http.Transport{
-			TLSClientConfig: tlsConfig,
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				RootCAs:    caCertPool,
+			},
 		}
 	}
 

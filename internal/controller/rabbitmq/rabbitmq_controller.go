@@ -386,9 +386,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, fmt.Errorf("error getting cluster FIPS config: %w", err)
 	}
 
-	// Calculate hash for config tracking
-	// We'll use a simple hash of the config parameters
-	configMapHash, err := util.ObjectHash(map[string]interface{}{
+	// Calculate hash for config tracking.
+	// Include TLS secret content so that certificate rotation (e.g. by
+	// cert-manager) triggers a rolling restart of the StatefulSet pods.
+	hashInput := map[string]interface{}{
 		"ipv6Enabled":       IPv6Enabled,
 		"fipsEnabled":       fipsEnabled,
 		"tlsSecret":         instance.Spec.TLS.SecretName,
@@ -399,7 +400,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		"additionalPlugins": instance.Spec.Config.AdditionalPlugins,
 		"containerImage":    instance.Spec.ContainerImage,
 		"replicas":          instance.Spec.Replicas,
-	})
+	}
+	if instance.Spec.TLS.SecretName != "" {
+		tlsSecret := &corev1.Secret{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      instance.Spec.TLS.SecretName,
+			Namespace: instance.Namespace,
+		}, tlsSecret); err == nil {
+			hashInput["tlsSecretData"] = tlsSecret.Data
+		}
+		if instance.Spec.TLS.CaSecretName != "" && instance.Spec.TLS.CaSecretName != instance.Spec.TLS.SecretName {
+			caSecret := &corev1.Secret{}
+			if err := r.Get(ctx, types.NamespacedName{
+				Name:      instance.Spec.TLS.CaSecretName,
+				Namespace: instance.Namespace,
+			}, caSecret); err == nil {
+				hashInput["caSecretData"] = caSecret.Data
+			}
+		}
+	}
+	configMapHash, err := util.ObjectHash(hashInput)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,

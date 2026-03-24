@@ -246,12 +246,14 @@ func buildAdvancedConfig(r *rabbitmqv1.RabbitMq, _ bool, fipsEnabled bool, confi
 func buildInterNodeTLSConfig(fipsEnabled bool, configVersion string) string {
 	tlsVersions := TLSVersionsForRabbitMQ(configVersion, fipsEnabled)
 
-	// Use verify_none for inter-node TLS distribution. OTP 26 changed
-	// verify_peer to enforce strict hostname verification, which breaks
-	// RabbitMQ 4.x peer discovery: the plugin spawns a hidden Erlang peer
-	// that connects back via TLS distribution, and the ephemeral peer's
-	// node name doesn't match the certificate's SAN entries.
-	// Certificate chain validation against the CA is still performed;
+	// Use verify_none for inter-node TLS distribution. OTP 26's default
+	// pkix_verify_hostname does not support wildcard certificate matching,
+	// and the HTTPS match function (public_key:pkix_verify_hostname_match_fun)
+	// cannot be used in a static -ssl_dist_optfile because function calls
+	// are not valid Erlang terms. Without wildcard support, verify_peer
+	// rejects connections since pod hostnames don't have exact SAN matches.
+	//
+	// With verify_none the CA certificate chain is still validated;
 	// only SNI-based hostname matching is skipped.
 	return fmt.Sprintf(`[
   {server, [
