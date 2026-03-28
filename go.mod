@@ -11,8 +11,8 @@ require (
 	github.com/onsi/gomega v1.39.1
 	github.com/openshift/api v3.9.0+incompatible
 	github.com/openstack-k8s-operators/infra-operator/apis v0.0.0-00010101000000-000000000000
-	github.com/openstack-k8s-operators/lib-common/modules/common v0.6.1-0.20260310070607-b96da8dd520e
-	github.com/openstack-k8s-operators/lib-common/modules/test v0.6.1-0.20260310070607-b96da8dd520e
+	github.com/openstack-k8s-operators/lib-common/modules/common v0.6.1-0.20260326092926-8a2950f0575b
+	github.com/openstack-k8s-operators/lib-common/modules/test v0.6.1-0.20260326092926-8a2950f0575b
 	github.com/rabbitmq/cluster-operator/v2 v2.16.0
 	go.uber.org/zap v1.27.1
 	golang.org/x/exp v0.0.0-20241217172543-b2144cdd0a67
