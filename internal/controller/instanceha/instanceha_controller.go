@@ -367,12 +367,25 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	cms := []util.Template{
 		// ScriptsConfigMap
 		{
-			Name:               instance.Name + "-sh",
-			Namespace:          instance.Namespace,
-			Type:               util.TemplateTypeScripts,
-			InstanceType:       instance.Kind,
-			AdditionalTemplate: map[string]string{},
-			Labels:             cmLabels,
+			Name:         instance.Name + "-sh",
+			Namespace:    instance.Namespace,
+			Type:         util.TemplateTypeScripts,
+			InstanceType: instance.Kind,
+			AdditionalTemplate: map[string]string{
+				// InstanceHA Python package modules
+				"instanceha_init_py":           "instanceha/bin/instanceha/__init__.py",
+				"instanceha_models_py":         "instanceha/bin/instanceha/models.py",
+				"instanceha_validation_py":     "instanceha/bin/instanceha/validation.py",
+				"instanceha_config_py":         "instanceha/bin/instanceha/config.py",
+				"instanceha_nova_py":           "instanceha/bin/instanceha/nova.py",
+				"instanceha_service_py":        "instanceha/bin/instanceha/service.py",
+				"instanceha_monitoring_py":     "instanceha/bin/instanceha/monitoring.py",
+				"instanceha_fencing_py":        "instanceha/bin/instanceha/fencing.py",
+				"instanceha_evacuation_py":     "instanceha/bin/instanceha/evacuation.py",
+				"instanceha_reserved_hosts_py": "instanceha/bin/instanceha/reserved_hosts.py",
+				"instanceha_main_py":           "instanceha/bin/instanceha/main.py",
+			},
+			Labels: cmLabels,
 		},
 	}
 

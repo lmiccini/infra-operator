@@ -89,7 +89,7 @@ func Deployment(
 					Containers: []corev1.Container{{
 						Name:    "instanceha",
 						Image:   containerImage,
-						Command: []string{"/usr/bin/python3", "-u", "/var/lib/instanceha/instanceha.py"},
+						Command: []string{"/usr/bin/python3", "-u", "/var/lib/instanceha/scripts/instanceha.py"},
 						SecurityContext: &corev1.SecurityContext{
 							RunAsUser:                ptr.To[int64](42401),
 							RunAsGroup:               ptr.To[int64](42401),
@@ -154,8 +154,7 @@ func instancehaPodVolumeMounts() []corev1.VolumeMount {
 		},
 		{
 			Name:      "instanceha-script",
-			MountPath: "/var/lib/instanceha/instanceha.py",
-			SubPath:   "instanceha.py",
+			MountPath: "/var/lib/instanceha/scripts",
 			ReadOnly:  true,
 		},
 		{
@@ -205,6 +204,22 @@ func instancehaPodVolumes(
 					DefaultMode: &config0644AccessMode,
 					LocalObjectReference: corev1.LocalObjectReference{
 						Name: instance.Name + "-sh",
+					},
+					Items: []corev1.KeyToPath{
+						// Entry point script
+						{Key: "instanceha.py", Path: "instanceha.py"},
+						// InstanceHA Python package
+						{Key: "instanceha_init_py", Path: "instanceha/__init__.py"},
+						{Key: "instanceha_models_py", Path: "instanceha/models.py"},
+						{Key: "instanceha_validation_py", Path: "instanceha/validation.py"},
+						{Key: "instanceha_config_py", Path: "instanceha/config.py"},
+						{Key: "instanceha_nova_py", Path: "instanceha/nova.py"},
+						{Key: "instanceha_service_py", Path: "instanceha/service.py"},
+						{Key: "instanceha_monitoring_py", Path: "instanceha/monitoring.py"},
+						{Key: "instanceha_fencing_py", Path: "instanceha/fencing.py"},
+						{Key: "instanceha_evacuation_py", Path: "instanceha/evacuation.py"},
+						{Key: "instanceha_reserved_hosts_py", Path: "instanceha/reserved_hosts.py"},
+						{Key: "instanceha_main_py", Path: "instanceha/main.py"},
 					},
 				},
 			},
