@@ -509,29 +509,44 @@ def _start_mcp_server(conn, service):
         return None
 
 
-def _create_llm_engine():
-    """Create an LLM engine from environment variables, if configured.
+def _create_llm_engine(config_manager):
+    """Create an LLM engine from the InstanceHA config file.
 
-    Environment variables:
-        AI_ENABLED:     "True" to enable (default: "False")
-        AI_MODEL_PATH:  Path to local GGUF model file (local backend)
-        AI_ENDPOINT:    URL for OpenAI-compatible API (remote backend)
-        AI_API_KEY:     API key for remote endpoint (optional)
-        AI_MODEL:       Model name for remote endpoint (default: "default")
-        AI_N_CTX:       Context window size, local only (default: 4096)
-        AI_N_THREADS:   CPU threads, local only (default: 4)
+    Reads AI settings from the 'ai' section of config.yaml (the same
+    ConfigMap used for all InstanceHA settings):
+
+        config:
+          # ... existing settings ...
+        ai:
+          enabled: true
+          endpoint: http://ollama.openstack.svc:11434
+          model: llama3.1:8b
+          # api_key: optional
+          # model_path: /path/to/model.gguf  (for local backend)
+          # n_ctx: 4096
+          # n_threads: 4
     """
     try:
         from .ai.engine import create_engine
 
+        # Read the ai: section from the same YAML config file
+        ai_section = {}
+        try:
+            import yaml
+            with open(config_manager.config_path, 'r') as f:
+                data = yaml.load(f, Loader=yaml.SafeLoader) or {}
+            ai_section = data.get("ai", {})
+        except Exception as e:
+            logging.debug("No AI section in config: %s", e)
+
         config = {
-            "ai_enabled": os.environ.get("AI_ENABLED", "False"),
-            "ai_model_path": os.environ.get("AI_MODEL_PATH", ""),
-            "ai_endpoint": os.environ.get("AI_ENDPOINT", ""),
-            "ai_api_key": os.environ.get("AI_API_KEY", ""),
-            "ai_model": os.environ.get("AI_MODEL", "default"),
-            "ai_n_ctx": os.environ.get("AI_N_CTX", "4096"),
-            "ai_n_threads": os.environ.get("AI_N_THREADS", "4"),
+            "ai_enabled": str(ai_section.get("enabled", "False")),
+            "ai_model_path": str(ai_section.get("model_path", "")),
+            "ai_endpoint": str(ai_section.get("endpoint", "")),
+            "ai_api_key": str(ai_section.get("api_key", "")),
+            "ai_model": str(ai_section.get("model", "default")),
+            "ai_n_ctx": str(ai_section.get("n_ctx", "4096")),
+            "ai_n_threads": str(ai_section.get("n_threads", "4")),
         }
 
         engine = create_engine(config)
@@ -545,7 +560,7 @@ def _create_llm_engine():
         return None
 
 
-def _start_chat_server(conn, service):
+def _start_chat_server(conn, service, config_manager):
     """Start the AI chat server as a daemon thread if the socket directory exists."""
     try:
         from .ai.chat_server import ChatServer
@@ -564,7 +579,7 @@ def _start_chat_server(conn, service):
             dry_run=True,
         )
 
-        llm_engine = _create_llm_engine()
+        llm_engine = _create_llm_engine(config_manager)
 
         chat_server = ChatServer(
             nova_connection=conn,
@@ -596,7 +611,7 @@ def main():
     # Start AI observer, MCP server, and chat server (daemon threads, non-blocking)
     _start_observer()
     _start_mcp_server(conn, service)
-    _start_chat_server(conn, service)
+    _start_chat_server(conn, service, config_manager)
 
     while True:
         service.update_health_hash()

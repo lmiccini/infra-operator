@@ -24,6 +24,46 @@ Two LLM backends are supported:
 
 ---
 
+## Configuration
+
+AI settings are configured in the InstanceHA ConfigMap (`instanceha-config` by
+default), under an `ai:` section alongside the existing `config:` section:
+
+```yaml
+config:
+  DELTA: 30
+  POLL: 45
+  # ... existing settings ...
+ai:
+  enabled: true
+  endpoint: http://ollama.openstack.svc:11434
+  model: llama3.1:8b
+```
+
+After editing the ConfigMap, restart the InstanceHA pod to pick up the change:
+
+```bash
+oc edit configmap instanceha-config
+# add the ai: section, save
+oc delete pod -l app=instanceha
+```
+
+### Configuration Reference
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `enabled` | Set to `true` to enable the LLM agent | `false` |
+| `endpoint` | URL for an OpenAI-compatible API (remote backend) | - |
+| `model` | Model name for the remote endpoint | `default` |
+| `api_key` | API key for the remote endpoint (if required) | - |
+| `model_path` | Path to a local GGUF model file (local backend) | - |
+| `n_ctx` | Context window size (local backend only) | `4096` |
+| `n_threads` | Number of CPU threads for inference (local backend only) | `4` |
+
+If both `model_path` and `endpoint` are set, the local backend takes precedence.
+
+---
+
 ## Quick Start with Ollama
 
 Ollama is the simplest way to deploy an LLM in your cluster. It runs on CPU
@@ -135,11 +175,25 @@ oc exec deployment/ollama -- ollama pull llama3.1:8b
 
 ### 2. Configure InstanceHA
 
+Edit the InstanceHA ConfigMap to add the `ai:` section:
+
 ```bash
-oc set env deployment/instanceha \
-  AI_ENABLED=True \
-  AI_ENDPOINT=http://ollama.openstack.svc:11434 \
-  AI_MODEL=llama3.1:8b
+oc edit configmap instanceha-config
+```
+
+```yaml
+config:
+  # ... existing settings ...
+ai:
+  enabled: true
+  endpoint: http://ollama.openstack.svc:11434
+  model: llama3.1:8b
+```
+
+Restart the pod:
+
+```bash
+oc delete pod -l app=instanceha
 ```
 
 ### 3. Test
@@ -256,10 +310,20 @@ oc wait --for=condition=ready pod -l app=vllm --timeout=600s
 ### 3. Configure InstanceHA
 
 ```bash
-oc set env deployment/instanceha \
-  AI_ENABLED=True \
-  AI_ENDPOINT=http://vllm.openstack.svc:8000 \
-  AI_MODEL=meta-llama/Llama-3.1-8B-Instruct
+oc edit configmap instanceha-config
+```
+
+```yaml
+ai:
+  enabled: true
+  endpoint: http://vllm.openstack.svc:8000
+  model: meta-llama/Llama-3.1-8B-Instruct
+```
+
+Restart the pod:
+
+```bash
+oc delete pod -l app=instanceha
 ```
 
 ---
@@ -316,9 +380,21 @@ oc patch deployment instanceha --type=json -p='[
 ### 3. Configure InstanceHA
 
 ```bash
-oc set env deployment/instanceha \
-  AI_ENABLED=True \
-  AI_MODEL_PATH=/var/lib/instanceha/models/model.gguf
+oc edit configmap instanceha-config
+```
+
+```yaml
+ai:
+  enabled: true
+  model_path: /var/lib/instanceha/models/model.gguf
+  # n_ctx: 4096
+  # n_threads: 4
+```
+
+Restart the pod:
+
+```bash
+oc delete pod -l app=instanceha
 ```
 
 ### Recommended models for local inference
@@ -328,23 +404,6 @@ oc set env deployment/instanceha \
 | Llama 3.1 8B Instruct | ~4.7 GB | ~6 GB | Best |
 | Mistral 7B Instruct | ~4.4 GB | ~6 GB | Good |
 | Phi-3 Mini 3.8B | ~2.3 GB | ~4 GB | Acceptable (lighter) |
-
----
-
-## Environment Variables Reference
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `AI_ENABLED` | Set to `True` to enable the LLM agent | `False` |
-| `AI_ENDPOINT` | URL for an OpenAI-compatible API (remote backend) | - |
-| `AI_MODEL` | Model name for the remote endpoint | `default` |
-| `AI_API_KEY` | API key for the remote endpoint (if required) | - |
-| `AI_MODEL_PATH` | Path to a local GGUF model file (local backend) | - |
-| `AI_N_CTX` | Context window size (local backend only) | `4096` |
-| `AI_N_THREADS` | Number of CPU threads for inference (local backend only) | `4` |
-
-If both `AI_MODEL_PATH` and `AI_ENDPOINT` are set, the local backend takes
-precedence.
 
 ---
 
@@ -366,7 +425,7 @@ precedence.
 
 ### Check if the LLM engine is loaded
 
-Look at the InstanceHA pod logs after setting the environment variables:
+Look at the InstanceHA pod logs after updating the ConfigMap:
 
 ```bash
 oc logs deployment/instanceha | grep -i "llm\|engine\|ai"
@@ -408,9 +467,10 @@ based on live cluster data.
 
 ### "AI engine disabled" in logs
 
-`AI_ENABLED` is not set to `True`. Check:
+The `ai:` section is missing from the ConfigMap or `enabled` is not `true`. Check:
+
 ```bash
-oc set env deployment/instanceha --list | grep AI_
+oc get configmap instanceha-config -o yaml | grep -A 10 "ai:"
 ```
 
 ### "Remote LLM inference failed: connection refused"
@@ -433,7 +493,7 @@ oc exec deployment/instanceha -- ls -la /var/lib/instanceha/models/
 - On CPU, 8B models take 5-30 seconds per response. This is normal.
 - For faster responses, use a GPU-backed vLLM deployment or a smaller model
   (`phi3:mini` on Ollama).
-- Reduce `AI_N_CTX` to lower memory usage and slightly improve speed.
+- Reduce `n_ctx` to lower memory usage and slightly improve speed.
 
 ### Tool calling not working
 
