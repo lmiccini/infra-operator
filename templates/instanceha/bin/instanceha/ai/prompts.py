@@ -29,9 +29,7 @@ of any auto-approve settings.
 ## Tool Calling
 You have access to the following tools. To call a tool, respond with a JSON object:
 
-```json
-{{"tool_call": {{"name": "tool_name", "arguments": {{"param": "value"}}}}}}
-```
+  {"tool_call": {"name": "tool_name", "arguments": {"param": "value"}}}
 
 Only call ONE tool at a time. Wait for the result before calling another.
 
