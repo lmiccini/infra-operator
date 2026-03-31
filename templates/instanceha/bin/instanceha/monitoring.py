@@ -63,6 +63,7 @@ def kdump_udp_listener(service) -> None:
                                 hostname = _extract_hostname(socket.gethostbyaddr(address[0])[0])
                                 service.kdump_hosts_timestamp[hostname] = time.time()
                                 logging.debug(f'Kdump message received from host: {hostname}')
+                                _publish_kdump_event(hostname)
 
                                 if len(service.kdump_hosts_timestamp) > KDUMP_CLEANUP_THRESHOLD:
                                     cutoff = time.time() - KDUMP_CLEANUP_AGE_SECONDS
@@ -163,6 +164,21 @@ def check_critical_services(conn, services, compute_nodes):
         return False, "All nova-scheduler services are down"
 
     return True, ""
+
+
+def _publish_kdump_event(host):
+    """Publish a kdump detection event to the event bus (best-effort)."""
+    try:
+        from .ai.event_bus import Event, EventType, get_event_bus
+        bus = get_event_bus()
+        bus.publish(Event(
+            event_type=EventType.KDUMP_DETECTED,
+            host=host,
+            data={"type": "kernel_crash_dump"},
+            source="monitoring",
+        ))
+    except Exception:
+        pass
 
 
 @contextmanager

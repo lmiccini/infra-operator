@@ -82,6 +82,11 @@ helper_functions_tests_passed=0
 functional_tests_passed=0
 integration_tests_passed=0
 region_isolation_tests_passed=0
+ai_tools_tests_passed=0
+chat_interface_tests_passed=0
+llm_integration_tests_passed=0
+intelligent_monitoring_tests_passed=0
+mcp_server_tests_passed=0
 
 # Run core unit tests
 echo -e "${BLUE}Running Core Unit Tests...${NC}"
@@ -182,13 +187,58 @@ fi
 echo
 echo
 
+# Run AI tools tests
+echo -e "${BLUE}Running AI Tools Tests...${NC}"
+if run_test_file "test_ai_tools.py" "AI Tools Tests"; then
+    ai_tools_tests_passed=1
+fi
+
+echo
+echo
+
+# Run chat interface tests
+echo -e "${BLUE}Running Chat Interface Tests...${NC}"
+if run_test_file "test_chat_interface.py" "Chat Interface Tests"; then
+    chat_interface_tests_passed=1
+fi
+
+echo
+echo
+
+# Run LLM integration tests
+echo -e "${BLUE}Running LLM Integration Tests...${NC}"
+if run_test_file "test_llm_integration.py" "LLM Integration Tests"; then
+    llm_integration_tests_passed=1
+fi
+
+echo
+echo
+
+# Run intelligent monitoring tests
+echo -e "${BLUE}Running Intelligent Monitoring Tests...${NC}"
+if run_test_file "test_intelligent_monitoring.py" "Intelligent Monitoring Tests"; then
+    intelligent_monitoring_tests_passed=1
+fi
+
+echo
+echo
+
+# Run MCP server tests
+echo -e "${BLUE}Running MCP Server Tests...${NC}"
+if run_test_file "test_mcp_server.py" "MCP Server Tests"; then
+    mcp_server_tests_passed=1
+fi
+
+echo
+echo
+
 # Summary
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}            Test Summary                ${NC}"
 echo -e "${BLUE}========================================${NC}"
 
-total_passed=$((unit_core_tests_passed + fencing_tests_passed + kdump_tests_passed + security_tests_passed + critical_error_tests_passed + evacuation_workflow_tests_passed + config_features_tests_passed + helper_functions_tests_passed + functional_tests_passed + integration_tests_passed + region_isolation_tests_passed))
-total_tests=11
+total_passed=$((unit_core_tests_passed + fencing_tests_passed + kdump_tests_passed + security_tests_passed + critical_error_tests_passed + evacuation_workflow_tests_passed + config_features_tests_passed + helper_functions_tests_passed + functional_tests_passed + integration_tests_passed + region_isolation_tests_passed + ai_tools_tests_passed + chat_interface_tests_passed + llm_integration_tests_passed + intelligent_monitoring_tests_passed + mcp_server_tests_passed))
+total_tests=16
 
 if [ $unit_core_tests_passed -eq 1 ]; then
     echo -e "${GREEN}[PASS] Core Unit Tests: PASSED${NC}"
@@ -254,6 +304,36 @@ if [ $region_isolation_tests_passed -eq 1 ]; then
     echo -e "${GREEN}[PASS] Region Isolation Tests: PASSED${NC}"
 else
     echo -e "${RED}[FAIL] Region Isolation Tests: FAILED${NC}"
+fi
+
+if [ $ai_tools_tests_passed -eq 1 ]; then
+    echo -e "${GREEN}[PASS] AI Tools Tests: PASSED${NC}"
+else
+    echo -e "${RED}[FAIL] AI Tools Tests: FAILED${NC}"
+fi
+
+if [ $chat_interface_tests_passed -eq 1 ]; then
+    echo -e "${GREEN}[PASS] Chat Interface Tests: PASSED${NC}"
+else
+    echo -e "${RED}[FAIL] Chat Interface Tests: FAILED${NC}"
+fi
+
+if [ $llm_integration_tests_passed -eq 1 ]; then
+    echo -e "${GREEN}[PASS] LLM Integration Tests: PASSED${NC}"
+else
+    echo -e "${RED}[FAIL] LLM Integration Tests: FAILED${NC}"
+fi
+
+if [ $intelligent_monitoring_tests_passed -eq 1 ]; then
+    echo -e "${GREEN}[PASS] Intelligent Monitoring Tests: PASSED${NC}"
+else
+    echo -e "${RED}[FAIL] Intelligent Monitoring Tests: FAILED${NC}"
+fi
+
+if [ $mcp_server_tests_passed -eq 1 ]; then
+    echo -e "${GREEN}[PASS] MCP Server Tests: PASSED${NC}"
+else
+    echo -e "${RED}[FAIL] MCP Server Tests: FAILED${NC}"
 fi
 
 echo

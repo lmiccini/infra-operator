@@ -1,0 +1,101 @@
+# InstanceHA AI-enabled container image
+#
+# Based on CentOS Stream 10 (Python 3.12), includes:
+# - Python 3 + OpenStack clients (novaclient, keystoneauth1)
+# - PyYAML for configuration parsing
+# - llama-cpp-python for local LLM inference (CPU-only)
+# - MCP SDK for Model Context Protocol server
+# - ipmitool for IPMI fencing
+#
+# Build:
+#   podman build -f Containerfile.instanceha-ai -t instanceha-ai:latest .
+#
+# Usage in InstanceHa CR:
+#   spec:
+#     containerImage: <registry>/instanceha-ai:latest
+
+FROM quay.io/centos/centos:stream10
+
+LABEL maintainer="InstanceHA <openstack-k8s-operators>"
+LABEL description="InstanceHA with AI-augmented monitoring and chat interface"
+
+# Install system packages:
+# - python3 + pip for Python dependencies
+# - gcc + python3-devel for building llama-cpp-python (C++ extension)
+# - cmake + make for llama.cpp compilation
+# - ipmitool for IPMI fencing agent
+# - openssh-clients for SSH-based operations
+RUN dnf install -y \
+        python3 \
+        python3-pip \
+        python3-devel \
+        gcc \
+        gcc-c++ \
+        cmake \
+        make \
+        ipmitool \
+        openssh-clients \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# Install Python dependencies
+# - python-novaclient + keystoneauth1: OpenStack Nova API access
+# - python-openstackclient: general OpenStack CLI (includes openstackSDK)
+# - PyYAML: configuration file parsing
+# - llama-cpp-python: local LLM inference (GGUF models, CPU-only)
+RUN CMAKE_ARGS="-DGGML_NATIVE=OFF" pip3 install --no-cache-dir \
+        python-novaclient \
+        python-keystoneclient \
+        keystoneauth1 \
+        python-openstackclient \
+        PyYAML \
+        llama-cpp-python \
+        "mcp>=1.25,<2"
+
+# Remove build-time dependencies to reduce image size
+RUN dnf remove -y \
+        python3-devel \
+        gcc \
+        gcc-c++ \
+        cmake \
+        make \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# Create directories used by InstanceHA at runtime
+# - /var/lib/instanceha/scripts: Python source (COPY'd below, overridden by ConfigMap in K8s)
+# - /var/run/instanceha: Unix socket for chat interface (emptyDir in K8s)
+# - /var/log/instanceha: audit logs (emptyDir in K8s)
+# - /home/cloud-admin/.config/openstack: clouds.yaml + secure.yaml
+RUN mkdir -p \
+        /var/lib/instanceha/scripts \
+        /var/run/instanceha \
+        /var/log/instanceha \
+        /home/cloud-admin/.config/openstack \
+    && chown -R 42401:42401 \
+        /var/lib/instanceha \
+        /var/run/instanceha \
+        /var/log/instanceha \
+        /home/cloud-admin
+
+# Copy the InstanceHA Python source into the image.
+# In K8s deployments the ConfigMap mount overrides this directory,
+# but having the code baked in allows standalone testing:
+#   podman run --rm -it instanceha-ai:latest
+COPY templates/instanceha/bin/ /var/lib/instanceha/scripts/
+
+# Run as the instanceha user (UID 42401, matches SecurityContext in deployment)
+USER 42401
+
+# Health check endpoint listens on 8080
+EXPOSE 8080/tcp
+
+# MCP server endpoint (streamable-http)
+EXPOSE 8081/tcp
+
+# Kdump notification port (UDP)
+EXPOSE 7410/udp
+
+# The actual command is set by the Kubernetes Deployment spec:
+#   /usr/bin/python3 -u /var/lib/instanceha/scripts/instanceha.py
+CMD ["/usr/bin/python3", "-u", "/var/lib/instanceha/scripts/instanceha.py"]

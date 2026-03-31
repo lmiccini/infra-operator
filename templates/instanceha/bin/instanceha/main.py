@@ -2,6 +2,7 @@
 
 import concurrent.futures
 import logging
+import os
 import sys
 import threading
 import time
@@ -341,6 +342,7 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
         threshold = service.config.get_config_value('THRESHOLD')
         if threshold_percent > threshold:
             logging.error(f'Number of impacted computes ({threshold_percent:.1f}%) exceeds threshold ({threshold}%). Not evacuating.')
+            _publish_threshold_event(threshold_percent, threshold, len(compute_nodes))
             _pkg._cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
             return
 
@@ -430,6 +432,114 @@ def _process_reenabling(conn, service, to_reenable) -> None:
             logging.error(f'Failed to enable {svc.host}: {e}')
 
 
+def _publish_service_state_event(host, state):
+    """Publish a service state change event to the event bus (best-effort)."""
+    try:
+        from .ai.event_bus import Event, EventType, get_event_bus
+        bus = get_event_bus()
+        bus.publish(Event(
+            event_type=EventType.SERVICE_STATE_CHANGE,
+            host=_extract_hostname(host),
+            data={"state": state},
+            source="main",
+        ))
+    except Exception:
+        pass
+
+
+def _publish_threshold_event(percent, threshold, host_count):
+    """Publish a threshold exceeded event to the event bus (best-effort)."""
+    try:
+        from .ai.event_bus import Event, EventType, get_event_bus
+        bus = get_event_bus()
+        bus.publish(Event(
+            event_type=EventType.THRESHOLD_EXCEEDED,
+            data={"percent": round(percent, 1), "threshold": threshold, "host_count": host_count},
+            source="main",
+        ))
+    except Exception:
+        pass
+
+
+def _start_observer():
+    """Start the AI observer, subscribing to the event bus (best-effort)."""
+    try:
+        from .ai.event_bus import get_event_bus
+        from .ai.observer import Observer
+        from . import ai as _ai_pkg
+        bus = get_event_bus()
+        observer = Observer(bus)
+        observer.start()
+        _ai_pkg._observer = observer
+        return observer
+    except Exception as e:
+        logging.warning("Failed to start AI observer: %s", e)
+        return None
+
+
+def _start_mcp_server(conn, service):
+    """Start the MCP server as a daemon thread (best-effort)."""
+    try:
+        from .ai.mcp_server import InstanceHAMCPServer
+        from .ai.safety import ApprovalManager, AuditLogger
+        from .ai.tools import ApprovalLevel
+
+        audit_logger = AuditLogger()
+        approval_manager = ApprovalManager(
+            auto_approve_level=ApprovalLevel.NONE,
+            audit_logger=audit_logger,
+            dry_run=True,
+        )
+
+        mcp_server = InstanceHAMCPServer(
+            nova_connection=conn,
+            service=service,
+            approval_manager=approval_manager,
+            allow_writes=False,
+        )
+
+        if not mcp_server.is_available:
+            logging.info("MCP SDK not installed, MCP server disabled")
+            return None
+
+        mcp_server.start()
+        return mcp_server
+    except Exception as e:
+        logging.warning("Failed to start MCP server: %s", e)
+        return None
+
+
+def _start_chat_server(conn, service):
+    """Start the AI chat server as a daemon thread if the socket directory exists."""
+    try:
+        from .ai.chat_server import ChatServer
+        from .ai.safety import ApprovalManager, AuditLogger
+        from .ai.tools import ApprovalLevel
+
+        socket_dir = "/var/run/instanceha"
+        if not os.path.isdir(socket_dir):
+            logging.info("Chat server socket directory %s not found, skipping", socket_dir)
+            return None
+
+        audit_logger = AuditLogger()
+        approval_manager = ApprovalManager(
+            auto_approve_level=ApprovalLevel.NONE,
+            audit_logger=audit_logger,
+            dry_run=True,
+        )
+
+        chat_server = ChatServer(
+            nova_connection=conn,
+            service=service,
+            approval_manager=approval_manager,
+        )
+        chat_server.start()
+        return chat_server
+    except Exception as e:
+        logging.warning("Failed to start chat server: %s", e)
+        return None
+
+
 def main():
     from .monitoring import categorize_services
 
@@ -444,6 +554,11 @@ def main():
     service = _pkg._initialize_service(config_manager)
     conn = _pkg._establish_nova_connection(service)
 
+    # Start AI observer, MCP server, and chat server (daemon threads, non-blocking)
+    _start_observer()
+    _start_mcp_server(conn, service)
+    _start_chat_server(conn, service)
+
     while True:
         service.update_health_hash()
 
@@ -457,6 +572,9 @@ def main():
             compute_nodes, to_resume, to_reenable = categorize_services(services, target_date)
 
             compute_nodes_list = list(compute_nodes)
+
+            for svc in compute_nodes_list:
+                _publish_service_state_event(svc.host, "down")
 
             _pkg._process_stale_services(conn, service, services, compute_nodes_list, to_resume)
 

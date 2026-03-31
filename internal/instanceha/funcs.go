@@ -102,11 +102,18 @@ func Deployment(
 							},
 						},
 						Env: env.MergeEnvs([]corev1.EnvVar{}, envVars),
-						Ports: []corev1.ContainerPort{{
-							ContainerPort: instance.Spec.InstanceHaKdumpPort,
-							Protocol:      "UDP",
-							Name:          "instanceha",
-						}},
+						Ports: []corev1.ContainerPort{
+							{
+								ContainerPort: instance.Spec.InstanceHaKdumpPort,
+								Protocol:      "UDP",
+								Name:          "instanceha",
+							},
+							{
+								ContainerPort: 8081,
+								Protocol:      "TCP",
+								Name:          "mcp",
+							},
+						},
 						VolumeMounts:  volumeMounts,
 						LivenessProbe: livenessProbe,
 					}},
@@ -162,6 +169,14 @@ func instancehaPodVolumeMounts() []corev1.VolumeMount {
 			MountPath: "/var/lib/instanceha/config.yaml",
 			SubPath:   "config.yaml",
 			ReadOnly:  true,
+		},
+		{
+			Name:      "instanceha-run",
+			MountPath: "/var/run/instanceha",
+		},
+		{
+			Name:      "instanceha-log",
+			MountPath: "/var/log/instanceha",
 		},
 	}
 }
@@ -220,8 +235,41 @@ func instancehaPodVolumes(
 						{Key: "instanceha_evacuation_py", Path: "instanceha/evacuation.py"},
 						{Key: "instanceha_reserved_hosts_py", Path: "instanceha/reserved_hosts.py"},
 						{Key: "instanceha_main_py", Path: "instanceha/main.py"},
+						// AI layer
+						{Key: "instanceha_ai_init_py", Path: "instanceha/ai/__init__.py"},
+						{Key: "instanceha_ai_tools_py", Path: "instanceha/ai/tools.py"},
+						{Key: "instanceha_ai_safety_py", Path: "instanceha/ai/safety.py"},
+						{Key: "instanceha_ai_read_tools_py", Path: "instanceha/ai/read_tools.py"},
+						{Key: "instanceha_ai_write_tools_py", Path: "instanceha/ai/write_tools.py"},
+						{Key: "instanceha_ai_diagnostic_tools_py", Path: "instanceha/ai/diagnostic_tools.py"},
+						// AI chat interface
+						{Key: "instanceha_ai_command_parser_py", Path: "instanceha/ai/command_parser.py"},
+						{Key: "instanceha_ai_chat_server_py", Path: "instanceha/ai/chat_server.py"},
+						{Key: "instanceha_ai_chat_client_py", Path: "instanceha/ai/chat_client.py"},
+						// AI LLM integration
+						{Key: "instanceha_ai_engine_py", Path: "instanceha/ai/engine.py"},
+						{Key: "instanceha_ai_agent_py", Path: "instanceha/ai/agent.py"},
+						{Key: "instanceha_ai_prompts_py", Path: "instanceha/ai/prompts.py"},
+						{Key: "instanceha_ai_context_py", Path: "instanceha/ai/context.py"},
+						// AI intelligent monitoring
+						{Key: "instanceha_ai_event_bus_py", Path: "instanceha/ai/event_bus.py"},
+						{Key: "instanceha_ai_observer_py", Path: "instanceha/ai/observer.py"},
+						// AI MCP server
+						{Key: "instanceha_ai_mcp_server_py", Path: "instanceha/ai/mcp_server.py"},
 					},
 				},
+			},
+		},
+		{
+			Name: "instanceha-run",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		{
+			Name: "instanceha-log",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
 		},
 		{

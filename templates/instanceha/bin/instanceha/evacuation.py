@@ -277,18 +277,48 @@ def _traditional_evacuate(connection, evacuables, host, target_host=None) -> boo
 def host_evacuate(connection, failed_service, service, target_host=None) -> bool:
     """Evacuate all instances from a failed host."""
     host = failed_service.host
+    hostname = _extract_hostname(host)
+    _publish_evacuation_event(hostname, "start", server_count=0)
 
     evacuables = _pkg._get_evacuable_servers(connection, host, service)
     if not evacuables:
         logging.info("Nothing to evacuate")
+        _publish_evacuation_event(hostname, "result", success=True, server_count=0)
         return True
 
+    _publish_evacuation_event(hostname, "start", server_count=len(evacuables))
     time.sleep(service.config.get_config_value('DELAY'))
 
     if service.config.get_config_value('SMART_EVACUATION'):
-        return _pkg._smart_evacuate(connection, evacuables, service, host, failed_service.id, target_host=target_host)
+        result = _pkg._smart_evacuate(connection, evacuables, service, host, failed_service.id, target_host=target_host)
     else:
-        return _pkg._traditional_evacuate(connection, evacuables, host, target_host=target_host)
+        result = _pkg._traditional_evacuate(connection, evacuables, host, target_host=target_host)
+
+    _publish_evacuation_event(hostname, "result", success=result, server_count=len(evacuables))
+    return result
+
+
+def _publish_evacuation_event(host, phase, success=None, server_count=0):
+    """Publish an evacuation event to the event bus (best-effort)."""
+    try:
+        from .ai.event_bus import Event, EventType, get_event_bus
+        bus = get_event_bus()
+        if phase == "start":
+            bus.publish(Event(
+                event_type=EventType.EVACUATION_START,
+                host=host,
+                data={"server_count": server_count},
+                source="evacuation",
+            ))
+        else:
+            bus.publish(Event(
+                event_type=EventType.EVACUATION_RESULT,
+                host=host,
+                data={"success": success, "server_count": server_count},
+                source="evacuation",
+            ))
+    except Exception:
+        pass
 
 
 def host_disable(connection, service, instanceha_service=None):
@@ -320,6 +350,7 @@ def host_disable(connection, service, instanceha_service=None):
         disable_reason = f"{DISABLED_REASON_EVACUATION}{suffix}: {datetime.now().isoformat()}"
         connection.services.disable_log_reason(service.id, disable_reason)
         logging.info("Successfully disabled %s with reason: %s", service_info, disable_reason)
+        _publish_host_state_event(service.host, "disabled")
         return True
     except Exception as e:
         return _handle_nova_exception("log disable reason", service_info, e, is_critical=False)
@@ -341,6 +372,7 @@ def host_enable(connection, nova_service, reenable: bool = False, service=None) 
                         service.kdump_hosts_timestamp.pop(hostname, None)
                 except (AttributeError, KeyError):
                     pass
+            _publish_host_state_event(nova_service.host, "enabled")
             return True
         except Exception as e:
             logging.warning(f'Could not unset force-down for {nova_service.host} as not all the migrations are complete yet. Will try again the next poll cycle.')
@@ -352,6 +384,7 @@ def host_enable(connection, nova_service, reenable: bool = False, service=None) 
             logging.info(f'Trying to enable {nova_service.host} (attempt {attempt + 1}/{MAX_ENABLE_RETRIES})')
             connection.services.enable(nova_service.id)
             logging.info(f'Host {nova_service.host} is now enabled')
+            _publish_host_state_event(nova_service.host, "enabled")
             return True
         except Exception as e:
             if attempt < MAX_ENABLE_RETRIES - 1:
@@ -361,3 +394,19 @@ def host_enable(connection, nova_service, reenable: bool = False, service=None) 
             continue
 
     return False
+
+
+def _publish_host_state_event(host, state):
+    """Publish a host state change event to the event bus (best-effort)."""
+    try:
+        from .ai.event_bus import Event, EventType, get_event_bus
+        bus = get_event_bus()
+        event_type = EventType.HOST_DISABLED if state == "disabled" else EventType.HOST_ENABLED
+        bus.publish(Event(
+            event_type=event_type,
+            host=_extract_hostname(host),
+            data={"state": state},
+            source="evacuation",
+        ))
+    except Exception:
+        pass

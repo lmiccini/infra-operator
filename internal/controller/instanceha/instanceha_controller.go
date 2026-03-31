@@ -384,6 +384,27 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 				"instanceha_evacuation_py":     "instanceha/bin/instanceha/evacuation.py",
 				"instanceha_reserved_hosts_py": "instanceha/bin/instanceha/reserved_hosts.py",
 				"instanceha_main_py":           "instanceha/bin/instanceha/main.py",
+				// AI layer modules
+				"instanceha_ai_init_py":             "instanceha/bin/instanceha/ai/__init__.py",
+				"instanceha_ai_tools_py":            "instanceha/bin/instanceha/ai/tools.py",
+				"instanceha_ai_safety_py":           "instanceha/bin/instanceha/ai/safety.py",
+				"instanceha_ai_read_tools_py":       "instanceha/bin/instanceha/ai/read_tools.py",
+				"instanceha_ai_write_tools_py":      "instanceha/bin/instanceha/ai/write_tools.py",
+				"instanceha_ai_diagnostic_tools_py": "instanceha/bin/instanceha/ai/diagnostic_tools.py",
+				// AI chat interface modules
+				"instanceha_ai_command_parser_py": "instanceha/bin/instanceha/ai/command_parser.py",
+				"instanceha_ai_chat_server_py":    "instanceha/bin/instanceha/ai/chat_server.py",
+				"instanceha_ai_chat_client_py":    "instanceha/bin/instanceha/ai/chat_client.py",
+				// AI LLM integration modules
+				"instanceha_ai_engine_py":  "instanceha/bin/instanceha/ai/engine.py",
+				"instanceha_ai_agent_py":   "instanceha/bin/instanceha/ai/agent.py",
+				"instanceha_ai_prompts_py": "instanceha/bin/instanceha/ai/prompts.py",
+				"instanceha_ai_context_py": "instanceha/bin/instanceha/ai/context.py",
+				// AI intelligent monitoring modules
+				"instanceha_ai_event_bus_py": "instanceha/bin/instanceha/ai/event_bus.py",
+				"instanceha_ai_observer_py":  "instanceha/bin/instanceha/ai/observer.py",
+				// AI MCP server module
+				"instanceha_ai_mcp_server_py": "instanceha/bin/instanceha/ai/mcp_server.py",
 			},
 			Labels: cmLabels,
 		},

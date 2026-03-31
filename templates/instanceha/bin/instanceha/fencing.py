@@ -417,6 +417,7 @@ def host_fence(host, action, service):
         return False
 
     logging.info(f"Fencing host {host} {action}")
+    _publish_fence_event(host, action, "start")
 
     try:
         short_hostname = _extract_hostname(host)
@@ -425,17 +426,45 @@ def host_fence(host, action, service):
 
         if not matching_configs:
             logging.error("No fencing data found for %s", host)
+            _publish_fence_event(host, action, "result", success=False)
             return False
 
         fencing_data = matching_configs[0]
 
         if not isinstance(fencing_data, dict) or "agent" not in fencing_data:
             logging.error("Invalid fencing data for %s", host)
+            _publish_fence_event(host, action, "result", success=False)
             return False
 
         logging.debug("Using fencing agent '%s' for %s", fencing_data["agent"], host)
-        return _pkg._execute_fence_operation(host, action, fencing_data, service)
+        result = _pkg._execute_fence_operation(host, action, fencing_data, service)
+        _publish_fence_event(host, action, "result", success=result)
+        return result
 
     except Exception as e:
         logging.error("Fencing failed for %s: %s", host, e)
+        _publish_fence_event(host, action, "result", success=False)
         return False
+
+
+def _publish_fence_event(host, action, phase, success=None):
+    """Publish a fencing event to the event bus (best-effort)."""
+    try:
+        from .ai.event_bus import Event, EventType, get_event_bus
+        bus = get_event_bus()
+        if phase == "start":
+            bus.publish(Event(
+                event_type=EventType.FENCE_START,
+                host=_extract_hostname(host),
+                data={"action": action},
+                source="fencing",
+            ))
+        else:
+            bus.publish(Event(
+                event_type=EventType.FENCE_RESULT,
+                host=_extract_hostname(host),
+                data={"action": action, "success": success},
+                source="fencing",
+            ))
+    except Exception:
+        pass  # Event bus is optional
