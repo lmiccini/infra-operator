@@ -130,20 +130,20 @@ class InstanceHAMCPServer:
 
         # We register a dynamic handler function.  FastMCP will discover
         # its name and use it as the tool name.
-        if not filtered_params:
-            # No user-facing parameters -- e.g., get_compute_services
-            async def _handler(_name=tool_name):
-                return server._execute(approval_manager, _name, {})
-            _handler.__name__ = tool_name
-            _handler.__doc__ = description
-            mcp.tool()(_handler)
-        else:
-            # Has user-facing parameters -- pass as kwargs dict
-            async def _handler(_name=tool_name, **kwargs):
-                return server._execute(approval_manager, _name, kwargs)
-            _handler.__name__ = tool_name
-            _handler.__doc__ = description
-            mcp.tool()(_handler)
+        # Use a factory function to capture tool_name in the closure
+        # (not as a default arg, which FastMCP would expose as a parameter).
+        def _make_handler(name, has_params):
+            if has_params:
+                async def handler(**kwargs):
+                    return server._execute(approval_manager, name, kwargs)
+            else:
+                async def handler():
+                    return server._execute(approval_manager, name, {})
+            handler.__name__ = name
+            handler.__doc__ = description
+            return handler
+
+        mcp.tool()(_make_handler(tool_name, bool(filtered_params)))
 
     def _execute(self, approval_manager, tool_name: str, params: dict) -> str:
         """Execute a tool through the approval manager, returning text."""
