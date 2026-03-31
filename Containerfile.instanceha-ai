@@ -84,6 +84,12 @@ RUN mkdir -p \
 #   podman run --rm -it instanceha-ai:latest
 COPY templates/instanceha/bin/ /var/lib/instanceha/scripts/
 
+# Create instanceha-chat wrapper on PATH so operators can run:
+#   oc rsh <pod> instanceha-chat
+RUN printf '#!/bin/sh\nexec /usr/bin/python3 /var/lib/instanceha/scripts/instanceha/ai/chat_client.py "$@"\n' \
+        > /usr/local/bin/instanceha-chat \
+    && chmod +x /usr/local/bin/instanceha-chat
+
 # Run as the instanceha user (UID 42401, matches SecurityContext in deployment)
 USER 42401
 
