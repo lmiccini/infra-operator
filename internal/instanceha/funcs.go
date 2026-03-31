@@ -14,6 +14,8 @@ limitations under the License.
 package instanceha
 
 import (
+	"os"
+
 	instancehav1 "github.com/openstack-k8s-operators/infra-operator/apis/instanceha/v1beta1"
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	env "github.com/openstack-k8s-operators/lib-common/modules/common/env"
@@ -41,6 +43,14 @@ func Deployment(
 	envVars["OS_CLOUD"] = env.SetValue(openstackcloud)
 	envVars["CONFIG_HASH"] = env.SetValue(configHash)
 	envVars["INSTANCEHA_DISABLED"] = env.SetValue(string(instance.Spec.Disabled))
+
+	// AI configuration: pass through from operator environment.
+	// These will be sourced from the CRD spec once AIConfig is added.
+	for _, aiVar := range []string{"AI_ENABLED", "AI_ENDPOINT", "AI_MODEL", "AI_API_KEY", "AI_MODEL_PATH", "AI_N_CTX", "AI_N_THREADS"} {
+		if val := os.Getenv(aiVar); val != "" {
+			envVars[aiVar] = env.SetValue(val)
+		}
+	}
 
 	// create Volume and VolumeMounts
 	volumes := instancehaPodVolumes(instance)
