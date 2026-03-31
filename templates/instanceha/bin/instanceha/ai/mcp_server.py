@@ -92,6 +92,8 @@ class InstanceHAMCPServer:
         """Build the FastMCP instance and register tools + resources."""
         mcp = FastMCP(
             "InstanceHA",
+            host=self._host,
+            port=self._port,
             instructions=(
                 "InstanceHA manages high availability for OpenStack compute "
                 "hosts. Use the tools to query cluster state, diagnose "
@@ -259,11 +261,7 @@ class InstanceHAMCPServer:
     def _serve(self):
         """Run the MCP server (blocking)."""
         try:
-            self._mcp.run(
-                transport="streamable-http",
-                host=self._host,
-                port=self._port,
-            )
+            self._mcp.run(transport="streamable-http")
         except Exception as e:
             logging.error("MCP server failed: %s", e)
             self._running = False
