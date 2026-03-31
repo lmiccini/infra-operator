@@ -509,6 +509,42 @@ def _start_mcp_server(conn, service):
         return None
 
 
+def _create_llm_engine():
+    """Create an LLM engine from environment variables, if configured.
+
+    Environment variables:
+        AI_ENABLED:     "True" to enable (default: "False")
+        AI_MODEL_PATH:  Path to local GGUF model file (local backend)
+        AI_ENDPOINT:    URL for OpenAI-compatible API (remote backend)
+        AI_API_KEY:     API key for remote endpoint (optional)
+        AI_MODEL:       Model name for remote endpoint (default: "default")
+        AI_N_CTX:       Context window size, local only (default: 4096)
+        AI_N_THREADS:   CPU threads, local only (default: 4)
+    """
+    try:
+        from .ai.engine import create_engine
+
+        config = {
+            "ai_enabled": os.environ.get("AI_ENABLED", "False"),
+            "ai_model_path": os.environ.get("AI_MODEL_PATH", ""),
+            "ai_endpoint": os.environ.get("AI_ENDPOINT", ""),
+            "ai_api_key": os.environ.get("AI_API_KEY", ""),
+            "ai_model": os.environ.get("AI_MODEL", "default"),
+            "ai_n_ctx": os.environ.get("AI_N_CTX", "4096"),
+            "ai_n_threads": os.environ.get("AI_N_THREADS", "4"),
+        }
+
+        engine = create_engine(config)
+        if engine and engine.is_available():
+            logging.info("LLM engine ready: %s", engine.model_info())
+        elif engine:
+            logging.warning("LLM engine created but not available: %s", engine.model_info())
+        return engine
+    except Exception as e:
+        logging.warning("Failed to create LLM engine: %s", e)
+        return None
+
+
 def _start_chat_server(conn, service):
     """Start the AI chat server as a daemon thread if the socket directory exists."""
     try:
@@ -528,10 +564,13 @@ def _start_chat_server(conn, service):
             dry_run=True,
         )
 
+        llm_engine = _create_llm_engine()
+
         chat_server = ChatServer(
             nova_connection=conn,
             service=service,
             approval_manager=approval_manager,
+            llm_engine=llm_engine,
         )
         chat_server.start()
         return chat_server
