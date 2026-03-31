@@ -23,6 +23,10 @@ class NovaConnectionError(Exception):
     pass
 
 
+# Standard path where lib-common mounts the CA bundle from CaBundleSecretName
+_CA_BUNDLE_PATH = "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+
+
 def nova_login(credentials: NovaLoginCredentials) -> Optional[OpenStackClient]:
     """Create and return Nova client connection."""
     try:
@@ -36,7 +40,12 @@ def nova_login(credentials: NovaLoginCredentials) -> Optional[OpenStackClient]:
             project_domain_name=credentials.project_domain_name,
         )
 
-        session = ksc_session.Session(auth=auth)
+        session_kwargs = {"auth": auth}
+        if credentials.cacert and os.path.exists(credentials.cacert):
+            session_kwargs["verify"] = credentials.cacert
+        elif os.path.exists(_CA_BUNDLE_PATH):
+            session_kwargs["verify"] = _CA_BUNDLE_PATH
+        session = ksc_session.Session(**session_kwargs)
         nova = client.Client("2.59", session=session, region_name=credentials.region_name)
         nova.versions.get_current()
         logging.info("Nova login successful")
@@ -88,7 +97,7 @@ def get_nova_connection(service):
             auth_url=auth["auth_url"],
             user_domain_name=auth["user_domain_name"],
             project_domain_name=auth["project_domain_name"],
-            region_name=region_name
+            region_name=region_name,
         )
         conn = _pkg.nova_login(credentials)
 

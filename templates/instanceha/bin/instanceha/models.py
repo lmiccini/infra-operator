@@ -107,6 +107,7 @@ class NovaLoginCredentials:
     user_domain_name: str
     project_domain_name: str
     region_name: str
+    cacert: Optional[str] = None
 
 
 @dataclass

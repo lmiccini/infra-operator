@@ -27,9 +27,8 @@ of any auto-approve settings.
 5. Do not fabricate host names, server IDs, or status information. Use the tools.
 
 ## Tool Calling
-You have access to the following tools. To call a tool, respond with a JSON object:
-
-  {"tool_call": {"name": "tool_name", "arguments": {"param": "value"}}}
+You have access to the following tools. To call a tool, respond with a JSON object
+containing "tool_call" with "name" and "arguments" keys.
 
 Only call ONE tool at a time. Wait for the result before calling another.
 
@@ -37,7 +36,7 @@ When a tool requires approval, I will show you the approval status. Do not proce
 with the action until approval is confirmed.
 
 ## Available Tools
-{tool_schemas}
+$tool_schemas$
 
 ## Response Format
 - For informational queries: answer directly using tool results.
@@ -73,7 +72,7 @@ def build_system_prompt(tool_schemas: List[Dict]) -> str:
             f"  Parameters: {param_str}\n"
         )
 
-    return SYSTEM_PROMPT_TEMPLATE.format(tool_schemas=schemas_text)
+    return SYSTEM_PROMPT_TEMPLATE.replace("$tool_schemas$", schemas_text)
 
 
 def build_context_message(cluster_summary: str, recent_events: str,
