@@ -1,0 +1,19 @@
+#
+# Step 0: Wait for single-replica cluster to become ready
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+commands:
+  - script: |
+      set -e
+      READY=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-scale -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: RabbitMq CR not ready, Ready condition: $READY"
+        exit 1
+      fi
+      COUNT=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-scale -o jsonpath='{.status.readyCount}')
+      if [ "$COUNT" != "1" ]; then
+        echo "FAIL: readyCount expected 1, got: $COUNT"
+        exit 1
+      fi
+      echo "PASS: RabbitMq ready with readyCount=$COUNT"

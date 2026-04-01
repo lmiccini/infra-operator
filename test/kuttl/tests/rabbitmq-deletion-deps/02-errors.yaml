@@ -1,0 +1,27 @@
+#
+# Step 2: After deletion, all resources should be gone
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMQPolicy
+metadata:
+  name: del-deps-policy
+---
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMQUser
+metadata:
+  name: del-deps-user
+---
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMQVhost
+metadata:
+  name: del-deps-vhost
+---
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: TransportURL
+metadata:
+  name: del-deps-url
+---
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq-del-deps

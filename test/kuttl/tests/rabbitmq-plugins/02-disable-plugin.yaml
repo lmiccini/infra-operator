@@ -1,0 +1,8 @@
+#
+# Step 2: Remove one additional plugin (keep only rabbitmq_shovel)
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+  - script: |
+      oc patch rabbitmq.rabbitmq.openstack.org rabbitmq-plugins -n $NAMESPACE --type merge -p '{"spec":{"rabbitmq":{"additionalPlugins":["rabbitmq_shovel"]}}}'

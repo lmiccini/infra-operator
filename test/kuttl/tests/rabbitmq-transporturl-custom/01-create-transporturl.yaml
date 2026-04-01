@@ -1,0 +1,11 @@
+#
+# Step 1: Create a TransportURL with custom username and vhost
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: TransportURL
+metadata:
+  name: custom-url
+spec:
+  rabbitmqClusterName: rabbitmq-url-custom
+  username: nova
+  vhost: nova-vhost

@@ -1,0 +1,10 @@
+#
+# Step 1: Create TransportURL with a custom username
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: TransportURL
+metadata:
+  name: cred-rot-url
+spec:
+  rabbitmqClusterName: rabbitmq-cred-rot
+  username: nova

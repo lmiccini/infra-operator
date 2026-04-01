@@ -1,23 +1,29 @@
 #
 # Check for:
 #
-# - 1 RabbitMQPolicy CR
+# - 1 RabbitMQUser CR
+# - 1 Secret for RabbitMQUser CR
 #
 
 apiVersion: rabbitmq.openstack.org/v1beta1
-kind: RabbitMQPolicy
+kind: RabbitMQUser
 metadata:
-  name: rabbitmqpolicy-sample
+  name: rabbitmquser-sample
 spec:
   rabbitmqClusterName: rabbitmq
   vhostRef: rabbitmqvhost-sample
-  name: "queue-limits"
-  pattern: ".*"
-  priority: 0
-  applyTo: "all"
 status:
   conditions:
   - status: "True"
     type: Ready
   - status: "True"
-    type: RabbitMQPolicyReady
+    type: RabbitMQUserReady
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rabbitmq-user-rabbitmquser-sample
+  ownerReferences:
+  - apiVersion: rabbitmq.openstack.org/v1beta1
+    kind: RabbitMQUser
+    name: rabbitmquser-sample

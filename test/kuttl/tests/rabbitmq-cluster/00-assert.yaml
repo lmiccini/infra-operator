@@ -1,0 +1,83 @@
+#
+# Step 0: Check that deploying a RabbitMq CR creates the expected resources:
+#
+# - StatefulSet owned by RabbitMq
+# - Headless Service (clusterIP: None) owned by RabbitMq
+# - Client Service owned by RabbitMq
+# - Erlang cookie Secret owned by RabbitMq
+# - Default user Secret owned by RabbitMq
+# - Plugins ConfigMap owned by RabbitMq
+# - Server config ConfigMap owned by RabbitMq
+#
+
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq-basic
+spec:
+  replicas: 1
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq-basic-server
+  ownerReferences:
+  - apiVersion: rabbitmq.openstack.org/v1beta1
+    kind: RabbitMq
+    name: rabbitmq-basic
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-basic-nodes
+  ownerReferences:
+  - apiVersion: rabbitmq.openstack.org/v1beta1
+    kind: RabbitMq
+    name: rabbitmq-basic
+spec:
+  clusterIP: None
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-basic
+  ownerReferences:
+  - apiVersion: rabbitmq.openstack.org/v1beta1
+    kind: RabbitMq
+    name: rabbitmq-basic
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rabbitmq-basic-default-user
+  ownerReferences:
+  - apiVersion: rabbitmq.openstack.org/v1beta1
+    kind: RabbitMq
+    name: rabbitmq-basic
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rabbitmq-basic-erlang-cookie
+  ownerReferences:
+  - apiVersion: rabbitmq.openstack.org/v1beta1
+    kind: RabbitMq
+    name: rabbitmq-basic
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rabbitmq-basic-plugins-conf
+  ownerReferences:
+  - apiVersion: rabbitmq.openstack.org/v1beta1
+    kind: RabbitMq
+    name: rabbitmq-basic
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rabbitmq-basic-server-conf
+  ownerReferences:
+  - apiVersion: rabbitmq.openstack.org/v1beta1
+    kind: RabbitMq
+    name: rabbitmq-basic

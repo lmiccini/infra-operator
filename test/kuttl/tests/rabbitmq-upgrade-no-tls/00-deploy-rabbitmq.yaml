@@ -1,0 +1,12 @@
+#
+# Step 0: Deploy RabbitMq with targetVersion 3.9
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq-upgrade-notls
+spec:
+  replicas: 1
+  containerImage: quay.io/openstack-k8s-operators/rabbitmq:3.9
+  terminationGracePeriodSeconds: 30
+  targetVersion: "3.9"

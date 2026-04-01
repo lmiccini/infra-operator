@@ -1,0 +1,12 @@
+#
+# Step 0: Assert TLS secrets exist
+#
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rabbitmq-tls-cert
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rabbitmq-tls-ca

@@ -1,0 +1,11 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+- script: |
+    oc delete rabbitmq.rabbitmq.openstack.org rabbitmq-new -n $NAMESPACE --ignore-not-found
+    oc delete rabbitmqcluster.rabbitmq.com rabbitmq-old -n $NAMESPACE --ignore-not-found
+    oc delete pvc -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-new --ignore-not-found
+    oc delete pvc -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-old --ignore-not-found
+    for pv in $(oc get pv -o jsonpath='{range .items[?(@.spec.claimRef.namespace=="'$NAMESPACE'")]}{.metadata.name}{" "}{.spec.claimRef.name}{"\n"}{end}' | grep -E 'rabbitmq-(new|old)-server-' | awk '{print $1}'); do
+      oc delete pv "$pv" --ignore-not-found
+    done

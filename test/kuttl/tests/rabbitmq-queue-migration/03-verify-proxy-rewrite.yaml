@@ -1,0 +1,47 @@
+#
+# Step 3: Spin up a client pod that declares a classic non-durable queue and
+#         exchange through the AMQP proxy to verify the proxy rewrites them
+#         to quorum/durable
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+- script: |
+    set -e
+    USER=$(oc get secret -n $NAMESPACE rabbitmq-qmigrate-default-user -o jsonpath='{.data.username}' | base64 -d)
+    PASS=$(oc get secret -n $NAMESPACE rabbitmq-qmigrate-default-user -o jsonpath='{.data.password}' | base64 -d)
+    HOST="rabbitmq-qmigrate.$NAMESPACE.svc"
+
+    # Spin up a client pod with python3 and pip available
+    oc run amqp-test-client -n $NAMESPACE \
+      --image=quay.io/centos/centos:stream9-minimal \
+      --restart=Never \
+      --command -- sleep 300
+
+    # Wait for the client pod to be ready
+    oc wait pod/amqp-test-client -n $NAMESPACE --for=condition=Ready --timeout=120s
+
+    # Install python3-pip and pika
+    oc exec -n $NAMESPACE amqp-test-client -- microdnf install -y python3-pip
+    oc exec -n $NAMESPACE amqp-test-client -- pip3 install pika
+
+    # Declare a queue as classic and non-durable, and an exchange as non-durable,
+    # connecting through the proxy on port 5672.
+    # The proxy should rewrite queue to quorum + durable, and exchange to durable.
+    oc exec -n $NAMESPACE amqp-test-client -- python3 -c "
+    import pika
+
+    creds = pika.PlainCredentials('${USER}', '${PASS}')
+    params = pika.ConnectionParameters(host='${HOST}', port=5672, credentials=creds)
+    conn = pika.BlockingConnection(params)
+    ch = conn.channel()
+
+    # Declare queue as classic, non-durable, auto-delete
+    ch.queue_declare(queue='proxy-test-queue', durable=False, auto_delete=True)
+
+    # Declare exchange as non-durable
+    ch.exchange_declare(exchange='proxy-test-exchange', exchange_type='direct', durable=False)
+
+    conn.close()
+    print('PASS: Declared queue and exchange through proxy')
+    "

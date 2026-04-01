@@ -1,0 +1,12 @@
+#
+# Step 3: After cleanup, all resources should be gone
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq-upgrade-notls
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq-upgrade-notls-server

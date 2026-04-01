@@ -1,0 +1,48 @@
+#
+# Step 3: After deleting the RabbitMq CR, all owned resources should be gone
+#
+
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq-basic
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq-basic-server
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-basic-nodes
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-basic
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rabbitmq-basic-default-user
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rabbitmq-basic-erlang-cookie
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rabbitmq-basic-plugins-conf
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rabbitmq-basic-server-conf
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rabbitmq-basic-config-data

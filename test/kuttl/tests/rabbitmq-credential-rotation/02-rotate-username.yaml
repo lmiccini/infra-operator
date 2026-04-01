@@ -1,0 +1,10 @@
+#
+# Step 2: Change the TransportURL username from nova to glance
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: TransportURL
+metadata:
+  name: cred-rot-url
+spec:
+  rabbitmqClusterName: rabbitmq-cred-rot
+  username: glance

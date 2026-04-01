@@ -1,0 +1,16 @@
+#
+# Step 1: Assert that queue migration triggers storage wipe and proxy injection
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 60
+commands:
+  - script: |
+      set -e
+      # wipeReason should be QueueTypeMigration
+      REASON=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-qmigrate -o jsonpath='{.status.wipeReason}')
+      if [ "$REASON" != "QueueTypeMigration" ]; then
+        echo "FAIL: Expected wipeReason 'QueueTypeMigration', got: '$REASON'"
+        exit 1
+      fi
+      echo "PASS: wipeReason is $REASON"

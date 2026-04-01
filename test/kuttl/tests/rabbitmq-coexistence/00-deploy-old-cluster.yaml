@@ -1,0 +1,47 @@
+#
+# Step 0: Deploy a RabbitmqCluster CR managed by the old rabbitmq-cluster-operator.
+# The override section clears security contexts so pods comply with
+# OpenShift's restricted SCC (the default sets UID 999 / fsGroup 0).
+#
+apiVersion: rabbitmq.com/v1beta1
+kind: RabbitmqCluster
+metadata:
+  name: rabbitmq-old
+spec:
+  replicas: 1
+  image: quay.io/openstack-k8s-operators/rabbitmq:3.9
+  rabbitmq:
+    additionalConfig: |
+      log.console = true
+      log.file = false
+  resources:
+    requests:
+      cpu: 100m
+      memory: 500Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+  override:
+    statefulSet:
+      spec:
+        template:
+          metadata: {}
+          spec:
+            containers:
+            - args:
+              - /usr/lib/rabbitmq/bin/rabbitmq-server
+              env:
+              - name: RABBITMQ_UPGRADE_LOG
+                value: /var/lib/rabbitmq/rabbitmq_upgrade.log
+              - name: HOME
+                value: /var/lib/rabbitmq
+              - name: PATH
+                value: /usr/lib/rabbitmq/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+              image: quay.io/openstack-k8s-operators/rabbitmq:3.9
+              name: rabbitmq
+              resources: {}
+            initContainers:
+            - name: setup-container
+              resources: {}
+              securityContext: {}
+            securityContext: {}

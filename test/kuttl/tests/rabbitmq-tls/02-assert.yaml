@@ -1,0 +1,63 @@
+#
+# Step 2: Validate TLS-specific configuration
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+commands:
+  - script: |
+      set -e
+      # Verify client service has AMQPS port (5671)
+      PORTS=$(oc get service -n $NAMESPACE rabbitmq-tls -o jsonpath='{.spec.ports[*].port}')
+      echo "Service ports: $PORTS"
+      if ! echo "$PORTS" | grep -qw 5671; then
+        echo "FAIL: Client service missing AMQPS port 5671"
+        exit 1
+      fi
+      echo "PASS: Client service has AMQPS port 5671"
+  - script: |
+      set -e
+      # Verify default-user secret port reflects TLS (5671)
+      PORT=$(oc get secret -n $NAMESPACE rabbitmq-tls-default-user -o jsonpath='{.data.port}' | base64 -d)
+      if [ "$PORT" != "5671" ]; then
+        echo "FAIL: Expected port 5671, got '$PORT'"
+        exit 1
+      fi
+      echo "PASS: default-user port is $PORT (TLS)"
+  - script: |
+      set -e
+      # Verify StatefulSet mounts TLS volumes
+      VOLUMES=$(oc get statefulset -n $NAMESPACE rabbitmq-tls-server -o jsonpath='{.spec.template.spec.volumes[*].name}')
+      echo "Volumes: $VOLUMES"
+      if ! echo "$VOLUMES" | grep -qw "rabbitmq-tls"; then
+        echo "FAIL: StatefulSet missing rabbitmq-tls volume"
+        exit 1
+      fi
+      echo "PASS: StatefulSet has rabbitmq-tls volume"
+  - script: |
+      set -e
+      # Verify rabbitmq-tls volume projects from the CA secret (caSecretName)
+      CA_SECRET=$(oc get statefulset -n $NAMESPACE rabbitmq-tls-server -o \
+        jsonpath='{.spec.template.spec.volumes[?(@.name=="rabbitmq-tls")].projected.sources[1].secret.name}')
+      if [ "$CA_SECRET" != "rabbitmq-tls-ca" ]; then
+        echo "FAIL: Expected CA from 'rabbitmq-tls-ca', got '$CA_SECRET'"
+        exit 1
+      fi
+      echo "PASS: CA certificate sourced from correct secret: $CA_SECRET"
+  - script: |
+      set -e
+      # Verify server-conf ConfigMap contains TLS listener configuration
+      CONF=$(oc get configmap -n $NAMESPACE rabbitmq-tls-server-conf -o jsonpath='{.data.operatorDefaults\.conf}')
+      if ! echo "$CONF" | grep -q "listeners.ssl.default"; then
+        echo "FAIL: server-conf missing TLS listener configuration"
+        exit 1
+      fi
+      echo "PASS: server-conf contains TLS listener configuration"
+  - script: |
+      set -e
+      # Verify inter-node TLS config exists
+      VOLUMES=$(oc get statefulset -n $NAMESPACE rabbitmq-tls-server -o jsonpath='{.spec.template.spec.volumes[*].name}')
+      if ! echo "$VOLUMES" | grep -qw "config-data"; then
+        echo "FAIL: StatefulSet missing config-data volume for inter-node TLS"
+        exit 1
+      fi
+      echo "PASS: StatefulSet has config-data volume for inter-node TLS"

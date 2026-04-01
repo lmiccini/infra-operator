@@ -35,8 +35,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	rabbitmqv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
-	test "github.com/openstack-k8s-operators/lib-common/modules/test"
-	rabbitmqclusterv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 )
 
 var (
@@ -60,15 +58,10 @@ var _ = BeforeSuite(func() {
 
 	ctx, cancel = context.WithCancel(context.TODO())
 
-	rabbitmqv2CRDs, err := test.GetCRDDirFromModule(
-		"github.com/rabbitmq/cluster-operator/v2", "../../../../go.mod", "config/crd/bases")
-	Expect(err).ShouldNot(HaveOccurred())
-
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
 		CRDDirectoryPaths: []string{
 			filepath.Join("..", "..", "..", "..", "config", "crd", "bases"),
-			rabbitmqv2CRDs,
 		},
 		ErrorIfCRDPathMissing: true,
 		WebhookInstallOptions: envtest.WebhookInstallOptions{
@@ -77,13 +70,12 @@ var _ = BeforeSuite(func() {
 		},
 	}
 
+	var err error
 	cfg, err = testEnv.Start()
 	Expect(err).NotTo(HaveOccurred())
 	Expect(cfg).NotTo(BeNil())
 
 	err = rabbitmqv1beta1.AddToScheme(scheme.Scheme)
-	Expect(err).NotTo(HaveOccurred())
-	err = rabbitmqclusterv2.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})

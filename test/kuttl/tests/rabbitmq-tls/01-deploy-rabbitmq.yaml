@@ -1,0 +1,11 @@
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq-tls
+spec:
+  replicas: 1
+  containerImage: quay.io/podified-antelope-centos9/openstack-rabbitmq:current-podified
+  terminationGracePeriodSeconds: 30
+  tls:
+    secretName: rabbitmq-tls-cert
+    caSecretName: rabbitmq-tls-ca

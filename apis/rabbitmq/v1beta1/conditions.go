@@ -19,6 +19,14 @@ import (
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 )
 
+// RabbitMQ Condition Types used by API objects.
+const (
+	// RabbitMQProxyActiveCondition indicates that the AMQP proxy sidecar is running.
+	// Status=True means the proxy is active and must be cleared by setting the
+	// clients-reconfigured annotation. Status=False means no proxy is running.
+	RabbitMQProxyActiveCondition condition.Type = "RabbitMQProxyActive"
+)
+
 // TransportURL Condition Types used by API objects.
 const (
 	// TransportURLReadyCondition Status=True condition which indicates if TransportURL is configured and operational
@@ -39,6 +47,17 @@ const ()
 
 // Common Messages used by API objects.
 const (
+	//
+	// RabbitMQProxyActive condition messages
+	//
+
+	// RabbitMQProxyActiveMessage is the message when the proxy is active
+	RabbitMQProxyActiveMessage = "AMQP proxy sidecar is active for queue migration. " +
+		"To remove it, set annotation '%s: \"true\"' on the RabbitMq CR after all clients have been reconfigured for quorum queues"
+
+	// RabbitMQProxyInactiveMessage is the message when the proxy is not active
+	RabbitMQProxyInactiveMessage = "AMQP proxy sidecar is not active"
+
 	//
 	// TransportURLReady condition messages
 	//

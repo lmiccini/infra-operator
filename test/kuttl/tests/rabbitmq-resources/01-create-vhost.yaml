@@ -1,0 +1,10 @@
+#
+# Step 1: Create a vhost
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMQVhost
+metadata:
+  name: test-vhost
+spec:
+  rabbitmqClusterName: rabbitmq-res
+  name: test

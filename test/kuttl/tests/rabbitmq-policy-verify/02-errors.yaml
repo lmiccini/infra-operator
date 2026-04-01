@@ -1,0 +1,17 @@
+#
+# Step 2: After cleanup, all resources should be gone
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMQPolicy
+metadata:
+  name: pol-ver-policy
+---
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMQVhost
+metadata:
+  name: pol-ver-vhost
+---
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq-pol-ver

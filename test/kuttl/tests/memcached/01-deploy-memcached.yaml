@@ -1,1 +1,6 @@
-../../../../config/samples/memcached_v1beta1_memcached.yaml
+apiVersion: memcached.openstack.org/v1beta1
+kind: Memcached
+metadata:
+  name: memcached
+spec:
+  replicas: 1

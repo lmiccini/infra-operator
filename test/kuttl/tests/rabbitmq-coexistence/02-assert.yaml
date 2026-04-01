@@ -1,0 +1,63 @@
+#
+# Step 2: Verify both clusters are running independently without interference
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 60
+commands:
+  # Verify old cluster is still managed by old operator (ownerReferences intact)
+  - script: |
+      set -e
+      OWNER=$(oc get statefulset -n $NAMESPACE rabbitmq-old-server -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].kind}')
+      if [ "$OWNER" != "RabbitmqCluster" ]; then
+        echo "FAIL: Old StatefulSet should be owned by RabbitmqCluster, got: $OWNER"
+        exit 1
+      fi
+      echo "PASS: Old StatefulSet still owned by RabbitmqCluster"
+  # Verify old cluster's finalizers are untouched
+  - script: |
+      set -e
+      FINALIZERS=$(oc get rabbitmqcluster.rabbitmq.com -n $NAMESPACE rabbitmq-old -o jsonpath='{.metadata.finalizers}')
+      if [ -z "$FINALIZERS" ]; then
+        echo "FAIL: Old RabbitmqCluster finalizers should not be empty"
+        exit 1
+      fi
+      echo "PASS: Old RabbitmqCluster finalizers intact: $FINALIZERS"
+  # Verify old cluster is still ready
+  - script: |
+      set -e
+      READY=$(oc get rabbitmqcluster.rabbitmq.com -n $NAMESPACE rabbitmq-old -o jsonpath='{.status.conditions[?(@.type=="AllReplicasReady")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: Old RabbitmqCluster should still be ready"
+        exit 1
+      fi
+      echo "PASS: Old RabbitmqCluster still ready"
+  # Verify new cluster is owned by RabbitMq (infra-operator)
+  - script: |
+      set -e
+      OWNER=$(oc get statefulset -n $NAMESPACE rabbitmq-new-server -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].kind}')
+      if [ "$OWNER" != "RabbitMq" ]; then
+        echo "FAIL: New StatefulSet should be owned by RabbitMq, got: $OWNER"
+        exit 1
+      fi
+      echo "PASS: New StatefulSet owned by RabbitMq"
+  # Verify new cluster has OldCRCleaned=True (no migration attempted)
+  - script: |
+      set -e
+      CLEANED=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-new -o jsonpath='{.status.oldCRCleaned}')
+      if [ "$CLEANED" != "True" ]; then
+        echo "FAIL: OldCRCleaned should be True for fresh deployment, got: $CLEANED"
+        exit 1
+      fi
+      echo "PASS: OldCRCleaned=True (no migration attempted)"
+  # Verify both clusters can serve AMQP independently
+  - script: |
+      set -e
+      OLD_POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-old -o jsonpath='{.items[0].metadata.name}')
+      oc exec -n $NAMESPACE "$OLD_POD" -- rabbitmq-diagnostics ping
+      echo "PASS: Old cluster responding to diagnostics"
+  - script: |
+      set -e
+      NEW_POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-new -o jsonpath='{.items[0].metadata.name}')
+      oc exec -n $NAMESPACE "$NEW_POD" -c rabbitmq -- rabbitmq-diagnostics ping
+      echo "PASS: New cluster responding to diagnostics"

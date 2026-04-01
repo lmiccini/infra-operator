@@ -19,6 +19,7 @@ package rabbitmq
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -42,7 +43,6 @@ import (
 	helper "github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	object "github.com/openstack-k8s-operators/lib-common/modules/common/object"
 	oko_secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
-	rabbitmqclusterv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -308,7 +308,7 @@ func (r *TransportURLReconciler) deleteUserAfterGracePeriod(
 	}
 
 	// Check if grace period has elapsed
-	remaining, hasTimestamp := r.checkGracePeriod(user)
+	remaining, hasTimestamp := r.checkGracePeriod(ctx, user)
 
 	if !hasTimestamp {
 		// Finalizer was removed but no timestamp set (shouldn't happen, but handle it)
@@ -358,8 +358,8 @@ func (r *TransportURLReconciler) deleteUserAfterGracePeriod(
 // Returns:
 //   - remaining: time remaining in grace period (0 if elapsed or parse error)
 //   - hasTimestamp: whether a valid timestamp annotation exists
-func (r *TransportURLReconciler) checkGracePeriod(user *rabbitmqv1.RabbitMQUser) (remaining time.Duration, hasTimestamp bool) {
-	Log := r.GetLogger(context.Background())
+func (r *TransportURLReconciler) checkGracePeriod(ctx context.Context, user *rabbitmqv1.RabbitMQUser) (remaining time.Duration, hasTimestamp bool) {
+	Log := r.GetLogger(ctx)
 
 	timestampStr, ok := user.Annotations[finalizerRemovedAtAnnotation]
 	if !ok {
@@ -402,7 +402,6 @@ func hasExternalFinalizers(user *rabbitmqv1.RabbitMQUser) bool {
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs,verbs=get;list;watch
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqusers,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqvhosts,verbs=get;list;watch;create;update;patch
-//+kubebuilder:rbac:groups=rabbitmq.com,resources=rabbitmqclusters,verbs=get;list;watch
 //+kubebuilder:rbac:groups=cinder.openstack.org;glance.openstack.org;heat.openstack.org;horizon.openstack.org;ironic.openstack.org;keystone.openstack.org;manila.openstack.org;neutron.openstack.org;nova.openstack.org;octavia.openstack.org;ovn.openstack.org;placement.openstack.org;swift.openstack.org;telemetry.openstack.org;designate.openstack.org;barbican.openstack.org;watcher.openstack.org,resources=*,verbs=get;list
 //+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete;
 
@@ -510,14 +509,7 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 	}
 
 	// Wait for RabbitMQ cluster to be ready
-	rabbitReady := false
-	for _, condition := range rabbit.Status.Conditions {
-		if condition.Reason == "AllPodsAreReady" && condition.Status == "True" {
-			rabbitReady = true
-			break
-		}
-	}
-	if !rabbitReady {
+	if err := checkClusterReadiness(rabbit); err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			rabbitmqv1.TransportURLReadyCondition,
 			condition.RequestedReason,
@@ -527,6 +519,14 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 	}
 
 	// Get cluster admin secret for connection details
+	if rabbit.Status.DefaultUser == nil {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			rabbitmqv1.TransportURLReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			rabbitmqv1.TransportURLInProgressMessage))
+		return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+	}
 	rabbitSecret, _, err := oko_secret.GetSecret(ctx, helper, rabbit.Status.DefaultUser.SecretReference.Name, instance.Namespace)
 	if err != nil {
 		if k8s_errors.IsNotFound(err) {
@@ -659,24 +659,25 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 	// This cleanup runs unconditionally to handle the case where a custom user is removed
 	// from the spec and the TransportURL switches to default admin credentials
 	userList := &rabbitmqv1.RabbitMQUserList{}
-	if err := r.List(ctx, userList, client.InNamespace(instance.Namespace)); err == nil {
-		for i := range userList.Items {
-			oldUser := &userList.Items[i]
-			isOwned := object.CheckOwnerRefExist(instance.GetUID(), oldUser.GetOwnerReferences())
+	if err := r.List(ctx, userList, client.InNamespace(instance.Namespace)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to list RabbitMQUsers: %w", err)
+	}
+	for i := range userList.Items {
+		oldUser := &userList.Items[i]
+		isOwned := object.CheckOwnerRefExist(instance.GetUID(), oldUser.GetOwnerReferences())
 
-			// If owned by this TransportURL but not the current user, handle cleanup
-			// When userRef is empty (using default credentials), all owned users should be cleaned up
-			if isOwned && oldUser.Name != userRef {
-				// Clean up old user - pass NamespacedName instead of full object
-				// This ensures we always fetch fresh data inside cleanupOldUser
-				oldUserName := types.NamespacedName{Name: oldUser.Name, Namespace: oldUser.Namespace}
-				userRequeueAfter, err := r.cleanupOldUser(ctx, instance, oldUserName)
-				if err != nil {
-					return ctrl.Result{}, fmt.Errorf("failed to cleanup old user %s: %w", oldUser.Name, err)
-				}
-				if userRequeueAfter > 0 && (requeueAfter == 0 || userRequeueAfter < requeueAfter) {
-					requeueAfter = userRequeueAfter
-				}
+		// If owned by this TransportURL but not the current user, handle cleanup
+		// When userRef is empty (using default credentials), all owned users should be cleaned up
+		if isOwned && oldUser.Name != userRef {
+			// Clean up old user - pass NamespacedName instead of full object
+			// This ensures we always fetch fresh data inside cleanupOldUser
+			oldUserName := types.NamespacedName{Name: oldUser.Name, Namespace: oldUser.Namespace}
+			userRequeueAfter, err := r.cleanupOldUser(ctx, instance, oldUserName)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to cleanup old user %s: %w", oldUser.Name, err)
+			}
+			if userRequeueAfter > 0 && (requeueAfter == 0 || userRequeueAfter < requeueAfter) {
+				requeueAfter = userRequeueAfter
 			}
 		}
 	}
@@ -685,35 +686,36 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 	// but only if they're no longer referenced in the TransportURL spec
 	// This handles vhost removal when the vhost definition is removed from the spec
 	vhostList := &rabbitmqv1.RabbitMQVhostList{}
-	if err := r.List(ctx, vhostList, client.InNamespace(instance.Namespace)); err == nil {
-		for i := range vhostList.Items {
-			oldVhost := &vhostList.Items[i]
+	if err := r.List(ctx, vhostList, client.InNamespace(instance.Namespace)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to list RabbitMQVhosts: %w", err)
+	}
+	for i := range vhostList.Items {
+		oldVhost := &vhostList.Items[i]
 
-			// Skip vhosts not owned by this TransportURL
-			isOwned := object.CheckOwnerRefExist(instance.GetUID(), oldVhost.GetOwnerReferences())
-			if !isOwned {
-				continue
-			}
+		// Skip vhosts not owned by this TransportURL
+		isOwned := object.CheckOwnerRefExist(instance.GetUID(), oldVhost.GetOwnerReferences())
+		if !isOwned {
+			continue
+		}
 
-			// Skip vhosts that are not being deleted
-			if oldVhost.DeletionTimestamp.IsZero() {
-				continue
-			}
+		// Skip vhosts that are not being deleted
+		if oldVhost.DeletionTimestamp.IsZero() {
+			continue
+		}
 
-			// Skip the current vhost - only clean up orphaned vhosts from previous specs
-			if oldVhost.Name == vhostRef {
-				continue
-			}
+		// Skip the current vhost - only clean up orphaned vhosts from previous specs
+		if oldVhost.Name == vhostRef {
+			continue
+		}
 
-			// Remove finalizer if present
-			if !controllerutil.RemoveFinalizer(oldVhost, rabbitmqv1.TransportURLFinalizer) {
-				continue
-			}
+		// Remove finalizer if present
+		if !controllerutil.RemoveFinalizer(oldVhost, rabbitmqv1.TransportURLFinalizer) {
+			continue
+		}
 
-			// Update the vhost
-			if err := r.Update(ctx, oldVhost); err != nil && !k8s_errors.IsNotFound(err) {
-				return ctrl.Result{}, fmt.Errorf("failed to remove TransportURL finalizer from old vhost %s: %w", oldVhost.Name, err)
-			}
+		// Update the vhost
+		if err := r.Update(ctx, oldVhost); err != nil && !k8s_errors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("failed to remove TransportURL finalizer from old vhost %s: %w", oldVhost.Name, err)
 		}
 	}
 
@@ -751,6 +753,9 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 		finalUsername = string(userSecret.Data["username"])
 		finalPassword = string(userSecret.Data["password"])
 		vhostName = rabbitUser.Status.Vhost
+		if vhostName == "" {
+			vhostName = "/"
+		}
 	} else {
 		// Use default cluster admin credentials
 		finalUsername = string(adminUsername)
@@ -763,11 +768,19 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 
 	// Get RabbitMq CR for both secret generation and status update
 	rabbitmqCR := &rabbitmqv1.RabbitMq{}
+	rabbitmqCRFound := true
 	err = r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbitmqCR)
+	if err != nil {
+		if !k8s_errors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("failed to get RabbitMQ CR %s: %w", instance.Spec.RabbitmqClusterName, err)
+		}
+		rabbitmqCRFound = false
+		Log.Info(fmt.Sprintf("RabbitMQ CR %s not found, using fallback values", instance.Spec.RabbitmqClusterName))
+	}
 
 	// Build list of hosts - use ServiceHostnames from status if available, otherwise use host from secret
 	var hosts []string
-	if err == nil && len(rabbitmqCR.Status.ServiceHostnames) > 0 {
+	if rabbitmqCRFound && len(rabbitmqCR.Status.ServiceHostnames) > 0 {
 		hosts = rabbitmqCR.Status.ServiceHostnames
 		Log.Info(fmt.Sprintf("Using per-pod service hostnames: %v", hosts))
 	} else {
@@ -788,10 +801,7 @@ func (r *TransportURLReconciler) reconcileNormal(ctx context.Context, instance *
 
 	// Determine quorum setting for secret generation
 	quorum := false
-	if err != nil {
-		Log.Info(fmt.Sprintf("Could not fetch RabbitMQ CR: %v", err))
-		// Default to false for quorum if we can't fetch the CR
-	} else {
+	if rabbitmqCRFound {
 		Log.Info(fmt.Sprintf("Found RabbitMQ CR: %s", rabbitmqCR.Name))
 
 		// Determine quorum setting - prefer Spec over Status
@@ -888,14 +898,20 @@ func (r *TransportURLReconciler) createTransportURLSecret(
 	}
 
 	// Ensure vhost has leading / (e.g., "/" or "/nova")
-	if vhost != "/" && vhost[0] != '/' {
+	if vhost == "" {
+		vhost = "/"
+	} else if vhost != "/" && vhost[0] != '/' {
 		vhost = "/" + vhost
 	}
 
-	// Build transport URL with all hosts
+	// Build transport URL with all hosts.
+	// URL-encode username and password to handle special characters
+	// (e.g., @, :, /, %) that would break AMQP URL parsing.
+	encodedUser := url.QueryEscape(username)
+	encodedPass := url.QueryEscape(password)
 	var hostParts []string
 	for _, host := range hosts {
-		hostParts = append(hostParts, fmt.Sprintf("%s:%s@%s:%s", username, password, host, port))
+		hostParts = append(hostParts, fmt.Sprintf("%s:%s@%s:%s", encodedUser, encodedPass, host, port))
 	}
 	transportURL := fmt.Sprintf("rabbit://%s%s%s", strings.Join(hostParts, ","), vhost, query)
 
@@ -927,41 +943,43 @@ func (r *TransportURLReconciler) reconcileDelete(ctx context.Context, instance *
 
 	// Remove TransportURL finalizers from all owned users and vhosts
 	userList := &rabbitmqv1.RabbitMQUserList{}
-	if err := r.List(ctx, userList, client.InNamespace(instance.Namespace)); err == nil {
-		for i := range userList.Items {
-			user := &userList.Items[i]
-			// Check if this user is owned by this TransportURL
-			isOwned := object.CheckOwnerRefExist(instance.GetUID(), user.GetOwnerReferences())
-			if isOwned {
-				// Remove both the TransportURL finalizer and the cleanup-blocked finalizer
-				// When TransportURL is deleted, we want to allow full cleanup of owned users
-				updated := false
-				if controllerutil.RemoveFinalizer(user, rabbitmqv1.TransportURLFinalizer) {
-					updated = true
-				}
-				if controllerutil.RemoveFinalizer(user, rabbitmqv1.RabbitMQUserCleanupBlockedFinalizer) {
-					updated = true
-				}
-				if updated {
-					if err := r.Update(ctx, user); err != nil {
-						return ctrl.Result{}, fmt.Errorf("failed to remove finalizers from user %s: %w", user.Name, err)
-					}
+	if err := r.List(ctx, userList, client.InNamespace(instance.Namespace)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to list RabbitMQUsers: %w", err)
+	}
+	for i := range userList.Items {
+		user := &userList.Items[i]
+		// Check if this user is owned by this TransportURL
+		isOwned := object.CheckOwnerRefExist(instance.GetUID(), user.GetOwnerReferences())
+		if isOwned {
+			// Remove both the TransportURL finalizer and the cleanup-blocked finalizer
+			// When TransportURL is deleted, we want to allow full cleanup of owned users
+			updated := false
+			if controllerutil.RemoveFinalizer(user, rabbitmqv1.TransportURLFinalizer) {
+				updated = true
+			}
+			if controllerutil.RemoveFinalizer(user, rabbitmqv1.RabbitMQUserCleanupBlockedFinalizer) {
+				updated = true
+			}
+			if updated {
+				if err := r.Update(ctx, user); err != nil {
+					return ctrl.Result{}, fmt.Errorf("failed to remove finalizers from user %s: %w", user.Name, err)
 				}
 			}
 		}
 	}
 
 	vhostList := &rabbitmqv1.RabbitMQVhostList{}
-	if err := r.List(ctx, vhostList, client.InNamespace(instance.Namespace)); err == nil {
-		for i := range vhostList.Items {
-			vhost := &vhostList.Items[i]
-			// Check if this vhost is owned by this TransportURL
-			isOwned := object.CheckOwnerRefExist(instance.GetUID(), vhost.GetOwnerReferences())
-			if isOwned {
-				if controllerutil.RemoveFinalizer(vhost, rabbitmqv1.TransportURLFinalizer) {
-					if err := r.Update(ctx, vhost); err != nil {
-						return ctrl.Result{}, fmt.Errorf("failed to remove TransportURL finalizer from vhost %s: %w", vhost.Name, err)
-					}
+	if err := r.List(ctx, vhostList, client.InNamespace(instance.Namespace)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to list RabbitMQVhosts: %w", err)
+	}
+	for i := range vhostList.Items {
+		vhost := &vhostList.Items[i]
+		// Check if this vhost is owned by this TransportURL
+		isOwned := object.CheckOwnerRefExist(instance.GetUID(), vhost.GetOwnerReferences())
+		if isOwned {
+			if controllerutil.RemoveFinalizer(vhost, rabbitmqv1.TransportURLFinalizer) {
+				if err := r.Update(ctx, vhost); err != nil {
+					return ctrl.Result{}, fmt.Errorf("failed to remove TransportURL finalizer from vhost %s: %w", vhost.Name, err)
 				}
 			}
 		}
@@ -995,11 +1013,6 @@ func (r *TransportURLReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Secret{}).
 		Owns(&rabbitmqv1.RabbitMQUser{}).
 		Owns(&rabbitmqv1.RabbitMQVhost{}).
-		Watches(
-			&rabbitmqclusterv2.RabbitmqCluster{},
-			handler.EnqueueRequestsFromMapFunc(r.findObjectsForSrc),
-			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
-		).
 		Watches(
 			&rabbitmqv1.RabbitMq{},
 			handler.EnqueueRequestsFromMapFunc(r.findObjectsForSrc),
@@ -1042,13 +1055,13 @@ func (r *TransportURLReconciler) findObjectsForSrc(ctx context.Context, src clie
 	return requests
 }
 
-// GetRabbitmqCluster - get RabbitmqCluster object in namespace
+// GetRabbitmqCluster - get RabbitMq object in namespace
 func getRabbitmqCluster(
 	ctx context.Context,
 	h *helper.Helper,
 	instance *rabbitmqv1.TransportURL,
-) (*rabbitmqclusterv2.RabbitmqCluster, error) {
-	rabbitMqCluster := &rabbitmqclusterv2.RabbitmqCluster{}
+) (*rabbitmqv1.RabbitMq, error) {
+	rabbitMqCluster := &rabbitmqv1.RabbitMq{}
 
 	err := h.GetClient().Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbitMqCluster)
 

@@ -1,0 +1,46 @@
+#
+# Step 2: Verify rabbitmq_shovel_management is removed and rabbitmq_shovel remains
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 120
+commands:
+  - script: |
+      set -e
+      READY=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-plugins -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: RabbitMq CR not ready after plugin change"
+        exit 1
+      fi
+      echo "PASS: RabbitMq cluster is ready after plugin change"
+  - script: |
+      set -e
+      # Verify plugins ConfigMap no longer contains rabbitmq_shovel_management
+      PLUGINS=$(oc get configmap -n $NAMESPACE rabbitmq-plugins-plugins-conf -o jsonpath='{.data.enabled_plugins}')
+      if echo "$PLUGINS" | grep -q "rabbitmq_shovel_management"; then
+        echo "FAIL: rabbitmq_shovel_management still in plugins ConfigMap after removal"
+        echo "Plugins: $PLUGINS"
+        exit 1
+      fi
+      if ! echo "$PLUGINS" | grep -q "rabbitmq_shovel"; then
+        echo "FAIL: rabbitmq_shovel should still be in plugins ConfigMap"
+        echo "Plugins: $PLUGINS"
+        exit 1
+      fi
+      echo "PASS: Plugin removed from ConfigMap, remaining plugin still present"
+  - script: |
+      set -e
+      # Verify the change is reflected in the running RabbitMQ node
+      POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-plugins -o jsonpath='{.items[0].metadata.name}')
+      ENABLED=$(oc exec -n $NAMESPACE "$POD" -- rabbitmq-plugins list --enabled --minimal)
+      if echo "$ENABLED" | grep -q "rabbitmq_shovel_management"; then
+        echo "FAIL: rabbitmq_shovel_management still enabled in RabbitMQ"
+        echo "Enabled plugins: $ENABLED"
+        exit 1
+      fi
+      if ! echo "$ENABLED" | grep -q "rabbitmq_shovel"; then
+        echo "FAIL: rabbitmq_shovel should still be enabled in RabbitMQ"
+        echo "Enabled plugins: $ENABLED"
+        exit 1
+      fi
+      echo "PASS: Plugin disabled in RabbitMQ, remaining plugin still enabled"
