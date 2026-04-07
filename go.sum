@@ -122,8 +122,6 @@ github.com/openstack-k8s-operators/lib-common/modules/common v0.6.1-0.2026033112
 github.com/openstack-k8s-operators/lib-common/modules/common v0.6.1-0.20260331122750-ecff41ebb61d/go.mod h1:XUUV+h1nZC4kra5oF+cXPkviWYJ3ELhccHxnVO7CvQQ=
 github.com/openstack-k8s-operators/lib-common/modules/test v0.6.1-0.20260331122750-ecff41ebb61d h1:R+04x9fcBpJqP109FIYoKonaCQOmDeqkjVzL5OCLNLs=
 github.com/openstack-k8s-operators/lib-common/modules/test v0.6.1-0.20260331122750-ecff41ebb61d/go.mod h1:dEjz8zHRIlP3vnMmWdHytlLeSZ6BHcIiSTPM7xTQxFg=
-github.com/openstack-k8s-operators/rabbitmq-cluster-operator/v2 v2.6.1-0.20250929174222-a0d328fa4dec h1:saovr368HPAKHN0aRPh8h8n9s9dn3d8Frmfua0UYRlc=
-github.com/openstack-k8s-operators/rabbitmq-cluster-operator/v2 v2.6.1-0.20250929174222-a0d328fa4dec/go.mod h1:Nh2NEePLjovUQof2krTAg4JaAoLacqtPTZQXK6izNfg=
 github.com/pkg/errors v0.9.1 h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=
 github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=

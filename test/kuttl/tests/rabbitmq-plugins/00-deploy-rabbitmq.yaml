@@ -1,0 +1,15 @@
+#
+# Step 0: Deploy a RabbitMq cluster with an additional plugin enabled
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq-plugins
+spec:
+  replicas: 1
+  containerImage: quay.io/podified-antelope-centos9/openstack-rabbitmq:current-podified
+  terminationGracePeriodSeconds: 30
+  rabbitmq:
+    additionalPlugins:
+      - rabbitmq_shovel
+      - rabbitmq_shovel_management

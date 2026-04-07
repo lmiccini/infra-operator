@@ -1,0 +1,24 @@
+#
+# Step 1: Create a vhost and a policy targeting it
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMQVhost
+metadata:
+  name: pol-ver-vhost
+spec:
+  rabbitmqClusterName: rabbitmq-pol-ver
+  name: policy-test-vhost
+---
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMQPolicy
+metadata:
+  name: pol-ver-policy
+spec:
+  rabbitmqClusterName: rabbitmq-pol-ver
+  vhostRef: pol-ver-vhost
+  pattern: "^test-.*"
+  applyTo: queues
+  priority: 5
+  definition:
+    max-length: 500
+    message-ttl: 60000

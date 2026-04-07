@@ -1,0 +1,42 @@
+#
+# Step 1: Create vhost, user, policy, and TransportURL
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMQVhost
+metadata:
+  name: del-deps-vhost
+spec:
+  rabbitmqClusterName: rabbitmq-del-deps
+  name: del-test-vhost
+---
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMQUser
+metadata:
+  name: del-deps-user
+spec:
+  rabbitmqClusterName: rabbitmq-del-deps
+  vhostRef: del-deps-vhost
+  username: deluser
+  permissions:
+    configure: ".*"
+    write: ".*"
+    read: ".*"
+---
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMQPolicy
+metadata:
+  name: del-deps-policy
+spec:
+  rabbitmqClusterName: rabbitmq-del-deps
+  vhostRef: del-deps-vhost
+  pattern: ".*"
+  definition:
+    max-length: 1000
+---
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: TransportURL
+metadata:
+  name: del-deps-url
+spec:
+  rabbitmqClusterName: rabbitmq-del-deps
+  username: del-deps-svc

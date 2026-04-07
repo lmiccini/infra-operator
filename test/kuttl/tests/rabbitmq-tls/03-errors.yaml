@@ -1,0 +1,22 @@
+#
+# Step 3: After cleanup, all resources should be gone
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq-tls
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq-tls-server
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-tls-nodes

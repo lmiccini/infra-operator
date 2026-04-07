@@ -1,0 +1,25 @@
+#
+# Step 1: Wait for RabbitMq to become ready
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+commands:
+  - script: |
+      set -e
+      # Wait for RabbitMq CR to report ready
+      READY=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-basic -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: RabbitMq CR not ready, Ready condition: $READY"
+        exit 1
+      fi
+      DEPLOY_READY=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-basic -o jsonpath='{.status.conditions[?(@.type=="DeploymentReady")].status}')
+      if [ "$DEPLOY_READY" != "True" ]; then
+        echo "FAIL: DeploymentReady condition: $DEPLOY_READY"
+        exit 1
+      fi
+      COUNT=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-basic -o jsonpath='{.status.readyCount}')
+      if [ "$COUNT" != "1" ]; then
+        echo "FAIL: readyCount expected 1, got: $COUNT"
+        exit 1
+      fi
+      echo "PASS: RabbitMq is ready with readyCount=$COUNT"

@@ -1,0 +1,11 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+- script: |
+    oc delete rabbitmqpolicy pol-ver-policy -n $NAMESPACE --ignore-not-found
+    oc delete rabbitmqvhost pol-ver-vhost -n $NAMESPACE --ignore-not-found
+    oc delete rabbitmq.rabbitmq.openstack.org rabbitmq-pol-ver -n $NAMESPACE --ignore-not-found
+    oc delete pvc -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-pol-ver --ignore-not-found
+    for pv in $(oc get pv -o jsonpath='{range .items[?(@.spec.claimRef.namespace=="'$NAMESPACE'")]}{.metadata.name}{" "}{.spec.claimRef.name}{"\n"}{end}' | grep rabbitmq-pol-ver | awk '{print $1}'); do
+      oc delete pv "$pv" --ignore-not-found
+    done

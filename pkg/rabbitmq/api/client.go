@@ -79,26 +79,22 @@ type Policy struct {
 }
 
 // NewClient creates a new RabbitMQ Management API client
-func NewClient(baseURL, username, password string, tlsEnabled bool, caCert []byte) *Client {
+func NewClient(baseURL, username, password string, tlsEnabled bool, caCert []byte) (*Client, error) {
 	httpClient := &http.Client{
 		Timeout: DefaultAPITimeout,
 	}
 
-	if tlsEnabled {
-		tlsConfig := &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		}
-
-		if len(caCert) > 0 {
-			caCertPool := x509.NewCertPool()
-			caCertPool.AppendCertsFromPEM(caCert)
-			tlsConfig.RootCAs = caCertPool
-		} else {
-			tlsConfig.InsecureSkipVerify = true
+	if tlsEnabled && len(caCert) > 0 {
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, fmt.Errorf("failed to parse CA certificate PEM data")
 		}
 
 		httpClient.Transport = &http.Transport{
-			TLSClientConfig: tlsConfig,
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				RootCAs:    caCertPool,
+			},
 		}
 	}
 
@@ -107,7 +103,7 @@ func NewClient(baseURL, username, password string, tlsEnabled bool, caCert []byt
 		username:   username,
 		password:   password,
 		httpClient: httpClient,
-	}
+	}, nil
 }
 
 // doRequest performs an HTTP request with authentication using the default timeout
@@ -126,8 +122,8 @@ func (c *Client) doRequestWithTimeout(method, path string, body interface{}, tim
 		reqBody = bytes.NewBuffer(jsonData)
 	}
 
-	url := fmt.Sprintf("%s%s", c.baseURL, path)
-	req, err := http.NewRequest(method, url, reqBody)
+	apiURL := fmt.Sprintf("%s%s", c.baseURL, path)
+	req, err := http.NewRequest(method, apiURL, reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -135,13 +131,15 @@ func (c *Client) doRequestWithTimeout(method, path string, body interface{}, tim
 	req.SetBasicAuth(c.username, c.password)
 	req.Header.Set("Content-Type", "application/json")
 
-	// Create a client with custom timeout for this request
-	client := &http.Client{
-		Timeout:   timeout,
-		Transport: c.httpClient.Transport,
+	httpClient := c.httpClient
+	if timeout != DefaultAPITimeout {
+		httpClient = &http.Client{
+			Timeout:   timeout,
+			Transport: c.httpClient.Transport,
+		}
 	}
 
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}

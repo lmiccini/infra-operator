@@ -1,0 +1,68 @@
+#
+# Step 2: Wait for upgrade to complete — cluster should be ready at version 4.2
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 600
+commands:
+  - script: |
+      set -e
+      READY=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upgrade-notls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: RabbitMq CR not ready after upgrade"
+        exit 1
+      fi
+      echo "PASS: RabbitMq CR is ready"
+  - script: |
+      set -e
+      VERSION=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upgrade-notls -o jsonpath='{.status.currentVersion}')
+      if [ "$VERSION" != "4.2" ]; then
+        echo "FAIL: Expected currentVersion 4.2, got: $VERSION"
+        exit 1
+      fi
+      echo "PASS: currentVersion is $VERSION"
+  - script: |
+      set -e
+      PHASE=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upgrade-notls -o jsonpath='{.status.upgradePhase}')
+      if [ -n "$PHASE" ]; then
+        echo "FAIL: upgradePhase should be empty after upgrade, got: $PHASE"
+        exit 1
+      fi
+      echo "PASS: upgradePhase is cleared"
+  - script: |
+      set -e
+      REASON=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upgrade-notls -o jsonpath='{.status.wipeReason}')
+      if [ -n "$REASON" ]; then
+        echo "FAIL: wipeReason should be empty after upgrade, got: $REASON"
+        exit 1
+      fi
+      echo "PASS: wipeReason is cleared"
+  - script: |
+      set -e
+      # Verify proxy sidecar container is present in StatefulSet
+      CONTAINERS=$(oc get statefulset -n $NAMESPACE rabbitmq-upgrade-notls-server -o jsonpath='{.spec.template.spec.containers[*].name}')
+      if ! echo "$CONTAINERS" | grep -qw "amqp-proxy"; then
+        echo "FAIL: Proxy sidecar container not found. Containers: $CONTAINERS"
+        exit 1
+      fi
+      echo "PASS: Proxy sidecar container present: $CONTAINERS"
+  - script: |
+      set -e
+      # Verify proxy listens on plain AMQP port 5672 (no TLS)
+      PROXY_PORT=$(oc get statefulset -n $NAMESPACE rabbitmq-upgrade-notls-server -o \
+        jsonpath='{.spec.template.spec.containers[?(@.name=="amqp-proxy")].ports[0].containerPort}')
+      if [ "$PROXY_PORT" != "5672" ]; then
+        echo "FAIL: Expected proxy to listen on port 5672 (plain AMQP), got: $PROXY_PORT"
+        exit 1
+      fi
+      echo "PASS: Proxy listens on plain AMQP port $PROXY_PORT"
+  - script: |
+      set -e
+      # Verify proxy command does NOT contain TLS args
+      ARGS=$(oc get statefulset -n $NAMESPACE rabbitmq-upgrade-notls-server -o \
+        jsonpath='{.spec.template.spec.containers[?(@.name=="amqp-proxy")].args}')
+      if echo "$ARGS" | grep -q "tls-cert"; then
+        echo "FAIL: Proxy should not have TLS args in non-TLS mode. Args: $ARGS"
+        exit 1
+      fi
+      echo "PASS: Proxy has no TLS args"

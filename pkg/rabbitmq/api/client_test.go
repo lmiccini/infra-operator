@@ -25,12 +25,33 @@ import (
 )
 
 func TestNewClient(t *testing.T) {
-	client := NewClient("http://localhost:15672", "user", "pass", false, nil)
+	client, err := NewClient("http://localhost:15672", "user", "pass", false, nil)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
 	if client == nil {
 		t.Fatal("Expected client to be created")
+		return
 	}
 	if client.baseURL != "http://localhost:15672" {
 		t.Errorf("Expected baseURL http://localhost:15672, got %s", client.baseURL)
+	}
+}
+
+func TestNewClient_InvalidCACert(t *testing.T) {
+	_, err := NewClient("https://localhost:15671", "user", "pass", true, []byte("not-valid-pem"))
+	if err == nil {
+		t.Fatal("Expected error for invalid CA cert PEM data")
+	}
+}
+
+func TestNewClient_NoCACert_TLSEnabled(t *testing.T) {
+	client, err := NewClient("https://localhost:15671", "user", "pass", true, nil)
+	if err != nil {
+		t.Fatalf("NewClient with TLS but no CA cert should succeed: %v", err)
+	}
+	if client == nil {
+		t.Fatal("Expected client to be created")
 	}
 }
 
@@ -55,8 +76,11 @@ func TestCreateOrUpdateUser(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "admin", "admin", false, nil)
-	err := client.CreateOrUpdateUser("testuser", "testpass", []string{"monitoring"})
+	client, err := NewClient(server.URL, "admin", "admin", false, nil)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	err = client.CreateOrUpdateUser("testuser", "testpass", []string{"monitoring"})
 	if err != nil {
 		t.Errorf("CreateOrUpdateUser failed: %v", err)
 	}
@@ -74,8 +98,11 @@ func TestDeleteUser(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "admin", "admin", false, nil)
-	err := client.DeleteUser("testuser")
+	client, err := NewClient(server.URL, "admin", "admin", false, nil)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	err = client.DeleteUser("testuser")
 	if err != nil {
 		t.Errorf("DeleteUser failed: %v", err)
 	}
@@ -93,8 +120,11 @@ func TestCreateOrUpdateVhost(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "admin", "admin", false, nil)
-	err := client.CreateOrUpdateVhost("testvhost")
+	client, err := NewClient(server.URL, "admin", "admin", false, nil)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	err = client.CreateOrUpdateVhost("testvhost")
 	if err != nil {
 		t.Errorf("CreateOrUpdateVhost failed: %v", err)
 	}
@@ -112,8 +142,11 @@ func TestDeleteVhost(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "admin", "admin", false, nil)
-	err := client.DeleteVhost("testvhost")
+	client, err := NewClient(server.URL, "admin", "admin", false, nil)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	err = client.DeleteVhost("testvhost")
 	if err != nil {
 		t.Errorf("DeleteVhost failed: %v", err)
 	}
@@ -140,8 +173,11 @@ func TestSetPermissions(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "admin", "admin", false, nil)
-	err := client.SetPermissions("/", "testuser", ".*", ".*", ".*")
+	client, err := NewClient(server.URL, "admin", "admin", false, nil)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	err = client.SetPermissions("/", "testuser", ".*", ".*", ".*")
 	if err != nil {
 		t.Errorf("SetPermissions failed: %v", err)
 	}
@@ -159,8 +195,11 @@ func TestDeletePermissions(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "admin", "admin", false, nil)
-	err := client.DeletePermissions("/", "testuser")
+	client, err := NewClient(server.URL, "admin", "admin", false, nil)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	err = client.DeletePermissions("/", "testuser")
 	if err != nil {
 		t.Errorf("DeletePermissions failed: %v", err)
 	}
@@ -187,9 +226,12 @@ func TestCreateOrUpdatePolicy(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "admin", "admin", false, nil)
+	client, err := NewClient(server.URL, "admin", "admin", false, nil)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
 	definition := map[string]interface{}{"max-length": 10000}
-	err := client.CreateOrUpdatePolicy("/", "testpolicy", ".*", definition, 1, "all")
+	err = client.CreateOrUpdatePolicy("/", "testpolicy", ".*", definition, 1, "all")
 	if err != nil {
 		t.Errorf("CreateOrUpdatePolicy failed: %v", err)
 	}
@@ -207,8 +249,11 @@ func TestDeletePolicy(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "admin", "admin", false, nil)
-	err := client.DeletePolicy("/", "testpolicy")
+	client, err := NewClient(server.URL, "admin", "admin", false, nil)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	err = client.DeletePolicy("/", "testpolicy")
 	if err != nil {
 		t.Errorf("DeletePolicy failed: %v", err)
 	}

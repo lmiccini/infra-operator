@@ -1,0 +1,43 @@
+#
+# Step 3: Verify all additional plugins are removed, only defaults remain
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 120
+commands:
+  - script: |
+      set -e
+      READY=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-plugins -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: RabbitMq CR not ready after removing all additional plugins"
+        exit 1
+      fi
+      echo "PASS: RabbitMq cluster is ready"
+  - script: |
+      set -e
+      # Verify plugins ConfigMap only contains the three default plugins
+      PLUGINS=$(oc get configmap -n $NAMESPACE rabbitmq-plugins-plugins-conf -o jsonpath='{.data.enabled_plugins}')
+      if echo "$PLUGINS" | grep -q "rabbitmq_shovel"; then
+        echo "FAIL: rabbitmq_shovel still in plugins ConfigMap"
+        echo "Plugins: $PLUGINS"
+        exit 1
+      fi
+      for p in rabbitmq_peer_discovery_k8s rabbitmq_prometheus rabbitmq_management; do
+        if ! echo "$PLUGINS" | grep -q "$p"; then
+          echo "FAIL: Default plugin $p missing from plugins ConfigMap"
+          echo "Plugins: $PLUGINS"
+          exit 1
+        fi
+      done
+      echo "PASS: Only default plugins remain in ConfigMap"
+  - script: |
+      set -e
+      # Verify only defaults are enabled in RabbitMQ
+      POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-plugins -o jsonpath='{.items[0].metadata.name}')
+      ENABLED=$(oc exec -n $NAMESPACE "$POD" -- rabbitmq-plugins list --enabled --minimal)
+      if echo "$ENABLED" | grep -q "rabbitmq_shovel"; then
+        echo "FAIL: rabbitmq_shovel still enabled in RabbitMQ"
+        echo "Enabled plugins: $ENABLED"
+        exit 1
+      fi
+      echo "PASS: All additional plugins disabled in RabbitMQ"

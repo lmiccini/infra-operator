@@ -1,0 +1,11 @@
+#
+# Step 1: Deploy a RabbitMq CR managed by the infra-operator (different name)
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq-new
+spec:
+  replicas: 1
+  containerImage: quay.io/podified-antelope-centos9/openstack-rabbitmq:current-podified
+  terminationGracePeriodSeconds: 30

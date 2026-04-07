@@ -1,0 +1,67 @@
+#
+# Step 1: After deploying the RabbitMq CR, all pre-existing resources
+# should be adopted (owned by the new RabbitMq CR)
+#
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq-migrate-server
+  ownerReferences:
+  - apiVersion: rabbitmq.openstack.org/v1beta1
+    kind: RabbitMq
+    name: rabbitmq-migrate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-migrate-nodes
+  ownerReferences:
+  - apiVersion: rabbitmq.openstack.org/v1beta1
+    kind: RabbitMq
+    name: rabbitmq-migrate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-migrate
+  ownerReferences:
+  - apiVersion: rabbitmq.openstack.org/v1beta1
+    kind: RabbitMq
+    name: rabbitmq-migrate
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rabbitmq-migrate-default-user
+  ownerReferences:
+  - apiVersion: rabbitmq.openstack.org/v1beta1
+    kind: RabbitMq
+    name: rabbitmq-migrate
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rabbitmq-migrate-erlang-cookie
+  ownerReferences:
+  - apiVersion: rabbitmq.openstack.org/v1beta1
+    kind: RabbitMq
+    name: rabbitmq-migrate
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rabbitmq-migrate-plugins-conf
+  ownerReferences:
+  - apiVersion: rabbitmq.openstack.org/v1beta1
+    kind: RabbitMq
+    name: rabbitmq-migrate
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rabbitmq-migrate-server-conf
+  ownerReferences:
+  - apiVersion: rabbitmq.openstack.org/v1beta1
+    kind: RabbitMq
+    name: rabbitmq-migrate

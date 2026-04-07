@@ -1,0 +1,47 @@
+#
+# Step 3: Verify the proxy rewrote the queue to quorum/durable and exchange to durable
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 60
+commands:
+  - script: |
+      set -e
+      POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-qmigrate -o jsonpath='{.items[0].metadata.name}')
+
+      # Verify queue type is quorum (proxy should have set x-queue-type=quorum)
+      QUEUE_TYPE=$(oc exec -n $NAMESPACE "$POD" -c rabbitmq -- \
+        rabbitmqctl list_queues name type --no-table-headers | grep proxy-test-queue | awk '{print $2}')
+      if [ "$QUEUE_TYPE" != "quorum" ]; then
+        echo "FAIL: Expected queue type 'quorum', got: '$QUEUE_TYPE'"
+        oc exec -n $NAMESPACE "$POD" -c rabbitmq -- rabbitmqctl list_queues name type durable
+        exit 1
+      fi
+      echo "PASS: Queue type is quorum (proxy rewrote classic -> quorum)"
+  - script: |
+      set -e
+      POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-qmigrate -o jsonpath='{.items[0].metadata.name}')
+
+      # Verify queue is durable (proxy should have forced durable=true)
+      QUEUE_DURABLE=$(oc exec -n $NAMESPACE "$POD" -c rabbitmq -- \
+        rabbitmqctl list_queues name durable --no-table-headers | grep proxy-test-queue | awk '{print $2}')
+      if [ "$QUEUE_DURABLE" != "true" ]; then
+        echo "FAIL: Expected queue durable=true, got: '$QUEUE_DURABLE'"
+        exit 1
+      fi
+      echo "PASS: Queue is durable (proxy rewrote non-durable -> durable)"
+  - script: |
+      set -e
+      POD=$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-qmigrate -o jsonpath='{.items[0].metadata.name}')
+
+      # Verify exchange is durable (proxy should have forced durable=true)
+      EXCHANGE_DURABLE=$(oc exec -n $NAMESPACE "$POD" -c rabbitmq -- \
+        rabbitmqctl list_exchanges name durable --no-table-headers | grep proxy-test-exchange | awk '{print $2}')
+      if [ "$EXCHANGE_DURABLE" != "true" ]; then
+        echo "FAIL: Expected exchange durable=true, got: '$EXCHANGE_DURABLE'"
+        exit 1
+      fi
+      echo "PASS: Exchange is durable (proxy rewrote non-durable -> durable)"
+  - script: |
+      # Clean up the client pod
+      oc delete pod amqp-test-client -n $NAMESPACE --ignore-not-found

@@ -1,0 +1,14 @@
+#
+# Step 1: Wait for the new RabbitMq cluster to become ready
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+commands:
+  - script: |
+      set -e
+      READY=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-new -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: New RabbitMq CR not ready"
+        exit 1
+      fi
+      echo "PASS: New RabbitMq cluster is ready"

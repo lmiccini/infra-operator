@@ -1,0 +1,39 @@
+#
+# Step 1: Assert StatefulSet has 3 replicas and cluster becomes ready
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 600
+commands:
+  - script: |
+      set -e
+      # Verify StatefulSet replicas updated to 3
+      REPLICAS=$(oc get statefulset -n $NAMESPACE rabbitmq-scale-server -o jsonpath='{.spec.replicas}')
+      if [ "$REPLICAS" != "3" ]; then
+        echo "FAIL: Expected 3 replicas, got: $REPLICAS"
+        exit 1
+      fi
+      echo "PASS: StatefulSet has $REPLICAS replicas"
+  - script: |
+      set -e
+      # Wait for all 3 replicas to be ready
+      READY=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-scale -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: RabbitMq CR not ready after scale-up"
+        exit 1
+      fi
+      COUNT=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-scale -o jsonpath='{.status.readyCount}')
+      if [ "$COUNT" != "3" ]; then
+        echo "FAIL: readyCount expected 3, got: $COUNT"
+        exit 1
+      fi
+      echo "PASS: Cluster ready with readyCount=$COUNT after scale-up"
+  - script: |
+      set -e
+      # Verify PDB was created for multi-replica cluster
+      PDB=$(oc get pdb -n $NAMESPACE rabbitmq-scale -o jsonpath='{.metadata.name}' 2>/dev/null || echo "")
+      if [ -z "$PDB" ]; then
+        echo "FAIL: PodDisruptionBudget not created for 3-replica cluster"
+        exit 1
+      fi
+      echo "PASS: PodDisruptionBudget exists: $PDB"

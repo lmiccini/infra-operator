@@ -20,14 +20,14 @@ import (
 	"context"
 	"fmt"
 
+	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	helper "github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	oko_secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
-	rabbitmqclusterv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 )
 
-// getManagementURL constructs the RabbitMQ management API URL from cluster spec and secret data
-func getManagementURL(rabbit *rabbitmqclusterv2.RabbitmqCluster, rabbitSecret *corev1.Secret) string {
+// getManagementURL constructs the RabbitMQ management API URL from RabbitMq spec and secret data
+func getManagementURL(rabbit *rabbitmqv1.RabbitMq, rabbitSecret *corev1.Secret) string {
 	tlsEnabled := rabbit.Spec.TLS.SecretName != ""
 	protocol := "http"
 	managementPort := "15672"
@@ -36,16 +36,21 @@ func getManagementURL(rabbit *rabbitmqclusterv2.RabbitmqCluster, rabbitSecret *c
 		managementPort = "15671"
 	}
 
-	// Use explicit management-port field if present (for test mock servers)
+	// Use explicit management-port/management-host if present (allows override for testing)
 	if mgmtPortBytes, ok := rabbitSecret.Data["management-port"]; ok {
 		managementPort = string(mgmtPortBytes)
 	}
 
-	return fmt.Sprintf("%s://%s:%s", protocol, string(rabbitSecret.Data["host"]), managementPort)
+	host := string(rabbitSecret.Data["host"])
+	if mgmtHostBytes, ok := rabbitSecret.Data["management-host"]; ok {
+		host = string(mgmtHostBytes)
+	}
+
+	return fmt.Sprintf("%s://%s:%s", protocol, host, managementPort)
 }
 
 // getTLSCACert retrieves the CA certificate for RabbitMQ TLS if configured
-func getTLSCACert(ctx context.Context, h *helper.Helper, rabbit *rabbitmqclusterv2.RabbitmqCluster, namespace string) ([]byte, error) {
+func getTLSCACert(ctx context.Context, h *helper.Helper, rabbit *rabbitmqv1.RabbitMq, namespace string) ([]byte, error) {
 	if rabbit.Spec.TLS.CaSecretName == "" {
 		return nil, nil
 	}
@@ -75,7 +80,7 @@ func (e *ClusterReadinessError) Error() string {
 }
 
 // checkClusterReadiness validates that a RabbitMQ cluster is ready for operations
-func checkClusterReadiness(rabbit *rabbitmqclusterv2.RabbitmqCluster) *ClusterReadinessError {
+func checkClusterReadiness(rabbit *rabbitmqv1.RabbitMq) *ClusterReadinessError {
 	if !rabbit.DeletionTimestamp.IsZero() {
 		return &ClusterReadinessError{
 			ClusterName: rabbit.Name,
@@ -84,12 +89,22 @@ func checkClusterReadiness(rabbit *rabbitmqclusterv2.RabbitmqCluster) *ClusterRe
 		}
 	}
 
-	if rabbit.Status.DefaultUser == nil ||
-		rabbit.Status.DefaultUser.SecretReference == nil ||
-		rabbit.Status.DefaultUser.SecretReference.Name == "" {
+	// Check if cluster is ready by checking ReadyCount
+	if rabbit.Status.ReadyCount == 0 {
 		return &ClusterReadinessError{
 			ClusterName: rabbit.Name,
-			Reason:      fmt.Sprintf("RabbitMQ cluster %s", rabbit.Name),
+			Reason:      fmt.Sprintf("RabbitMQ cluster %s is not ready yet", rabbit.Name),
+			IsWaiting:   true,
+		}
+	}
+
+	// DefaultUser status is populated by the RabbitMQ controller after the
+	// admin secret is created. There is a brief window where ReadyCount > 0
+	// but DefaultUser has not been set yet.
+	if rabbit.Status.DefaultUser == nil {
+		return &ClusterReadinessError{
+			ClusterName: rabbit.Name,
+			Reason:      fmt.Sprintf("RabbitMQ cluster %s admin credentials not yet available", rabbit.Name),
 			IsWaiting:   true,
 		}
 	}

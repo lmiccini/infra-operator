@@ -1,0 +1,19 @@
+#
+# Step 0: Wait for cluster to become ready at version 3.9
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+commands:
+  - script: |
+      set -e
+      READY=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upgrade -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: RabbitMq CR not ready"
+        exit 1
+      fi
+      VERSION=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upgrade -o jsonpath='{.status.currentVersion}')
+      if [ "$VERSION" != "3.9" ]; then
+        echo "FAIL: Expected currentVersion 3.9, got: $VERSION"
+        exit 1
+      fi
+      echo "PASS: RabbitMq ready at version $VERSION"

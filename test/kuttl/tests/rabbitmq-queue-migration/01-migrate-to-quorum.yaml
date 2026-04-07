@@ -1,0 +1,11 @@
+#
+# Step 1: Migrate from Mirrored to Quorum queue type
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+- script: |
+    set -e
+    oc patch rabbitmq.rabbitmq.openstack.org rabbitmq-qmigrate -n $NAMESPACE \
+      --type merge -p '{"spec":{"queueType":"Quorum"}}'
+    echo "PASS: Patched queueType to Quorum"

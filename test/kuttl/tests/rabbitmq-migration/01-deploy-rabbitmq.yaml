@@ -1,0 +1,12 @@
+#
+# Deploy the RabbitMq CR. The controller should adopt the pre-existing
+# StatefulSet and secrets, reparenting them under the new RabbitMq CR.
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq-migrate
+spec:
+  replicas: 1
+  containerImage: quay.io/podified-antelope-centos9/openstack-rabbitmq:current-podified
+  terminationGracePeriodSeconds: 30

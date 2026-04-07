@@ -19,6 +19,7 @@ package rabbitmq
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -33,7 +34,6 @@ import (
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	helper "github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	oko_secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
-	rabbitmqclusterv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -55,7 +55,6 @@ type RabbitMQPolicyReconciler struct {
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqpolicies/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqpolicies/finalizers,verbs=update
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs,verbs=get;list;watch
-//+kubebuilder:rbac:groups=rabbitmq.com,resources=rabbitmqclusters,verbs=get;list;watch
 
 // Reconcile reconciles a RabbitMQPolicy object
 func (r *RabbitMQPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -70,7 +69,10 @@ func (r *RabbitMQPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
-	h, _ := helper.NewHelper(instance, r.Client, r.Kclient, r.Scheme, Log)
+	h, err := helper.NewHelper(instance, r.Client, r.Kclient, r.Scheme, Log)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 
 	// Save a copy of the conditions so that we can restore the LastTransitionTime
 	// when a condition's state doesn't change
@@ -127,7 +129,7 @@ func (r *RabbitMQPolicyReconciler) reconcileNormal(ctx context.Context, instance
 	}
 
 	// Get RabbitMQ cluster
-	rabbit := &rabbitmqclusterv2.RabbitmqCluster{}
+	rabbit := &rabbitmqv1.RabbitMq{}
 	err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbit)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.RabbitMQPolicyReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.RabbitMQPolicyReadyErrorMessage, err.Error()))
@@ -172,7 +174,10 @@ func (r *RabbitMQPolicyReconciler) reconcileNormal(ctx context.Context, instance
 		instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.RabbitMQPolicyReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.RabbitMQPolicyReadyErrorMessage, err.Error()))
 		return ctrl.Result{}, err
 	}
-	apiClient := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled, caCert)
+	apiClient, err := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled, caCert)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to create RabbitMQ API client: %w", err)
+	}
 
 	// Create or update policy
 	var definition map[string]interface{}
@@ -212,7 +217,7 @@ func (r *RabbitMQPolicyReconciler) reconcileDelete(ctx context.Context, instance
 	}
 
 	// Get RabbitMQ cluster
-	rabbit := &rabbitmqclusterv2.RabbitmqCluster{}
+	rabbit := &rabbitmqv1.RabbitMq{}
 	err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbit)
 
 	// If cluster is being deleted or not found, skip cleanup and just remove finalizer
@@ -228,6 +233,10 @@ func (r *RabbitMQPolicyReconciler) reconcileDelete(ctx context.Context, instance
 	}
 
 	// Cluster exists and is not being deleted - perform cleanup
+	if rabbit.Status.DefaultUser == nil {
+		// Admin credentials not yet available, requeue
+		return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+	}
 	// Get admin credentials
 	rabbitSecret, _, err := oko_secret.GetSecret(ctx, h, rabbit.Status.DefaultUser.SecretReference.Name, instance.Namespace)
 	if err != nil {
@@ -244,7 +253,10 @@ func (r *RabbitMQPolicyReconciler) reconcileDelete(ctx context.Context, instance
 		instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.RabbitMQPolicyReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.RabbitMQPolicyReadyErrorMessage, err.Error()))
 		return ctrl.Result{}, err
 	}
-	apiClient := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled, caCert)
+	apiClient, err := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled, caCert)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to create RabbitMQ API client: %w", err)
+	}
 
 	// Delete policy from RabbitMQ
 	// Note: DeletePolicy already treats 404 as success
@@ -298,8 +310,6 @@ func (r *RabbitMQPolicyReconciler) clusterToPolicyMapFunc(ctx context.Context, o
 func (r *RabbitMQPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&rabbitmqv1.RabbitMQPolicy{}).
-		Watches(&rabbitmqclusterv2.RabbitmqCluster{},
-			handler.EnqueueRequestsFromMapFunc(r.clusterToPolicyMapFunc)).
 		Watches(&rabbitmqv1.RabbitMq{},
 			handler.EnqueueRequestsFromMapFunc(r.clusterToPolicyMapFunc)).
 		Complete(r)

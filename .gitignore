@@ -45,3 +45,7 @@ go.work.sum
 .coverage
 __pycache__/
 *.pyc
+
+# claude and AI tools
+.claude
+CLAUDE.md

@@ -1,0 +1,87 @@
+#
+# Step 2: Validate migration details
+#
+# - Old RabbitmqCluster CR is deleted (finalizers removed + deleted)
+# - Existing credentials are preserved in the default-user secret
+# - Erlang cookie value is preserved
+# - StatefulSet is owned by the new RabbitMq CR
+# - Host field in default-user secret is updated to new service DNS
+# - Services have correct ports and configuration
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 120
+commands:
+  - script: |
+      set -e
+      # Verify the old RabbitmqCluster CR has been deleted
+      if oc get rabbitmqcluster.rabbitmq.com -n $NAMESPACE rabbitmq-migrate 2>/dev/null; then
+        echo "FAIL: Old RabbitmqCluster CR should be deleted after migration"
+        exit 1
+      fi
+      echo "PASS: Old RabbitmqCluster CR deleted"
+  - script: |
+      set -e
+      # Verify existing credentials are preserved (non-empty, set by old operator)
+      USERNAME=$(oc get secret -n $NAMESPACE rabbitmq-migrate-default-user -o jsonpath='{.data.username}' | base64 -d)
+      PASSWORD=$(oc get secret -n $NAMESPACE rabbitmq-migrate-default-user -o jsonpath='{.data.password}' | base64 -d)
+      if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
+        echo "FAIL: Credentials should not be empty"
+        exit 1
+      fi
+      echo "PASS: Credentials preserved (username=$USERNAME)"
+  - script: |
+      set -e
+      # Verify the erlang cookie value is preserved (non-empty)
+      COOKIE=$(oc get secret -n $NAMESPACE rabbitmq-migrate-erlang-cookie -o jsonpath='{.data.\.erlang\.cookie}' | base64 -d)
+      if [ -z "$COOKIE" ]; then
+        echo "FAIL: Erlang cookie should not be empty"
+        exit 1
+      fi
+      echo "PASS: Erlang cookie preserved"
+  - script: |
+      set -e
+      # Verify StatefulSet is owned by the new RabbitMq CR
+      OWNER=$(oc get statefulset -n $NAMESPACE rabbitmq-migrate-server -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].kind}')
+      if [ "$OWNER" != "RabbitMq" ]; then
+        echo "FAIL: StatefulSet should be owned by RabbitMq, got: $OWNER"
+        exit 1
+      fi
+      echo "PASS: StatefulSet owned by RabbitMq"
+  - script: |
+      set -e
+      # Verify the host field in default-user secret has been updated to new service DNS
+      HOST=$(oc get secret -n $NAMESPACE rabbitmq-migrate-default-user -o jsonpath='{.data.host}' | base64 -d)
+      EXPECTED="rabbitmq-migrate.$NAMESPACE.svc"
+      if [ "$HOST" != "$EXPECTED" ]; then
+        echo "FAIL: Host should be updated to new service DNS. Expected '$EXPECTED', got '$HOST'"
+        exit 1
+      fi
+      echo "PASS: Host updated to new service DNS: $HOST"
+  - script: |
+      set -e
+      # Verify the headless service has correct configuration
+      PNRA=$(oc get service -n $NAMESPACE rabbitmq-migrate-nodes -o jsonpath='{.spec.publishNotReadyAddresses}')
+      if [ "$PNRA" != "true" ]; then
+        echo "FAIL: Headless service should have publishNotReadyAddresses: true"
+        exit 1
+      fi
+      echo "PASS: Headless service has publishNotReadyAddresses: true"
+  - script: |
+      set -e
+      # Verify the client service has AMQP port
+      AMQP_PORT=$(oc get service -n $NAMESPACE rabbitmq-migrate -o jsonpath='{.spec.ports[?(@.name=="amqp")].port}')
+      if [ "$AMQP_PORT" != "5672" ]; then
+        echo "FAIL: Client service missing AMQP port 5672, got: $AMQP_PORT"
+        exit 1
+      fi
+      echo "PASS: Client service has AMQP port 5672"
+  - script: |
+      set -e
+      # Verify StatefulSet has config-hash annotation
+      HASH=$(oc get statefulset -n $NAMESPACE rabbitmq-migrate-server -o jsonpath='{.spec.template.metadata.annotations.config-hash}')
+      if [ -z "$HASH" ]; then
+        echo "FAIL: StatefulSet pod template missing config-hash annotation"
+        exit 1
+      fi
+      echo "PASS: config-hash annotation is set: $HASH"

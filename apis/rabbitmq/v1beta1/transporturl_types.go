@@ -50,7 +50,7 @@ type TransportURLStatus struct {
 	SecretName string `json:"secretName,omitempty"`
 
 	// QueueType - the queue type from the associated RabbitMq instance
-	QueueType string `json:"queueType,omitempty"`
+	QueueType QueueType `json:"queueType,omitempty"`
 
 	// RabbitmqUsername - the actual username used for the RabbitMQ user
 	RabbitmqUsername string `json:"rabbitmqUsername,omitempty"`

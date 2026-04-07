@@ -1,0 +1,34 @@
+#
+# Step 3: Assert proxy is removed after clients-reconfigured annotation
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 120
+commands:
+  - script: |
+      set -e
+      # Verify proxyRequired is cleared
+      PROXY=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-qmigrate -o jsonpath='{.status.proxyRequired}')
+      if [ "$PROXY" == "True" ]; then
+        echo "FAIL: proxyRequired should be False after clients-reconfigured"
+        exit 1
+      fi
+      echo "PASS: proxyRequired is cleared"
+  - script: |
+      set -e
+      # Verify proxy sidecar is removed from StatefulSet
+      CONTAINERS=$(oc get statefulset -n $NAMESPACE rabbitmq-qmigrate-server -o jsonpath='{.spec.template.spec.containers[*].name}')
+      if echo "$CONTAINERS" | grep -qw "amqp-proxy"; then
+        echo "FAIL: Proxy sidecar should be removed after clients-reconfigured. Containers: $CONTAINERS"
+        exit 1
+      fi
+      echo "PASS: Proxy sidecar removed. Containers: $CONTAINERS"
+  - script: |
+      set -e
+      # Verify annotation is removed
+      ANN=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-qmigrate -o jsonpath='{.metadata.annotations.rabbitmq\.openstack\.org/clients-reconfigured}')
+      if [ -n "$ANN" ]; then
+        echo "FAIL: clients-reconfigured annotation should be removed, got: $ANN"
+        exit 1
+      fi
+      echo "PASS: clients-reconfigured annotation removed"

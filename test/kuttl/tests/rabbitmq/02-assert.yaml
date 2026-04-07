@@ -1,19 +1,22 @@
 #
 # Check for:
 #
-# - 1 RabbitMQVhost CR
+# - 1 TransportURL CR
+# - 1 Secret for TransporURL CR
 #
 
 apiVersion: rabbitmq.openstack.org/v1beta1
-kind: RabbitMQVhost
+kind: TransportURL
 metadata:
-  name: rabbitmqvhost-sample
+  name: transporturl
 spec:
   rabbitmqClusterName: rabbitmq
-  name: "openstack"
-status:
-  conditions:
-  - status: "True"
-    type: Ready
-  - status: "True"
-    type: RabbitMQVhostReady
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rabbitmq-transport-url-transporturl
+  ownerReferences:
+  - apiVersion: rabbitmq.openstack.org/v1beta1
+    kind: TransportURL
+    name: transporturl

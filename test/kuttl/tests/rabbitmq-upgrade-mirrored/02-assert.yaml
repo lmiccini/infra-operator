@@ -1,0 +1,70 @@
+#
+# Step 2: Wait for upgrade to complete — cluster should be ready at version 4.2
+# with Quorum queue type, proxy enabled, and no second storage wipe
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 600
+commands:
+  - script: |
+      set -e
+      READY=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upmir -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: RabbitMq CR not ready after upgrade"
+        exit 1
+      fi
+      echo "PASS: RabbitMq CR is ready"
+  - script: |
+      set -e
+      # Verify currentVersion updated to 4.2
+      VERSION=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upmir -o jsonpath='{.status.currentVersion}')
+      if [ "$VERSION" != "4.2" ]; then
+        echo "FAIL: Expected currentVersion 4.2, got: $VERSION"
+        exit 1
+      fi
+      echo "PASS: currentVersion is $VERSION"
+  - script: |
+      set -e
+      # Verify queueType migrated to Quorum
+      QT=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upmir -o jsonpath='{.status.queueType}')
+      if [ "$QT" != "Quorum" ]; then
+        echo "FAIL: Expected status.queueType Quorum, got: $QT"
+        exit 1
+      fi
+      echo "PASS: status.queueType is $QT"
+  - script: |
+      set -e
+      # Verify upgradePhase is cleared
+      PHASE=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upmir -o jsonpath='{.status.upgradePhase}')
+      if [ -n "$PHASE" ]; then
+        echo "FAIL: upgradePhase should be empty after upgrade, got: $PHASE"
+        exit 1
+      fi
+      echo "PASS: upgradePhase is cleared"
+  - script: |
+      set -e
+      # Verify wipeReason is cleared
+      REASON=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upmir -o jsonpath='{.status.wipeReason}')
+      if [ -n "$REASON" ]; then
+        echo "FAIL: wipeReason should be empty after upgrade, got: $REASON"
+        exit 1
+      fi
+      echo "PASS: wipeReason is cleared"
+  - script: |
+      set -e
+      # Verify proxyRequired is set (3.x Mirrored to 4.x Quorum upgrade)
+      PROXY=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-upmir -o jsonpath='{.status.proxyRequired}')
+      if [ "$PROXY" != "True" ]; then
+        echo "FAIL: Expected proxyRequired=True after Mirrored->Quorum upgrade, got: $PROXY"
+        exit 1
+      fi
+      echo "PASS: proxyRequired is $PROXY"
+  - script: |
+      set -e
+      # Verify proxy sidecar container is present in StatefulSet
+      CONTAINERS=$(oc get statefulset -n $NAMESPACE rabbitmq-upmir-server -o jsonpath='{.spec.template.spec.containers[*].name}')
+      if ! echo "$CONTAINERS" | grep -qw "amqp-proxy"; then
+        echo "FAIL: Proxy sidecar container not found. Containers: $CONTAINERS"
+        exit 1
+      fi
+      echo "PASS: Proxy sidecar container present: $CONTAINERS"

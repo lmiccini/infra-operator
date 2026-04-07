@@ -1,0 +1,28 @@
+#
+# Step 0: Wait for cluster to become ready with Mirrored queue type
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+commands:
+  - script: |
+      set -e
+      READY=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-qmigrate -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: RabbitMq CR not ready"
+        exit 1
+      fi
+      QT=$(oc get rabbitmq.rabbitmq.openstack.org -n $NAMESPACE rabbitmq-qmigrate -o jsonpath='{.status.queueType}')
+      if [ "$QT" != "Mirrored" ]; then
+        echo "FAIL: Expected queueType Mirrored, got: $QT"
+        exit 1
+      fi
+      echo "PASS: RabbitMq ready with queueType=$QT"
+  - script: |
+      set -e
+      # Verify no proxy sidecar in Mirrored mode
+      CONTAINERS=$(oc get statefulset -n $NAMESPACE rabbitmq-qmigrate-server -o jsonpath='{.spec.template.spec.containers[*].name}')
+      if echo "$CONTAINERS" | grep -qw "amqp-proxy"; then
+        echo "FAIL: Proxy sidecar should not exist in Mirrored mode"
+        exit 1
+      fi
+      echo "PASS: No proxy sidecar in Mirrored mode"

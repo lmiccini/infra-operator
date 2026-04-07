@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
@@ -93,8 +94,9 @@ var _ = Describe("TransportURL controller", func() {
 
 			Eventually(func(g Gomega) {
 				s := th.GetSecret(transportURLSecretName)
-				g.Expect(s.Data).To(HaveLen(1))
-				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@host.%s.svc:5672/?ssl=0", namespace)))
+				g.Expect(s.Data).To(HaveLen(2))
+				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@rabbitmq.%s.svc:5672/?ssl=0", namespace)))
+				g.Expect(s.Data).To(HaveKeyWithValue("quorumqueues", []byte("true")))
 
 			}, timeout, interval).Should(Succeed())
 
@@ -113,6 +115,10 @@ var _ = Describe("TransportURL controller", func() {
 
 	When("a TLS TransportURL gets created", func() {
 		BeforeEach(func() {
+			certSecretName := types.NamespacedName{Name: "cert-rabbitmq-svc", Namespace: namespace}
+			CreateCertSecret(certSecretName)
+			DeferCleanup(th.DeleteSecret, certSecretName)
+
 			CreateRabbitMQCluster(rabbitmqClusterName, GetDefaultRabbitMQClusterSpec(true))
 			DeferCleanup(DeleteRabbitMQCluster, rabbitmqClusterName)
 
@@ -127,8 +133,8 @@ var _ = Describe("TransportURL controller", func() {
 
 			Eventually(func(g Gomega) {
 				s := th.GetSecret(transportURLSecretName)
-				g.Expect(s.Data).To(HaveLen(1))
-				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@host.%s.svc:5671/?ssl=1", namespace)))
+				g.Expect(s.Data).To(HaveLen(2))
+				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@rabbitmq.%s.svc:5671/?ssl=1", namespace)))
 
 			}, timeout, interval).Should(Succeed())
 
@@ -162,19 +168,23 @@ var _ = Describe("TransportURL controller", func() {
 			// validate non tls transport_url
 			Eventually(func(g Gomega) {
 				s := th.GetSecret(transportURLSecretName)
-				g.Expect(s.Data).To(HaveLen(1))
-				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@host.%s.svc:5672/?ssl=0", namespace)))
+				g.Expect(s.Data).To(HaveLen(2))
+				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@rabbitmq.%s.svc:5672/?ssl=0", namespace)))
+				g.Expect(s.Data).To(HaveKeyWithValue("quorumqueues", []byte("true")))
 
 			}, timeout, interval).Should(Succeed())
 
 			// update rabbitmq to be tls
+			certSecretName := types.NamespacedName{Name: "cert-rabbitmq-svc", Namespace: namespace}
+			CreateCertSecret(certSecretName)
+			DeferCleanup(th.DeleteSecret, certSecretName)
 			UpdateRabbitMQClusterToTLS(rabbitmqClusterName)
 			SimulateRabbitMQClusterReady(rabbitmqClusterName)
 
 			Eventually(func(g Gomega) {
 				s := th.GetSecret(transportURLSecretName)
-				g.Expect(s.Data).To(HaveLen(1))
-				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@host.%s.svc:5671/?ssl=1", namespace)))
+				g.Expect(s.Data).To(HaveLen(2))
+				g.Expect(s.Data).To(HaveKeyWithValue("transport_url", fmt.Appendf(nil, "rabbit://user:12345678@rabbitmq.%s.svc:5671/?ssl=1", namespace)))
 
 			}, timeout, interval).Should(Succeed())
 
@@ -196,14 +206,11 @@ var _ = Describe("TransportURL controller", func() {
 				Namespace: namespace,
 			}
 
-			// Create RabbitMQCluster first
-			CreateRabbitMQCluster(rabbitmqName, GetDefaultRabbitMQClusterSpec(false))
-			DeferCleanup(DeleteRabbitMQCluster, rabbitmqName)
-
 			// Create RabbitMq CR with podOverride
 			spec := GetDefaultRabbitMQSpec()
+			spec["containerImage"] = "quay.io/podified-antelope-centos9/openstack-rabbitmq:current-podified"
 			spec["replicas"] = 3
-			spec["queueType"] = "None"
+			spec["queueType"] = "Quorum"
 			spec["podOverride"] = map[string]any{
 				"services": []map[string]any{
 					{
@@ -254,18 +261,10 @@ var _ = Describe("TransportURL controller", func() {
 		It("should create a secret with multi-host transport URL", func() {
 			SimulateRabbitMQClusterReady(rabbitmqName)
 
-			// Simulate RabbitMq CR being ready with ServiceHostnames
+			// Wait for controller to populate ServiceHostnames from per-pod services
 			Eventually(func(g Gomega) {
 				rabbitmq := GetRabbitMQ(rabbitmqName)
-				g.Expect(rabbitmq).ToNot(BeNil())
-
-				// Populate ServiceHostnames in status
-				rabbitmq.Status.ServiceHostnames = []string{
-					fmt.Sprintf("%s-server-0.%s.svc", rabbitmqName.Name, namespace),
-					fmt.Sprintf("%s-server-1.%s.svc", rabbitmqName.Name, namespace),
-					fmt.Sprintf("%s-server-2.%s.svc", rabbitmqName.Name, namespace),
-				}
-				g.Expect(k8sClient.Status().Update(ctx, rabbitmq)).Should(Succeed())
+				g.Expect(rabbitmq.Status.ServiceHostnames).To(HaveLen(3))
 			}, timeout, interval).Should(Succeed())
 
 			// Verify transport URL contains all three hosts
@@ -302,14 +301,11 @@ var _ = Describe("TransportURL controller", func() {
 			}
 			vhostName = "nova"
 
-			// Create RabbitMQCluster first
-			CreateRabbitMQCluster(rabbitmqName, GetDefaultRabbitMQClusterSpec(false))
-			DeferCleanup(DeleteRabbitMQCluster, rabbitmqName)
-
 			// Create RabbitMq CR with podOverride
 			spec := GetDefaultRabbitMQSpec()
+			spec["containerImage"] = "quay.io/podified-antelope-centos9/openstack-rabbitmq:current-podified"
 			spec["replicas"] = 3
-			spec["queueType"] = "None"
+			spec["queueType"] = "Quorum"
 			spec["podOverride"] = map[string]any{
 				"services": []map[string]any{
 					{
@@ -388,18 +384,10 @@ var _ = Describe("TransportURL controller", func() {
 			// Simulate RabbitMQUser being ready with the custom vhost
 			SimulateRabbitMQUserReady(userCRName, vhostName)
 
-			// Simulate RabbitMq CR being ready with ServiceHostnames
+			// Wait for controller to populate ServiceHostnames from per-pod services
 			Eventually(func(g Gomega) {
 				rabbitmq := GetRabbitMQ(rabbitmqName)
-				g.Expect(rabbitmq).ToNot(BeNil())
-
-				// Populate ServiceHostnames in status
-				rabbitmq.Status.ServiceHostnames = []string{
-					fmt.Sprintf("%s-server-0.%s.svc", rabbitmqName.Name, namespace),
-					fmt.Sprintf("%s-server-1.%s.svc", rabbitmqName.Name, namespace),
-					fmt.Sprintf("%s-server-2.%s.svc", rabbitmqName.Name, namespace),
-				}
-				g.Expect(k8sClient.Status().Update(ctx, rabbitmq)).Should(Succeed())
+				g.Expect(rabbitmq.Status.ServiceHostnames).To(HaveLen(3))
 			}, timeout, interval).Should(Succeed())
 
 			// Verify RabbitMQUser permissions are set to ".*"
@@ -1753,6 +1741,391 @@ var _ = Describe("TransportURL controller", func() {
 			}, timeout, interval).Should(Succeed())
 
 			// Verify TransportURL is ready
+			th.ExpectCondition(
+				transportURLName,
+				ConditionGetterFunc(TransportURLConditionGetter),
+				rabbitmqv1.TransportURLReadyCondition,
+				corev1.ConditionTrue,
+			)
+		})
+	})
+
+	When("TransportURL is created without username or userRef (default credentials)", func() {
+		BeforeEach(func() {
+			CreateRabbitMQCluster(rabbitmqClusterName, GetDefaultRabbitMQClusterSpec(false))
+			DeferCleanup(DeleteRabbitMQCluster, rabbitmqClusterName)
+
+			spec := map[string]any{
+				"rabbitmqClusterName": rabbitmqClusterName.Name,
+			}
+			DeferCleanup(th.DeleteInstance, CreateTransportURL(transportURLName, spec))
+		})
+
+		It("should use admin credentials from the cluster secret", func() {
+			SimulateRabbitMQClusterReady(rabbitmqClusterName)
+
+			// Verify transport URL uses admin credentials (user/12345678 from cluster secret)
+			Eventually(func(g Gomega) {
+				s := th.GetSecret(transportURLSecretName)
+				g.Expect(s.Data).To(HaveKey("transport_url"))
+				transportURL := string(s.Data["transport_url"])
+				g.Expect(transportURL).To(ContainSubstring("user:12345678@"))
+				g.Expect(transportURL).To(MatchRegexp(`/\?ssl=0$`), "Should use default vhost /")
+			}, timeout, interval).Should(Succeed())
+
+			// Verify no RabbitMQUser or RabbitMQVhost CRs were created
+			userList := &rabbitmqv1.RabbitMQUserList{}
+			Expect(k8sClient.List(ctx, userList, client.InNamespace(namespace))).Should(Succeed())
+			for _, user := range userList.Items {
+				// No user should be owned by this TransportURL
+				tr := th.GetTransportURL(transportURLName)
+				for _, ref := range user.GetOwnerReferences() {
+					Expect(ref.UID).ToNot(Equal(tr.UID), "No RabbitMQUser should be owned by TransportURL using default credentials")
+				}
+			}
+
+			// Verify status reflects admin credentials
+			Eventually(func(g Gomega) {
+				tr := th.GetTransportURL(transportURLName)
+				g.Expect(tr.Status.RabbitmqUsername).To(Equal("user"))
+				g.Expect(tr.Status.RabbitmqVhost).To(Equal("/"))
+				g.Expect(tr.Status.RabbitmqUserRef).To(BeEmpty())
+			}, timeout, interval).Should(Succeed())
+
+			th.ExpectCondition(
+				transportURLName,
+				ConditionGetterFunc(TransportURLConditionGetter),
+				rabbitmqv1.TransportURLReadyCondition,
+				corev1.ConditionTrue,
+			)
+		})
+	})
+
+	When("TransportURL is created with userRef pointing to an existing RabbitMQUser", func() {
+		var rabbitmqName types.NamespacedName
+		var externalUserName types.NamespacedName
+
+		BeforeEach(func() {
+			rabbitmqName = types.NamespacedName{
+				Name:      "rabbitmq-userref",
+				Namespace: namespace,
+			}
+
+			// Set up mock RabbitMQ Management API
+			SetupMockRabbitMQAPI()
+			DeferCleanup(StopMockRabbitMQAPI)
+
+			// Create RabbitMQCluster
+			CreateRabbitMQCluster(rabbitmqName, GetDefaultRabbitMQClusterSpec(false))
+			DeferCleanup(DeleteRabbitMQCluster, rabbitmqName)
+
+			// Create RabbitMq CR
+			spec := GetDefaultRabbitMQSpec()
+			rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+			DeferCleanup(th.DeleteInstance, rabbitmq)
+
+			// Create an external RabbitMQUser (not owned by TransportURL)
+			externalUserName = types.NamespacedName{
+				Name:      "external-nova-user",
+				Namespace: namespace,
+			}
+			userSpec := map[string]any{
+				"rabbitmqClusterName": rabbitmqName.Name,
+				"username":            "nova",
+			}
+			DeferCleanup(th.DeleteInstance, CreateRabbitMQUser(externalUserName, userSpec))
+
+			// Create TransportURL with userRef
+			tuSpec := map[string]any{
+				"rabbitmqClusterName": rabbitmqName.Name,
+				"userRef":             externalUserName.Name,
+			}
+			DeferCleanup(th.DeleteInstance, CreateTransportURL(transportURLName, tuSpec))
+		})
+
+		It("should wait for the referenced user to be ready and use its credentials", func() {
+			SimulateRabbitMQClusterReady(rabbitmqName)
+
+			// TransportURL should be waiting for user to be ready
+			th.ExpectCondition(
+				transportURLName,
+				ConditionGetterFunc(TransportURLConditionGetter),
+				rabbitmqv1.TransportURLReadyCondition,
+				corev1.ConditionFalse,
+			)
+
+			// Simulate the external user being ready
+			SimulateRabbitMQUserReady(externalUserName, "/")
+
+			// Verify transport URL uses the external user's credentials
+			Eventually(func(g Gomega) {
+				// Get the actual password from the user's secret
+				user := &rabbitmqv1.RabbitMQUser{}
+				g.Expect(k8sClient.Get(ctx, externalUserName, user)).Should(Succeed())
+				g.Expect(user.Status.SecretName).ToNot(BeEmpty())
+				userSecret := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: user.Status.SecretName, Namespace: namespace}, userSecret)).Should(Succeed())
+				userPassword := string(userSecret.Data["password"])
+
+				s := th.GetSecret(transportURLSecretName)
+				g.Expect(s.Data).To(HaveKey("transport_url"))
+				transportURL := string(s.Data["transport_url"])
+				g.Expect(transportURL).To(ContainSubstring(fmt.Sprintf("nova:%s@", userPassword)))
+			}, timeout, interval).Should(Succeed())
+
+			// Verify status reflects the userRef
+			Eventually(func(g Gomega) {
+				tr := th.GetTransportURL(transportURLName)
+				g.Expect(tr.Status.RabbitmqUsername).To(Equal("nova"))
+				g.Expect(tr.Status.RabbitmqUserRef).To(Equal(externalUserName.Name))
+			}, timeout, interval).Should(Succeed())
+
+			th.ExpectCondition(
+				transportURLName,
+				ConditionGetterFunc(TransportURLConditionGetter),
+				rabbitmqv1.TransportURLReadyCondition,
+				corev1.ConditionTrue,
+			)
+		})
+	})
+
+	When("TransportURL is created before RabbitMQ cluster is ready", func() {
+		BeforeEach(func() {
+			// Create RabbitMQ cluster but do NOT simulate it as ready
+			CreateRabbitMQCluster(rabbitmqClusterName, GetDefaultRabbitMQClusterSpec(false))
+			DeferCleanup(DeleteRabbitMQCluster, rabbitmqClusterName)
+
+			spec := map[string]any{
+				"rabbitmqClusterName": rabbitmqClusterName.Name,
+			}
+			DeferCleanup(th.DeleteInstance, CreateTransportURL(transportURLName, spec))
+		})
+
+		It("should set InProgress condition while cluster is not ready", func() {
+			// Cluster is created but not ready (ReadyCount=0)
+			// TransportURL should be in InProgress state
+			th.ExpectCondition(
+				transportURLName,
+				ConditionGetterFunc(TransportURLConditionGetter),
+				rabbitmqv1.TransportURLReadyCondition,
+				corev1.ConditionFalse,
+			)
+
+			// Now make the cluster ready
+			SimulateRabbitMQClusterReady(rabbitmqClusterName)
+
+			// TransportURL should become ready
+			Eventually(func(g Gomega) {
+				s := th.GetSecret(transportURLSecretName)
+				g.Expect(s.Data).To(HaveKey("transport_url"))
+			}, timeout, interval).Should(Succeed())
+
+			th.ExpectCondition(
+				transportURLName,
+				ConditionGetterFunc(TransportURLConditionGetter),
+				rabbitmqv1.TransportURLReadyCondition,
+				corev1.ConditionTrue,
+			)
+		})
+	})
+
+	When("TransportURL with username is deleted", func() {
+		var rabbitmqName types.NamespacedName
+
+		BeforeEach(func() {
+			rabbitmqName = types.NamespacedName{
+				Name:      "rabbitmq-deletion",
+				Namespace: namespace,
+			}
+
+			// Set up mock RabbitMQ Management API
+			SetupMockRabbitMQAPI()
+			DeferCleanup(StopMockRabbitMQAPI)
+
+			// Create RabbitMQCluster
+			CreateRabbitMQCluster(rabbitmqName, GetDefaultRabbitMQClusterSpec(false))
+			DeferCleanup(DeleteRabbitMQCluster, rabbitmqName)
+
+			// Create RabbitMq CR
+			spec := GetDefaultRabbitMQSpec()
+			rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+			DeferCleanup(th.DeleteInstance, rabbitmq)
+
+			// Create TransportURL with username and vhost
+			tuSpec := map[string]any{
+				"rabbitmqClusterName": rabbitmqName.Name,
+				"username":            "delete-test-user",
+				"vhost":               "delete-test-vhost",
+			}
+			CreateTransportURL(transportURLName, tuSpec)
+		})
+
+		It("should remove finalizers from owned users and vhosts on deletion", func() {
+			SimulateRabbitMQClusterReady(rabbitmqName)
+
+			// Wait for RabbitMQVhost and RabbitMQUser to be created
+			vhostCRName := types.NamespacedName{
+				Name:      fmt.Sprintf("%s-delete-test-vhost-vhost", transportURLName.Name),
+				Namespace: namespace,
+			}
+			userCRName := types.NamespacedName{
+				Name:      fmt.Sprintf("%s-delete-test-user-user", transportURLName.Name),
+				Namespace: namespace,
+			}
+
+			Eventually(func(g Gomega) {
+				vhost := &rabbitmqv1.RabbitMQVhost{}
+				g.Expect(k8sClient.Get(ctx, vhostCRName, vhost)).Should(Succeed())
+				g.Expect(controllerutil.ContainsFinalizer(vhost, rabbitmqv1.TransportURLFinalizer)).To(BeTrue())
+			}, timeout, interval).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				user := &rabbitmqv1.RabbitMQUser{}
+				g.Expect(k8sClient.Get(ctx, userCRName, user)).Should(Succeed())
+				g.Expect(controllerutil.ContainsFinalizer(user, rabbitmqv1.TransportURLFinalizer)).To(BeTrue())
+				g.Expect(controllerutil.ContainsFinalizer(user, rabbitmqv1.RabbitMQUserCleanupBlockedFinalizer)).To(BeTrue())
+			}, timeout, interval).Should(Succeed())
+
+			// Simulate resources ready
+			SimulateRabbitMQVhostReady(vhostCRName)
+			SimulateRabbitMQUserReady(userCRName, "delete-test-vhost")
+
+			// Verify TransportURL is ready
+			th.ExpectCondition(
+				transportURLName,
+				ConditionGetterFunc(TransportURLConditionGetter),
+				rabbitmqv1.TransportURLReadyCondition,
+				corev1.ConditionTrue,
+			)
+
+			// Delete the TransportURL
+			tr := th.GetTransportURL(transportURLName)
+			Expect(k8sClient.Delete(ctx, tr)).Should(Succeed())
+
+			// Verify TransportURL finalizers are removed from user and vhost
+			Eventually(func(g Gomega) {
+				user := &rabbitmqv1.RabbitMQUser{}
+				err := k8sClient.Get(ctx, userCRName, user)
+				if err == nil {
+					g.Expect(controllerutil.ContainsFinalizer(user, rabbitmqv1.TransportURLFinalizer)).To(BeFalse(),
+						"TransportURL finalizer should be removed from user")
+					g.Expect(controllerutil.ContainsFinalizer(user, rabbitmqv1.RabbitMQUserCleanupBlockedFinalizer)).To(BeFalse(),
+						"Cleanup-blocked finalizer should be removed from user")
+				}
+			}, timeout, interval).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				vhost := &rabbitmqv1.RabbitMQVhost{}
+				err := k8sClient.Get(ctx, vhostCRName, vhost)
+				if err == nil {
+					g.Expect(controllerutil.ContainsFinalizer(vhost, rabbitmqv1.TransportURLFinalizer)).To(BeFalse(),
+						"TransportURL finalizer should be removed from vhost")
+				}
+			}, timeout, interval).Should(Succeed())
+
+			// Verify TransportURL is eventually deleted
+			Eventually(func(g Gomega) {
+				tr := &rabbitmqv1.TransportURL{}
+				err := k8sClient.Get(ctx, transportURLName, tr)
+				g.Expect(k8s_errors.IsNotFound(err)).To(BeTrue(), "TransportURL should be deleted")
+			}, timeout, interval).Should(Succeed())
+		})
+	})
+
+	When("TransportURL switches from custom username to default credentials", func() {
+		var rabbitmqName types.NamespacedName
+
+		BeforeEach(func() {
+			rabbitmqName = types.NamespacedName{
+				Name:      "rabbitmq-switch-default",
+				Namespace: namespace,
+			}
+
+			// Set up mock RabbitMQ Management API
+			SetupMockRabbitMQAPI()
+			DeferCleanup(StopMockRabbitMQAPI)
+
+			// Create RabbitMQCluster
+			CreateRabbitMQCluster(rabbitmqName, GetDefaultRabbitMQClusterSpec(false))
+			DeferCleanup(DeleteRabbitMQCluster, rabbitmqName)
+
+			// Create RabbitMq CR
+			spec := GetDefaultRabbitMQSpec()
+			rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
+			DeferCleanup(th.DeleteInstance, rabbitmq)
+
+			// Create TransportURL with custom username
+			tuSpec := map[string]any{
+				"rabbitmqClusterName": rabbitmqName.Name,
+				"username":            "custom-user",
+			}
+			DeferCleanup(th.DeleteInstance, CreateTransportURL(transportURLName, tuSpec))
+		})
+
+		It("should switch to admin credentials when username is removed from spec", func() {
+			SimulateRabbitMQClusterReady(rabbitmqName)
+
+			// Wait for RabbitMQUser to be created
+			customUserCRName := types.NamespacedName{
+				Name:      fmt.Sprintf("%s-custom-user-user", transportURLName.Name),
+				Namespace: namespace,
+			}
+			Eventually(func(g Gomega) {
+				user := &rabbitmqv1.RabbitMQUser{}
+				g.Expect(k8sClient.Get(ctx, customUserCRName, user)).Should(Succeed())
+			}, timeout, interval).Should(Succeed())
+
+			// Simulate user being ready
+			SimulateRabbitMQUserReady(customUserCRName, "/")
+
+			// Verify TransportURL uses custom user
+			Eventually(func(g Gomega) {
+				s := th.GetSecret(transportURLSecretName)
+				transportURL := string(s.Data["transport_url"])
+				g.Expect(transportURL).To(ContainSubstring("custom-user:"))
+			}, timeout, interval).Should(Succeed())
+
+			// Verify status shows custom user
+			Eventually(func(g Gomega) {
+				tr := th.GetTransportURL(transportURLName)
+				g.Expect(tr.Status.RabbitmqUsername).To(Equal("custom-user"))
+				g.Expect(tr.Status.RabbitmqUserRef).ToNot(BeEmpty())
+			}, timeout, interval).Should(Succeed())
+
+			// Remove username from spec to switch to default credentials
+			Eventually(func(g Gomega) {
+				tr := th.GetTransportURL(transportURLName)
+				tr.Spec.Username = ""
+				g.Expect(k8sClient.Update(ctx, tr)).Should(Succeed())
+			}, timeout, interval).Should(Succeed())
+
+			// Verify TransportURL switches to admin credentials
+			Eventually(func(g Gomega) {
+				s := th.GetSecret(transportURLSecretName)
+				transportURL := string(s.Data["transport_url"])
+				g.Expect(transportURL).To(ContainSubstring("user:12345678@"),
+					"Should use admin credentials after removing username")
+				g.Expect(transportURL).ToNot(ContainSubstring("custom-user:"),
+					"Should no longer use custom user credentials")
+			}, timeout, interval).Should(Succeed())
+
+			// Verify status reflects admin credentials
+			Eventually(func(g Gomega) {
+				tr := th.GetTransportURL(transportURLName)
+				g.Expect(tr.Status.RabbitmqUsername).To(Equal("user"))
+				g.Expect(tr.Status.RabbitmqUserRef).To(BeEmpty())
+			}, timeout, interval).Should(Succeed())
+
+			// Verify old user's TransportURL finalizer was removed
+			Eventually(func(g Gomega) {
+				user := &rabbitmqv1.RabbitMQUser{}
+				err := k8sClient.Get(ctx, customUserCRName, user)
+				if err == nil {
+					g.Expect(controllerutil.ContainsFinalizer(user, rabbitmqv1.TransportURLFinalizer)).To(BeFalse(),
+						"TransportURL finalizer should be removed from old user")
+				}
+			}, timeout, interval).Should(Succeed())
+
 			th.ExpectCondition(
 				transportURLName,
 				ConditionGetterFunc(TransportURLConditionGetter),

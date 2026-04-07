@@ -1,0 +1,9 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+- script: |
+    oc delete rabbitmq.rabbitmq.openstack.org rabbitmq-upgrade-notls -n $NAMESPACE --ignore-not-found
+    oc delete pvc -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq-upgrade-notls --ignore-not-found
+    for pv in $(oc get pv -o jsonpath='{range .items[?(@.spec.claimRef.namespace=="'$NAMESPACE'")]}{.metadata.name}{" "}{.spec.claimRef.name}{"\n"}{end}' | grep rabbitmq-upgrade-notls-server- | awk '{print $1}'); do
+      oc delete pv "$pv" --ignore-not-found
+    done

@@ -1,0 +1,12 @@
+#
+# Step 2: After cleanup, all resources should be gone
+#
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: TransportURL
+metadata:
+  name: custom-url
+---
+apiVersion: rabbitmq.openstack.org/v1beta1
+kind: RabbitMq
+metadata:
+  name: rabbitmq-url-custom

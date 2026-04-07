@@ -1,0 +1,16 @@
+#
+# Step 0: Wait for the old RabbitmqCluster to become ready
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 300
+commands:
+  - script: |
+      set -e
+      READY=$(oc get rabbitmqcluster.rabbitmq.com -n $NAMESPACE rabbitmq-old -o jsonpath='{.status.conditions[?(@.type=="AllReplicasReady")].status}')
+      if [ "$READY" != "True" ]; then
+        echo "FAIL: Old RabbitmqCluster not ready"
+        oc get rabbitmqcluster.rabbitmq.com -n $NAMESPACE rabbitmq-old -o yaml
+        exit 1
+      fi
+      echo "PASS: Old RabbitmqCluster is ready"

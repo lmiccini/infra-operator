@@ -1,0 +1,25 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+delete:
+- apiVersion: rabbitmq.openstack.org/v1beta1
+  kind: RabbitMQPolicy
+  name: rabbitmqpolicy-sample
+- apiVersion: rabbitmq.openstack.org/v1beta1
+  kind: RabbitMQUser
+  name: rabbitmquser-sample
+- apiVersion: rabbitmq.openstack.org/v1beta1
+  kind: RabbitMQVhost
+  name: rabbitmqvhost-sample
+- apiVersion: rabbitmq.openstack.org/v1beta1
+  kind: TransportURL
+  name: transporturl
+- apiVersion: rabbitmq.openstack.org/v1beta1
+  kind: RabbitMq
+  name: rabbitmq
+commands:
+- script: |
+    oc delete pvc -n $NAMESPACE -l app.kubernetes.io/name=rabbitmq --ignore-not-found
+    # Clean up Released PVs to avoid stale data on re-runs
+    for pv in $(oc get pv -o jsonpath='{range .items[?(@.spec.claimRef.namespace=="'$NAMESPACE'")]}{.metadata.name}{" "}{.spec.claimRef.name}{"\n"}{end}' | grep 'persistence-rabbitmq-server-' | awk '{print $1}'); do
+      oc delete pv "$pv" --ignore-not-found
+    done

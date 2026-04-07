@@ -1,0 +1,13 @@
+#
+# Step 1: Upgrade from 3.13 to 4.2 with queueType still set to Mirrored.
+# This simulates what the openstack-operator sends during an upgrade.
+# The defaulting webhook will force queueType from Mirrored to Quorum.
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+- script: |
+    set -e
+    oc patch rabbitmq.rabbitmq.openstack.org rabbitmq-upmir -n $NAMESPACE \
+      --type merge -p '{"spec":{"targetVersion":"4.2","containerImage":"quay.io/podified-antelope-centos9/openstack-rabbitmq:current-podified","queueType":"Mirrored"}}'
+    echo "PASS: Patched targetVersion to 4.2 with queueType Mirrored (webhook forces Quorum)"

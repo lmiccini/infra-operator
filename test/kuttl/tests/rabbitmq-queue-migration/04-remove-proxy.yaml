@@ -1,0 +1,11 @@
+#
+# Step 3: Signal that clients have been reconfigured, which should remove the proxy
+#
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+- script: |
+    set -e
+    oc annotate rabbitmq.rabbitmq.openstack.org rabbitmq-qmigrate -n $NAMESPACE \
+      rabbitmq.openstack.org/clients-reconfigured=true
+    echo "PASS: Set clients-reconfigured annotation"
