@@ -127,6 +127,7 @@ type Reconciler struct {
 
 // Required to determine IPv6 and FIPS
 // +kubebuilder:rbac:groups=config.openshift.io,resources=networks,verbs=get;list;watch;
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
 
 // Required to exec into pods
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete;
