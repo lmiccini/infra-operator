@@ -50,6 +50,9 @@ type ReservationStatus struct {
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
 //+kubebuilder:printcolumn:name="Reservation",type="string",JSONPath=".spec.reservation",description="Reservation"
+//+kubebuilder:metadata:labels=backup.openstack.org/restore=true
+//+kubebuilder:metadata:labels=backup.openstack.org/category=dataplane
+//+kubebuilder:metadata:labels=backup.openstack.org/restore-order=30
 
 // Reservation is the Schema for the reservations API
 type Reservation struct {

@@ -75,6 +75,9 @@ type RabbitMQPolicyStatus struct {
 //+kubebuilder:printcolumn:name="Pattern",type="string",JSONPath=".spec.pattern"
 //+kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.conditions[0].status"
 //+kubebuilder:printcolumn:name="Message",type="string",JSONPath=".status.conditions[0].message"
+//+kubebuilder:metadata:labels=backup.openstack.org/restore=true
+//+kubebuilder:metadata:labels=backup.openstack.org/category=controlplane
+//+kubebuilder:metadata:labels=backup.openstack.org/restore-order=40
 
 // RabbitMQPolicy is the Schema for the rabbitmqpolicies API
 type RabbitMQPolicy struct {

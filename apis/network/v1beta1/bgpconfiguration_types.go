@@ -54,6 +54,9 @@ type BGPConfigurationStatus struct {
 
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
+//+kubebuilder:metadata:labels=backup.openstack.org/restore=true
+//+kubebuilder:metadata:labels=backup.openstack.org/category=dataplane
+//+kubebuilder:metadata:labels=backup.openstack.org/restore-order=20
 
 // BGPConfiguration is the Schema for the bgpconfigurations API
 type BGPConfiguration struct {
