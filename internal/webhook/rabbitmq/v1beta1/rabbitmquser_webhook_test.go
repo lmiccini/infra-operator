@@ -17,9 +17,12 @@ limitations under the License.
 package v1beta1
 
 import (
+	"fmt"
+
 	. "github.com/onsi/ginkgo/v2" //revive:disable:dot-imports
 	. "github.com/onsi/gomega"    //revive:disable:dot-imports
 	rabbitmqv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -125,6 +128,93 @@ var _ = Describe("RabbitMQUser webhook", func() {
 			_, err := user.ValidateCreate(k8sClient)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("invalid character"))
+		})
+
+		It("should reject username matching the cluster's default user", func() {
+			clusterName := "my-cluster"
+			defaultUsername := fmt.Sprintf("default_user_%s", clusterName)
+
+			// Create the default user secret that the cluster controller would create
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("%s-default-user", clusterName),
+					Namespace: "default",
+				},
+				Data: map[string][]byte{
+					"username": []byte(defaultUsername),
+					"password": []byte("secret-password"),
+				},
+			}
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
+			})
+
+			user := &rabbitmqv1beta1.RabbitMQUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "conflicting-user",
+					Namespace: "default",
+				},
+				Spec: rabbitmqv1beta1.RabbitMQUserSpec{
+					RabbitmqClusterName: clusterName,
+					Username:            defaultUsername,
+				},
+			}
+
+			_, err := user.ValidateCreate(k8sClient)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("conflicts with the default user"))
+		})
+
+		It("should accept username not matching the cluster's default user", func() {
+			clusterName := "other-cluster"
+			defaultUsername := fmt.Sprintf("default_user_%s", clusterName)
+
+			// Create the default user secret
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("%s-default-user", clusterName),
+					Namespace: "default",
+				},
+				Data: map[string][]byte{
+					"username": []byte(defaultUsername),
+					"password": []byte("secret-password"),
+				},
+			}
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
+			})
+
+			user := &rabbitmqv1beta1.RabbitMQUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "non-conflicting-user",
+					Namespace: "default",
+				},
+				Spec: rabbitmqv1beta1.RabbitMQUserSpec{
+					RabbitmqClusterName: clusterName,
+					Username:            "my-custom-user",
+				},
+			}
+
+			_, err := user.ValidateCreate(k8sClient)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("should accept username when cluster default user secret does not exist", func() {
+			user := &rabbitmqv1beta1.RabbitMQUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "early-user",
+					Namespace: "default",
+				},
+				Spec: rabbitmqv1beta1.RabbitMQUserSpec{
+					RabbitmqClusterName: "nonexistent-cluster",
+					Username:            "default_user_nonexistent-cluster",
+				},
+			}
+
+			_, err := user.ValidateCreate(k8sClient)
+			Expect(err).NotTo(HaveOccurred())
 		})
 	})
 

@@ -112,6 +112,11 @@ func (r *RabbitMQUser) ValidateCreate(k8sClient client.Client) (admission.Warnin
 		}
 	}
 
+	// Validate username doesn't conflict with the cluster's default user
+	if err := r.validateNotDefaultUser(k8sClient); err != nil {
+		return nil, err
+	}
+
 	return nil, r.validateUniqueUsername(k8sClient, r.Spec.Username)
 }
 
@@ -358,6 +363,40 @@ func (r *RabbitMQUser) validateUniqueUsername(k8sClient client.Client, username 
 				},
 			)
 		}
+	}
+
+	return nil
+}
+
+// validateNotDefaultUser checks that the username doesn't match the cluster's default user
+func (r *RabbitMQUser) validateNotDefaultUser(k8sClient client.Client) error {
+	secretName := fmt.Sprintf("%s-default-user", r.Spec.RabbitmqClusterName)
+	secret := &corev1.Secret{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := k8sClient.Get(ctx,
+		client.ObjectKey{Name: secretName, Namespace: r.Namespace},
+		secret); err != nil {
+		// If the secret doesn't exist, the cluster may not be created yet - skip check
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return apierrors.NewInternalError(fmt.Errorf("failed to look up default user secret: %w", err))
+	}
+
+	defaultUsername := string(secret.Data["username"])
+	if r.Spec.Username == defaultUsername {
+		return apierrors.NewInvalid(
+			schema.GroupKind{Group: "rabbitmq.openstack.org", Kind: "RabbitMQUser"},
+			r.Name,
+			field.ErrorList{
+				field.Invalid(field.NewPath("spec", "username"), r.Spec.Username,
+					fmt.Sprintf("username %q conflicts with the default user of cluster %q",
+						r.Spec.Username, r.Spec.RabbitmqClusterName)),
+			},
+		)
 	}
 
 	return nil
