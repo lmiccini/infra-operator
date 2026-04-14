@@ -5,11 +5,9 @@
 generate_configs
 sudo -E kolla_set_configs
 
-# 1. check if a redis cluster is already running by contacting sentinel
-output=$(timeout ${TIMEOUT} $REDIS_CLI_CMD -h ${SVC_FQDN} -p 26379 sentinel master redis)
+# 1. check if a redis cluster is already running by contacting peer sentinels
+master=$(wait_for_master)
 if [ $? -eq 0 ]; then
-    master=$(echo "$output" | awk '/^ip$/ {getline; print $0; exit}')
-    # TODO skip if no master was found
     log "Connecting to the existing sentinel cluster (master: $master)"
     echo "sentinel monitor redis ${master} 6379 ${SENTINEL_QUORUM}" >> $SENTINEL_CONFIG
     exec redis-sentinel $SENTINEL_CONFIG

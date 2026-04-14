@@ -84,6 +84,52 @@ function remove_pod_label() {
     configure_pod_label $pod "$patch" "(200|422)"
 }
 
+# Wait for a peer sentinel to report a valid master for the cluster.
+# Contacts each peer pod individually by FQDN (skipping self) to avoid
+# the headless service DNS resolving to our own uninitialized sentinel.
+# If a peer still reports US as master (stale info before
+# down-after-milliseconds triggers failover), keeps retrying until
+# failover completes and a different master is elected.
+# If no peers are reachable at all (first deployment), returns
+# immediately so the bootstrap pod can start without delay.
+# Prints the master address on success (FQDN or IP).
+function wait_for_master() {
+    local retries=${SENTINEL_RETRIES:-10}
+    local delay=${SENTINEL_RETRY_DELAY:-3}
+    local pod_ordinal=${POD_NAME##*-}
+    local pod_base=${POD_NAME%-*}
+    local replicas=${REPLICAS:-3}
+
+    for i in $(seq 1 $retries); do
+        local any_peer_reachable=0
+        local ordinal=0
+        while [ $ordinal -lt $replicas ]; do
+            if [ "$ordinal" != "$pod_ordinal" ]; then
+                local peer="${pod_base}-${ordinal}.${SVC_FQDN}"
+                local output
+                if output=$(timeout ${TIMEOUT} $REDIS_CLI_CMD -h ${peer} -p 26379 sentinel master redis 2>/dev/null); then
+                    any_peer_reachable=1
+                    local master
+                    master=$(echo "$output" | awk '/^ip$/ {getline; print $0; exit}')
+                    # If the peer still thinks WE are master, it has stale
+                    # pre-failover info — try remaining peers before waiting.
+                    if ! echo "$master" | grep -q "^${POD_NAME}\."; then
+                        echo "$master"
+                        return 0
+                    fi
+                fi
+            fi
+            ordinal=$((ordinal + 1))
+        done
+        if [ $any_peer_reachable -eq 0 ]; then
+            return 1
+        fi
+        log "Attempt $i/$retries: no valid master found, retrying in ${delay}s..."
+        sleep $delay
+    done
+    return 1
+}
+
 function set_pod_label() {
     local pod="$1"
     local label="$2"
