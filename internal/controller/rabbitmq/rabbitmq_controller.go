@@ -49,6 +49,7 @@ import (
 	rabbitmqv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	"github.com/openstack-k8s-operators/infra-operator/internal/rabbitmq"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/backup"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
@@ -1334,6 +1335,11 @@ func (r *Reconciler) ensureDefaultUser(
 		if err := r.setOwnership(secret, instance, migrate); err != nil {
 			return err
 		}
+
+		// Add backup/restore labels so the secret is restored from backup,
+		// preserving RabbitMQ credentials across backup/restore cycles.
+		secret.Labels = util.MergeMaps(secret.Labels,
+			backup.GetRestoreLabels(backup.RestoreOrder10, backup.CategoryControlPlane))
 
 		// Only generate credentials on first creation
 		if len(secret.Data) == 0 {
