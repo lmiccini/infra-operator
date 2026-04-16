@@ -606,7 +606,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 
 	// Ensure default user secret exists (optional, for initial setup)
-	err = r.ensureDefaultUser(ctx, instance, isMigration)
+	err = r.ensureDefaultUser(ctx, instance, isMigration, configVersion)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1314,6 +1314,7 @@ func (r *Reconciler) ensureDefaultUser(
 	ctx context.Context,
 	instance *rabbitmqv1beta1.RabbitMq,
 	migrate bool,
+	configVersion string,
 ) error {
 	Log := r.GetLogger(ctx)
 	secretName := fmt.Sprintf("%s-default-user", instance.Name)
@@ -1343,7 +1344,7 @@ func (r *Reconciler) ensureDefaultUser(
 
 		// Only generate credentials on first creation
 		if len(secret.Data) == 0 {
-			generated, genErr := rabbitmq.GenerateDefaultUser(instance)
+			generated, genErr := rabbitmq.GenerateDefaultUser(instance, configVersion)
 			if genErr != nil {
 				return fmt.Errorf("failed to generate default user: %w", genErr)
 			}
@@ -1355,7 +1356,10 @@ func (r *Reconciler) ensureDefaultUser(
 		if _, ok := secret.Data["default_user.conf"]; !ok {
 			username := string(secret.Data["username"])
 			password := string(secret.Data["password"])
-			defaultUserConf := fmt.Sprintf("default_user = %s\ndefault_pass = %s\ndefault_user_tags.administrator = true\n", username, password)
+			defaultUserConf := fmt.Sprintf("default_user = %s\ndefault_pass = %s\n", username, password)
+			if !rabbitmq.IsVersion4OrLater(configVersion) {
+				defaultUserConf += "default_user_tags.administrator = true\n"
+			}
 			secret.Data["default_user.conf"] = []byte(defaultUserConf)
 		}
 
