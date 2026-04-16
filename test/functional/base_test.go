@@ -43,6 +43,7 @@ import (
 	memcachedv1 "github.com/openstack-k8s-operators/infra-operator/apis/memcached/v1beta1"
 	networkv1 "github.com/openstack-k8s-operators/infra-operator/apis/network/v1beta1"
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
+	redisv1 "github.com/openstack-k8s-operators/infra-operator/apis/redis/v1beta1"
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	appsv1 "k8s.io/api/apps/v1"
@@ -930,6 +931,41 @@ func GetMemcached(name types.NamespacedName) *memcachedv1.Memcached {
 		g.Expect(k8sClient.Get(ctx, name, instance)).Should(Succeed())
 	}, timeout, interval).Should(Succeed())
 	return instance
+}
+
+func CreateRedisConfig(namespace string, spec map[string]any) client.Object {
+	name := "redis-" + uuid.New().String()[:25]
+
+	raw := map[string]any{
+		"apiVersion": "redis.openstack.org/v1beta1",
+		"kind":       "Redis",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": namespace,
+		},
+		"spec": spec,
+	}
+
+	return th.CreateUnstructured(raw)
+}
+
+func GetDefaultRedisSpec() map[string]any {
+	return map[string]any{
+		"replicas": 3,
+	}
+}
+
+func GetRedis(name types.NamespacedName) *redisv1.Redis {
+	instance := &redisv1.Redis{}
+	Eventually(func(g Gomega) {
+		g.Expect(k8sClient.Get(ctx, name, instance)).Should(Succeed())
+	}, timeout, interval).Should(Succeed())
+	return instance
+}
+
+func RedisConditionGetter(name types.NamespacedName) condition.Conditions {
+	instance := GetRedis(name)
+	return instance.Status.Conditions
 }
 
 func CreateBGPConfiguration(namespace string, spec map[string]any) client.Object {

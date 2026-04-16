@@ -46,14 +46,17 @@ import (
 	memcachedv1 "github.com/openstack-k8s-operators/infra-operator/apis/memcached/v1beta1"
 	networkv1 "github.com/openstack-k8s-operators/infra-operator/apis/network/v1beta1"
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
+	redisv1 "github.com/openstack-k8s-operators/infra-operator/apis/redis/v1beta1"
 
 	memcached_ctrl "github.com/openstack-k8s-operators/infra-operator/internal/controller/memcached"
 	network_ctrl "github.com/openstack-k8s-operators/infra-operator/internal/controller/network"
 	rabbitmq_ctrl "github.com/openstack-k8s-operators/infra-operator/internal/controller/rabbitmq"
+	redis_ctrl "github.com/openstack-k8s-operators/infra-operator/internal/controller/redis"
 
 	webhookmemcachedv1beta1 "github.com/openstack-k8s-operators/infra-operator/internal/webhook/memcached/v1beta1"
 	webhooknetworkv1beta1 "github.com/openstack-k8s-operators/infra-operator/internal/webhook/network/v1beta1"
 	webhookrabbitmqv1beta1 "github.com/openstack-k8s-operators/infra-operator/internal/webhook/rabbitmq/v1beta1"
+	webhookredisv1beta1 "github.com/openstack-k8s-operators/infra-operator/internal/webhook/redis/v1beta1"
 
 	ocp_configv1 "github.com/openshift/api/config/v1"
 	infra_test "github.com/openstack-k8s-operators/infra-operator/apis/test/helpers"
@@ -150,6 +153,8 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	err = memcachedv1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
+	err = redisv1.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
 	err = k8s_networkv1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 	err = frrk8sv1.AddToScheme(scheme.Scheme)
@@ -210,6 +215,8 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	err = webhookmemcachedv1beta1.SetupMemcachedWebhookWithManager(k8sManager)
 	Expect(err).NotTo(HaveOccurred())
+	err = webhookredisv1beta1.SetupRedisWebhookWithManager(k8sManager)
+	Expect(err).NotTo(HaveOccurred())
 	err = webhookrabbitmqv1beta1.SetupRabbitMqWebhookWithManager(k8sManager)
 	Expect(err).NotTo(HaveOccurred())
 	err = webhookrabbitmqv1beta1.SetupRabbitMQUserWebhookWithManager(k8sManager)
@@ -262,6 +269,13 @@ var _ = BeforeSuite(func() {
 	Expect(err).ToNot(HaveOccurred())
 
 	err = (&memcached_ctrl.Reconciler{
+		Client:  k8sManager.GetClient(),
+		Scheme:  k8sManager.GetScheme(),
+		Kclient: kclient,
+	}).SetupWithManager(k8sManager)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = (&redis_ctrl.Reconciler{
 		Client:  k8sManager.GetClient(),
 		Scheme:  k8sManager.GetScheme(),
 		Kclient: kclient,

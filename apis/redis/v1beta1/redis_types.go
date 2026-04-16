@@ -17,12 +17,17 @@ limitations under the License.
 package v1beta1
 
 import (
+	"context"
+	"fmt"
+
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
@@ -36,6 +41,13 @@ const (
 	// omit issue with statefulset pod label "controller-revision-hash": "<statefulset_name>-<hash>"
 	// Int32 is a 10 character + hyphen = 11
 	CrMaxLengthCorrection = 11
+
+	// SentinelPort is the port on which Redis Sentinel listens
+	SentinelPort = 26379
+
+	// SentinelMasterName is the name of the Redis master as known to Sentinel.
+	// This is hardcoded in the sentinel configuration templates.
+	SentinelMasterName = "redis"
 )
 
 // RedisSpec defines the desired state of Redis
@@ -79,6 +91,14 @@ type RedisStatus struct {
 	// Conditions
 	Conditions condition.Conditions `json:"conditions,omitempty" optional:"true"`
 
+	// +kubebuilder:validation:Enum=True;False;""
+	// Whether TLS is supported by the Redis instance
+	TLSSupport string `json:"tlsSupport,omitempty"`
+
+	// SentinelHosts - List of sentinel endpoints in host:port format
+	// +listType=atomic
+	SentinelHosts []string `json:"sentinelHosts,omitempty" optional:"true"`
+
 	// ObservedGeneration - the most recent generation observed for this
 	// service. If the observed generation is less than the spec generation,
 	// then the controller has not processed the latest changes injected by
@@ -120,6 +140,71 @@ func init() {
 // IsReady - returns true if service is ready to serve requests
 func (instance Redis) IsReady() bool {
 	return instance.Status.Conditions.IsTrue(condition.ReadyCondition)
+}
+
+// GetRedisTLSSupport - return the TLS support of the Redis instance
+func (instance *Redis) GetRedisTLSSupport() bool {
+	return instance.Status.TLSSupport == "True"
+}
+
+// GetRedisClientURL - return the connection URL for Redis clients
+func (instance *Redis) GetRedisClientURL() string {
+	url := fmt.Sprintf("redis://%s:%d/", instance.Name, 6379)
+	if instance.GetRedisTLSSupport() {
+		url += "?ssl=true"
+	}
+	return url
+}
+
+// GetSentinelMasterName - return the name of the Redis master as configured in Sentinel
+func (instance *Redis) GetSentinelMasterName() string {
+	return SentinelMasterName
+}
+
+// GetSentinelHosts - return the list of sentinel host:port endpoints
+func (instance *Redis) GetSentinelHosts() []string {
+	return instance.Status.SentinelHosts
+}
+
+// GetRedisSentinelURL - return a connection URL for Redis Sentinel clients.
+// The URL format follows the tooz/oslo.cache convention:
+//
+//	redis://<sentinel host>:<sentinel port>?sentinel=<master name>&sentinel_fallback=<host2>:<port>&sentinel_fallback=<host3>:<port>
+//
+// When TLS is enabled, ssl, sentinel_ssl, and ssl_ca_certs parameters are appended.
+func (instance *Redis) GetRedisSentinelURL() string {
+	if len(instance.Status.SentinelHosts) == 0 {
+		return ""
+	}
+	url := fmt.Sprintf("redis://%s?sentinel=%s", instance.Status.SentinelHosts[0], SentinelMasterName)
+	for _, fallback := range instance.Status.SentinelHosts[1:] {
+		url += "&sentinel_fallback=" + fallback
+	}
+	if instance.GetRedisTLSSupport() {
+		url += "&ssl=true&sentinel_ssl=true&ssl_ca_certs=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+	}
+	return url
+}
+
+// GetRedisByName - gets the Redis instance by name
+func GetRedisByName(
+	ctx context.Context,
+	h *helper.Helper,
+	name string,
+	namespace string,
+) (*Redis, error) {
+	redis := &Redis{}
+	err := h.GetClient().Get(
+		ctx,
+		types.NamespacedName{
+			Name:      name,
+			Namespace: namespace,
+		},
+		redis)
+	if err != nil {
+		return nil, err
+	}
+	return redis, err
 }
 
 // RbacConditionsSet - set the conditions for the rbac object
