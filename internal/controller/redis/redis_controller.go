@@ -55,6 +55,7 @@ import (
 	redis "github.com/openstack-k8s-operators/infra-operator/internal/redis"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 
+	"github.com/openstack-k8s-operators/lib-common/modules/common/clusterdns"
 	common_rbac "github.com/openstack-k8s-operators/lib-common/modules/common/rbac"
 	commonservice "github.com/openstack-k8s-operators/lib-common/modules/common/service"
 	commonstatefulset "github.com/openstack-k8s-operators/lib-common/modules/common/statefulset"
@@ -291,6 +292,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 	// all cert input checks out so report InputReady
 	instance.Status.Conditions.MarkTrue(condition.TLSInputReadyCondition, condition.InputReadyMessage)
+	if instance.Spec.TLS.Enabled() {
+		instance.Status.TLSSupport = "True"
+	} else {
+		instance.Status.TLSSupport = "False"
+	}
 
 	// Redis config maps
 	err = r.generateConfigMaps(ctx, helper, instance, &inputHashEnv)
@@ -348,6 +354,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			err.Error()))
 		return hlres, hlerr
 	}
+
+	// Build sentinel host list from statefulset pod DNS names
+	headlessServiceName := instance.GetName() + "-redis"
+	clusterDomain := clusterdns.GetDNSClusterDomain()
+	replicas := int32(1)
+	if instance.Spec.Replicas != nil {
+		replicas = *instance.Spec.Replicas
+	}
+	sentinelHosts := make([]string, 0, int(replicas))
+	for i := int32(0); i < replicas; i++ {
+		host := fmt.Sprintf("%s-%d.%s.%s.svc.%s:%d",
+			headlessServiceName, i,
+			headlessServiceName,
+			instance.Namespace,
+			clusterDomain,
+			redisv1.SentinelPort,
+		)
+		sentinelHosts = append(sentinelHosts, host)
+	}
+	instance.Status.SentinelHosts = sentinelHosts
 
 	// Service to expose Redis pods
 	commonsvc, err := commonservice.NewService(redis.Service(instance), time.Duration(5)*time.Second, nil)

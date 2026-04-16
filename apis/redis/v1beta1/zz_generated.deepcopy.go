@@ -172,6 +172,11 @@ func (in *RedisStatus) DeepCopyInto(out *RedisStatus) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
+	if in.SentinelHosts != nil {
+		in, out := &in.SentinelHosts, &out.SentinelHosts
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.LastAppliedTopology != nil {
 		in, out := &in.LastAppliedTopology, &out.LastAppliedTopology
 		*out = new(topologyv1beta1.TopoRef)
