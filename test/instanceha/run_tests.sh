@@ -83,6 +83,7 @@ functional_tests_passed=0
 integration_tests_passed=0
 region_isolation_tests_passed=0
 coverage_gaps_tests_passed=0
+orchestrated_evacuation_tests_passed=0
 
 # Run core unit tests
 echo -e "${BLUE}Running Core Unit Tests...${NC}"
@@ -189,6 +190,12 @@ if run_test_file "test_coverage_gaps.py" "Coverage Gaps Tests"; then
     coverage_gaps_tests_passed=1
 fi
 
+# Run orchestrated evacuation tests
+echo -e "${BLUE}Running Orchestrated Evacuation Tests...${NC}"
+if run_test_file "test_orchestrated_evacuation.py" "Orchestrated Evacuation Tests"; then
+    orchestrated_evacuation_tests_passed=1
+fi
+
 echo
 echo
 
@@ -197,8 +204,8 @@ echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}            Test Summary                ${NC}"
 echo -e "${BLUE}========================================${NC}"
 
-total_passed=$((unit_core_tests_passed + fencing_tests_passed + kdump_tests_passed + security_tests_passed + critical_error_tests_passed + evacuation_workflow_tests_passed + config_features_tests_passed + helper_functions_tests_passed + functional_tests_passed + integration_tests_passed + region_isolation_tests_passed + coverage_gaps_tests_passed))
-total_tests=12
+total_passed=$((unit_core_tests_passed + fencing_tests_passed + kdump_tests_passed + security_tests_passed + critical_error_tests_passed + evacuation_workflow_tests_passed + config_features_tests_passed + helper_functions_tests_passed + functional_tests_passed + integration_tests_passed + region_isolation_tests_passed + coverage_gaps_tests_passed + orchestrated_evacuation_tests_passed))
+total_tests=13
 
 if [ $unit_core_tests_passed -eq 1 ]; then
     echo -e "${GREEN}[PASS] Core Unit Tests: PASSED${NC}"
@@ -270,6 +277,12 @@ if [ $coverage_gaps_tests_passed -eq 1 ]; then
     echo -e "${GREEN}[PASS] Coverage Gaps Tests: PASSED${NC}"
 else
     echo -e "${RED}[FAIL] Coverage Gaps Tests: FAILED${NC}"
+fi
+
+if [ $orchestrated_evacuation_tests_passed -eq 1 ]; then
+    echo -e "${GREEN}[PASS] Orchestrated Evacuation Tests: PASSED${NC}"
+else
+    echo -e "${RED}[FAIL] Orchestrated Evacuation Tests: FAILED${NC}"
 fi
 
 echo

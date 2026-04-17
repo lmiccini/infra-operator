@@ -4,9 +4,9 @@
 
 InstanceHA is a high-availability service for OpenStack that automatically detects and evacuates instances from failed compute nodes.
 
-**Version**: 2.2
-**Code Size**: 2,872 lines
-**Test Suite**: 477 tests across 12 test suites, ~26 seconds execution time
+**Version**: 2.3
+**Code Size**: 3,032 lines
+**Test Suite**: 517 tests across 13 test suites
 
 ## Table of Contents
 
@@ -116,6 +116,7 @@ _config_map: Dict[str, ConfigItem] = {
     'SSL_VERIFY': ConfigItem('bool', True),
     'FENCING_TIMEOUT': ConfigItem('int', 30, 5, 120),
     'HASH_INTERVAL': ConfigItem('int', 60, 30, 300),
+    'ORCHESTRATED_RESTART': ConfigItem('bool', False),
 }
 ```
 
@@ -517,6 +518,7 @@ process_service(failed_service, reserved_hosts, resume, service)
     │       ├─ List servers on host
     │       ├─ Filter evacuable servers
     │       └─ Execute evacuation
+    │           ├─ Orchestrated: _orchestrated_evacuate (priority-ordered phases)
     │           ├─ Smart: _server_evacuate_future (track to completion)
     │           └─ Traditional: fire-and-forget
     │
@@ -825,7 +827,54 @@ def _server_evacuate_future(connection, server) -> bool:
 
 ---
 
-### 3. Server Evacuability Logic
+### 3. Orchestrated Evacuation
+
+**Configuration**: `ORCHESTRATED_RESTART: true` (or auto-detected from server metadata)
+
+**Server Metadata** (set via `openstack server set --property`):
+- `instanceha:restart_priority` (int, 1-1000, default 500): Higher values = evacuated first
+- `instanceha:restart_group` (str, optional): Servers with same group evacuate concurrently
+
+**Flow**:
+```python
+# 1. Read orchestration metadata from all evacuable servers
+# 2. Group servers by restart_group (ungrouped → individual phases)
+# 3. Sort groups by highest member priority (descending)
+# 4. Evacuate each phase sequentially
+# 5. Within each phase, use ThreadPoolExecutor (concurrent, like smart evacuation)
+
+phases = _build_evacuation_groups(evacuables)  # group + sort
+for phase in phases:
+    # Evacuate phase concurrently, wait for completion
+    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+        futures = {executor.submit(_server_evacuate_future, conn, s, target): s
+                   for s in phase}
+        # Wait for all futures, fail-fast on any failure
+```
+
+**Example**:
+```
+Server metadata:
+  db-1:  priority=900, group=database
+  db-2:  priority=800, group=database
+  app-1: priority=500, group=app
+  web-1: priority=100 (no group)
+
+Evacuation order:
+  Phase 1: [db-1, db-2]  (group=database, priority=900) -- concurrent
+  Phase 2: [app-1]       (group=app, priority=500)
+  Phase 3: [web-1]       (ungrouped, priority=100)
+```
+
+**Activation**:
+- Explicit: Set `ORCHESTRATED_RESTART: true` in config
+- Auto-detected: If any evacuable server has `instanceha:restart_priority` or `instanceha:restart_group` metadata
+
+**Backwards Compatibility**: If no server has orchestration metadata and `ORCHESTRATED_RESTART` is not enabled, behavior is identical to current smart/traditional evacuation.
+
+---
+
+### 4. Server Evacuability Logic
 
 **Tagging System** (OR semantics):
 1. **Flavor-based** (`TAGGED_FLAVORS: true`)
@@ -1304,8 +1353,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
 
 ### Test Statistics
 
-- **Total Tests**: 401 across 11 test suites
-- **Execution Time**: ~26 seconds (all tests)
+- **Total Tests**: 516 across 13 test suites
 
 ### Test Categories
 
@@ -1378,6 +1426,14 @@ Core unit tests covering:
 - Traditional evacuation logic: `_traditional_evacuate`
 - Step execution wrapper: `_execute_step`
 - Redfish URL construction edge cases: `_build_redfish_url`
+
+**13. Orchestrated Evacuation Tests** (`test_orchestrated_evacuation.py`):
+- Metadata extraction: `_get_evacuation_metadata` (priority parsing, clamping, defaults)
+- Auto-detection: `_has_orchestration_metadata`
+- Group building: `_build_evacuation_groups` (grouping, priority sorting, mixed inputs)
+- Phase execution: `_orchestrated_evacuate` (multi-phase success/failure, target_host passthrough)
+- Branching logic: `_host_evacuate` orchestrated/smart/traditional routing
+- Configuration: `ORCHESTRATED_RESTART` config key validation
 
 ### Coverage by Component
 
@@ -1722,6 +1778,51 @@ config:
 **Notes**:
 - Smart mode increases API load (polling) and memory usage (thread pool)
 - Traditional mode does not track completion or verify success after submission
+
+---
+
+#### ORCHESTRATED_RESTART
+**Type**: Boolean
+**Default**: `false`
+**Range**: N/A
+
+**Description**: Enable priority-based evacuation ordering using server metadata. When enabled, servers are evacuated in priority-ordered phases rather than all at once.
+
+**Usage**:
+- Controls evacuation strategy selection in `_host_evacuate()`
+- When `true`: Uses `_orchestrated_evacuate()` with priority-ordered phases
+- Auto-enabled if any evacuable server has `instanceha:restart_priority` or `instanceha:restart_group` metadata
+
+**Behavior**:
+- Servers grouped by `instanceha:restart_group` metadata
+- Groups sorted by highest `instanceha:restart_priority` (descending)
+- Each group evacuated concurrently (using WORKERS thread pool)
+- Groups processed sequentially (wait for completion before next group)
+- Fail-fast: stops on first group failure
+
+**Server Metadata Keys**:
+- `instanceha:restart_priority`: Integer 1-1000 (default 500). Higher = evacuated first.
+- `instanceha:restart_group`: String (optional). Servers with same group evacuate together.
+
+**Testing**:
+- Metadata extraction and validation tests
+- Group building and priority sorting tests
+- Orchestrated evacuation with phase sequencing tests
+- Host evacuate branching logic tests
+- Auto-detection of orchestration metadata tests
+
+**Example**:
+```yaml
+config:
+  ORCHESTRATED_RESTART: true
+```
+
+Server metadata:
+```bash
+openstack server set --property instanceha:restart_priority=900 --property instanceha:restart_group=database db-server
+openstack server set --property instanceha:restart_priority=500 --property instanceha:restart_group=app app-server
+openstack server set --property instanceha:restart_priority=100 web-server
+```
 
 ---
 
@@ -2273,8 +2374,8 @@ config:
 
 ## References
 
-- **Code**: `instanceha.py` (2,872 lines)
-- **Tests**: 477 tests across 12 test suites
+- **Code**: `instanceha.py` (3,032 lines)
+- **Tests**: 517 tests across 13 test suites
   - `test_unit_core.py` (core unit tests)
   - `test_fencing_agents.py` (fencing agent tests)
   - `test_kdump_detection.py` (kdump detection tests)
@@ -2287,6 +2388,7 @@ config:
   - `integration_test.py` (integration tests)
   - `test_region_isolation.py` (region tests)
   - `test_coverage_gaps.py` (coverage gap tests)
+  - `test_orchestrated_evacuation.py` (orchestrated evacuation tests)
 - **Documentation**: This file (INSTANCEHA_ARCHITECTURE.md)
 - **OpenStack API**: https://docs.openstack.org/api-ref/compute/
 - **Redfish**: https://www.dmtf.org/standards/redfish

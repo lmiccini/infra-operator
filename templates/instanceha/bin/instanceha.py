@@ -495,6 +495,7 @@ class ConfigManager:
         'SSL_VERIFY': ConfigItem('bool', True),
         'FENCING_TIMEOUT': ConfigItem('int', 30, 5, 120),
         'HASH_INTERVAL': ConfigItem('int', 60, 30, 300),
+        'ORCHESTRATED_RESTART': ConfigItem('bool', False),
     }
 
     def get_config_value(self, key: str) -> Union[str, int, bool]:
@@ -1333,6 +1334,141 @@ def _get_evacuable_servers(connection, host, service) -> List:
 
     return evacuables
 
+
+def _get_evacuation_metadata(server) -> Tuple[int, Optional[str]]:
+    """Extract restart orchestration metadata from a server.
+
+    Args:
+        server: Nova server object
+
+    Returns:
+        Tuple of (priority, group) where priority is 1-1000 (default 500)
+        and group is the restart group name or None
+    """
+    raw = getattr(server, 'metadata', None)
+    metadata = raw if isinstance(raw, dict) else {}
+    group = metadata.get('instanceha:restart_group') or None
+
+    try:
+        priority = int(metadata.get('instanceha:restart_priority', 500))
+        priority = max(1, min(1000, priority))
+    except (ValueError, TypeError):
+        priority = 500
+
+    return priority, group
+
+
+def _has_orchestration_metadata(evacuables) -> bool:
+    """Check if any server has restart orchestration metadata."""
+    for server in evacuables:
+        raw = getattr(server, 'metadata', None)
+        metadata = raw if isinstance(raw, dict) else {}
+        if 'instanceha:restart_priority' in metadata or 'instanceha:restart_group' in metadata:
+            return True
+    return False
+
+
+def _build_evacuation_groups(evacuables) -> List[List]:
+    """Build priority-ordered evacuation groups from server metadata.
+
+    Groups servers by restart_group, sorts groups by highest priority (descending).
+    Servers without a restart_group form individual single-server groups.
+
+    Args:
+        evacuables: List of server objects to evacuate
+
+    Returns:
+        List of lists - each inner list is a group of servers to evacuate concurrently,
+        ordered by priority (highest first)
+    """
+    grouped = defaultdict(list)
+    ungrouped = []
+    group_priorities = defaultdict(int)
+
+    for server in evacuables:
+        priority, group = _get_evacuation_metadata(server)
+        if group is not None:
+            grouped[group].append(server)
+            group_priorities[group] = max(group_priorities[group], priority)
+        else:
+            ungrouped.append((priority, server))
+
+    phases = []
+    for group_name, servers in grouped.items():
+        phases.append((group_priorities[group_name], group_name, servers))
+
+    for priority, server in ungrouped:
+        phases.append((priority, None, [server]))
+
+    phases.sort(key=lambda x: x[0], reverse=True)
+
+    for priority, group_name, servers in phases:
+        server_ids = [s.id for s in servers]
+        if group_name:
+            logging.info("Evacuation phase: group=%s priority=%d servers=%s",
+                        group_name, priority, server_ids)
+        else:
+            logging.info("Evacuation phase: ungrouped priority=%d servers=%s",
+                        priority, server_ids)
+
+    return [servers for _, _, servers in phases]
+
+
+def _orchestrated_evacuate(connection, evacuables, service, host, service_id, target_host=None) -> bool:
+    """Execute orchestrated evacuation with priority-ordered phases.
+
+    Servers are grouped by restart_group metadata and sorted by priority.
+    Each phase is evacuated concurrently, but phases run sequentially.
+
+    Args:
+        connection: Nova client connection
+        evacuables: List of servers to evacuate
+        service: Service instance
+        host: Source host name
+        service_id: Service ID
+        target_host: Optional target host for evacuation
+
+    Returns:
+        bool: True if all phases succeeded
+    """
+    phases = _build_evacuation_groups(evacuables)
+    total_phases = len(phases)
+    total_servers = sum(len(p) for p in phases)
+
+    logging.info("Orchestrated evacuation: %d phases, %d total servers from %s",
+                total_phases, total_servers, host)
+
+    for phase_num, phase_servers in enumerate(phases, 1):
+        logging.info("Starting evacuation phase %d/%d (%d servers)",
+                    phase_num, total_phases, len(phase_servers))
+
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=service.config.get_config_value('WORKERS')) as executor:
+            future_to_server = {
+                executor.submit(_server_evacuate_future, connection, s, target_host): s
+                for s in phase_servers
+            }
+
+            for future in concurrent.futures.as_completed(future_to_server):
+                server = future_to_server[future]
+                try:
+                    if not future.result():
+                        logging.error('Phase %d: evacuation of %s failed', phase_num, server.id)
+                        _update_service_disable_reason(connection, host, service_id)
+                        return False
+                    logging.info('Phase %d: %r evacuated successfully', phase_num, server.id)
+                except Exception as exc:
+                    logging.error('Phase %d: evacuation generated an exception: %s',
+                                phase_num, exc)
+                    logging.debug('Exception traceback:', exc_info=True)
+                    _update_service_disable_reason(connection, host, service_id)
+                    return False
+
+        logging.info("Evacuation phase %d/%d completed successfully", phase_num, total_phases)
+
+    return True
+
+
 def _smart_evacuate(connection, evacuables, service, host, service_id, target_host=None) -> bool:
     """Execute smart evacuation with migration tracking.
 
@@ -1426,7 +1562,13 @@ def _host_evacuate(connection, failed_service, service, target_host=None) -> boo
 
     time.sleep(service.config.get_config_value('DELAY'))
 
-    if service.config.get_config_value('SMART_EVACUATION'):
+    use_orchestrated = service.config.get_config_value('ORCHESTRATED_RESTART') is True
+    if not use_orchestrated:
+        use_orchestrated = _has_orchestration_metadata(evacuables)
+
+    if use_orchestrated:
+        return _orchestrated_evacuate(connection, evacuables, service, host, failed_service.id, target_host=target_host)
+    elif service.config.get_config_value('SMART_EVACUATION'):
         return _smart_evacuate(connection, evacuables, service, host, failed_service.id, target_host=target_host)
     else:
         return _traditional_evacuate(connection, evacuables, host, target_host=target_host)
