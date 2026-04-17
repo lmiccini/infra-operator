@@ -151,7 +151,8 @@ class TestDisabledConfig(unittest.TestCase):
             'TAGGED_IMAGES': False,
             'TAGGED_FLAVORS': False,
             'TAGGED_AGGREGATES': False,
-            'POLL': 45
+            'POLL': 45,
+            'WORKERS': 4,
         }
         mock_service.config.get_config_value = Mock(side_effect=lambda key: config_values.get(key, False))
         mock_service.processing_lock = Mock()

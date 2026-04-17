@@ -9,6 +9,7 @@ Tests critical evacuation flow paths including:
 
 import os
 import sys
+import threading
 import unittest
 from unittest.mock import Mock, patch, MagicMock
 from datetime import datetime
@@ -150,6 +151,7 @@ class TestPostEvacuationRecoveryErrors(unittest.TestCase):
         self.mock_service.config.is_leave_disabled_enabled = Mock(return_value=False)
         self.mock_service.kdump_fenced_hosts = set()
         self.mock_service.kdump_hosts_checking = {}
+        self.mock_service.kdump_lock = threading.Lock()
 
         self.mock_failed_service = Mock()
         self.mock_failed_service.host = 'test-host.example.com'

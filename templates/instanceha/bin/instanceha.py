@@ -48,6 +48,7 @@ CACHE_TIMEOUT_SECONDS = 300
 KDUMP_CLEANUP_THRESHOLD = 100
 KDUMP_CLEANUP_AGE_SECONDS = 300
 MAX_EVACUATION_TIMEOUT_SECONDS = 300
+FUTURE_RESULT_TIMEOUT_SECONDS = MAX_EVACUATION_TIMEOUT_SECONDS + 60
 INITIAL_EVACUATION_WAIT_SECONDS = 10
 EVACUATION_POLL_INTERVAL_SECONDS = 5
 EVACUATION_RETRY_WAIT_SECONDS = 5
@@ -63,6 +64,7 @@ MIGRATION_QUERY_LIMIT = 1000
 USERNAME_MAX_LENGTH = 64
 FENCING_RETRY_DELAY_SECONDS = 1
 KDUMP_REENABLE_DELAY_SECONDS = 60
+MAX_NOVA_BACKOFF_SECONDS = 300
 
 # Disabled reason markers
 DISABLED_REASON_EVACUATION = "instanceha evacuation"
@@ -264,8 +266,8 @@ def _make_ssl_request(method: str, url: str, auth: tuple, timeout: int,
 def _wait_for_power_off(check_func: Callable[[], Optional[str]], timeout: int,
                        host_identifier: str, expected_state: str, agent_type: str) -> bool:
     """Wait for host to power off by polling power state."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         time.sleep(1)
         power_state = check_func()
         if power_state == expected_state:
@@ -617,7 +619,14 @@ class InstanceHAService(CloudConnectionProvider):
         self.UDP_IP = ''  # UDP listener IP
 
     def _initialize_kdump_state(self) -> None:
-        """Initialize kdump detection and management state."""
+        """Initialize kdump detection and management state.
+
+        Thread safety: kdump_hosts_timestamp, kdump_hosts_checking, and
+        kdump_fenced_hosts are accessed by both the UDP listener thread
+        and the main polling thread. All access must be protected by
+        kdump_lock.
+        """
+        self.kdump_lock = threading.Lock()
         self.kdump_hosts_timestamp = defaultdict(float)
         self.kdump_hosts_checking = defaultdict(float)
         self.kdump_listener_stop_event = threading.Event()
@@ -1177,7 +1186,14 @@ class InstanceHAService(CloudConnectionProvider):
                     self.end_headers()
                     self.wfile.write(b"Error: Hash not updated properly.")
 
-        HTTPServer(('', HEALTH_CHECK_PORT), HealthHandler).serve_forever()
+        try:
+            server = HTTPServer(('', HEALTH_CHECK_PORT), HealthHandler)
+            server.serve_forever()
+        except OSError as e:
+            logging.error('Health check server failed to bind to port %d: %s',
+                         HEALTH_CHECK_PORT, e)
+        except Exception as e:
+            logging.error('Health check server failed: %s', e)
 
     def _cleanup_dict_by_condition(self, dictionary: dict, condition_func: Callable[[Any, Any], bool],
                                    log_message: Optional[str] = None) -> int:
@@ -1269,18 +1285,19 @@ def _kdump_udp_listener(service: 'InstanceHAService') -> None:
                         if magic_native == KDUMP_MAGIC_NUMBER or magic_network == KDUMP_MAGIC_NUMBER:
                             try:
                                 hostname = _extract_hostname(socket.gethostbyaddr(address[0])[0])
-                                service.kdump_hosts_timestamp[hostname] = time.time()
-                                logging.debug('Kdump message received from host: %s', hostname)
-
-                                # Cleanup old entries periodically
-                                if len(service.kdump_hosts_timestamp) > KDUMP_CLEANUP_THRESHOLD:
-                                    cutoff = time.time() - KDUMP_CLEANUP_AGE_SECONDS
-                                    service.kdump_hosts_timestamp = defaultdict(float,
-                                        {k: v for k, v in service.kdump_hosts_timestamp.items() if v >= cutoff})
+                                # Record kdump timestamp under lock — the main thread
+                                # reads this in _check_kdump() to decide fencing strategy
+                                with service.kdump_lock:
+                                    service.kdump_hosts_timestamp[hostname] = time.time()
+                                    if len(service.kdump_hosts_timestamp) > KDUMP_CLEANUP_THRESHOLD:
+                                        cutoff = time.time() - KDUMP_CLEANUP_AGE_SECONDS
+                                        service.kdump_hosts_timestamp = defaultdict(float,
+                                            {k: v for k, v in service.kdump_hosts_timestamp.items() if v >= cutoff})
+                                logging.info('Kdump message received from host: %s', hostname)
                             except Exception as e:
-                                logging.debug('Failed to process kdump message from %s: %s', address[0], e)
+                                logging.warning('Failed to process kdump message from %s: %s', address[0], e)
                         else:
-                            logging.debug('Invalid magic number from %s: 0x%x / 0x%x', address[0], magic_native, magic_network)
+                            logging.warning('Invalid magic number from %s: 0x%x / 0x%x', address[0], magic_native, magic_network)
                 except socket.timeout:
                     continue
                 except OSError as e:
@@ -1453,11 +1470,16 @@ def _orchestrated_evacuate(connection, evacuables, service, host, service_id, ta
             for future in concurrent.futures.as_completed(future_to_server):
                 server = future_to_server[future]
                 try:
-                    if not future.result():
+                    if not future.result(timeout=FUTURE_RESULT_TIMEOUT_SECONDS):
                         logging.error('Phase %d: evacuation of %s failed', phase_num, server.id)
                         _update_service_disable_reason(connection, host, service_id)
                         return False
                     logging.info('Phase %d: %r evacuated successfully', phase_num, server.id)
+                except concurrent.futures.TimeoutError:
+                    logging.error('Phase %d: evacuation of %s timed out waiting for result',
+                                phase_num, server.id)
+                    _update_service_disable_reason(connection, host, service_id)
+                    return False
                 except Exception as exc:
                     logging.error('Phase %d: evacuation generated an exception: %s',
                                 phase_num, exc)
@@ -1496,11 +1518,15 @@ def _smart_evacuate(connection, evacuables, service, host, service_id, target_ho
         for future in concurrent.futures.as_completed(future_to_server):
             server = future_to_server[future]
             try:
-                if not future.result():
+                if not future.result(timeout=FUTURE_RESULT_TIMEOUT_SECONDS):
                     logging.debug('Evacuation of %s failed', server.id)
                     _update_service_disable_reason(connection, host, service_id)
                     return False
                 logging.info('%r evacuated successfully', server.id)
+            except concurrent.futures.TimeoutError:
+                logging.error('Evacuation of %s timed out waiting for result', server.id)
+                _update_service_disable_reason(connection, host, service_id)
+                return False
             except Exception as exc:
                 logging.error('Evacuation generated an exception: %s', exc)
                 logging.debug('Exception traceback:', exc_info=True)
@@ -1658,28 +1684,59 @@ def _server_evacuation_status(connection, server) -> EvacuationStatus:
         return EvacuationStatus(completed=False, error=True)
 
 
-def _server_evacuate_future(connection, server, target_host=None) -> bool:
-    """
-    Evacuate a server and monitor the evacuation process until completion.
-
-    Args:
-        connection: Nova client connection
-        server: Server object to evacuate
-        target_host: Optional target host to evacuate to
-
-    Returns:
-        bool: True if evacuation completed successfully, False otherwise
-    """
-
-    # Initialize variables
+def _monitor_evacuation(connection, server_id, response_uuid, start_time) -> bool:
+    """Poll Nova migrations API until evacuation completes, errors out, or times out."""
     error_count = 0
-    start_time = time.time()
 
-    # Validate server object
+    while True:
+        if time.monotonic() - start_time > MAX_EVACUATION_TIMEOUT_SECONDS:
+            logging.error("Evacuation of %s timed out after %d seconds. Giving up.",
+                         response_uuid, MAX_EVACUATION_TIMEOUT_SECONDS)
+            return False
+
+        try:
+            status = _server_evacuation_status(connection, server_id)
+
+            if status.completed:
+                logging.info("Evacuation of %s completed successfully", response_uuid)
+                return True
+
+            if status.error:
+                error_count += 1
+                if error_count >= MAX_EVACUATION_RETRIES:
+                    logging.error("Failed evacuating %s %d times. Giving up.",
+                                 response_uuid, MAX_EVACUATION_RETRIES)
+                    return False
+                logging.warning("Evacuation of instance %s failed %d times. Retrying...",
+                               response_uuid, error_count)
+                time.sleep(EVACUATION_RETRY_WAIT_SECONDS)
+                continue
+
+            logging.debug("Evacuation of %s still in progress", response_uuid)
+            time.sleep(EVACUATION_POLL_INTERVAL_SECONDS)
+
+        except Exception as e:
+            error_count += 1
+            logging.error("Error checking evacuation status for %s: %s",
+                         response_uuid, str(e))
+            logging.debug('Exception traceback:', exc_info=True)
+            if error_count >= MAX_EVACUATION_RETRIES:
+                logging.error("Too many errors checking evacuation status for %s. Giving up.",
+                             response_uuid)
+                return False
+            logging.warning("Retrying evacuation status check for %s in %d seconds (attempt %d/%d)...",
+                           response_uuid, EVACUATION_RETRY_WAIT_SECONDS, error_count, MAX_EVACUATION_RETRIES)
+            time.sleep(EVACUATION_RETRY_WAIT_SECONDS)
+
+
+def _server_evacuate_future(connection, server, target_host=None) -> bool:
+    """Evacuate a server and monitor until completion."""
     if not hasattr(server, 'id'):
         logging.warning("Could not evacuate instance - missing server ID: %s",
                        getattr(server, 'to_dict', lambda: str(server))())
         return False
+
+    start_time = time.monotonic()
 
     if target_host:
         logging.info("Processing evacuation for server %s to target host %s", server.id, target_host)
@@ -1687,7 +1744,6 @@ def _server_evacuate_future(connection, server, target_host=None) -> bool:
         logging.info("Processing evacuation for server %s", server.id)
 
     try:
-        # Initiate evacuation
         response = _server_evacuate(connection, server.id, target_host=target_host)
 
         if not response.accepted:
@@ -1696,64 +1752,15 @@ def _server_evacuate_future(connection, server, target_host=None) -> bool:
             return False
 
         logging.debug("Starting evacuation of %s", response.uuid)
-
-        # Initial wait before polling
         time.sleep(INITIAL_EVACUATION_WAIT_SECONDS)
 
-        # Monitor evacuation progress
-        while True:
-            # Check for overall timeout
-            if time.time() - start_time > MAX_EVACUATION_TIMEOUT_SECONDS:
-                logging.error("Evacuation of %s timed out after %d seconds. Giving up.",
-                             response.uuid, MAX_EVACUATION_TIMEOUT_SECONDS)
-                return False
-
-            try:
-                status = _server_evacuation_status(connection, server.id)
-
-                if status.completed:
-                    logging.info("Evacuation of %s completed successfully", response.uuid)
-                    return True
-
-                if status.error:
-                    error_count += 1
-                    if error_count >= MAX_EVACUATION_RETRIES:
-                        logging.error("Failed evacuating %s %d times. Giving up.",
-                                     response.uuid, MAX_EVACUATION_RETRIES)
-                        return False
-
-                    logging.warning("Evacuation of instance %s failed %d times. Retrying...",
-                                   response.uuid, error_count)
-                    time.sleep(EVACUATION_RETRY_WAIT_SECONDS)
-                    continue
-
-                # Evacuation still in progress
-                logging.debug("Evacuation of %s still in progress", response.uuid)
-                time.sleep(EVACUATION_POLL_INTERVAL_SECONDS)
-
-            except Exception as e:
-                error_count += 1
-                logging.error("Error checking evacuation status for %s: %s",
-                             response.uuid, str(e))
-                logging.debug('Exception traceback:', exc_info=True)
-
-                if error_count >= MAX_EVACUATION_RETRIES:
-                    logging.error("Too many errors checking evacuation status for %s. Giving up.",
-                                 response.uuid)
-                    return False
-
-                logging.warning("Retrying evacuation status check for %s in %d seconds (attempt %d/%d)...",
-                               response.uuid, EVACUATION_RETRY_WAIT_SECONDS, error_count, MAX_EVACUATION_RETRIES)
-                time.sleep(EVACUATION_RETRY_WAIT_SECONDS)
-                continue
+        return _monitor_evacuation(connection, server.id, response.uuid, start_time)
 
     except Exception as e:
         logging.error("Unexpected error during evacuation of server %s: %s",
                      server.id, str(e))
         logging.debug('Exception traceback:', exc_info=True)
         return False
-
-    return False
 
 
 def nova_login(credentials: NovaLoginCredentials) -> Optional[OpenStackClient]:
@@ -1840,7 +1847,11 @@ def _host_disable(connection, service, instanceha_service=None):
 
     # Step 2: Log the reason for disabling (only if force_down succeeded)
     try:
-        is_kdump = instanceha_service and _extract_hostname(service.host) in instanceha_service.kdump_fenced_hosts
+        if instanceha_service:
+            with instanceha_service.kdump_lock:
+                is_kdump = _extract_hostname(service.host) in instanceha_service.kdump_fenced_hosts
+        else:
+            is_kdump = False
         suffix = f" {DISABLED_REASON_KDUMP_MARKER}" if is_kdump else ""
         disable_reason = f"{DISABLED_REASON_EVACUATION}{suffix}: {datetime.now().isoformat()}"
         connection.services.disable_log_reason(service.id, disable_reason)
@@ -1861,35 +1872,32 @@ def _check_kdump(stale_services: List[Any], service: InstanceHAService) -> Tuple
     current_time = time.time()
     kdump_timeout = service.config.get_config_value('KDUMP_TIMEOUT')
 
-    # Kdump timeout state machine per host:
+    # Kdump state machine per host (under lock — UDP listener writes timestamps concurrently):
     # State 1: Fresh down host (check_start==0) → start waiting, set check_start=now
     # State 2: Waiting (check_start > 0, time < timeout) → continue waiting
-    # State 3a: Kdump received (last_msg within timeout) → fenced, evacuate immediately
-    # State 3b: Timeout expired (time >= timeout) → no kdump, evacuate normally
-    for svc in stale_services:
-        hostname = _extract_hostname(svc.host)
-        last_msg = service.kdump_hosts_timestamp.get(hostname, 0)
-        check_start = service.kdump_hosts_checking.get(hostname, 0)
+    # State 3a: Kdump received (last_msg within timeout) → mark fenced, evacuate immediately
+    # State 3b: Timeout expired (time >= timeout) → no kdump received, evacuate normally
+    with service.kdump_lock:
+        for svc in stale_services:
+            hostname = _extract_hostname(svc.host)
+            last_msg = service.kdump_hosts_timestamp.get(hostname, 0)
+            check_start = service.kdump_hosts_checking.get(hostname, 0)
 
-        # State 3a: Kdump message received - host is fenced, evacuate immediately
-        if last_msg > 0 and (current_time - last_msg) <= kdump_timeout:
-            kdump_fenced.append(svc.host)
-            service.kdump_fenced_hosts.add(hostname)
-            service.kdump_hosts_checking.pop(hostname, None)
-            logging.info('Host %s fenced via kdump - evacuating', svc.host)
-        # State 1: First time seeing host down - start waiting
-        elif check_start == 0:
-            service.kdump_hosts_checking[hostname] = current_time
-            waiting.append(svc.host)
-            logging.info('Host %s down, waiting %ds for kdump', svc.host, kdump_timeout)
-        # State 2: Still waiting for timeout
-        elif (current_time - check_start) < kdump_timeout:
-            waiting.append(svc.host)
-            logging.info('Host %s waiting (%.1fs/%ds)', svc.host, current_time - check_start, kdump_timeout)
-        # State 3b: Timeout expired - proceed with evacuation
-        else:
-            service.kdump_hosts_checking.pop(hostname, None)
-            logging.info('Host %s timeout expired, no kdump - evacuating', svc.host)
+            if last_msg > 0 and (current_time - last_msg) <= kdump_timeout:
+                kdump_fenced.append(svc.host)
+                service.kdump_fenced_hosts.add(hostname)
+                service.kdump_hosts_checking.pop(hostname, None)
+                logging.info('Host %s fenced via kdump - evacuating', svc.host)
+            elif check_start == 0:
+                service.kdump_hosts_checking[hostname] = current_time
+                waiting.append(svc.host)
+                logging.info('Host %s down, waiting %ds for kdump', svc.host, kdump_timeout)
+            elif (current_time - check_start) < kdump_timeout:
+                waiting.append(svc.host)
+                logging.info('Host %s waiting (%.1fs/%ds)', svc.host, current_time - check_start, kdump_timeout)
+            else:
+                service.kdump_hosts_checking.pop(hostname, None)
+                logging.info('Host %s timeout expired, no kdump - evacuating', svc.host)
 
     kdump_fenced_services = [s for s in stale_services if s.host in kdump_fenced]
     to_evacuate = [s for s in stale_services if s.host not in waiting and s.host not in kdump_fenced]
@@ -1910,9 +1918,12 @@ def _host_enable(connection, nova_service, reenable: bool = False, service=None)
                 try:
                     connection.services.disable_log_reason(nova_service.id, f"{DISABLED_REASON_EVACUATION_COMPLETE}: {datetime.now().isoformat()}")
                     if service:
+                        # Clean up kdump tracking under lock — UDP listener
+                        # may still be writing timestamps for this host
                         hostname = _extract_hostname(nova_service.host)
-                        service.kdump_fenced_hosts.discard(hostname)
-                        service.kdump_hosts_timestamp.pop(hostname, None)
+                        with service.kdump_lock:
+                            service.kdump_fenced_hosts.discard(hostname)
+                            service.kdump_hosts_timestamp.pop(hostname, None)
                 except (AttributeError, KeyError):
                     pass
             return True
@@ -2149,10 +2160,10 @@ def _bmh_wait_for_power_off(get_url, headers, cacert, host, timeout, poll_interv
 
     logging.debug("Waiting up to %d seconds for %s to power off", timeout, host)
 
-    timeout_end = time.time() + timeout
+    timeout_end = time.monotonic() + timeout
 
     with requests.Session() as session:
-        while time.time() < timeout_end:
+        while time.monotonic() < timeout_end:
             time.sleep(poll_interval)
 
             try:
@@ -2489,7 +2500,8 @@ def _post_evacuation_recovery(conn, failed_service, service, resume=False):
         bool: True if recovery completed successfully, False otherwise
     """
     hostname = _extract_hostname(failed_service.host)
-    kdump_fenced = hostname in service.kdump_fenced_hosts
+    with service.kdump_lock:
+        kdump_fenced = hostname in service.kdump_fenced_hosts
     leave_disabled = service.config.get_config_value('LEAVE_DISABLED')
 
     logging.info("Evacuation successful. Starting recovery for %s", failed_service.host)
@@ -2812,7 +2824,7 @@ def _cleanup_filtered_hosts(service, marked_hostnames, final_hostnames, current_
 
 def _filter_processing_hosts(service, compute_nodes, to_resume):
     """Filter out hosts already being processed and mark new ones."""
-    current_time = time.time()
+    current_time = time.monotonic()
     max_processing_time = max(service.config.get_config_value('FENCING_TIMEOUT'), MAX_EVACUATION_TIMEOUT_SECONDS)
     marked_hostnames = set()
 
@@ -2952,20 +2964,27 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
             to_evacuate = compute_nodes
             kdump_fenced = []
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            poll_interval = service.config.get_config_value('POLL')
-            # Process new evacuations
-            results = list(executor.map(lambda svc: process_service(svc, reserved_hosts, False, service), to_evacuate))
-            if not all(results):
-                logging.warning('Some services failed to evacuate. Retrying in %d seconds.', poll_interval)
-            # Process kdump-fenced hosts (skip fencing step)
-            results = list(executor.map(lambda svc: process_service(svc, reserved_hosts, True, service), kdump_fenced))
-            if not all(results):
-                logging.warning('Some kdump-fenced services failed to evacuate. Retrying in %d seconds.', poll_interval)
-            # Process resumed evacuations
-            results = list(executor.map(lambda svc: process_service(svc, reserved_hosts, True, service), to_resume))
-            if not all(results):
-                logging.warning('Some services failed to evacuate. Retrying in %d seconds.', poll_interval)
+        workers = service.config.get_config_value('WORKERS')
+        poll_interval = service.config.get_config_value('POLL')
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            for batch_name, batch, resume in [
+                ('new evacuations', to_evacuate, False),
+                ('kdump-fenced', kdump_fenced, True),
+                ('resumed', to_resume, True),
+            ]:
+                if not batch:
+                    continue
+                futures = {
+                    executor.submit(process_service, svc, reserved_hosts, resume, service): svc
+                    for svc in batch
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    svc = futures[future]
+                    try:
+                        if not future.result():
+                            logging.warning('Evacuation failed for %s (%s)', svc.host, batch_name)
+                    except Exception as e:
+                        logging.error('Evacuation raised exception for %s (%s): %s', svc.host, batch_name, e)
 
         # Clean up any hosts that were marked but filtered out before processing
         # (process_service cleans up hosts it processes, so we only need to clean up filtered ones)
@@ -3052,7 +3071,8 @@ def _process_reenabling(conn, service, to_reenable) -> None:
             # For kdump hosts, wait until kdump messages stop (60s timeout)
             if 'kdump' in getattr(svc, 'disabled_reason', ''):
                 hostname = _extract_hostname(svc.host)
-                last_kdump = service.kdump_hosts_timestamp.get(hostname, 0)
+                with service.kdump_lock:
+                    last_kdump = service.kdump_hosts_timestamp.get(hostname, 0)
                 time_since_kdump = time.time() - last_kdump if last_kdump > 0 else float('inf')
                 if time_since_kdump < KDUMP_REENABLE_DELAY_SECONDS:
                     logging.info('%s waiting for kdump to complete (%.0fs since last message, waiting for %ds)', svc.host, time_since_kdump, KDUMP_REENABLE_DELAY_SECONDS)
@@ -3095,40 +3115,51 @@ def main():
     service = _initialize_service(config_manager)
     conn = _establish_nova_connection(service)
 
+    consecutive_failures = 0
+
     while True:
-        # Update health monitoring hash
         service.update_health_hash()
+        poll_interval = service.config.get_config_value('POLL')
 
         try:
             services = conn.services.list(binary="nova-compute")
             if not services:
-                time.sleep(service.config.get_config_value('POLL'))
+                time.sleep(poll_interval)
                 continue
 
             target_date = datetime.now() - timedelta(seconds=service.config.get_config_value('DELTA'))
             compute_nodes, to_resume, to_reenable = _categorize_services(services, target_date)
 
-            # Convert generator to list for processing
             compute_nodes_list = list(compute_nodes)
 
-            # Process stale services for evacuation
             _process_stale_services(conn, service, services, compute_nodes_list, to_resume)
-
-            # Process services that can be re-enabled
             _process_reenabling(conn, service, to_reenable)
 
+            consecutive_failures = 0
+
         except (Unauthorized, DiscoveryFailure) as e:
-            logging.warning("Nova session expired or discovery failed: %s. Reconnecting...", type(e).__name__)
+            consecutive_failures += 1
+            backoff = min(poll_interval * (2 ** consecutive_failures), MAX_NOVA_BACKOFF_SECONDS)
+            logging.warning("Nova session expired or discovery failed (attempt %d): %s. "
+                           "Reconnecting in %ds...", consecutive_failures, type(e).__name__, backoff)
+            time.sleep(backoff)
             try:
                 conn = _establish_nova_connection(service)
             except SystemExit:
                 logging.error("Failed to re-establish Nova connection, exiting")
                 raise
-        except Exception as e:
-            logging.warning("Failed to query compute status from Nova API: %s. Please check the Nova API availability.", e)
-            logging.debug('Exception traceback:', exc_info=True)
+            continue
 
-        time.sleep(service.config.get_config_value('POLL'))
+        except Exception as e:
+            consecutive_failures += 1
+            backoff = min(poll_interval * (2 ** consecutive_failures), MAX_NOVA_BACKOFF_SECONDS)
+            logging.warning("Failed to query Nova API (attempt %d): %s. Retrying in %ds.",
+                           consecutive_failures, e, backoff)
+            logging.debug('Exception traceback:', exc_info=True)
+            time.sleep(backoff)
+            continue
+
+        time.sleep(poll_interval)
 
 
 if __name__ == "__main__":

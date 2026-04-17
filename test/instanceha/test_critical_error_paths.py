@@ -327,7 +327,7 @@ class TestEvacuationTimeouts(unittest.TestCase):
         time_values = [0, 0.5, 2] + [2] * 10  # Extra values for logging calls
         with patch('instanceha.time.sleep'):  # Speed up test
             with patch('instanceha.MAX_EVACUATION_TIMEOUT_SECONDS', 1):
-                with patch('instanceha.time.time', side_effect=time_values):  # Simulate timeout
+                with patch('instanceha.time.monotonic', side_effect=time_values):  # Simulate timeout
                     result = instanceha._server_evacuate_future(mock_connection, mock_server)
 
         self.assertFalse(result)

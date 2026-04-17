@@ -936,10 +936,14 @@ class TestBMHFencing(unittest.TestCase):
     @patch('instanceha.requests.Session')
     @patch('instanceha.requests.patch')
     @patch('instanceha.time.sleep')
-    def test_bmh_wait_for_power_off_success(self, mock_sleep, mock_patch, mock_session_class, mock_exists):
+    @patch('instanceha.time.monotonic')
+    def test_bmh_wait_for_power_off_success(self, mock_monotonic, mock_sleep, mock_patch, mock_session_class, mock_exists):
         """Test BMH wait for power off successfully detects power off."""
         # Mock CA cert exists
         mock_exists.return_value = True
+
+        # Simulate time progression within timeout (timeout=30s from setUp)
+        mock_monotonic.side_effect = [0, 0, 1, 1, 2, 2] + [3] * 10
 
         # Mock successful patch response
         mock_patch_response = Mock()
@@ -986,10 +990,14 @@ class TestBMHFencing(unittest.TestCase):
     @patch('instanceha.requests.Session')
     @patch('instanceha.requests.patch')
     @patch('instanceha.time.sleep')
-    def test_bmh_wait_for_power_off_timeout(self, mock_sleep, mock_patch, mock_session_class, mock_exists):
+    @patch('instanceha.time.monotonic')
+    def test_bmh_wait_for_power_off_timeout(self, mock_monotonic, mock_sleep, mock_patch, mock_session_class, mock_exists):
         """Test BMH wait for power off times out when host never powers off."""
         # Mock CA cert exists
         mock_exists.return_value = True
+
+        # Simulate time exceeding timeout (timeout=2s)
+        mock_monotonic.side_effect = [0, 0, 1, 1, 3, 3] + [4] * 10
 
         # Mock successful patch response
         mock_patch_response = Mock()
@@ -1271,7 +1279,7 @@ class TestBMHFencingEdgeCases(unittest.TestCase):
 
         with patch('requests.Session', return_value=mock_session), \
              patch('time.sleep'), \
-             patch('time.time', side_effect=[0, 2]):  # Simulate timeout
+             patch('instanceha.time.monotonic', side_effect=[0, 2]):  # Simulate timeout
             get_url = 'https://api.test.com/apis/metal3.io/v1alpha1/namespaces/test-ns/baremetalhosts/test-bmh'
             headers = {'Authorization': 'Bearer fake-token'}
 
@@ -1301,7 +1309,7 @@ class TestBMHFencingEdgeCases(unittest.TestCase):
 
         with patch('requests.Session', return_value=mock_session), \
              patch('time.sleep'), \
-             patch('time.time', side_effect=[0, 2]):  # Simulate timeout
+             patch('instanceha.time.monotonic', side_effect=[0, 2]):  # Simulate timeout
             get_url = 'https://api.test.com/apis/metal3.io/v1alpha1/namespaces/test-ns/baremetalhosts/test-bmh'
             headers = {'Authorization': 'Bearer fake-token'}
 
@@ -1333,7 +1341,7 @@ class TestBMHFencingEdgeCases(unittest.TestCase):
 
             with patch('requests.Session', return_value=mock_session), \
                  patch('time.sleep'), \
-                 patch('time.time', side_effect=[0, 2]):  # Simulate timeout
+                 patch('instanceha.time.monotonic', side_effect=[0, 2]):  # Simulate timeout
                 get_url = 'https://api.test.com/apis/metal3.io/v1alpha1/namespaces/test-ns/baremetalhosts/test-bmh'
                 headers = {'Authorization': 'Bearer fake-token'}
 
@@ -1356,10 +1364,9 @@ class TestBMHFencingEdgeCases(unittest.TestCase):
         mock_session.get.side_effect = requests.exceptions.Timeout("Network timeout")
 
         with patch('requests.Session', return_value=mock_session), \
-             patch('time.time') as mock_time, \
+             patch('instanceha.time.monotonic') as mock_monotonic, \
              patch('time.sleep'):
-            # Mock time to simulate timeout immediately
-            mock_time.side_effect = [0, 2]  # Start at 0, next call returns 2 (past 1 sec timeout)
+            mock_monotonic.side_effect = [0, 2]
 
             get_url = 'https://api.test.com/apis/metal3.io/v1alpha1/namespaces/test-ns/baremetalhosts/test-bmh'
             headers = {'Authorization': 'Bearer fake-token'}

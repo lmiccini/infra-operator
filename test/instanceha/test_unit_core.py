@@ -2664,6 +2664,7 @@ class TestFunctionalIntegration(unittest.TestCase):
             'TAGGED_IMAGES': False,
             'EVACUABLE_TAG': 'evacuable',
             'THRESHOLD': 50,
+            'WORKERS': 4,
         }
         service.config.get_config_value = Mock(side_effect=lambda key: config_values.get(key, False))
 
@@ -2754,6 +2755,7 @@ class TestFunctionalIntegration(unittest.TestCase):
             'TAGGED_AGGREGATES': False,
             'EVACUABLE_TAG': 'evacuable',
             'THRESHOLD': 40,
+            'WORKERS': 4,
         }
         service.config.get_config_value = Mock(side_effect=lambda key: config_values.get(key, False))
 
@@ -3128,12 +3130,11 @@ class TestAdvancedIntegration(unittest.TestCase):
         # Migration never completes
         conn.migrations.list.return_value = [Mock(status='running')]
 
-        # Mock time to simulate timeout instantly
-        # Add extra values for logging calls in Python 3.9
-        time_values = [0, 0, 1000] + [1000] * 10  # Start, check, timeout + extra for logging
-        with patch('instanceha.time.time') as mock_time:
+        # Mock time.monotonic to simulate timeout instantly
+        time_values = [0, 0, 1000] + [1000] * 10
+        with patch('instanceha.time.monotonic') as mock_monotonic:
             with patch('instanceha.time.sleep'):
-                mock_time.side_effect = time_values
+                mock_monotonic.side_effect = time_values
                 result = instanceha._server_evacuate_future(conn, server)
 
         self.assertFalse(result)
