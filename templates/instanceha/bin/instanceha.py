@@ -3079,7 +3079,7 @@ def _process_reenabling(conn, service, to_reenable) -> None:
                 migrations_complete = len(incomplete) == 0
 
             if not migrations_complete:
-                logging.debug('%d/%d migration(s) incomplete for %s, not re-enabling', len(incomplete), len(migrations), svc.host)
+                logging.debug('%d migration(s) incomplete for %s, not re-enabling', len(incomplete), svc.host)
                 continue
 
             # For kdump hosts, wait until kdump messages stop (60s timeout)
