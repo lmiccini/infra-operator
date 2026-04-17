@@ -191,6 +191,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			Resources: []string{"pods"},
 			Verbs:     []string{"create", "get", "list", "watch", "update", "patch", "delete"},
 		},
+		{
+			APIGroups: []string{""},
+			Resources: []string{"events"},
+			Verbs:     []string{"create", "patch"},
+		},
 	}
 	rbacResult, err := common_rbac.ReconcileRbac(ctx, helper, instance, rbacRules)
 	if err != nil {

@@ -41,6 +41,9 @@ func Deployment(
 	envVars["OS_CLOUD"] = env.SetValue(openstackcloud)
 	envVars["CONFIG_HASH"] = env.SetValue(configHash)
 	envVars["INSTANCEHA_DISABLED"] = env.SetValue(string(instance.Spec.Disabled))
+	envVars["POD_NAME"] = env.DownwardAPI("metadata.name")
+	envVars["POD_NAMESPACE"] = env.DownwardAPI("metadata.namespace")
+	envVars["INSTANCEHA_CR_NAME"] = env.SetValue(instance.Name)
 
 	// create Volume and VolumeMounts
 	volumes := instancehaPodVolumes(instance)

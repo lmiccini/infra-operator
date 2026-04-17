@@ -5,7 +5,7 @@ import sys
 import time
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -20,6 +20,7 @@ import struct
 import threading
 import hashlib
 import json
+import uuid
 from typing import Dict, Any, Optional, Union, List, Protocol, Tuple, Callable
 from collections import defaultdict
 from abc import ABC, abstractmethod
@@ -2533,6 +2534,89 @@ def _post_evacuation_recovery(conn, failed_service, service, resume=False):
         return False
 
 
+_K8S_TOKEN_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/token'
+_K8S_CA_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
+_K8S_API_BASE = 'https://kubernetes.default.svc'
+
+
+def _get_k8s_credentials():
+    """Read ServiceAccount token and namespace from the pod filesystem."""
+    try:
+        with open(_K8S_TOKEN_PATH, 'r') as f:
+            token = f.read().strip()
+        namespace = os.environ.get('POD_NAMESPACE', '')
+        if not token or not namespace:
+            return None, None
+        return token, namespace
+    except (IOError, OSError):
+        return None, None
+
+
+def _emit_k8s_event(host, reason, message, event_type='Normal'):
+    """Emit a Kubernetes Event on the InstanceHA CR.
+
+    Args:
+        host: The compute host this event relates to
+        reason: CamelCase reason string (e.g., HostFenced, EvacuationStarted)
+        message: Human-readable message
+        event_type: Normal or Warning
+    """
+    token, namespace = _get_k8s_credentials()
+    if not token:
+        logging.debug("K8s credentials not available, skipping event emission")
+        return
+
+    cr_name = os.environ.get('INSTANCEHA_CR_NAME', '')
+    if not cr_name:
+        logging.debug("INSTANCEHA_CR_NAME not set, skipping event emission")
+        return
+
+    now = datetime.now(tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    event_name = f"{cr_name}.{uuid.uuid4().hex[:16]}"
+
+    event = {
+        'apiVersion': 'v1',
+        'kind': 'Event',
+        'metadata': {
+            'name': event_name,
+            'namespace': namespace,
+        },
+        'involvedObject': {
+            'apiVersion': 'instanceha.openstack.org/v1beta1',
+            'kind': 'InstanceHa',
+            'name': cr_name,
+            'namespace': namespace,
+        },
+        'reason': reason,
+        'message': f"[{host}] {message}",
+        'type': event_type,
+        'firstTimestamp': now,
+        'lastTimestamp': now,
+        'source': {
+            'component': 'instanceha',
+        },
+        'reportingComponent': 'instanceha',
+        'reportingInstance': os.environ.get('POD_NAME', 'instanceha'),
+    }
+
+    url = f"{_K8S_API_BASE}/api/v1/namespaces/{namespace}/events"
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json',
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=event,
+                                 verify=_K8S_CA_PATH, timeout=5)
+        if response.status_code in (200, 201):
+            logging.debug("Emitted K8s event: %s for host %s", reason, host)
+        else:
+            logging.debug("Failed to emit K8s event (HTTP %d): %s",
+                          response.status_code, response.text[:200])
+    except Exception as e:
+        logging.debug("Failed to emit K8s event: %s", e)
+
+
 def _execute_step(step_name, step_func, host_name, *args, **kwargs):
     """Execute a processing step with unified error handling."""
     try:
@@ -2568,8 +2652,14 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
             # Execute processing steps
             if not resume:
                 # Fence (power off) the host before evacuation
+                _emit_k8s_event(host_name, 'FencingStarted',
+                                'Fencing host (power off)')
                 if not _execute_step("Fencing", _host_fence, host_name, host_name, 'off', service):
+                    _emit_k8s_event(host_name, 'FencingFailed',
+                                    'Fencing failed', event_type='Warning')
                     return False
+                _emit_k8s_event(host_name, 'FencingSucceeded',
+                                'Host fenced successfully')
 
             # Disable the host (skip if already disabled from previous evacuation attempt)
             # Note: kdump-fenced hosts use resume=True but are NOT yet disabled, so we still disable them
@@ -2589,25 +2679,36 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
                 return False
 
             # Evacuate instances, optionally targeting the enabled reserved host
+            _emit_k8s_event(host_name, 'EvacuationStarted',
+                            'Starting VM evacuation')
             if target_host and service.config.get_config_value('FORCE_RESERVED_HOST_EVACUATION'):
                 logging.info("Forcing evacuation to reserved host: %s", target_host)
                 if not _execute_step("Evacuation", _host_evacuate, host_name,
                                     conn, failed_service, service, target_host):
+                    _emit_k8s_event(host_name, 'EvacuationFailed',
+                                    'VM evacuation failed', event_type='Warning')
                     return False
             else:
                 if not _execute_step("Evacuation", _host_evacuate, host_name,
                                     conn, failed_service, service):
+                    _emit_k8s_event(host_name, 'EvacuationFailed',
+                                    'VM evacuation failed', event_type='Warning')
                     return False
+            _emit_k8s_event(host_name, 'EvacuationSucceeded',
+                            'VM evacuation completed successfully')
 
             if not _execute_step("Recovery", _post_evacuation_recovery, host_name,
                                 conn, failed_service, service, resume):
                 return False
 
-            logging.debug("Service processing completed successfully for %s", host_name)
+            _emit_k8s_event(host_name, 'RecoveryCompleted',
+                            'Host recovery workflow completed')
             return True
 
         except Exception as e:
             logging.error("Service processing failed for %s: %s", host_name, e)
+            _emit_k8s_event(host_name, 'ProcessingFailed',
+                            f'Service processing failed: {e}', event_type='Warning')
             return False
 
 
@@ -2811,6 +2912,9 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
 
     if compute_nodes:
         logging.warning('The following computes are down: %s', [svc.host for svc in compute_nodes])
+        for svc in compute_nodes:
+            _emit_k8s_event(svc.host, 'HostDown',
+                            'Compute host detected as down', event_type='Warning')
 
     # Prepare resources for evacuation
     compute_nodes, reserved_hosts, images, flavors = _prepare_evacuation_resources(conn, service, services, compute_nodes)
@@ -2827,6 +2931,9 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
         threshold = service.config.get_config_value('THRESHOLD')
         if threshold_percent > threshold:
             logging.error('Number of impacted computes (%.1f%%) exceeds threshold (%d%%). Not evacuating.', threshold_percent, threshold)
+            _emit_k8s_event('cluster', 'ThresholdExceeded',
+                            f'Impacted computes ({threshold_percent:.1f}%) exceed threshold ({threshold}%%), evacuation skipped',
+                            event_type='Warning')
             _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
             return
 
@@ -2962,6 +3069,8 @@ def _process_reenabling(conn, service, to_reenable) -> None:
                 if svc.state == 'up':
                     _host_enable(conn, svc, reenable=False)
                     logging.info('Enabled %s (migrations complete, service is up)', svc.host)
+                    _emit_k8s_event(svc.host, 'HostReenabled',
+                                    'Host re-enabled after successful evacuation')
                 else:
                     logging.debug('%s still down, will enable once up', svc.host)
         except Exception as e:
