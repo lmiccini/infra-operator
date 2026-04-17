@@ -1100,7 +1100,9 @@ class InstanceHAService(CloudConnectionProvider):
                 except Exception as e:
                     logging.warning("Failed to get servers for host %s: %s", service.host, e)
                     logging.debug('Exception traceback:', exc_info=True)
-                    host_servers[service.host] = []
+                    # Don't cache empty — treat query failure as "might have servers"
+                    # so the host is not incorrectly skipped during evacuation
+                    host_servers[service.host] = None
 
         return host_servers
 
@@ -1117,7 +1119,8 @@ class InstanceHAService(CloudConnectionProvider):
         """
         return [
             service for service in services
-            if host_servers_cache.get(service.host, [])
+            if host_servers_cache.get(service.host) is None
+            or host_servers_cache.get(service.host)
         ]
 
     def filter_hosts_with_evacuable_servers(self, services, host_servers_cache, flavors=None, images=None):
@@ -1141,7 +1144,13 @@ class InstanceHAService(CloudConnectionProvider):
         services_with_evacuable = []
 
         for service in services:
-            servers = host_servers_cache.get(service.host, [])
+            servers = host_servers_cache.get(service.host)
+
+            if servers is None:
+                # Query failed — assume host has evacuable servers (fail safe)
+                services_with_evacuable.append(service)
+                logging.warning("Server query failed for %s, assuming evacuable", service.host)
+                continue
 
             # Check if any server on this host is evacuable
             has_evacuable = any(
@@ -1924,8 +1933,8 @@ def _host_enable(connection, nova_service, reenable: bool = False, service=None)
                         with service.kdump_lock:
                             service.kdump_fenced_hosts.discard(hostname)
                             service.kdump_hosts_timestamp.pop(hostname, None)
-                except (AttributeError, KeyError):
-                    pass
+                except (AttributeError, KeyError) as e:
+                    logging.warning('Failed to clean up kdump marker for %s: %s', nova_service.host, e)
             return True
         except Exception as e:
             logging.warning('Could not unset force-down for %s as not all the migrations are complete yet. Will try again the next poll cycle.', nova_service.host)
@@ -2439,6 +2448,8 @@ def _enable_matching_reserved_host(conn, failed_service, reserved_hosts, service
 
         if not _host_enable(conn, selected_host, reenable=False):
             logging.error("Failed to enable reserved host %s", selected_host.host)
+            with service.reserved_hosts_lock:
+                reserved_hosts.append(selected_host)
             return ReservedHostResult(success=False)
 
         logging.info("Enabled host %s from the reserved pool (same %s as %s)", selected_host.host, match_type.value, failed_service.host)
@@ -2512,7 +2523,8 @@ def _post_evacuation_recovery(conn, failed_service, service, resume=False):
             logging.debug("Skipping power on for %s (resume)", failed_service.host)
         elif kdump_fenced:
             logging.info("Skipping power on for %s (kdump fenced)", failed_service.host)
-            service.kdump_hosts_checking.pop(hostname, None)
+            with service.kdump_lock:
+                service.kdump_hosts_checking.pop(hostname, None)
         else:
             logging.debug("Powering on host %s", failed_service.host)
             power_on_result = _host_fence(failed_service.host, 'on', service)
@@ -2981,8 +2993,10 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
                 for future in concurrent.futures.as_completed(futures):
                     svc = futures[future]
                     try:
-                        if not future.result():
+                        if not future.result(timeout=FUTURE_RESULT_TIMEOUT_SECONDS):
                             logging.warning('Evacuation failed for %s (%s)', svc.host, batch_name)
+                    except concurrent.futures.TimeoutError:
+                        logging.error('Evacuation timed out waiting for result for %s (%s)', svc.host, batch_name)
                     except Exception as e:
                         logging.error('Evacuation raised exception for %s (%s): %s', svc.host, batch_name, e)
 
