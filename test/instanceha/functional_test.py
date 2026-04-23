@@ -23,14 +23,37 @@ import logging
 if 'novaclient' not in sys.modules:
     sys.modules['novaclient'] = MagicMock()
     sys.modules['novaclient.client'] = MagicMock()
-    sys.modules['novaclient.exceptions'] = MagicMock()
+    class NotFound(Exception):
+        pass
+    class Conflict(Exception):
+        pass
+    class Forbidden(Exception):
+        pass
+    class Unauthorized(Exception):
+        pass
+    novaclient_exceptions = MagicMock()
+    novaclient_exceptions.NotFound = NotFound
+    novaclient_exceptions.Conflict = Conflict
+    novaclient_exceptions.Forbidden = Forbidden
+    novaclient_exceptions.Unauthorized = Unauthorized
+    sys.modules['novaclient.exceptions'] = novaclient_exceptions
 
 if 'keystoneauth1' not in sys.modules:
     sys.modules['keystoneauth1'] = MagicMock()
     sys.modules['keystoneauth1.loading'] = MagicMock()
     sys.modules['keystoneauth1.session'] = MagicMock()
-    sys.modules['keystoneauth1.exceptions'] = MagicMock()
-    sys.modules['keystoneauth1.exceptions.discovery'] = MagicMock()
+
+    class DiscoveryFailure(Exception):
+        pass
+
+    discovery_module = MagicMock()
+    discovery_module.DiscoveryFailure = DiscoveryFailure
+
+    exceptions_module = MagicMock()
+    exceptions_module.discovery = discovery_module
+
+    sys.modules['keystoneauth1.exceptions'] = exceptions_module
+    sys.modules['keystoneauth1.exceptions.discovery'] = discovery_module
 
 # Suppress warnings globally for testing
 logging.getLogger().setLevel(logging.ERROR)
@@ -2513,8 +2536,8 @@ class TestFencingRaceCondition(BaseTestCase):
 
     def test_fencing_race_condition_expired_cleanup(self):
         """Test automatic cleanup of expired processing entries."""
-        # Add some expired processing entries
-        current_time = time.time()
+        # Use monotonic clock to match _filter_processing_hosts cleanup logic
+        current_time = time.monotonic()
         expired_time = current_time - 400  # 400 seconds ago (older than max processing time)
 
         with self.env.service.processing_lock:

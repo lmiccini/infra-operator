@@ -9,6 +9,7 @@ Tests critical evacuation flow paths including:
 
 import os
 import sys
+import threading
 import unittest
 from unittest.mock import Mock, patch, MagicMock
 from datetime import datetime
@@ -36,8 +37,18 @@ if 'keystoneauth1' not in sys.modules:
     sys.modules['keystoneauth1'] = MagicMock()
     sys.modules['keystoneauth1.loading'] = MagicMock()
     sys.modules['keystoneauth1.session'] = MagicMock()
-    sys.modules['keystoneauth1.exceptions'] = MagicMock()
-    sys.modules['keystoneauth1.exceptions.discovery'] = MagicMock()
+
+    class DiscoveryFailure(Exception):
+        pass
+
+    discovery_module = MagicMock()
+    discovery_module.DiscoveryFailure = DiscoveryFailure
+
+    exceptions_module = MagicMock()
+    exceptions_module.discovery = discovery_module
+
+    sys.modules['keystoneauth1.exceptions'] = exceptions_module
+    sys.modules['keystoneauth1.exceptions.discovery'] = discovery_module
 
 # Add module path
 test_dir = os.path.dirname(os.path.abspath(__file__))
@@ -150,6 +161,7 @@ class TestPostEvacuationRecoveryErrors(unittest.TestCase):
         self.mock_service.config.is_leave_disabled_enabled = Mock(return_value=False)
         self.mock_service.kdump_fenced_hosts = set()
         self.mock_service.kdump_hosts_checking = {}
+        self.mock_service.kdump_lock = threading.Lock()
 
         self.mock_failed_service = Mock()
         self.mock_failed_service.host = 'test-host.example.com'

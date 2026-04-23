@@ -57,8 +57,18 @@ if 'keystoneauth1' not in sys.modules:
     sys.modules['keystoneauth1'] = MagicMock()
     sys.modules['keystoneauth1.loading'] = MagicMock()
     sys.modules['keystoneauth1.session'] = MagicMock()
-    sys.modules['keystoneauth1.exceptions'] = MagicMock()
-    sys.modules['keystoneauth1.exceptions.discovery'] = MagicMock()
+
+    class DiscoveryFailure(Exception):
+        pass
+
+    discovery_module = MagicMock()
+    discovery_module.DiscoveryFailure = DiscoveryFailure
+
+    exceptions_module = MagicMock()
+    exceptions_module.discovery = discovery_module
+
+    sys.modules['keystoneauth1.exceptions'] = exceptions_module
+    sys.modules['keystoneauth1.exceptions.discovery'] = discovery_module
 
 # Add the module path for testing
 # Calculate the path to instanceha.py relative to this test file
@@ -2033,9 +2043,9 @@ class TestEvacuationStatusEdgeCases(unittest.TestCase):
             self.mock_nova, mock_server
         )
 
-        # Should return EvacuationStatus - uses first migration from list (old_migration)
+        # Should return EvacuationStatus - uses most recent migration (new_migration, status='running')
         self.assertIsInstance(result, instanceha.EvacuationStatus)
-        self.assertTrue(result.completed)
+        self.assertFalse(result.completed)
         self.assertFalse(result.error)
 
     def test_server_evacuation_status_old_migrations(self):
@@ -2063,15 +2073,19 @@ class TestEvacuationStatusEdgeCases(unittest.TestCase):
 
     def test_server_evacuation_status_migration_query_limit(self):
         """Test migration query with large number of results."""
+        from datetime import datetime, timedelta
         mock_server = Mock()
         mock_server.id = 'server-123'
 
-        # Create many migrations
+        # Create many migrations with created_at timestamps
+        # Most recent migration should be used (the last 'completed' one)
         migrations = []
+        base_time = datetime.now() - timedelta(hours=1)
         for i in range(150):  # More than typical limit
             mock_migration = Mock()
             mock_migration.instance_uuid = 'server-123'
             mock_migration.status = 'completed' if i < 100 else 'running'
+            mock_migration.created_at = (base_time + timedelta(seconds=i)).isoformat()
             migrations.append(mock_migration)
 
         self.mock_nova.migrations.list.return_value = migrations
@@ -2080,9 +2094,9 @@ class TestEvacuationStatusEdgeCases(unittest.TestCase):
             self.mock_nova, mock_server
         )
 
-        # Should handle large result sets - uses first migration (completed)
+        # Should handle large result sets - most recent migration (i=149, 'running') is used
         self.assertIsInstance(result, instanceha.EvacuationStatus)
-        self.assertTrue(result.completed)
+        self.assertFalse(result.completed)
         self.assertFalse(result.error)
 
     def test_server_evacuation_status_time_window_boundaries(self):
@@ -2660,6 +2674,7 @@ class TestFunctionalIntegration(unittest.TestCase):
             'TAGGED_IMAGES': False,
             'EVACUABLE_TAG': 'evacuable',
             'THRESHOLD': 50,
+            'WORKERS': 4,
         }
         service.config.get_config_value = Mock(side_effect=lambda key: config_values.get(key, False))
 
@@ -2750,6 +2765,7 @@ class TestFunctionalIntegration(unittest.TestCase):
             'TAGGED_AGGREGATES': False,
             'EVACUABLE_TAG': 'evacuable',
             'THRESHOLD': 40,
+            'WORKERS': 4,
         }
         service.config.get_config_value = Mock(side_effect=lambda key: config_values.get(key, False))
 
@@ -3124,12 +3140,11 @@ class TestAdvancedIntegration(unittest.TestCase):
         # Migration never completes
         conn.migrations.list.return_value = [Mock(status='running')]
 
-        # Mock time to simulate timeout instantly
-        # Add extra values for logging calls in Python 3.9
-        time_values = [0, 0, 1000] + [1000] * 10  # Start, check, timeout + extra for logging
-        with patch('instanceha.time.time') as mock_time:
+        # Mock time.monotonic to simulate timeout instantly
+        time_values = [0, 0, 1000] + [1000] * 10
+        with patch('instanceha.time.monotonic') as mock_monotonic:
             with patch('instanceha.time.sleep'):
-                mock_time.side_effect = time_values
+                mock_monotonic.side_effect = time_values
                 result = instanceha._server_evacuate_future(conn, server)
 
         self.assertFalse(result)
@@ -3478,7 +3493,7 @@ class TestMainFunction(unittest.TestCase):
 
             # Mock ConfigManager instance
             mock_cm = Mock()
-            mock_cm.get_log_level.return_value = 'INFO'
+            mock_cm.get_config_value.return_value = 'INFO'
             mock_cm_class.return_value = mock_cm
 
             # Mock service with proper attributes
@@ -3495,8 +3510,8 @@ class TestMainFunction(unittest.TestCase):
 
             # Verify ConfigManager was created
             mock_cm_class.assert_called_once()
-            # Verify _initialize_service was called
-            mock_init.assert_called_once()
+            # Verify _initialize_service was called with the config manager
+            mock_init.assert_called_once_with(mock_cm)
 
     def test_main_config_initialization_failure(self):
         """Test main() handles ConfigurationError with sys.exit(1)."""
@@ -3524,7 +3539,7 @@ class TestMainFunction(unittest.TestCase):
              patch('instanceha.logging.basicConfig'):
 
             mock_cm = Mock()
-            mock_cm.get_log_level.return_value = 'INFO'
+            mock_cm.get_config_value.return_value = 'INFO'
             mock_cm_class.return_value = mock_cm
 
             mock_service = Mock()
@@ -3538,8 +3553,8 @@ class TestMainFunction(unittest.TestCase):
                 except KeyboardInterrupt:
                     pass
 
-            # Verify _initialize_service was called (which uses global config_manager)
-            mock_init.assert_called_once()
+            # Verify _initialize_service was called with the config manager
+            mock_init.assert_called_once_with(mock_cm)
 
 
 if __name__ == '__main__':

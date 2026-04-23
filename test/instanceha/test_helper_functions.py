@@ -166,7 +166,7 @@ class TestFilterProcessingHosts(unittest.TestCase):
         to_resume = []
 
         # Mark host1 as already being processed
-        service.hosts_processing['host1'] = time.time()
+        service.hosts_processing['host1'] = time.monotonic()
 
         result = instanceha._filter_processing_hosts(service, compute_nodes, to_resume)
         compute_filtered, resume_filtered, marked, current_time = result
@@ -189,7 +189,7 @@ class TestFilterProcessingHosts(unittest.TestCase):
         service = instanceha.InstanceHAService(mock_config)
 
         # Add an expired entry (more than max timeout + padding ago)
-        old_time = time.time() - 500  # Way in the past
+        old_time = time.monotonic() - 500  # Way in the past
         service.hosts_processing['old-host'] = old_time
 
         svc1 = Mock()
@@ -247,7 +247,7 @@ class TestFilterProcessingHosts(unittest.TestCase):
         service = instanceha.InstanceHAService(mock_config)
 
         # Mark a host as being processed
-        service.hosts_processing['resume-host'] = time.time()
+        service.hosts_processing['resume-host'] = time.monotonic()
 
         svc_resume = Mock()
         svc_resume.host = 'resume-host.example.com'

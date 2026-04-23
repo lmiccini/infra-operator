@@ -53,8 +53,18 @@ if 'keystoneauth1' not in sys.modules:
     sys.modules['keystoneauth1'] = MagicMock()
     sys.modules['keystoneauth1.loading'] = MagicMock()
     sys.modules['keystoneauth1.session'] = MagicMock()
-    sys.modules['keystoneauth1.exceptions'] = MagicMock()
-    sys.modules['keystoneauth1.exceptions.discovery'] = MagicMock()
+
+    class DiscoveryFailure(Exception):
+        pass
+
+    discovery_module = MagicMock()
+    discovery_module.DiscoveryFailure = DiscoveryFailure
+
+    exceptions_module = MagicMock()
+    exceptions_module.discovery = discovery_module
+
+    sys.modules['keystoneauth1.exceptions'] = exceptions_module
+    sys.modules['keystoneauth1.exceptions.discovery'] = discovery_module
 
 # Add the module path for testing
 # Calculate the path to instanceha.py relative to this test file

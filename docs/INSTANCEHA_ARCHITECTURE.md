@@ -4,10 +4,9 @@
 
 InstanceHA is a high-availability service for OpenStack that automatically detects and evacuates instances from failed compute nodes.
 
-**Version**: 2.1
-**Code Size**: 2,872 lines
-**Code Coverage**: 70%
-**Test Suite**: 401 tests, ~26 seconds execution time
+**Version**: 2.3
+**Code Size**: 3,190 lines
+**Test Suite**: 576 tests across 15 test suites
 
 ## Table of Contents
 
@@ -18,12 +17,13 @@ InstanceHA is a high-availability service for OpenStack that automatically detec
 5. [Configuration System](#configuration-system)
 6. [Evacuation Mechanisms](#evacuation-mechanisms)
 7. [Fencing Agents](#fencing-agents)
-8. [Advanced Features](#advanced-features)
-9. [Region Handling](#region-handling)
-10. [Security](#security)
-11. [Performance](#performance)
-12. [Testing](#testing)
-13. [Configuration Options Reference](#configuration-options-reference)
+8. [Kubernetes Events](#kubernetes-events)
+9. [Advanced Features](#advanced-features)
+10. [Region Handling](#region-handling)
+11. [Security](#security)
+12. [Performance](#performance)
+13. [Testing](#testing)
+14. [Configuration Options Reference](#configuration-options-reference)
 
 ---
 
@@ -54,21 +54,6 @@ class EvacuationStatus:
     """Status of an ongoing server evacuation."""
     completed: bool
     error: bool
-
-@dataclass
-class FencingCredentials:
-    """Credentials and connection info for fencing operations."""
-    agent: str
-    ipaddr: str
-    login: str
-    passwd: str
-    ipport: str = "443"
-    timeout: int = 30
-    uuid: str = "System.Embedded.1"
-    tls: str = "false"
-    token: Optional[str] = None
-    namespace: Optional[str] = None
-    host: Optional[str] = None
 
 @dataclass
 class NovaLoginCredentials:
@@ -105,7 +90,7 @@ class ReservedHostResult:
 - **Configuration Sources**: Main config, clouds.yaml, secure.yaml, fencing.yaml
 - **Validation**: Type checking, range validation (min/max), enum validation
 - **SSL Support**: CA bundle, client certificates, verification toggle
-- **Environment Overrides**: OS_CLOUD, UDP_PORT, SSL paths
+- **Environment Overrides**: OS_CLOUD, UDP_PORT (validated: 1-65535), SSL paths
 - **Direct Access**: Configuration accessed via `get_config_value()` method
 
 **Configuration Map**:
@@ -132,6 +117,7 @@ _config_map: Dict[str, ConfigItem] = {
     'SSL_VERIFY': ConfigItem('bool', True),
     'FENCING_TIMEOUT': ConfigItem('int', 30, 5, 120),
     'HASH_INTERVAL': ConfigItem('int', 60, 30, 300),
+    'ORCHESTRATED_RESTART': ConfigItem('bool', False),
 }
 ```
 
@@ -197,6 +183,7 @@ self.kdump_fenced_hosts = set()                 # Kdump-fenced host tracking
 ```python
 self.hosts_processing = defaultdict(float)      # Host -> processing start
 self.processing_lock = threading.Lock()         # Thread-safe tracking
+self.reserved_hosts_lock = threading.Lock()     # Thread-safe reserved host access
 ```
 
 *Threading* (`_initialize_threading()`):
@@ -290,7 +277,7 @@ def track_host_processing(service: 'InstanceHAService', hostname: str):
     finally:
         with service.processing_lock:
             service.hosts_processing.pop(hostname, None)
-            logging.debug(f'Cleaned up processing tracking for {hostname}')
+            logging.debug('Cleaned up processing tracking for %s', hostname)
 ```
 
 **UDP Socket Management**:
@@ -313,7 +300,7 @@ class UDPSocketManager:
 
 **Cache Access**:
 ```python
-# Pattern: read check → API call outside lock → write update
+# Pattern: read check → API call outside lock → write update → return local var
 # Lock held only for dictionary operations, not during API calls
 
 # 1. Check cache with lock (fast read)
@@ -325,9 +312,10 @@ with self._cache_lock:
 flavors = connection.flavors.list()
 cache_data = [f.id for f in flavors if self._is_flavor_evacuable(f)]
 
-# 3. Update cache with lock (fast write)
+# 3. Update cache with lock (fast write), return local variable
 with self._cache_lock:
     self._evacuable_flavors_cache = cache_data
+return cache_data  # Return local var, not self._evacuable_flavors_cache
 ```
 
 **Implementation**:
@@ -371,7 +359,7 @@ def _try_validate(validator_func: Callable[[], bool], error_msg: str, context: s
         return validator_func()
     except (ValueError, AttributeError, TypeError) as e:
         if log_error:
-            logging.error(f"{error_msg} for {context}: {e}")
+            logging.error("%s for %s: %s", error_msg, context, e)
         return False
 
 VALIDATION_PATTERNS = {
@@ -383,19 +371,33 @@ VALIDATION_PATTERNS = {
 }
 
 def validate_input(value: str, validation_type: str, context: str) -> bool:
-    # Special validation for URLs (block localhost, link-local)
+    # Special validation for URLs (block localhost, link-local via ipaddress module)
     if validation_type == 'url':
         def _validate_url():
             p = urlparse(value)
             if p.scheme not in ['http', 'https'] or not p.netloc:
                 return False
             h = p.hostname
-            if h and (h.lower() in ['localhost', '127.0.0.1', '::1', '0.0.0.0'] or h.startswith('169.254.')):
-                logging.error(f"Blocked localhost/link-local access in {context}")
+            if not h:
                 return False
+            h_lower = h.lower()
+            if h_lower in ['localhost', '0.0.0.0']:
+                return False
+            try:
+                addr = ipaddress.ip_address(h_lower.strip('[]'))
+                if addr.is_loopback or addr.is_link_local:
+                    return False
+            except ValueError:
+                pass  # Not an IP literal (hostname) - allow through
             return True
         return _try_validate(_validate_url, "Invalid URL", context, log_error=False)
-    # ... other validations using _try_validate helper
+
+    # Unknown validation types are rejected (fail-closed)
+    pattern_data = VALIDATION_PATTERNS.get(validation_type)
+    if not pattern_data:
+        logging.error("Unknown validation type '%s' - rejecting input", validation_type)
+        return False
+    # ... pattern-based and list-based validations using _try_validate helper
 ```
 
 ---
@@ -460,7 +462,17 @@ def validate_input(value: str, validation_type: str, context: str) -> bool:
                             │
                             ▼
     ┌──────────────────────────────────────────────────┐
-    │ 6. Sleep (POLL seconds)                          │
+    │ 6. Handle Stale Connections                      │
+    │    - Catch Unauthorized/DiscoveryFailure         │
+    │    - Exponential backoff (capped at 300s)        │
+    │    - Reconnect via create_connection()           │
+    │    - Generic exceptions also use backoff         │
+    │    - Successful poll resets failure counter      │
+    └──────────────────────────────────────────────────┘
+                            │
+                            ▼
+    ┌──────────────────────────────────────────────────┐
+    │ 7. Sleep (POLL seconds)                          │
     └──────────────────────────────────────────────────┘
                             │
                             └──────────────┐
@@ -509,6 +521,7 @@ process_service(failed_service, reserved_hosts, resume, service)
     │       ├─ List servers on host
     │       ├─ Filter evacuable servers
     │       └─ Execute evacuation
+    │           ├─ Orchestrated: _orchestrated_evacuate (priority-ordered phases)
     │           ├─ Smart: _server_evacuate_future (track to completion)
     │           └─ Traditional: fire-and-forget
     │
@@ -547,12 +560,20 @@ def _is_service_resume_candidate(svc) -> bool:
             DISABLED_REASON_EVACUATION_FAILED not in reason and
             DISABLED_REASON_EVACUATION_COMPLETE not in reason)
 
+def _is_service_stale(svc, target_date: datetime) -> bool:
+    """Check whether a service's updated_at timestamp is older than target_date."""
+    try:
+        return datetime.fromisoformat(svc.updated_at) < target_date
+    except (ValueError, TypeError, AttributeError):
+        logging.warning("Service %s has invalid updated_at: %r, treating as stale",
+                       getattr(svc, 'host', 'unknown'), getattr(svc, 'updated_at', None))
+        return True
+
 def _categorize_services(services: List[Any], target_date: datetime) -> tuple:
     # Compute nodes: not disabled/forced-down, and (down OR stale)
     compute_nodes = (svc for svc in services
                      if not ('disabled' in svc.status or svc.forced_down)
-                     and (svc.state == 'down' or
-                          datetime.fromisoformat(svc.updated_at) < target_date))
+                     and (svc.state == 'down' or _is_service_stale(svc, target_date)))
 
     # Resume candidates (forced down, disabled with instanceha marker, not failed, not complete)
     resume = (svc for svc in services if _is_service_resume_candidate(svc))
@@ -627,7 +648,7 @@ Checks if at least one `nova-scheduler` service has `state == 'up'`.
 ```python
 can_evacuate, error_msg = _check_critical_services(conn, services, compute_nodes)
 if not can_evacuate:
-    logging.error(f'Cannot evacuate: {error_msg}. Skipping evacuation.')
+    logging.error('Cannot evacuate: %s. Skipping evacuation.', error_msg)
     _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
     return
 ```
@@ -730,7 +751,7 @@ def get_int(self, key: str, default: int = 0,
     try:
         int_value = int(value)
     except (ValueError, TypeError):
-        logging.warning(f"Configuration {key} should be integer, got {type(value).__name__}, using default: {default}")
+        logging.warning("Configuration %s should be integer, got %s, using default: %s", key, type(value).__name__, default)
         return default
 
     # Clamp to min/max bounds
@@ -790,9 +811,9 @@ def _server_evacuate_future(connection, server) -> bool:
     time.sleep(INITIAL_EVACUATION_WAIT_SECONDS)
 
     # 3. Poll migration status until completion or timeout
-    start_time = time.time()
+    start_time = time.monotonic()
     while True:
-        if time.time() - start_time > MAX_EVACUATION_TIMEOUT_SECONDS:
+        if time.monotonic() - start_time > MAX_EVACUATION_TIMEOUT_SECONDS:
             return False
 
         status = _server_evacuation_status(connection, server.id)
@@ -817,7 +838,54 @@ def _server_evacuate_future(connection, server) -> bool:
 
 ---
 
-### 3. Server Evacuability Logic
+### 3. Orchestrated Evacuation
+
+**Configuration**: `ORCHESTRATED_RESTART: true`
+
+**Server Metadata** (set via `openstack server set --property`):
+- `instanceha:restart_priority` (int, 1-1000, default 500): Higher values = evacuated first
+- `instanceha:restart_group` (str, optional): Servers with same group evacuate concurrently
+
+**Flow**:
+```python
+# 1. Read orchestration metadata from all evacuable servers
+# 2. Group servers by restart_group (ungrouped → individual phases)
+# 3. Sort groups by highest member priority (descending)
+# 4. Evacuate each phase sequentially
+# 5. Within each phase, use ThreadPoolExecutor (concurrent, like smart evacuation)
+
+phases = _build_evacuation_groups(evacuables)  # group + sort
+for phase in phases:
+    # Evacuate phase concurrently, wait for completion
+    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+        futures = {executor.submit(_server_evacuate_future, conn, s, target): s
+                   for s in phase}
+        # Wait for all futures, fail-fast on any failure
+```
+
+**Example**:
+```
+Server metadata:
+  db-1:  priority=900, group=database
+  db-2:  priority=800, group=database
+  app-1: priority=500, group=app
+  web-1: priority=100 (no group)
+
+Evacuation order:
+  Phase 1: [db-1, db-2]  (group=database, priority=900) -- concurrent
+  Phase 2: [app-1]       (group=app, priority=500)
+  Phase 3: [web-1]       (ungrouped, priority=100)
+```
+
+**Activation**:
+- Set `ORCHESTRATED_RESTART: true` in config
+- Server metadata is only read when this config option is enabled
+
+**Backwards Compatibility**: When `ORCHESTRATED_RESTART` is not enabled, behavior is identical to smart/traditional evacuation regardless of server metadata.
+
+---
+
+### 4. Server Evacuability Logic
 
 **Tagging System** (OR semantics):
 1. **Flavor-based** (`TAGGED_FLAVORS: true`)
@@ -866,9 +934,9 @@ FENCING_AGENTS = {
 
 def _execute_fence_operation(host, action, fencing_data, service):
     agent = fencing_data.get("agent", "").lower()
-    for agent_key, agent_func in FENCING_AGENTS.items():
-        if agent_key in agent:
-            return agent_func(host, action, fencing_data, service)
+    agent_func = FENCING_AGENTS.get(agent)
+    if agent_func:
+        return agent_func(host, action, fencing_data, service)
     logging.error("Unknown fencing agent: %s", agent)
     return False
 ```
@@ -936,6 +1004,105 @@ compute-03:
 - Uses bearer token authentication
 - Waits for power-off confirmation
 - Validates input parameters
+
+---
+
+## Kubernetes Events
+
+InstanceHA emits Kubernetes Events on the InstanceHa CR to provide observability into the evacuation lifecycle. Events are created via the K8s API using the pod's ServiceAccount token.
+
+### Prerequisites
+
+- ServiceAccount token mounted at `/var/run/secrets/kubernetes.io/serviceaccount/token`
+- `POD_NAMESPACE` environment variable set
+- `INSTANCEHA_CR_NAME` environment variable set to the InstanceHa CR name
+- `POD_NAME` environment variable set (used as `reportingInstance`)
+- RBAC: the operator ClusterRole must have `create` and `patch` permissions on `events`
+
+### Event Catalog
+
+| Reason | Type | Host | When |
+|--------|------|------|------|
+| `HostDown` | Warning | compute host | Compute service detected as down or stale |
+| `FencingStarted` | Normal | compute host | Power-off fencing operation begins |
+| `FencingSucceeded` | Normal | compute host | Fencing completed successfully |
+| `FencingFailed` | Warning | compute host | Fencing operation failed |
+| `EvacuationStarted` | Normal | compute host | VM evacuation begins |
+| `EvacuationSucceeded` | Normal | compute host | All VMs evacuated successfully |
+| `EvacuationFailed` | Warning | compute host | VM evacuation failed |
+| `RecoveryCompleted` | Normal | compute host | Post-evacuation recovery workflow completed |
+| `ProcessingFailed` | Warning | compute host | Unhandled exception during service processing |
+| `ThresholdExceeded` | Warning | `cluster` | Failed host percentage exceeds THRESHOLD, evacuation skipped |
+| `HostReenabled` | Normal | compute host | Host re-enabled after successful evacuation |
+
+### Event Structure
+
+All events are created on the `InstanceHa` CR as the involved object:
+
+```yaml
+apiVersion: v1
+kind: Event
+metadata:
+  name: instanceha.a1b2c3d4e5f67890
+  namespace: openstack
+involvedObject:
+  apiVersion: instanceha.openstack.org/v1beta1
+  kind: InstanceHa
+  name: instanceha
+  namespace: openstack
+reason: FencingStarted
+message: "[compute-0] Fencing host (power off)"
+type: Normal
+firstTimestamp: "2026-04-23T10:15:30Z"
+lastTimestamp: "2026-04-23T10:15:30Z"
+source:
+  component: instanceha
+reportingComponent: instanceha
+reportingInstance: instanceha-0
+```
+
+### Event Lifecycle Example
+
+A typical compute host failure produces this sequence of events:
+
+```
+1. HostDown        (Warning)  [compute-0] Compute host detected as down
+2. FencingStarted  (Normal)   [compute-0] Fencing host (power off)
+3. FencingSucceeded(Normal)   [compute-0] Host fenced successfully
+4. EvacuationStarted(Normal)  [compute-0] Starting VM evacuation
+5. EvacuationSucceeded(Normal)[compute-0] VM evacuation completed successfully
+6. RecoveryCompleted(Normal)  [compute-0] Host recovery workflow completed
+7. HostReenabled   (Normal)   [compute-0] Host re-enabled after successful evacuation
+```
+
+A fencing failure stops the sequence early:
+
+```
+1. HostDown        (Warning)  [compute-0] Compute host detected as down
+2. FencingStarted  (Normal)   [compute-0] Fencing host (power off)
+3. FencingFailed   (Warning)  [compute-0] Fencing failed
+```
+
+A threshold breach prevents any evacuation:
+
+```
+1. HostDown          (Warning) [compute-0] Compute host detected as down
+2. HostDown          (Warning) [compute-1] Compute host detected as down
+3. ThresholdExceeded (Warning) [cluster] Impacted computes (66.7%) exceed threshold (50%), evacuation skipped
+```
+
+### Querying Events
+
+```bash
+# All InstanceHA events
+kubectl get events -n openstack --field-selector involvedObject.kind=InstanceHa
+
+# Warning events only
+kubectl get events -n openstack --field-selector involvedObject.kind=InstanceHa,type=Warning
+
+# Events for a specific reason
+kubectl get events -n openstack --field-selector involvedObject.kind=InstanceHa,reason=FencingFailed
+```
 
 ---
 
@@ -1041,7 +1208,7 @@ Reserved Hosts: reserved-01 (aggregate-A), reserved-02 (aggregate-B)
 ```python
 threshold_percent = (len(compute_nodes) / len(services)) * 100
 if threshold_percent > service.config.get_threshold():
-    logging.error(f'Impacted ({threshold_percent:.1f}%) exceeds threshold')
+    logging.error('Impacted (%.1f%%) exceeds threshold', threshold_percent)
     return  # Do not evacuate
 ```
 
@@ -1178,8 +1345,8 @@ clouds:
 ### 1. Input Validation
 
 **SSRF Prevention**:
-- URL validation (block localhost, link-local) with specific exception handling
-- IP address validation (IPv4/IPv6)
+- URL validation using `ipaddress` module to block loopback and link-local addresses
+- IP address validation (IPv4/IPv6) via `ipaddress.ip_address()`
 - Port range validation (1-65535)
 
 **Injection Prevention**:
@@ -1296,92 +1463,101 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
 
 ### Test Statistics
 
-- **Total Tests**: 401 (203 unit + 16 security + 29 critical error + 12 workflow + 32 config + 18 helper + 68 functional + 22 integration + 7 region)
-- **Code Coverage**: 71% (unit tests alone), 83% (with all tests)
-- **Execution Time**: ~13 seconds (unit tests), ~26 seconds (all tests)
+- **Total Tests**: 559 across 15 test suites
 
 ### Test Categories
 
-**1. Unit Tests** (203 tests):
-The unit test suite in `test_instanceha.py` includes tests for:
+**1. Core Unit Tests** (`test_unit_core.py`):
+Core unit tests covering:
 - Configuration management and validation
 - Service initialization and caching
 - Main function initialization and error handling
 - Evacuation logic and tag checking
 - Smart evacuation with success, failure, and exception path testing
-- Kdump detection and UDP message processing
-- Redfish, IPMI, and BMH fencing operations
 - Thread safety and memory management
 - Security and secret sanitization
-- Input validation and SSRF prevention
 - Reserved host management (aggregate and zone matching)
 - FORCE_ENABLE configuration behavior
 
-**2. Security Validation Tests** (16 tests):
-The security validation test suite in `test_security_validation.py` covers:
-- SSRF prevention (6 tests): URL validation, localhost/link-local blocking
-- Injection prevention (7 tests): Port validation, power action whitelisting, username validation, Kubernetes resource validation
-- Fencing validation (3 tests): Power action validation, parameter validation
+**2. Fencing Agents Tests** (`test_fencing_agents.py`):
+- IPMI fencing operations (power on/off, status, timeouts)
+- Redfish fencing operations (SSL, retries, power state verification)
+- BMH/Metal3 fencing (Kubernetes API, bearer token auth, power-off wait)
+- Noop fencing agent
+- Fencing agent dispatch and validation
 
-**3. Critical Error Path Tests** (29 tests):
-The critical error path test suite in `test_critical_error_paths.py` covers:
-- Configuration errors (7 tests): YAML parsing, missing files, permissions, type validation
-- Nova API exceptions (8 tests): NotFound, Forbidden, Unauthorized, connection failures
-- Service disable validation (4 tests): Missing connection/service, attribute validation
-- Evacuation timeouts (3 tests): Smart evacuation timeout, retry exhaustion
-- Fencing failures (7 tests): Missing configuration, invalid parameters
+**3. Kdump Detection Tests** (`test_kdump_detection.py`):
+- UDP message processing and magic number validation
+- Kdump host timestamp tracking and cleanup
+- Reverse DNS lookup integration
+- Kdump timeout and delay behavior
 
-**4. Evacuation Workflow Tests** (12 tests):
-The evacuation workflow test suite in `test_evacuation_workflow.py` covers:
-- Kdump resume disable logic (3 tests): Already disabled service handling, kdump-fenced host handling, new evacuation handling
-- Post-evacuation recovery error paths (3 tests): Power-on failures, disable reason update failures, unexpected exceptions
-- Process service step failures (6 tests): Fencing, disable, reserved hosts, evacuation, recovery step failures
+**4. Security Validation Tests** (`test_security_validation.py`):
+- SSRF prevention: URL validation, loopback/link-local blocking via `ipaddress` module
+- Injection prevention: Port validation, power action whitelisting, username validation, Kubernetes resource validation
+- Fencing validation: Power action validation, parameter validation
 
-**5. Configuration Feature Tests** (32 tests):
-The configuration feature test suite in `test_config_features.py` covers:
-- DISABLED configuration (2 tests): Skip evacuations when enabled
-- Critical services check (8 tests): Scheduler and conductor validation
-- FORCE_ENABLE configuration (8 tests): Migration completion bypass, kdump delay respect, forced_down two-stage process
-- LEAVE_DISABLED configuration (2 tests): Service filtering for re-enable
-- TAGGED_AGGREGATES configuration (2 tests): Aggregate-based filtering
-- DELAY configuration (4 tests): Pre-evacuation delay validation
-- HASH_INTERVAL configuration (6 tests): Health hash update interval
+**5. Critical Error Path Tests** (`test_critical_error_paths.py`):
+- Configuration errors: YAML parsing, missing files, permissions, type validation
+- Nova API exceptions: NotFound, Forbidden, Unauthorized, connection failures
+- Evacuation timeouts and fencing failures
 
-**6. Helper Functions Tests** (18 tests):
-The helper functions test suite in `test_helper_functions.py` covers:
-- _cleanup_filtered_hosts (4 tests): Host cleanup logic
-- _filter_processing_hosts (5 tests): Processing state filtering
-- _prepare_evacuation_resources (5 tests): Resource preparation
-- _count_evacuable_hosts (4 tests): Evacuable host counting
+**6. Evacuation Workflow Tests** (`test_evacuation_workflow.py`):
+- Kdump resume disable logic and post-evacuation recovery error paths
+- Process service step failures: Fencing, disable, reserved hosts, evacuation, recovery
 
-**7. Functional Tests** (68 tests):
-The functional test suite in `functional_test.py` covers:
-- End-to-end evacuation workflows
-- Large-scale scenarios (100+ hosts)
-- Host state classification and filtering
+**7. Configuration Feature Tests** (`test_config_features.py`):
+- DISABLED, FORCE_ENABLE, LEAVE_DISABLED, TAGGED_AGGREGATES, DELAY, HASH_INTERVAL
+- Critical services check: Scheduler and conductor validation
+
+**8. Helper Functions Tests** (`test_helper_functions.py`):
+- `_cleanup_filtered_hosts`, `_filter_processing_hosts`, `_prepare_evacuation_resources`, `_count_evacuable_hosts`
+
+**9. Functional Tests** (`functional_test.py`):
+- End-to-end evacuation workflows and large-scale scenarios
 - Tagging logic combinations (flavors, images, aggregates)
-- Reserved host management (aggregate/zone matching and forced evacuation)
-- Performance testing
-- Kdump integration workflows
+- Reserved host management and kdump integration workflows
 
-**8. Integration Tests** (22 tests):
-The integration test suite in `integration_test.py` covers:
-- Service initialization workflows
-- Nova connection establishment
-- Service categorization and filtering pipelines
-- Full evacuation workflows with all components
-- Re-enabling workflows with migration checks
-- Performance and scaling under load
-- Error handling and recovery scenarios
+**10. Integration Tests** (`integration_test.py`):
+- Service initialization and Nova connection
+- Full evacuation and re-enabling workflows
+- Performance, scaling, and error recovery
 
-**9. Region Isolation Tests** (7 tests):
-The region isolation test suite in `test_region_isolation.py` covers:
-- Nova client region scoping verification
-- Service list filtering by region
-- Evacuation operation region boundaries
-- Multi-region deployment independence
-- Region name authentication chain validation
+**11. Region Isolation Tests** (`test_region_isolation.py`):
+- Nova client region scoping and multi-region independence
 - Configuration requirement validation
+
+**12. Coverage Gaps Tests** (`test_coverage_gaps.py`):
+- Validation helpers: `_try_validate`, `_validate_fencing_params`, `_validate_fencing_inputs`
+- Fencing agent dispatchers: `_fence_noop`, `_fence_ipmi`, `_fence_redfish`, `_fence_bmh`
+- IPMI execution with retry logic: `_execute_ipmi_fence`
+- Service resume eligibility: `_is_service_resume_candidate`
+- Aggregate filtering: `_aggregate_ids`
+- Traditional evacuation logic: `_traditional_evacuate`
+- Step execution wrapper: `_execute_step`
+- Redfish URL construction edge cases: `_build_redfish_url`
+- Datetime parsing protection: `_is_service_stale` (None, malformed, missing attribute)
+- Evacuation monitoring: `_monitor_evacuation` (completion, retry, timeout)
+- Main loop backoff: exponential backoff on Unauthorized/DiscoveryFailure/generic errors
+- Process stale services safety: empty nodes, threshold exceeded, disabled mode
+
+**13. K8s Events Tests** (`test_k8s_events.py`):
+- K8s credential reading and event emission
+- Event lifecycle: fencing, evacuation, recovery, re-enable
+- Error handling: missing credentials, failed API calls, missing CR name
+
+**14. Thread Safety Tests** (`test_thread_safety.py`):
+- Concurrent cache access and refresh
+- Processing lock contention under parallel poll cycles
+- Reserved host list thread-safe removal
+
+**15. Orchestrated Evacuation Tests** (`test_orchestrated_evacuation.py`):
+- Metadata extraction: `_get_evacuation_metadata` (priority parsing, clamping, defaults)
+- Missing metadata warning: logs when enabled but no servers have metadata
+- Group building: `_build_evacuation_groups` (grouping, priority sorting, mixed inputs)
+- Phase execution: `_orchestrated_evacuate` (multi-phase success/failure, target_host passthrough)
+- Branching logic: `_host_evacuate` orchestrated/smart/traditional routing
+- Configuration: `ORCHESTRATED_RESTART` config key validation
 
 ### Coverage by Component
 
@@ -1726,6 +1902,52 @@ config:
 **Notes**:
 - Smart mode increases API load (polling) and memory usage (thread pool)
 - Traditional mode does not track completion or verify success after submission
+
+---
+
+#### ORCHESTRATED_RESTART
+**Type**: Boolean
+**Default**: `false`
+**Range**: N/A
+
+**Description**: Enable priority-based evacuation ordering using server metadata. When enabled, servers are evacuated in priority-ordered phases rather than all at once.
+
+**Usage**:
+- Controls evacuation strategy selection in `_host_evacuate()`
+- When `true`: Uses `_orchestrated_evacuate()` with priority-ordered phases
+- Must be explicitly enabled; server metadata alone does not activate orchestrated mode
+- A warning is logged if enabled but no servers have orchestration metadata
+
+**Behavior**:
+- Servers grouped by `instanceha:restart_group` metadata
+- Groups sorted by highest `instanceha:restart_priority` (descending)
+- Each group evacuated concurrently (using WORKERS thread pool)
+- Groups processed sequentially (wait for completion before next group)
+- Fail-fast: stops on first group failure
+
+**Server Metadata Keys**:
+- `instanceha:restart_priority`: Integer 1-1000 (default 500). Higher = evacuated first.
+- `instanceha:restart_group`: String (optional). Servers with same group evacuate together.
+
+**Testing**:
+- Metadata extraction and validation tests
+- Group building and priority sorting tests
+- Orchestrated evacuation with phase sequencing tests
+- Host evacuate branching logic tests
+- Config-only activation: metadata ignored when ORCHESTRATED_RESTART=false
+
+**Example**:
+```yaml
+config:
+  ORCHESTRATED_RESTART: true
+```
+
+Server metadata:
+```bash
+openstack server set --property instanceha:restart_priority=900 --property instanceha:restart_group=database db-server
+openstack server set --property instanceha:restart_priority=500 --property instanceha:restart_group=app app-server
+openstack server set --property instanceha:restart_priority=100 web-server
+```
 
 ---
 
@@ -2277,17 +2499,23 @@ config:
 
 ## References
 
-- **Code**: `instanceha.py` (2,872 lines)
-- **Tests**: 401 tests across 9 test files
-  - `test_instanceha.py` (203 unit tests)
-  - `test_security_validation.py` (16 security tests)
-  - `test_critical_error_paths.py` (29 critical error tests)
-  - `test_evacuation_workflow.py` (12 workflow tests)
-  - `test_config_features.py` (32 config tests)
-  - `test_helper_functions.py` (18 helper tests)
-  - `functional_test.py` (68 functional tests)
-  - `integration_test.py` (22 integration tests)
-  - `test_region_isolation.py` (7 region tests)
+- **Code**: `instanceha.py` (3,190 lines)
+- **Tests**: 576 tests across 15 test suites
+  - `test_unit_core.py` (core unit tests)
+  - `test_fencing_agents.py` (fencing agent tests)
+  - `test_kdump_detection.py` (kdump detection tests)
+  - `test_security_validation.py` (security tests)
+  - `test_critical_error_paths.py` (critical error tests)
+  - `test_evacuation_workflow.py` (workflow tests)
+  - `test_config_features.py` (config tests)
+  - `test_helper_functions.py` (helper tests)
+  - `functional_test.py` (functional tests)
+  - `integration_test.py` (integration tests)
+  - `test_region_isolation.py` (region tests)
+  - `test_coverage_gaps.py` (coverage gap tests)
+  - `test_k8s_events.py` (K8s events tests)
+  - `test_thread_safety.py` (thread safety tests)
+  - `test_orchestrated_evacuation.py` (orchestrated evacuation tests)
 - **Documentation**: This file (INSTANCEHA_ARCHITECTURE.md)
 - **OpenStack API**: https://docs.openstack.org/api-ref/compute/
 - **Redfish**: https://www.dmtf.org/standards/redfish

@@ -28,14 +28,37 @@ import concurrent.futures
 if 'novaclient' not in sys.modules:
     sys.modules['novaclient'] = MagicMock()
     sys.modules['novaclient.client'] = MagicMock()
-    sys.modules['novaclient.exceptions'] = MagicMock()
+    class NotFound(Exception):
+        pass
+    class Conflict(Exception):
+        pass
+    class Forbidden(Exception):
+        pass
+    class Unauthorized(Exception):
+        pass
+    novaclient_exceptions = MagicMock()
+    novaclient_exceptions.NotFound = NotFound
+    novaclient_exceptions.Conflict = Conflict
+    novaclient_exceptions.Forbidden = Forbidden
+    novaclient_exceptions.Unauthorized = Unauthorized
+    sys.modules['novaclient.exceptions'] = novaclient_exceptions
 
 if 'keystoneauth1' not in sys.modules:
     sys.modules['keystoneauth1'] = MagicMock()
     sys.modules['keystoneauth1.loading'] = MagicMock()
     sys.modules['keystoneauth1.session'] = MagicMock()
-    sys.modules['keystoneauth1.exceptions'] = MagicMock()
-    sys.modules['keystoneauth1.exceptions.discovery'] = MagicMock()
+
+    class DiscoveryFailure(Exception):
+        pass
+
+    discovery_module = MagicMock()
+    discovery_module.DiscoveryFailure = DiscoveryFailure
+
+    exceptions_module = MagicMock()
+    exceptions_module.discovery = discovery_module
+
+    sys.modules['keystoneauth1.exceptions'] = exceptions_module
+    sys.modules['keystoneauth1.exceptions.discovery'] = discovery_module
 
 # Suppress warnings during testing
 logging.getLogger().setLevel(logging.CRITICAL)
@@ -308,26 +331,18 @@ class TestServiceInitialization(unittest.TestCase):
         config_manager.secure_path = secure_path
         config_manager.__init__(config_path)
 
-        # Set config_manager as module attribute for _initialize_service to use
-        instanceha.config_manager = config_manager
+        with patch('threading.Thread') as mock_thread:
+            mock_thread_instance = Mock()
+            mock_thread.return_value = mock_thread_instance
 
-        try:
-            with patch('threading.Thread') as mock_thread:
-                mock_thread_instance = Mock()
-                mock_thread.return_value = mock_thread_instance
+            service = instanceha._initialize_service(config_manager)
 
-                service = instanceha._initialize_service()
+            # Verify threads were created (health check + potentially kdump)
+            self.assertGreaterEqual(mock_thread.call_count, 1)
+            mock_thread_instance.start.assert_called()
 
-                # Verify threads were created (health check + potentially kdump)
-                self.assertGreaterEqual(mock_thread.call_count, 1)
-                mock_thread_instance.start.assert_called()
-
-                # Verify service was created
-                self.assertIsNotNone(service)
-        finally:
-            # Clean up module attribute
-            if hasattr(instanceha, 'config_manager'):
-                delattr(instanceha, 'config_manager')
+            # Verify service was created
+            self.assertIsNotNone(service)
 
 
 class TestServiceCategorization(unittest.TestCase):
