@@ -4,10 +4,9 @@
 
 InstanceHA is a high-availability service for OpenStack that automatically detects and evacuates instances from failed compute nodes.
 
-**Version**: 2.1
-**Code Size**: 2,872 lines
-**Code Coverage**: 70%
-**Test Suite**: 401 tests, ~26 seconds execution time
+**Version**: 2.5
+**Code Size**: 3,449 lines
+**Test Suite**: 656 tests across 17 test suites
 
 ## Table of Contents
 
@@ -18,12 +17,17 @@ InstanceHA is a high-availability service for OpenStack that automatically detec
 5. [Configuration System](#configuration-system)
 6. [Evacuation Mechanisms](#evacuation-mechanisms)
 7. [Fencing Agents](#fencing-agents)
-8. [Advanced Features](#advanced-features)
-9. [Region Handling](#region-handling)
-10. [Security](#security)
-11. [Performance](#performance)
-12. [Testing](#testing)
-13. [Configuration Options Reference](#configuration-options-reference)
+8. [Kubernetes Events](#kubernetes-events)
+9. [Advanced Features](#advanced-features)
+10. [Region Handling](#region-handling)
+11. [Authentication](#authentication)
+12. [Startup Reconciliation](#startup-reconciliation)
+13. [Graceful Shutdown](#graceful-shutdown)
+14. [Security](#security)
+15. [Performance](#performance)
+16. [Testing](#testing)
+17. [Deployment](#deployment)
+18. [Configuration Options Reference](#configuration-options-reference)
 
 ---
 
@@ -48,27 +52,13 @@ class EvacuationResult:
     uuid: str
     accepted: bool
     reason: str
+    status_code: Optional[int] = None  # HTTP status code for retry decisions
 
 @dataclass
 class EvacuationStatus:
     """Status of an ongoing server evacuation."""
     completed: bool
     error: bool
-
-@dataclass
-class FencingCredentials:
-    """Credentials and connection info for fencing operations."""
-    agent: str
-    ipaddr: str
-    login: str
-    passwd: str
-    ipport: str = "443"
-    timeout: int = 30
-    uuid: str = "System.Embedded.1"
-    tls: str = "false"
-    token: Optional[str] = None
-    namespace: Optional[str] = None
-    host: Optional[str] = None
 
 @dataclass
 class NovaLoginCredentials:
@@ -79,6 +69,14 @@ class NovaLoginCredentials:
     auth_url: str
     user_domain_name: str
     project_domain_name: str
+    region_name: str
+
+@dataclass
+class ACLoginCredentials:
+    """Credentials for Application Credential based login."""
+    auth_url: str
+    application_credential_id: str
+    application_credential_secret: str
     region_name: str
 
 @dataclass
@@ -105,7 +103,7 @@ class ReservedHostResult:
 - **Configuration Sources**: Main config, clouds.yaml, secure.yaml, fencing.yaml
 - **Validation**: Type checking, range validation (min/max), enum validation
 - **SSL Support**: CA bundle, client certificates, verification toggle
-- **Environment Overrides**: OS_CLOUD, UDP_PORT, SSL paths
+- **Environment Overrides**: OS_CLOUD, UDP_PORT (validated: 1-65535), SSL paths
 - **Direct Access**: Configuration accessed via `get_config_value()` method
 
 **Configuration Map**:
@@ -128,10 +126,14 @@ _config_map: Dict[str, ConfigItem] = {
     'FORCE_ENABLE': ConfigItem('bool', False),
     'CHECK_KDUMP': ConfigItem('bool', False),
     'KDUMP_TIMEOUT': ConfigItem('int', 30, 5, 300),
+    'CHECK_HEARTBEAT': ConfigItem('bool', False),
+    'HEARTBEAT_TIMEOUT': ConfigItem('int', 120, 30, 600),
     'DISABLED': ConfigItem('bool', False),
     'SSL_VERIFY': ConfigItem('bool', True),
     'FENCING_TIMEOUT': ConfigItem('int', 30, 5, 120),
     'HASH_INTERVAL': ConfigItem('int', 60, 30, 300),
+    'ORCHESTRATED_RESTART': ConfigItem('bool', False),
+    'SKIP_SERVERS_WITH_NAME': ConfigItem('list', []),
 }
 ```
 
@@ -155,55 +157,53 @@ def __init__(self, config_manager: ConfigManager, cloud_client: Optional[OpenSta
     self.config = config_manager
     self.cloud_client = cloud_client
 
-    # Initialization split into domain-specific methods
-    self._initialize_health_state()
-    self._initialize_cache()
-    self._initialize_threading()
-    self._initialize_kdump_state()
-    self._initialize_processing_state()
+    # Health monitoring
+    self.current_hash = ""
+    self.hash_update_successful = True
+    self._last_hash_time = 0
+    self._previous_hash = ""
+    self.ready = False                              # Readiness flag (set after first poll)
+
+    # Caching
+    self._host_servers_cache = {}
+    self._evacuable_flavors_cache = None
+    self._evacuable_images_cache = None
+    self._cache_timestamp = 0
+    self._cache_lock = threading.Lock()
+    self.evacuable_tag = self.config.get_config_value('EVACUABLE_TAG')
+
+    # Threading
+    self.health_check_thread = None
+    self.udp_ip = ''
+    self.shutdown_event = threading.Event()          # Graceful SIGTERM shutdown
+
+    # Kdump state (protected by kdump_lock)
+    self.kdump_lock = threading.Lock()               # Protects all kdump state
+    self.kdump_hosts_timestamp = defaultdict(float)
+    self.kdump_hosts_checking = defaultdict(float)
+    self.kdump_listener_stop_event = threading.Event()
+    self.kdump_fenced_hosts = set()
+
+    # Heartbeat state (protected by heartbeat_lock)
+    self.heartbeat_lock = threading.Lock()
+    self.heartbeat_hosts_timestamp = defaultdict(float)
+    self.heartbeat_listener_stop_event = threading.Event()
+    self.heartbeat_listener_start_time = 0.0
+
+    # Host processing tracking
+    self.hosts_processing = defaultdict(float)
+    self.processing_lock = threading.Lock()
+    self.reserved_hosts_lock = threading.Lock()
 
     logging.info("InstanceHA service initialized successfully")
 ```
 
-**State Management** (organized by domain):
+**State Management Notes**:
 
-*Health Monitoring* (`_initialize_health_state()`):
-```python
-self.current_hash = ""                          # Health check hash
-self.hash_update_successful = True              # Health status
-self._last_hash_time = 0                        # Hash timestamp
-self._previous_hash = ""                        # Previous hash for validation
-```
-
-*Caching* (`_initialize_cache()`):
-```python
-self._host_servers_cache = {}                   # Host -> servers mapping
-self._evacuable_flavors_cache = None            # Cached evacuable flavors
-self._evacuable_images_cache = None             # Cached evacuable images
-self._cache_timestamp = 0                       # Cache age
-self._cache_lock = threading.Lock()             # Thread-safe access
-self.evacuable_tag = config.get_evacuable_tag() # Cached config value
-```
-
-*Kdump Detection* (`_initialize_kdump_state()`):
-```python
-self.kdump_hosts_timestamp = defaultdict(float) # Host -> last kdump time
-self.kdump_hosts_checking = defaultdict(float)  # Host -> check start time
-self.kdump_listener_stop_event = threading.Event()  # Stop signal
-self.kdump_fenced_hosts = set()                 # Kdump-fenced host tracking
-```
-
-*Processing Tracking* (`_initialize_processing_state()`):
-```python
-self.hosts_processing = defaultdict(float)      # Host -> processing start
-self.processing_lock = threading.Lock()         # Thread-safe tracking
-```
-
-*Threading* (`_initialize_threading()`):
-```python
-self.health_check_thread = None                 # Health check thread handle
-self.UDP_IP = ''                                # UDP listener IP
-```
+- `ready` flag starts `False` and is set to `True` after the first successful poll cycle. This drives the `/healthz` readiness probe endpoint — Kubernetes won't route traffic until the service has completed its first poll.
+- `shutdown_event` is set by the SIGTERM handler to signal the main loop and all `wait()` calls to exit gracefully.
+- `kdump_lock` protects all kdump-related state since the UDP listener thread writes concurrently with the main poll loop.
+- `heartbeat_lock` similarly protects heartbeat state from concurrent UDP listener writes.
 
 **Key Methods**:
 - `get_connection()` - Get Nova client with dependency injection support
@@ -290,7 +290,7 @@ def track_host_processing(service: 'InstanceHAService', hostname: str):
     finally:
         with service.processing_lock:
             service.hosts_processing.pop(hostname, None)
-            logging.debug(f'Cleaned up processing tracking for {hostname}')
+            logging.debug('Cleaned up processing tracking for %s', hostname)
 ```
 
 **UDP Socket Management**:
@@ -313,7 +313,7 @@ class UDPSocketManager:
 
 **Cache Access**:
 ```python
-# Pattern: read check → API call outside lock → write update
+# Pattern: read check → API call outside lock → write update → return local var
 # Lock held only for dictionary operations, not during API calls
 
 # 1. Check cache with lock (fast read)
@@ -325,9 +325,10 @@ with self._cache_lock:
 flavors = connection.flavors.list()
 cache_data = [f.id for f in flavors if self._is_flavor_evacuable(f)]
 
-# 3. Update cache with lock (fast write)
+# 3. Update cache with lock (fast write), return local variable
 with self._cache_lock:
     self._evacuable_flavors_cache = cache_data
+return cache_data  # Return local var, not self._evacuable_flavors_cache
 ```
 
 **Implementation**:
@@ -371,7 +372,7 @@ def _try_validate(validator_func: Callable[[], bool], error_msg: str, context: s
         return validator_func()
     except (ValueError, AttributeError, TypeError) as e:
         if log_error:
-            logging.error(f"{error_msg} for {context}: {e}")
+            logging.error("%s for %s: %s", error_msg, context, e)
         return False
 
 VALIDATION_PATTERNS = {
@@ -383,19 +384,33 @@ VALIDATION_PATTERNS = {
 }
 
 def validate_input(value: str, validation_type: str, context: str) -> bool:
-    # Special validation for URLs (block localhost, link-local)
+    # Special validation for URLs (block localhost, link-local via ipaddress module)
     if validation_type == 'url':
         def _validate_url():
             p = urlparse(value)
             if p.scheme not in ['http', 'https'] or not p.netloc:
                 return False
             h = p.hostname
-            if h and (h.lower() in ['localhost', '127.0.0.1', '::1', '0.0.0.0'] or h.startswith('169.254.')):
-                logging.error(f"Blocked localhost/link-local access in {context}")
+            if not h:
                 return False
+            h_lower = h.lower()
+            if h_lower in ['localhost', '0.0.0.0']:
+                return False
+            try:
+                addr = ipaddress.ip_address(h_lower.strip('[]'))
+                if addr.is_loopback or addr.is_link_local:
+                    return False
+            except ValueError:
+                pass  # Not an IP literal (hostname) - allow through
             return True
         return _try_validate(_validate_url, "Invalid URL", context, log_error=False)
-    # ... other validations using _try_validate helper
+
+    # Unknown validation types are rejected (fail-closed)
+    pattern_data = VALIDATION_PATTERNS.get(validation_type)
+    if not pattern_data:
+        logging.error("Unknown validation type '%s' - rejecting input", validation_type)
+        return False
+    # ... pattern-based and list-based validations using _try_validate helper
 ```
 
 ---
@@ -441,7 +456,8 @@ def validate_input(value: str, validation_type: str, context: str) -> bool:
     │ 4. Process Stale Services                        │
     │    - Filter processing hosts (deduplication)     │
     │    - Filter by servers, tags, aggregates         │
-    │    - Check threshold                             │
+    │    - Filter reachable hosts (heartbeat check)    │
+    │    - Check threshold (active services only)      │
     │    - Check critical services operational         │
     │    - Execute evacuations (with cleanup)          │
     └──────────────────────────────────────────────────┘
@@ -460,7 +476,19 @@ def validate_input(value: str, validation_type: str, context: str) -> bool:
                             │
                             ▼
     ┌──────────────────────────────────────────────────┐
-    │ 6. Sleep (POLL seconds)                          │
+    │ 6. Handle Stale Connections                      │
+    │    - Catch Unauthorized/DiscoveryFailure         │
+    │    - Exponential backoff (capped at 300s)        │
+    │    - Reconnect via _establish_nova_connection    │
+    │      with fatal=False (returns None on failure,  │
+    │      loop continues retrying)                    │
+    │    - Generic exceptions also use backoff         │
+    │    - Successful poll resets failure counter      │
+    └──────────────────────────────────────────────────┘
+                            │
+                            ▼
+    ┌──────────────────────────────────────────────────┐
+    │ 7. Sleep (POLL seconds)                          │
     └──────────────────────────────────────────────────┘
                             │
                             └──────────────┐
@@ -507,10 +535,15 @@ process_service(failed_service, reserved_hosts, resume, service)
     │   └─ _host_evacuate(connection, failed_service, service)
     │       ├─ Get evacuable images/flavors
     │       ├─ List servers on host
-    │       ├─ Filter evacuable servers
+    │       ├─ Filter evacuable servers (ACTIVE, ERROR, SHUTOFF)
     │       └─ Execute evacuation
+    │           ├─ Orchestrated: _orchestrated_evacuate (priority-ordered phases)
     │           ├─ Smart: _server_evacuate_future (track to completion)
     │           └─ Traditional: fire-and-forget
+    │       On failure: check if VMs landed on reserved host
+    │           ├─ VMs present: keep reserved host (has workload)
+    │           ├─ No VMs: _return_reserved_host() to pool
+    │           └─ API error: keep reserved host (safe default)
     │
     └─ 5. Post-Evacuation Recovery
         └─ _post_evacuation_recovery(conn, failed_service, service, resume)
@@ -547,12 +580,29 @@ def _is_service_resume_candidate(svc) -> bool:
             DISABLED_REASON_EVACUATION_FAILED not in reason and
             DISABLED_REASON_EVACUATION_COMPLETE not in reason)
 
+def _is_service_stale(svc, target_date: datetime) -> bool:
+    """Check whether a service's updated_at timestamp is older than target_date.
+
+    Handles both naive and timezone-aware datetime objects by normalizing
+    both to naive UTC before comparison.
+    """
+    try:
+        updated = svc.updated_at
+        if isinstance(updated, datetime):
+            updated_naive = updated.replace(tzinfo=None)
+        else:
+            updated_naive = datetime.fromisoformat(updated)
+        return updated_naive < target_date.replace(tzinfo=None)
+    except (ValueError, TypeError, AttributeError):
+        logging.warning("Service %s has invalid updated_at: %r, skipping (not treating as stale)",
+                       getattr(svc, 'host', 'unknown'), getattr(svc, 'updated_at', None))
+        return False
+
 def _categorize_services(services: List[Any], target_date: datetime) -> tuple:
     # Compute nodes: not disabled/forced-down, and (down OR stale)
     compute_nodes = (svc for svc in services
                      if not ('disabled' in svc.status or svc.forced_down)
-                     and (svc.state == 'down' or
-                          datetime.fromisoformat(svc.updated_at) < target_date))
+                     and (svc.state == 'down' or _is_service_stale(svc, target_date)))
 
     # Resume candidates (forced down, disabled with instanceha marker, not failed, not complete)
     resume = (svc for svc in services if _is_service_resume_candidate(svc))
@@ -627,7 +677,7 @@ Checks if at least one `nova-scheduler` service has `state == 'up'`.
 ```python
 can_evacuate, error_msg = _check_critical_services(conn, services, compute_nodes)
 if not can_evacuate:
-    logging.error(f'Cannot evacuate: {error_msg}. Skipping evacuation.')
+    logging.error('Cannot evacuate: %s. Skipping evacuation.', error_msg)
     _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
     return
 ```
@@ -696,14 +746,14 @@ clouds:
 ```yaml
 FencingConfig:
   compute-01.example.com:
-    agent: fence_ipmilan
+    agent: ipmi
     ipaddr: 192.168.1.10
     ipport: '623'
     login: admin
     passwd: ipmi_password
 
   compute-02.example.com:
-    agent: fence_redfish
+    agent: redfish
     ipaddr: 192.168.1.11
     ipport: '443'
     login: root
@@ -712,7 +762,7 @@ FencingConfig:
     uuid: System.Embedded.1
 
   compute-03.example.com:
-    agent: fence_metal3
+    agent: bmh
     host: metal3-0
     namespace: openshift-machine-api
     token: eyJhbGciOi...
@@ -730,7 +780,7 @@ def get_int(self, key: str, default: int = 0,
     try:
         int_value = int(value)
     except (ValueError, TypeError):
-        logging.warning(f"Configuration {key} should be integer, got {type(value).__name__}, using default: {default}")
+        logging.warning("Configuration %s should be integer, got %s, using default: %s", key, type(value).__name__, default)
         return default
 
     # Clamp to min/max bounds
@@ -780,44 +830,114 @@ for server in evacuables:
 
 **Flow**:
 ```python
-def _server_evacuate_future(connection, server) -> bool:
-    # 1. Initiate evacuation
-    response = _server_evacuate(connection, server.id)
-    if not response.accepted:
-        return False
+def _server_evacuate_future(connection, server, target_host=None) -> bool:
+    # 0. Lock server to prevent concurrent operations
+    connection.servers.lock(server.id, reason=LOCK_REASON_EVACUATION)
 
-    # 2. Wait before first poll
-    time.sleep(INITIAL_EVACUATION_WAIT_SECONDS)
+    try:
+        # 1. Reset stuck task_state if present
+        if getattr(server, 'OS-EXT-STS:task_state', None) is not None:
+            connection.servers.reset_state(server.id, 'error')
 
-    # 3. Poll migration status until completion or timeout
-    start_time = time.time()
-    while True:
-        if time.time() - start_time > MAX_EVACUATION_TIMEOUT_SECONDS:
+        # 2. Initiate evacuation
+        response = _server_evacuate(connection, server.id, target_host=target_host)
+
+        # 2a. Retry without target host on 409/500
+        if not response.accepted and response.status_code in (409, 500) and target_host:
+            response = _server_evacuate(connection, server.id)
+
+        if not response.accepted:
             return False
 
-        status = _server_evacuation_status(connection, server.id)
+        # 3. Wait before first poll
+        time.sleep(INITIAL_EVACUATION_WAIT_SECONDS)
 
-        if status.completed:
-            return True
-        if status.error:
-            error_count += 1
-            if error_count >= MAX_EVACUATION_RETRIES:
-                return False
-            time.sleep(EVACUATION_RETRY_WAIT_SECONDS)
-            continue
+        # 4. Poll migration status until completion or timeout
+        result = _monitor_evacuation(connection, server.id, response.uuid, start_time)
 
-        time.sleep(EVACUATION_POLL_INTERVAL_SECONDS)
+        # 5. Restore original server state (skip if Nova already preserved it)
+        if result and original_status in ('SHUTOFF', 'ERROR'):
+            current = connection.servers.get(server.id)
+            if current.status != original_status:
+                if original_status == 'SHUTOFF':
+                    connection.servers.stop(server.id)
+                else:
+                    connection.servers.reset_state(server.id, 'error')
+
+    finally:
+        # 6. Always unlock
+        connection.servers.unlock(server.id)
 ```
 
+**Monitoring** (`_monitor_evacuation`):
+- Separate counters for migration errors (`MAX_EVACUATION_RETRIES=5`) and API errors (`MAX_API_RETRIES=10`)
+- API error counter resets on successful API call
+- On migration failure: resets server state to `error` and re-issues `_server_evacuate` (scheduler picks new target)
+- Hard timeout: `MAX_EVACUATION_TIMEOUT_SECONDS` (300s) via `time.monotonic()`
+- Per-instance K8s events emitted: `InstanceEvacuationStarted`, `InstanceEvacuationSucceeded`, `InstanceEvacuationFailed`
+
 **Behavior**:
+- Locks the server before evacuation (`LOCK_REASON_EVACUATION`) to prevent concurrent operations
+- Resets stuck `task_state` before submitting the evacuation request
 - Tracks migration status via Nova API
-- Retries on transient errors (max 5 retries)
+- Target host retry: if evacuation to a specific host fails with 409/500, retries without target (scheduler picks)
+- Migration failures trigger automatic re-issue (reset state + new evacuate call)
+- API errors retried independently (budget of 10, not shared with migration errors)
 - Times out after 300 seconds
-- Detects and reports errors
+- Skips redundant state restore when Nova already preserved the original state after evacuation
+- Restores original VM state after successful evacuation only when needed (`SHUTOFF` → stop, `ERROR` → reset_state)
+- Unlocks the server in `finally` block (even on failure)
 
 ---
 
-### 3. Server Evacuability Logic
+### 3. Orchestrated Evacuation
+
+**Configuration**: `ORCHESTRATED_RESTART: true`
+
+**Server Metadata** (set via `openstack server set --property`):
+- `instanceha:restart_priority` (int, 1-1000, default 500): Higher values = evacuated first
+- `instanceha:restart_group` (str, optional): Servers with same group evacuate concurrently
+
+**Flow**:
+```python
+# 1. Read orchestration metadata from all evacuable servers
+# 2. Group servers by restart_group (ungrouped → individual phases)
+# 3. Sort groups by highest member priority (descending)
+# 4. Evacuate each phase sequentially
+# 5. Within each phase, use ThreadPoolExecutor (concurrent, like smart evacuation)
+
+phases = _build_evacuation_groups(evacuables)  # group + sort
+for phase in phases:
+    # Evacuate phase concurrently, wait for completion
+    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+        futures = {executor.submit(_server_evacuate_future, conn, s, target): s
+                   for s in phase}
+        # Wait for all futures, fail-fast on any failure
+```
+
+**Example**:
+```
+Server metadata:
+  db-1:  priority=900, group=database
+  db-2:  priority=800, group=database
+  app-1: priority=500, group=app
+  web-1: priority=100 (no group)
+
+Evacuation order:
+  Phase 1: [db-1, db-2]  (group=database, priority=900) -- concurrent
+  Phase 2: [app-1]       (group=app, priority=500)
+  Phase 3: [web-1]       (ungrouped, priority=100)
+```
+
+**Activation**:
+- Set `ORCHESTRATED_RESTART: true` in config
+- Server metadata is only read when this config option is enabled
+
+**Backwards Compatibility**: When `ORCHESTRATED_RESTART` is not enabled, behavior is identical to smart/traditional evacuation regardless of server metadata.
+
+---
+
+### 4. Server Evacuability Logic
 
 **Tagging System** (OR semantics):
 1. **Flavor-based** (`TAGGED_FLAVORS: true`)
@@ -866,21 +986,21 @@ FENCING_AGENTS = {
 
 def _execute_fence_operation(host, action, fencing_data, service):
     agent = fencing_data.get("agent", "").lower()
-    for agent_key, agent_func in FENCING_AGENTS.items():
-        if agent_key in agent:
-            return agent_func(host, action, fencing_data, service)
+    agent_func = FENCING_AGENTS.get(agent)
+    if agent_func:
+        return agent_func(host, action, fencing_data, service)
     logging.error("Unknown fencing agent: %s", agent)
     return False
 ```
 
 ### 1. IPMI (Intelligent Platform Management Interface)
 
-**Agent**: `fence_ipmilan`
+**Agent**: `ipmi`
 
 **Configuration**:
 ```yaml
 compute-01:
-  agent: fence_ipmilan
+  agent: ipmi
   ipaddr: 192.168.1.10
   ipport: '623'
   login: admin
@@ -896,12 +1016,12 @@ compute-01:
 
 ### 2. Redfish
 
-**Agent**: `fence_redfish`
+**Agent**: `redfish`
 
 **Configuration**:
 ```yaml
 compute-02:
-  agent: fence_redfish
+  agent: redfish
   ipaddr: 192.168.1.11
   ipport: '443'
   login: root
@@ -920,12 +1040,12 @@ compute-02:
 
 ### 3. BMH (BareMetal Host - Metal3)
 
-**Agent**: `fence_metal3` (BMH)
+**Agent**: `bmh`
 
 **Configuration**:
 ```yaml
 compute-03:
-  agent: fence_metal3
+  agent: bmh
   host: metal3-0
   namespace: openshift-machine-api
   token: eyJhbGciOi...
@@ -936,6 +1056,109 @@ compute-03:
 - Uses bearer token authentication
 - Waits for power-off confirmation
 - Validates input parameters
+
+---
+
+## Kubernetes Events
+
+InstanceHA emits Kubernetes Events on the InstanceHa CR to provide observability into the evacuation lifecycle. Events are created via the K8s API using the pod's ServiceAccount token.
+
+### Prerequisites
+
+- ServiceAccount token mounted at `/var/run/secrets/kubernetes.io/serviceaccount/token`
+- `POD_NAMESPACE` environment variable set
+- `INSTANCEHA_CR_NAME` environment variable set to the InstanceHa CR name
+- `POD_NAME` environment variable set (used as `reportingInstance`)
+- RBAC: the operator ClusterRole must have `create` and `patch` permissions on `events`
+
+### Event Catalog
+
+| Reason | Type | Host | When |
+|--------|------|------|------|
+| `HostDown` | Warning | compute host | Compute service detected as down or stale |
+| `FencingStarted` | Normal | compute host | Power-off fencing operation begins |
+| `FencingSucceeded` | Normal | compute host | Fencing completed successfully |
+| `FencingFailed` | Warning | compute host | Fencing operation failed |
+| `EvacuationStarted` | Normal | compute host | VM evacuation begins (host-level) |
+| `EvacuationSucceeded` | Normal | compute host | All VMs evacuated successfully (host-level) |
+| `EvacuationFailed` | Warning | compute host | VM evacuation failed (host-level) |
+| `InstanceEvacuationStarted` | Normal | compute host | Individual VM evacuation begins (per-instance, smart/orchestrated mode) |
+| `InstanceEvacuationSucceeded` | Normal | compute host | Individual VM evacuated successfully |
+| `InstanceEvacuationFailed` | Warning | compute host | Individual VM evacuation failed |
+| `RecoveryCompleted` | Normal | compute host | Post-evacuation recovery workflow completed |
+| `ProcessingFailed` | Warning | compute host | Unhandled exception during service processing |
+| `ThresholdExceeded` | Warning | `cluster` | Failed host percentage exceeds THRESHOLD, evacuation skipped |
+| `HostReenabled` | Normal | compute host | Host re-enabled after successful evacuation |
+| `OrphanedHostRecovered` | Warning | compute host | Startup reconciliation recovered a fenced host left without evacuation marker |
+
+### Event Structure
+
+All events are created on the `InstanceHa` CR as the involved object:
+
+```yaml
+apiVersion: v1
+kind: Event
+metadata:
+  name: instanceha.a1b2c3d4e5f67890
+  namespace: openstack
+involvedObject:
+  apiVersion: instanceha.openstack.org/v1beta1
+  kind: InstanceHa
+  name: instanceha
+  namespace: openstack
+reason: FencingStarted
+message: "[compute-0] Fencing host (power off)"
+type: Normal
+firstTimestamp: "2026-04-23T10:15:30Z"
+lastTimestamp: "2026-04-23T10:15:30Z"
+source:
+  component: instanceha
+reportingComponent: instanceha
+reportingInstance: instanceha-0
+```
+
+### Event Lifecycle Example
+
+A typical compute host failure produces this sequence of events:
+
+```
+1. HostDown        (Warning)  [compute-0] Compute host detected as down
+2. FencingStarted  (Normal)   [compute-0] Fencing host (power off)
+3. FencingSucceeded(Normal)   [compute-0] Host fenced successfully
+4. EvacuationStarted(Normal)  [compute-0] Starting VM evacuation
+5. EvacuationSucceeded(Normal)[compute-0] VM evacuation completed successfully
+6. RecoveryCompleted(Normal)  [compute-0] Host recovery workflow completed
+7. HostReenabled   (Normal)   [compute-0] Host re-enabled after successful evacuation
+```
+
+A fencing failure stops the sequence early:
+
+```
+1. HostDown        (Warning)  [compute-0] Compute host detected as down
+2. FencingStarted  (Normal)   [compute-0] Fencing host (power off)
+3. FencingFailed   (Warning)  [compute-0] Fencing failed
+```
+
+A threshold breach prevents any evacuation:
+
+```
+1. HostDown          (Warning) [compute-0] Compute host detected as down
+2. HostDown          (Warning) [compute-1] Compute host detected as down
+3. ThresholdExceeded (Warning) [cluster] Impacted computes (66.7%) exceed threshold (50%), evacuation skipped
+```
+
+### Querying Events
+
+```bash
+# All InstanceHA events
+kubectl get events -n openstack --field-selector involvedObject.kind=InstanceHa
+
+# Warning events only
+kubectl get events -n openstack --field-selector involvedObject.kind=InstanceHa,type=Warning
+
+# Events for a specific reason
+kubectl get events -n openstack --field-selector involvedObject.kind=InstanceHa,reason=FencingFailed
+```
 
 ---
 
@@ -974,7 +1197,45 @@ compute-03:
 
 ---
 
-### 2. Reserved Hosts
+### 2. Heartbeat Detection
+
+**Purpose**: Dual-channel failure detection — distinguish host-level failures from nova-compute crashes by listening for heartbeat packets from compute nodes.
+
+**Architecture**:
+- Background UDP listener thread (port 7411, configurable)
+- Magic number validation (`0x48425631`, 4 bytes)
+- UTF-8 hostname extraction with regex validation
+- Timestamp tracking per host
+
+**Configuration**: `CHECK_HEARTBEAT: true`, `HEARTBEAT_TIMEOUT: 120`
+
+**Behavior**:
+1. Compute nodes send UDP heartbeat packets every 30s (via systemd timer + `instanceha-heartbeat.py`)
+2. InstanceHA records timestamps in `heartbeat_hosts_timestamp`
+3. When Nova reports a host as down, `_filter_reachable_hosts` checks:
+   - If heartbeat received within `HEARTBEAT_TIMEOUT` seconds → host OS is alive → skip fencing (only nova-compute crashed)
+   - If no heartbeat → host is genuinely down → proceed with fencing and evacuation
+4. **Grace period**: During the first `HEARTBEAT_TIMEOUT` seconds after listener startup, all hosts bypass heartbeat filtering (no heartbeat history exists yet)
+
+**Packet Format**:
+```
+Bytes 0-3: Magic number 0x48425631 (unsigned int, native byte order)
+Bytes 4+:  Hostname (UTF-8, short hostname without domain)
+```
+
+**Compute-Side Deployment** (edpm-ansible `edpm_instanceha_monitoring` role):
+- `instanceha-heartbeat.py` — Python script using stdlib only (socket, struct)
+- `instanceha-heartbeat.timer` — systemd timer (OnBootSec=10s, OnUnitActiveSec=30s)
+- Runs as `nobody:nobody` (no root required for UDP send)
+
+**Security**:
+- Hostname validated against `VALIDATION_PATTERNS['hostname']` regex
+- Maximum hostname length enforced
+- Packets from any source accepted (same trust model as kdump, mitigated by dedicated network)
+
+---
+
+### 3. Reserved Hosts
 
 **Purpose**: Maintain spare capacity by auto-enabling reserved hosts and optionally forcing evacuation to them.
 
@@ -1000,6 +1261,11 @@ compute-03:
 4. If `FORCE_RESERVED_HOST_EVACUATION=false` or no host enabled:
    - Normal evacuation (Nova scheduler chooses destination)
    - `servers.evacuate(server=id)` without host parameter
+5. If evacuation fails and a reserved host was activated:
+   - Check if any VMs landed on the reserved host (`servers.list(host=target)`)
+   - If VMs present: keep the reserved host active (it has workload, cannot be a spare)
+   - If no VMs: `_return_reserved_host()` disables the host and returns it to the pool
+   - If the VM check API call fails: err on the safe side and keep the reserved host
 
 **Example Flow**:
 ```
@@ -1015,7 +1281,7 @@ Reserved Hosts: reserved-01 (aggregate-A), reserved-02 (aggregate-B)
 
 ---
 
-### 3. Caching System
+### 4. Caching System
 
 **Purpose**: Cache evacuable resources to reduce Nova API calls.
 
@@ -1033,17 +1299,22 @@ Reserved Hosts: reserved-01 (aggregate-A), reserved-02 (aggregate-B)
 
 ---
 
-### 4. Threshold Protection
+### 5. Threshold Protection
 
 **Purpose**: Prevent mass evacuations during datacenter-level failures.
 
 **Implementation**:
 ```python
-threshold_percent = (len(compute_nodes) / len(services)) * 100
+# Filter to active services only — disabled and force-downed hosts excluded from denominator
+active_services = [s for s in services if 'disabled' not in s.status and not s.forced_down]
+threshold_percent = (len(compute_nodes) / len(active_services)) * 100 if active_services else 0
+
 if threshold_percent > service.config.get_threshold():
-    logging.error(f'Impacted ({threshold_percent:.1f}%) exceeds threshold')
+    logging.error('Impacted (%.1f%%) exceeds threshold', threshold_percent)
     return  # Do not evacuate
 ```
+
+Both the standard path and the `TAGGED_AGGREGATES` path (`_count_evacuable_hosts`) use the same active-only filtering.
 
 ---
 
@@ -1173,13 +1444,165 @@ clouds:
 
 ---
 
+## Authentication
+
+InstanceHA supports two authentication methods for connecting to the Nova API:
+
+### 1. Password Authentication (Default)
+
+Uses `clouds.yaml` and `secure.yaml` for standard Keystone password authentication:
+
+```python
+def create_connection(self) -> Optional[OpenStackClient]:
+    cloud_name = self.config.get_cloud_name()
+    auth = self.config.clouds[cloud_name]["auth"]
+    password = self.config.secure[cloud_name]["auth"]["password"]
+    region_name = self.config.clouds[cloud_name]["region_name"]
+    credentials = NovaLoginCredentials(...)
+    return nova_login(credentials, ca_bundle=self.config.ssl_ca_bundle)
+```
+
+### 2. Application Credential Authentication
+
+Uses Keystone Application Credentials for token-scoped authentication without storing user passwords.
+
+**Activation**:
+- Set `auth.applicationCredentialSecret` in the InstanceHa CR spec
+- The controller mounts the referenced Secret and sets `AC_ENABLED=True` environment variable
+- The Python service detects `AC_ENABLED` and loads credentials from the mounted path
+
+**Credential Loading**:
+```python
+AC_CREDENTIALS_PATH = "/secrets/ac-credentials"
+
+def _load_ac_credentials(auth_url: str, region_name: str) -> Optional[ACLoginCredentials]:
+    """Load Application Credential from the mounted secret directory."""
+    # Reads AC_ID and AC_SECRET files from the mounted secret
+    return ACLoginCredentials(
+        auth_url=auth_url,
+        application_credential_id=ac_id,
+        application_credential_secret=ac_secret,
+        region_name=region_name,
+    )
+```
+
+**Nova Login**:
+```python
+def nova_login_ac(credentials: ACLoginCredentials, ca_bundle=None) -> OpenStackClient:
+    loader = loading.get_plugin_loader("v3applicationcredential")
+    auth = loader.load_from_options(
+        auth_url=credentials.auth_url,
+        application_credential_id=credentials.application_credential_id,
+        application_credential_secret=credentials.application_credential_secret,
+    )
+    session = ksc_session.Session(auth=auth, verify=verify, timeout=NOVA_API_TIMEOUT_SECONDS)
+    nova = client.Client("2.73", session=session, region_name=credentials.region_name)
+    nova.versions.get_current()  # Verify connectivity
+    return nova
+```
+
+**Fallback**: If `AC_ENABLED` is set but credentials cannot be loaded, falls back to password authentication with a warning.
+
+**Secret Format** (Kubernetes Secret with keys `AC_ID` and `AC_SECRET`):
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: instanceha-ac-credentials
+type: Opaque
+stringData:
+  AC_ID: "application-credential-id"
+  AC_SECRET: "application-credential-secret"
+```
+
+**Kubernetes Operator Integration**:
+```yaml
+apiVersion: instanceha.openstack.org/v1beta1
+kind: InstanceHa
+spec:
+  auth:
+    applicationCredentialSecret: instanceha-ac-credentials
+```
+
+---
+
+## Startup Reconciliation
+
+**Function**: `_reconcile_orphaned_hosts(conn)`
+
+**Purpose**: Recover hosts left in an inconsistent state after a pod crash. Called once at startup before entering the main poll loop.
+
+### Host Recovery
+
+If the pod crashed after fencing a host (`forced_down=True`) but before setting the `disabled_reason` evacuation marker, the host would be incorrectly routed to the re-enable path instead of the evacuation path.
+
+**Detection**: Finds services where `forced_down=True`, `state='down'`, but status is NOT `disabled` (missing the evacuation marker).
+
+**Action**: Sets `disabled_reason` to `"instanceha evacuation (recovered): {timestamp}"` so the normal resume logic picks the host up for evacuation.
+
+```python
+for svc in services:
+    if not (svc.forced_down and svc.state == 'down'):
+        continue
+    if 'disabled' in svc.status:
+        continue
+    # Orphaned — fenced but not marked for evacuation
+    conn.services.disable_log_reason(svc.id, disable_reason)
+    _emit_k8s_event(svc.host, 'OrphanedHostRecovered', ...)
+```
+
+### VM Unlock
+
+If the pod crashed while evacuating VMs, some may be left locked with `locked_reason=instanceha-evacuation`. The reconciliation loop unlocks these VMs:
+
+```python
+for svc in services:
+    if not (svc.forced_down and svc.state == 'down'):
+        continue
+    servers = conn.servers.list(search_opts={'host': svc.host, 'all_tenants': 1})
+    for s in servers:
+        if getattr(s, 'locked_reason', None) == LOCK_REASON_EVACUATION:
+            conn.servers.unlock(s.id)
+```
+
+### K8s Event
+
+Emits `OrphanedHostRecovered` (Warning) for each recovered host.
+
+---
+
+## Graceful Shutdown
+
+InstanceHA supports graceful shutdown via SIGTERM signal handling.
+
+**Implementation**:
+```python
+def _sigterm_handler(signum, frame):
+    logging.info("SIGTERM received, finishing in-flight work before shutdown")
+    service.shutdown_event.set()
+
+signal.signal(signal.SIGTERM, _sigterm_handler)
+```
+
+**Behavior**:
+- `shutdown_event` is a `threading.Event` checked in the main loop condition (`while not service.shutdown_event.is_set()`)
+- All `time.sleep()` calls replaced with `service.shutdown_event.wait(seconds)` — these return immediately when the event is set
+- In-flight evacuations complete before shutdown (no abrupt termination)
+- Logs `"Graceful shutdown complete"` on exit
+
+**Kubernetes Integration**:
+- The Deployment's `terminationGracePeriodSeconds` is set to 30 seconds
+- The Deployment strategy is `Recreate` (not `RollingUpdate`) to avoid two instances running simultaneously
+
+---
+
 ## Security
 
 ### 1. Input Validation
 
 **SSRF Prevention**:
-- URL validation (block localhost, link-local) with specific exception handling
-- IP address validation (IPv4/IPv6)
+- URL validation using `ipaddress` module to block loopback and link-local addresses
+- IP address validation (IPv4/IPv6) via `ipaddress.ip_address()`
 - Port range validation (1-65535)
 
 **Injection Prevention**:
@@ -1195,7 +1618,34 @@ clouds:
 
 ---
 
-### 2. Credential Security
+### 2. Server Locking
+
+During smart/orchestrated evacuation, servers are locked before evacuation and unlocked after completion to prevent concurrent operations (e.g., user-initiated live migration) from interfering with the evacuation workflow.
+
+```python
+LOCK_REASON_EVACUATION = "instanceha-evacuation"
+
+# In _server_evacuate_future:
+try:
+    connection.servers.lock(server.id, reason=LOCK_REASON_EVACUATION)
+except Exception:
+    logging.debug("Could not lock server %s (may already be locked)", server.id)
+
+try:
+    # ... evacuation logic ...
+finally:
+    try:
+        connection.servers.unlock(server.id)
+    except Exception:
+        logging.debug("Could not unlock server %s (may have been deleted)", server.id)
+```
+
+- Lock uses a specific reason string to distinguish from user locks
+- Startup reconciliation unlocks VMs left locked by a crashed instance (see [Startup Reconciliation](#startup-reconciliation))
+
+---
+
+### 3. Credential Security
 
 **Password Handling**:
 ```python
@@ -1212,6 +1662,8 @@ _SECRET_PATTERNS = {
     'token': re.compile(r'\btoken=[^\s)\'\"]+', re.IGNORECASE),
     'secret': re.compile(r'\bsecret=[^\s)\'\"]+', re.IGNORECASE),
     'credential': re.compile(r'\bcredential=[^\s)\'\"]+', re.IGNORECASE),
+    'application_credential_secret': re.compile(r'\bapplication_credential_secret=[^\s)\'\"]+', re.IGNORECASE),
+    'application_credential_id': re.compile(r'\bapplication_credential_id=[^\s)\'\"]+', re.IGNORECASE),
     'auth': re.compile(r'\bauth=[^\s)\'\"]+', re.IGNORECASE),
 }
 
@@ -1224,7 +1676,7 @@ def _safe_log_exception(msg: str, e: Exception):
 
 ---
 
-### 3. SSL/TLS Configuration
+### 4. SSL/TLS Configuration
 
 **Requests SSL Config**:
 ```python
@@ -1279,7 +1731,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
     }
 ```
 
-**Concurrency**: WORKERS configuration controls number of concurrent evacuations.
+**Concurrency**: WORKERS controls the number of hosts processed concurrently and, for smart/orchestrated mode, the per-host server concurrency (capped at `MAX_TOTAL_EVACUATION_THREADS=32`).
 
 ---
 
@@ -1296,92 +1748,115 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
 
 ### Test Statistics
 
-- **Total Tests**: 401 (203 unit + 16 security + 29 critical error + 12 workflow + 32 config + 18 helper + 68 functional + 22 integration + 7 region)
-- **Code Coverage**: 71% (unit tests alone), 83% (with all tests)
-- **Execution Time**: ~13 seconds (unit tests), ~26 seconds (all tests)
+- **Total Tests**: 653 across 17 test suites
 
 ### Test Categories
 
-**1. Unit Tests** (203 tests):
-The unit test suite in `test_instanceha.py` includes tests for:
+**1. Core Unit Tests** (`test_unit_core.py`):
+Core unit tests covering:
 - Configuration management and validation
 - Service initialization and caching
 - Main function initialization and error handling
 - Evacuation logic and tag checking
 - Smart evacuation with success, failure, and exception path testing
-- Kdump detection and UDP message processing
-- Redfish, IPMI, and BMH fencing operations
 - Thread safety and memory management
 - Security and secret sanitization
-- Input validation and SSRF prevention
 - Reserved host management (aggregate and zone matching)
 - FORCE_ENABLE configuration behavior
 
-**2. Security Validation Tests** (16 tests):
-The security validation test suite in `test_security_validation.py` covers:
-- SSRF prevention (6 tests): URL validation, localhost/link-local blocking
-- Injection prevention (7 tests): Port validation, power action whitelisting, username validation, Kubernetes resource validation
-- Fencing validation (3 tests): Power action validation, parameter validation
+**2. Fencing Agents Tests** (`test_fencing_agents.py`):
+- IPMI fencing operations (power on/off, status, timeouts)
+- Redfish fencing operations (SSL, retries, power state verification)
+- BMH/Metal3 fencing (Kubernetes API, bearer token auth, power-off wait)
+- Noop fencing agent
+- Fencing agent dispatch and validation
 
-**3. Critical Error Path Tests** (29 tests):
-The critical error path test suite in `test_critical_error_paths.py` covers:
-- Configuration errors (7 tests): YAML parsing, missing files, permissions, type validation
-- Nova API exceptions (8 tests): NotFound, Forbidden, Unauthorized, connection failures
-- Service disable validation (4 tests): Missing connection/service, attribute validation
-- Evacuation timeouts (3 tests): Smart evacuation timeout, retry exhaustion
-- Fencing failures (7 tests): Missing configuration, invalid parameters
+**3. Kdump Detection Tests** (`test_kdump_detection.py`):
+- UDP message processing and magic number validation
+- Kdump host timestamp tracking and cleanup
+- Reverse DNS lookup integration
+- Kdump timeout and delay behavior
 
-**4. Evacuation Workflow Tests** (12 tests):
-The evacuation workflow test suite in `test_evacuation_workflow.py` covers:
-- Kdump resume disable logic (3 tests): Already disabled service handling, kdump-fenced host handling, new evacuation handling
-- Post-evacuation recovery error paths (3 tests): Power-on failures, disable reason update failures, unexpected exceptions
-- Process service step failures (6 tests): Fencing, disable, reserved hosts, evacuation, recovery step failures
+**4. Security Validation Tests** (`test_security_validation.py`):
+- SSRF prevention: URL validation, loopback/link-local blocking via `ipaddress` module
+- Injection prevention: Port validation, power action whitelisting, username validation, Kubernetes resource validation
+- Fencing validation: Power action validation, parameter validation
 
-**5. Configuration Feature Tests** (32 tests):
-The configuration feature test suite in `test_config_features.py` covers:
-- DISABLED configuration (2 tests): Skip evacuations when enabled
-- Critical services check (8 tests): Scheduler and conductor validation
-- FORCE_ENABLE configuration (8 tests): Migration completion bypass, kdump delay respect, forced_down two-stage process
-- LEAVE_DISABLED configuration (2 tests): Service filtering for re-enable
-- TAGGED_AGGREGATES configuration (2 tests): Aggregate-based filtering
-- DELAY configuration (4 tests): Pre-evacuation delay validation
-- HASH_INTERVAL configuration (6 tests): Health hash update interval
+**5. Critical Error Path Tests** (`test_critical_error_paths.py`):
+- Configuration errors: YAML parsing, missing files, permissions, type validation
+- Nova API exceptions: NotFound, Forbidden, Unauthorized, connection failures
+- Evacuation timeouts and fencing failures
 
-**6. Helper Functions Tests** (18 tests):
-The helper functions test suite in `test_helper_functions.py` covers:
-- _cleanup_filtered_hosts (4 tests): Host cleanup logic
-- _filter_processing_hosts (5 tests): Processing state filtering
-- _prepare_evacuation_resources (5 tests): Resource preparation
-- _count_evacuable_hosts (4 tests): Evacuable host counting
+**6. Evacuation Workflow Tests** (`test_evacuation_workflow.py`):
+- Kdump resume disable logic and post-evacuation recovery error paths
+- Process service step failures: Fencing, disable, reserved hosts, evacuation, recovery
+- Reserved host return on partial evacuation failure: VMs present, empty host, API failure
 
-**7. Functional Tests** (68 tests):
-The functional test suite in `functional_test.py` covers:
-- End-to-end evacuation workflows
-- Large-scale scenarios (100+ hosts)
-- Host state classification and filtering
+**7. Configuration Feature Tests** (`test_config_features.py`):
+- DISABLED, FORCE_ENABLE, LEAVE_DISABLED, TAGGED_AGGREGATES, DELAY, HASH_INTERVAL
+- Critical services check: Scheduler and conductor validation
+
+**8. Helper Functions Tests** (`test_helper_functions.py`):
+- `_cleanup_filtered_hosts`, `_filter_processing_hosts`, `_prepare_evacuation_resources`, `_count_evacuable_hosts`
+
+**9. Functional Tests** (`functional_test.py`):
+- End-to-end evacuation workflows and large-scale scenarios
 - Tagging logic combinations (flavors, images, aggregates)
-- Reserved host management (aggregate/zone matching and forced evacuation)
-- Performance testing
-- Kdump integration workflows
+- Reserved host management and kdump integration workflows
 
-**8. Integration Tests** (22 tests):
-The integration test suite in `integration_test.py` covers:
-- Service initialization workflows
-- Nova connection establishment
-- Service categorization and filtering pipelines
-- Full evacuation workflows with all components
-- Re-enabling workflows with migration checks
-- Performance and scaling under load
-- Error handling and recovery scenarios
+**10. Integration Tests** (`integration_test.py`):
+- Service initialization and Nova connection
+- Full evacuation and re-enabling workflows
+- Performance, scaling, and error recovery
 
-**9. Region Isolation Tests** (7 tests):
-The region isolation test suite in `test_region_isolation.py` covers:
-- Nova client region scoping verification
-- Service list filtering by region
-- Evacuation operation region boundaries
-- Multi-region deployment independence
-- Region name authentication chain validation
+**11. Region Isolation Tests** (`test_region_isolation.py`):
+- Nova client region scoping and multi-region independence
 - Configuration requirement validation
+
+**12. Coverage Gaps Tests** (`test_coverage_gaps.py`):
+- Validation helpers: `_try_validate`, `_validate_fencing_params`, `_validate_fencing_inputs`
+- Fencing agent dispatchers: `_fence_noop`, `_fence_ipmi`, `_fence_redfish`, `_fence_bmh`
+- IPMI execution with retry logic: `_execute_ipmi_fence`
+- Service resume eligibility: `_is_service_resume_candidate`
+- Aggregate filtering: `_aggregate_ids`
+- Traditional evacuation logic: `_traditional_evacuate`
+- Step execution wrapper: `_execute_step`
+- Redfish URL construction edge cases: `_build_redfish_url`
+- Datetime parsing protection: `_is_service_stale` (None, malformed, missing attribute)
+- Evacuation monitoring: `_monitor_evacuation` (completion, retry, timeout)
+- Main loop backoff: exponential backoff on Unauthorized/DiscoveryFailure/generic errors
+- Process stale services safety: empty nodes, threshold exceeded, disabled mode
+
+**13. K8s Events Tests** (`test_k8s_events.py`):
+- K8s credential reading and event emission
+- Event lifecycle: fencing, evacuation, recovery, re-enable
+- Error handling: missing credentials, failed API calls, missing CR name
+
+**14. Thread Safety Tests** (`test_thread_safety.py`):
+- Concurrent cache access and refresh
+- Processing lock contention under parallel poll cycles
+- Reserved host list thread-safe removal
+
+**15. Heartbeat Detection Tests** (`test_heartbeat_detection.py`):
+- UDP heartbeat message processing and magic number validation
+- Hostname extraction from packet payload
+- Heartbeat timestamp tracking and expiry
+- Grace period behavior during listener startup
+- Reachable host filtering based on heartbeat freshness
+- Heartbeat listener thread lifecycle
+
+**16. Heartbeat Scale Tests** (`test_heartbeat_scale.py`):
+- Large-scale heartbeat timestamp tracking
+- Concurrent heartbeat writes under load
+- Cleanup threshold behavior with many hosts
+
+**17. Orchestrated Evacuation Tests** (`test_orchestrated_evacuation.py`):
+- Metadata extraction: `_get_evacuation_metadata` (priority parsing, clamping, defaults)
+- Missing metadata warning: logs when enabled but no servers have metadata
+- Group building: `_build_evacuation_groups` (grouping, priority sorting, mixed inputs)
+- Phase execution: `_orchestrated_evacuate` (multi-phase success/failure, target_host passthrough)
+- Branching logic: `_host_evacuate` orchestrated/smart/traditional routing
+- Configuration: `ORCHESTRATED_RESTART` config key validation
 
 ### Coverage by Component
 
@@ -1445,10 +1920,16 @@ spec:
           httpGet:
             path: /
             port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 30
         readinessProbe:
           httpGet:
-            path: /
+            path: /healthz
             port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 10
       volumes:
       - name: config
         configMap:
@@ -1557,19 +2038,20 @@ config:
 **Description**: Maximum percentage of failed compute services before evacuation is blocked.
 
 **Usage**:
+- Denominator always excludes disabled and force-downed hosts (active services only)
 - Calculation depends on `TAGGED_AGGREGATES` setting:
-  - When `TAGGED_AGGREGATES=false`: `(failed_hosts / total_hosts) * 100`
-  - When `TAGGED_AGGREGATES=true`: `(failed_hosts / total_evacuable_hosts) * 100`
+  - When `TAGGED_AGGREGATES=false`: `(failed_hosts / active_hosts) * 100`
+  - When `TAGGED_AGGREGATES=true`: `(failed_hosts / active_evacuable_hosts) * 100`
 - If threshold exceeded, evacuation is skipped and error logged
 
 **Behavior**:
 - **Without aggregate filtering** (`TAGGED_AGGREGATES=false`):
-  - Calculates percentage against all compute services
-  - Example: 5 failed / 10 total = 50%
+  - Calculates percentage against active compute services (excludes disabled/force-downed)
+  - Example: 3 failed / 6 active = 50% (not 3/10 total = 30%)
 
 - **With aggregate filtering** (`TAGGED_AGGREGATES=true`):
-  - Calculates percentage against only hosts in evacuable aggregates
-  - Example: 5 failed / 8 evacuable = 62.5% (vs 5/10=50% without filtering)
+  - Calculates percentage against active hosts in evacuable aggregates
+  - Example: 3 failed / 5 active evacuable = 60%
 
 **Testing**:
 - Unit tests verify percentage validation and clamping
@@ -1597,12 +2079,11 @@ config:
 **Default**: `4`
 **Range**: `1-50`
 
-**Description**: Thread pool size for concurrent smart evacuations. Controls how many server evacuations can be processed simultaneously.
+**Description**: Thread pool size for concurrent processing. Controls parallelism at two levels: host-level processing and per-host server evacuation.
 
 **Usage**:
-- Used with `ThreadPoolExecutor` for parallel evacuation tracking
-- Only applies when `SMART_EVACUATION=true`
-- Higher values increase concurrency but consume more resources
+- **Host-level**: `_process_stale_services` uses `_run_concurrent` with `WORKERS` threads to process multiple failed hosts in parallel via `process_service`. This applies to all evacuation modes (traditional, smart, and orchestrated).
+- **Per-host (smart/orchestrated only)**: Within each host's evacuation, `_smart_evacuate` and `_orchestrated_evacuate` use `_run_concurrent` to evacuate multiple VMs concurrently. The per-host thread count is calculated as `MAX_TOTAL_EVACUATION_THREADS (32) // WORKERS` to cap the total system-wide thread count.
 
 **Testing**:
 - Unit tests verify range validation (1-50)
@@ -1613,10 +2094,10 @@ config:
 **Example**:
 ```yaml
 config:
-  WORKERS: 8  # Process 8 evacuations concurrently
+  WORKERS: 8  # Process 8 hosts concurrently; each host gets up to 4 per-host threads (32/8)
 ```
 
-**Notes**: Only relevant when `SMART_EVACUATION=true` (traditional mode doesn't use threads).
+**Notes**: Applies to all evacuation modes at the host level. For smart/orchestrated mode, also controls per-host server concurrency (capped by `MAX_TOTAL_EVACUATION_THREADS=32`).
 
 ---
 
@@ -1699,8 +2180,10 @@ config:
 **Behavior**:
 - **Smart mode**:
   - Tracks migration status via Nova API
-  - Polls every 10 seconds until completion or timeout (300s)
-  - Retries on transient errors (max 5 retries)
+  - Polls every 5 seconds until completion or timeout (300s)
+  - Separate error budgets: migration errors (max 5) and API errors (max 10)
+  - Migration failures trigger automatic re-issue (reset state + new evacuate call)
+  - Restores original VM state after success (`SHUTOFF` → stop, `ERROR` → reset_state)
   - Updates service `disabled_reason` on success/failure
   - Uses thread pool (`WORKERS`) for concurrent tracking
 
@@ -1726,6 +2209,86 @@ config:
 **Notes**:
 - Smart mode increases API load (polling) and memory usage (thread pool)
 - Traditional mode does not track completion or verify success after submission
+
+---
+
+#### ORCHESTRATED_RESTART
+**Type**: Boolean
+**Default**: `false`
+**Range**: N/A
+
+**Description**: Enable priority-based evacuation ordering using server metadata. When enabled, servers are evacuated in priority-ordered phases rather than all at once.
+
+**Usage**:
+- Controls evacuation strategy selection in `_host_evacuate()`
+- When `true`: Uses `_orchestrated_evacuate()` with priority-ordered phases
+- Must be explicitly enabled; server metadata alone does not activate orchestrated mode
+- A warning is logged if enabled but no servers have orchestration metadata
+
+**Behavior**:
+- Servers grouped by `instanceha:restart_group` metadata
+- Groups sorted by highest `instanceha:restart_priority` (descending)
+- Each group evacuated concurrently (using WORKERS thread pool)
+- Groups processed sequentially (wait for completion before next group)
+- Fail-fast: stops on first group failure
+
+**Server Metadata Keys**:
+- `instanceha:restart_priority`: Integer 1-1000 (default 500). Higher = evacuated first.
+- `instanceha:restart_group`: String (optional). Servers with same group evacuate together.
+
+**Testing**:
+- Metadata extraction and validation tests
+- Group building and priority sorting tests
+- Orchestrated evacuation with phase sequencing tests
+- Host evacuate branching logic tests
+- Config-only activation: metadata ignored when ORCHESTRATED_RESTART=false
+
+**Example**:
+```yaml
+config:
+  ORCHESTRATED_RESTART: true
+```
+
+Server metadata:
+```bash
+openstack server set --property instanceha:restart_priority=900 --property instanceha:restart_group=database db-server
+openstack server set --property instanceha:restart_priority=500 --property instanceha:restart_group=app app-server
+openstack server set --property instanceha:restart_priority=100 web-server
+```
+
+---
+
+#### SKIP_SERVERS_WITH_NAME
+**Type**: List (of strings)
+**Default**: `[]` (empty list — no servers skipped)
+**Range**: N/A
+
+**Description**: List of name patterns to exclude from evacuation. Any server whose name contains one of these substrings is skipped during evacuation.
+
+**Usage**:
+- Evaluated in `_get_evacuable_servers()` before evacuability filtering
+- Uses substring matching (`pattern in server.name`) — not regex
+- Skipped servers are logged with their IDs for auditability
+
+**Behavior**:
+- When empty (default): all servers in matching states are eligible for evacuation
+- When populated: servers with names containing any listed pattern are excluded
+- Filtering applied after state filtering (ACTIVE, ERROR, SHUTOFF) but before tag-based filtering
+
+**Example**:
+```yaml
+config:
+  SKIP_SERVERS_WITH_NAME:
+    - "test-"
+    - "dev-instance"
+```
+
+This would skip servers named `test-vm-1`, `dev-instance-02`, etc.
+
+**Use Cases**:
+- Exclude test or development VMs from evacuation
+- Protect specific workloads that should not be evacuated (e.g., VMs with local-only state)
+- Temporary exclusion during maintenance of specific applications
 
 ---
 
@@ -1890,11 +2453,11 @@ openstack flavor set --property ha-enabled=true m1.small
 - When `true`:
   - Only evacuate servers if host is in an aggregate with `{EVACUABLE_TAG}: true` metadata
   - Reserved hosts matched by shared aggregate
-  - `THRESHOLD` percentage calculated against evacuable hosts only
+  - `THRESHOLD` percentage calculated against active evacuable hosts only
 - When `false`:
   - Ignore aggregate tags (all aggregates considered evacuable)
   - Reserved hosts matched by availability zone
-  - `THRESHOLD` percentage calculated against all compute services
+  - `THRESHOLD` percentage calculated against active compute services (excludes disabled/force-downed)
 
 **Testing**:
 - Functional tests verify aggregate-based filtering
@@ -1917,7 +2480,7 @@ openstack aggregate set --property ha-enabled=true production-hosts
 
 **Notes**:
 - Affects reserved host matching behavior
-- Affects threshold calculation (percentage of evacuable hosts vs all hosts)
+- Affects threshold calculation (percentage of active evacuable hosts vs active hosts)
 
 ---
 
@@ -2090,6 +2653,68 @@ POLL=45, KDUMP_TIMEOUT=300
 
 ---
 
+### Heartbeat Detection Options
+
+#### CHECK_HEARTBEAT
+**Type**: Boolean
+**Default**: `false`
+**Range**: N/A
+
+**Description**: Enable heartbeat-based dual-channel failure detection. When enabled, compute nodes send periodic UDP heartbeat packets. If Nova reports a host as down but heartbeats are still arriving, the host OS is alive and only nova-compute has crashed — fencing is skipped.
+
+**Usage**:
+- Controls whether heartbeat UDP listener thread is started (port 7411)
+- Affects host filtering in `_filter_reachable_hosts()` before evacuation
+
+**Behavior**:
+- **Enabled**:
+  - Start UDP listener on port 7411 (or `HEARTBEAT_PORT` env var)
+  - Record heartbeat timestamps per hostname
+  - When host detected as down, check if heartbeat received within `HEARTBEAT_TIMEOUT`
+  - If heartbeat recent: skip fencing (nova-compute crash, not host failure)
+  - If no heartbeat: proceed with normal evacuation
+  - Grace period: first `HEARTBEAT_TIMEOUT` seconds after listener startup, all hosts bypass heartbeat filtering
+
+- **Disabled**:
+  - No heartbeat listener thread
+  - All down hosts processed through normal fencing/evacuation
+
+**Compute-Side Requirements**:
+- Deploy `edpm_instanceha_monitoring` role via edpm-ansible
+- Installs `instanceha-heartbeat.py` script + systemd timer
+- Sends UDP packets every 30s with magic `0x48425631` + hostname
+
+**Example**:
+```yaml
+config:
+  CHECK_HEARTBEAT: true
+  HEARTBEAT_TIMEOUT: 120
+```
+
+---
+
+#### HEARTBEAT_TIMEOUT
+**Type**: Integer
+**Default**: `120`
+**Range**: `30-600` seconds
+
+**Description**: Maximum time since last heartbeat before a host is considered unreachable. Also used as the grace period duration after listener startup.
+
+**Usage**:
+- Hosts with heartbeat received within `HEARTBEAT_TIMEOUT` seconds are skipped during evacuation
+- Grace period: listener bypasses heartbeat filtering for the first `HEARTBEAT_TIMEOUT` seconds (no history exists yet)
+
+**Example**:
+```yaml
+config:
+  CHECK_HEARTBEAT: true
+  HEARTBEAT_TIMEOUT: 180  # 3-minute window for heartbeat freshness
+```
+
+**Notes**: Should be at least 2x the heartbeat send interval (default 30s) to tolerate missed packets.
+
+---
+
 ### Service Control Options
 
 #### DISABLED
@@ -2252,8 +2877,11 @@ requests.post(url, timeout=20)  # Retry up to 3 times
 
 **Behavior**:
 - Health hash updated approximately every `HASH_INTERVAL` seconds
-- Hash exposed via HTTP endpoint for monitoring
-- `hash_update_successful` flag indicates service health
+- Hash exposed via HTTP health check server on port 8080:
+  - `GET /` — **Liveness probe**: returns 200 with current hash if `hash_update_successful`, 500 otherwise
+  - `GET /healthz` — **Readiness probe**: returns 200 if `ready` flag is set (after first successful poll), 503 otherwise
+- `hash_update_successful` flag indicates service liveness
+- `ready` flag set to `True` after first successful poll cycle completes
 - Hash updated at most once per `HASH_INTERVAL` seconds
 
 **Testing**:
@@ -2277,17 +2905,25 @@ config:
 
 ## References
 
-- **Code**: `instanceha.py` (2,872 lines)
-- **Tests**: 401 tests across 9 test files
-  - `test_instanceha.py` (203 unit tests)
-  - `test_security_validation.py` (16 security tests)
-  - `test_critical_error_paths.py` (29 critical error tests)
-  - `test_evacuation_workflow.py` (12 workflow tests)
-  - `test_config_features.py` (32 config tests)
-  - `test_helper_functions.py` (18 helper tests)
-  - `functional_test.py` (68 functional tests)
-  - `integration_test.py` (22 integration tests)
-  - `test_region_isolation.py` (7 region tests)
+- **Code**: `instanceha.py` (3,449 lines)
+- **Tests**: 656 tests across 17 test suites
+  - `test_unit_core.py` (core unit tests)
+  - `test_fencing_agents.py` (fencing agent tests)
+  - `test_kdump_detection.py` (kdump detection tests)
+  - `test_security_validation.py` (security tests)
+  - `test_critical_error_paths.py` (critical error tests)
+  - `test_evacuation_workflow.py` (workflow tests)
+  - `test_config_features.py` (config tests)
+  - `test_helper_functions.py` (helper tests)
+  - `functional_test.py` (functional tests)
+  - `integration_test.py` (integration tests)
+  - `test_region_isolation.py` (region tests)
+  - `test_coverage_gaps.py` (coverage gap tests)
+  - `test_k8s_events.py` (K8s events tests)
+  - `test_thread_safety.py` (thread safety tests)
+  - `test_orchestrated_evacuation.py` (orchestrated evacuation tests)
+  - `test_heartbeat_detection.py` (heartbeat detection tests)
+  - `test_heartbeat_scale.py` (heartbeat scale tests)
 - **Documentation**: This file (INSTANCEHA_ARCHITECTURE.md)
 - **OpenStack API**: https://docs.openstack.org/api-ref/compute/
 - **Redfish**: https://www.dmtf.org/standards/redfish

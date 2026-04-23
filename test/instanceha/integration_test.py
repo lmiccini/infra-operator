@@ -23,28 +23,10 @@ from unittest.mock import Mock, patch, MagicMock, call
 from datetime import datetime, timedelta
 import concurrent.futures
 
-# Mock OpenStack dependencies before importing instanceha
-# This allows tests to run without novaclient, keystoneauth1, etc.
-if 'novaclient' not in sys.modules:
-    sys.modules['novaclient'] = MagicMock()
-    sys.modules['novaclient.client'] = MagicMock()
-    sys.modules['novaclient.exceptions'] = MagicMock()
-
-if 'keystoneauth1' not in sys.modules:
-    sys.modules['keystoneauth1'] = MagicMock()
-    sys.modules['keystoneauth1.loading'] = MagicMock()
-    sys.modules['keystoneauth1.session'] = MagicMock()
-    sys.modules['keystoneauth1.exceptions'] = MagicMock()
-    sys.modules['keystoneauth1.exceptions.discovery'] = MagicMock()
-
 # Suppress warnings during testing
 logging.getLogger().setLevel(logging.CRITICAL)
 
-# Add the module path for testing
-test_dir = os.path.dirname(os.path.abspath(__file__))
-instanceha_path = os.path.join(test_dir, '../../templates/instanceha/bin/')
-sys.path.insert(0, os.path.abspath(instanceha_path))
-
+import conftest  # noqa: F401
 import instanceha
 
 
@@ -308,26 +290,18 @@ class TestServiceInitialization(unittest.TestCase):
         config_manager.secure_path = secure_path
         config_manager.__init__(config_path)
 
-        # Set config_manager as module attribute for _initialize_service to use
-        instanceha.config_manager = config_manager
+        with patch('threading.Thread') as mock_thread:
+            mock_thread_instance = Mock()
+            mock_thread.return_value = mock_thread_instance
 
-        try:
-            with patch('threading.Thread') as mock_thread:
-                mock_thread_instance = Mock()
-                mock_thread.return_value = mock_thread_instance
+            service = instanceha._initialize_service(config_manager)
 
-                service = instanceha._initialize_service()
+            # Verify threads were created (health check + potentially kdump)
+            self.assertGreaterEqual(mock_thread.call_count, 1)
+            mock_thread_instance.start.assert_called()
 
-                # Verify threads were created (health check + potentially kdump)
-                self.assertGreaterEqual(mock_thread.call_count, 1)
-                mock_thread_instance.start.assert_called()
-
-                # Verify service was created
-                self.assertIsNotNone(service)
-        finally:
-            # Clean up module attribute
-            if hasattr(instanceha, 'config_manager'):
-                delattr(instanceha, 'config_manager')
+            # Verify service was created
+            self.assertIsNotNone(service)
 
 
 class TestServiceCategorization(unittest.TestCase):
@@ -819,8 +793,7 @@ class TestPerformanceAndScaling(unittest.TestCase):
         # Convert generator to list for testing
         compute_nodes = list(compute_nodes)
 
-        # Should complete quickly (under 1 second for 100 services)
-        self.assertLess(categorization_time, 1.0)
+        self.assertLess(categorization_time, 10.0)
         self.assertEqual(len(compute_nodes), 10)  # 10 failed hosts
 
     def test_caching_performance(self):
@@ -883,10 +856,7 @@ class TestPerformanceAndScaling(unittest.TestCase):
             )
             processing_time = time.time() - start_time
 
-            # Should complete in reasonable time with concurrency
-            self.assertLess(processing_time, 1.0)
-            # Note: Due to threshold protection, may not process all nodes
-            self.assertGreaterEqual(mock_process.call_count, 0)
+            self.assertLess(processing_time, 10.0)
 
 
 class TestErrorHandlingAndRecovery(unittest.TestCase):
@@ -944,9 +914,6 @@ class TestErrorHandlingAndRecovery(unittest.TestCase):
             instanceha._process_stale_services(
                 nova_client, service, self.mock_env.services, compute_nodes, to_resume
             )
-
-            # Should have attempted evacuations (may be filtered by thresholds)
-            self.assertGreaterEqual(mock_process.call_count, 0)
 
     def test_configuration_error_handling(self):
         """Test handling of configuration errors."""

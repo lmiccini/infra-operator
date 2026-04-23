@@ -25,6 +25,8 @@ import (
 	"k8s.io/utils/ptr"
 )
 
+const instanceHaUID int64 = 42401
+
 // Deployment creates a Kubernetes Deployment for the InstanceHa resource
 func Deployment(
 	instance *instancehav1.InstanceHa,
@@ -41,13 +43,15 @@ func Deployment(
 	envVars["OS_CLOUD"] = env.SetValue(openstackcloud)
 	envVars["CONFIG_HASH"] = env.SetValue(configHash)
 	envVars["INSTANCEHA_DISABLED"] = env.SetValue(string(instance.Spec.Disabled))
+	envVars["POD_NAME"] = env.DownwardAPI("metadata.name")
+	envVars["POD_NAMESPACE"] = env.DownwardAPI("metadata.namespace")
+	envVars["INSTANCEHA_CR_NAME"] = env.SetValue(instance.Name)
 
 	// create Volume and VolumeMounts
 	volumes := instancehaPodVolumes(instance)
 	volumeMounts := instancehaPodVolumeMounts()
 
 	livenessProbe := &corev1.Probe{
-		// TODO might need tuning
 		TimeoutSeconds:      30,
 		PeriodSeconds:       30,
 		InitialDelaySeconds: 10,
@@ -55,6 +59,17 @@ func Deployment(
 
 	livenessProbe.HTTPGet = &corev1.HTTPGetAction{
 		Path: "/",
+		Port: intstr.IntOrString{Type: intstr.Int, IntVal: 8080},
+	}
+
+	readinessProbe := &corev1.Probe{
+		TimeoutSeconds:      10,
+		PeriodSeconds:       10,
+		InitialDelaySeconds: 5,
+	}
+
+	readinessProbe.HTTPGet = &corev1.HTTPGetAction{
+		Path: "/healthz",
 		Port: intstr.IntOrString{Type: intstr.Int, IntVal: 8080},
 	}
 
@@ -83,16 +98,19 @@ func Deployment(
 					Annotations: annotations,
 				},
 				Spec: corev1.PodSpec{
-					ServiceAccountName:            instance.RbacResourceName(),
+					ServiceAccountName: instance.RbacResourceName(),
+					SecurityContext: &corev1.PodSecurityContext{
+						FSGroup: ptr.To(instanceHaUID),
+					},
 					Volumes:                       volumes,
-					TerminationGracePeriodSeconds: ptr.To[int64](0),
+					TerminationGracePeriodSeconds: ptr.To[int64](30),
 					Containers: []corev1.Container{{
 						Name:    "instanceha",
 						Image:   containerImage,
 						Command: []string{"/usr/bin/python3", "-u", "/var/lib/instanceha/instanceha.py"},
 						SecurityContext: &corev1.SecurityContext{
-							RunAsUser:                ptr.To[int64](42401),
-							RunAsGroup:               ptr.To[int64](42401),
+							RunAsUser:                ptr.To(instanceHaUID),
+							RunAsGroup:               ptr.To(instanceHaUID),
 							RunAsNonRoot:             ptr.To(true),
 							AllowPrivilegeEscalation: ptr.To(false),
 							Capabilities: &corev1.Capabilities{
@@ -107,8 +125,9 @@ func Deployment(
 							Protocol:      "UDP",
 							Name:          "instanceha",
 						}},
-						VolumeMounts:  volumeMounts,
-						LivenessProbe: livenessProbe,
+						VolumeMounts:   volumeMounts,
+						LivenessProbe:  livenessProbe,
+						ReadinessProbe: readinessProbe,
 					}},
 				},
 			},
@@ -186,7 +205,8 @@ func instancehaPodVolumes(
 			Name: "openstack-config-secret",
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
-					SecretName: instance.Spec.OpenStackConfigSecret,
+					SecretName:  instance.Spec.OpenStackConfigSecret,
+					DefaultMode: ptr.To[int32](0o440),
 				},
 			},
 		},
@@ -194,7 +214,8 @@ func instancehaPodVolumes(
 			Name: "fencing-secret",
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
-					SecretName: instance.Spec.FencingSecret,
+					SecretName:  instance.Spec.FencingSecret,
+					DefaultMode: ptr.To[int32](0o440),
 				},
 			},
 		},
