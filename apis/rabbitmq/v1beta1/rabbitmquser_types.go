@@ -17,6 +17,8 @@ limitations under the License.
 package v1beta1
 
 import (
+	"strings"
+
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -177,5 +179,7 @@ const (
 func IsInternalFinalizer(finalizer string) bool {
 	return finalizer == UserFinalizer ||
 		finalizer == TransportURLFinalizer ||
-		finalizer == userControllerFinalizer
+		finalizer == userControllerFinalizer ||
+		finalizer == RabbitMQUserCleanupBlockedFinalizer ||
+		strings.HasPrefix(finalizer, UserVhostFinalizerPrefix)
 }

@@ -61,6 +61,7 @@ import (
 	ocp_configv1 "github.com/openshift/api/config/v1"
 	infra_test "github.com/openstack-k8s-operators/infra-operator/apis/test/helpers"
 	test "github.com/openstack-k8s-operators/lib-common/modules/test"
+	dataplanev1 "github.com/openstack-k8s-operators/openstack-operator/api/dataplane/v1beta1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	//+kubebuilder:scaffold:imports
 )
@@ -104,6 +105,10 @@ var _ = BeforeSuite(func() {
 		"github.com/k8snetworkplumbingwg/network-attachment-definition-client", "../../go.mod", "artifacts/networks-crd.yaml")
 	Expect(err).ShouldNot(HaveOccurred())
 
+	dataplaneCRDs, err := test.GetCRDDirFromModule(
+		"github.com/openstack-k8s-operators/openstack-operator/api", "../../go.mod", "bases")
+	Expect(err).ShouldNot(HaveOccurred())
+
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
 		// Increase this to 60 or 120 seconds for the single-core run
@@ -114,6 +119,7 @@ var _ = BeforeSuite(func() {
 			filepath.Join("..", "..", "config", "crd", "bases"),
 			ocpconfigv1CRDs,
 			frrCRDs,
+			dataplaneCRDs,
 		},
 		CRDInstallOptions: envtest.CRDInstallOptions{
 			Paths: []string{
@@ -165,7 +171,7 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	err = apiextensionsv1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
-	err = rabbitmqv1.AddToScheme(scheme.Scheme)
+	err = dataplanev1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 
 	//+kubebuilder:scaffold:scheme

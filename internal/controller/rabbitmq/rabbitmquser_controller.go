@@ -39,6 +39,7 @@ import (
 	helper "github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/object"
 	oko_secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
+	dataplanev1 "github.com/openstack-k8s-operators/openstack-operator/api/dataplane/v1beta1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -53,6 +54,20 @@ const userFinalizer = "rabbitmquser.openstack.org/finalizer"
 
 // credentialSecretNameField is the field index for the credential secret
 const credentialSecretNameField = ".spec.secret"
+
+// ConnectionCheckInterval is the fallback polling interval for nodeset status during deletion.
+// The primary notification path is the NodeSet watch; this interval is a safety net.
+const ConnectionCheckInterval = 5 * time.Minute
+
+// DeletionGracePeriod is the default time to wait before allowing deletion despite check failures
+// This prevents indefinite blocking on transient API errors or RBAC issues
+const DeletionGracePeriod = 1 * time.Hour
+
+// DeletionGracePeriodAnnotation allows overriding the default grace period (duration format like "2h", "30m")
+const DeletionGracePeriodAnnotation = "rabbitmq.openstack.org/deletion-grace-period"
+
+// RabbitMQ user secret prefix
+const rabbitmqUserSecretPrefix = "rabbitmq-user-"
 
 // generatePassword generates a random password
 func generatePassword(length int) (string, error) {
@@ -80,6 +95,7 @@ type RabbitMQUserReconciler struct {
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqvhosts/finalizers,verbs=update
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs,verbs=get;list;watch
 //+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=dataplane.openstack.org,resources=openstackdataplanenodesets,verbs=get;list;watch
 
 // Reconcile reconciles a RabbitMQUser object
 func (r *RabbitMQUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -119,6 +135,11 @@ func (r *RabbitMQUserReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			instance.Status.Conditions.Set(instance.Status.Conditions.Mirror(condition.ReadyCondition))
 		}
 		if err := h.PatchInstance(ctx, instance); err != nil {
+			// After finalizer removal the object may be garbage-collected before
+			// the patch lands — suppress the resulting NotFound error.
+			if !instance.DeletionTimestamp.IsZero() && k8s_errors.IsNotFound(err) {
+				return
+			}
 			Log.Error(err, "Failed to patch instance")
 		}
 	}()
@@ -413,11 +434,102 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 	return ctrl.Result{}, nil
 }
 
+// isUserStillInUseByNodeSets checks if any nodeset still has nodes that haven't been
+// updated with new secrets yet. This prevents premature deletion of old credentials when
+// nodes are offline or when partial deployments (AnsibleLimit) haven't covered all nodes.
+//
+// With the new generic secret tracking, we check if all nodes in all nodesets have been
+// updated with their current secret versions. If any nodeset has AllNodesUpdated=false,
+// it means some nodes may still be using old credentials, so we block deletion.
+func (r *RabbitMQUserReconciler) isUserStillInUseByNodeSets(
+	ctx context.Context,
+	instance *rabbitmqv1.RabbitMQUser,
+) (stillInUse bool, nodesetInfo string, err error) {
+	log := log.FromContext(ctx)
+
+	log.Info("Checking nodesets for secret deployment status",
+		"user", instance.Name,
+		"namespace", instance.Namespace)
+
+	// List OpenStackDataPlaneNodeSets in the same namespace
+	nodesets := &dataplanev1.OpenStackDataPlaneNodeSetList{}
+	if err := r.List(ctx, nodesets, client.InNamespace(instance.Namespace)); err != nil {
+		// Conservative: if we can't list nodesets, block deletion
+		return true, "", fmt.Errorf("failed to list OpenStackDataPlaneNodeSets: %w", err)
+	}
+
+	if len(nodesets.Items) == 0 {
+		log.Info("No nodesets found in namespace - credentials not in use",
+			"namespace", instance.Namespace)
+		return false, "", nil
+	}
+
+	log.V(1).Info("Checking secret deployment status across nodesets",
+		"nodesetCount", len(nodesets.Items),
+		"namespace", instance.Namespace)
+
+	var nodesetsWithEmptyStatus []string
+
+	// Check each nodeset's secret deployment status
+	for i := range nodesets.Items {
+		nodeset := &nodesets.Items[i]
+
+		// Check for context cancellation
+		if err := ctx.Err(); err != nil {
+			return true, "", fmt.Errorf("context cancelled during nodeset check: %w", err)
+		}
+
+		// Check if all nodes in this nodeset have been updated using helper function
+		if !nodeset.AreAllNodesUpdated() {
+			// Either tracking not initialized OR not all nodes have current versions
+			// Check which case it is for better error messaging
+			if nodeset.Status.SecretDeployment == nil {
+				log.Info("Nodeset has no secret deployment status - cannot verify safety",
+					"nodeset", nodeset.Name,
+					"namespace", nodeset.Namespace)
+				nodesetsWithEmptyStatus = append(nodesetsWithEmptyStatus, nodeset.Name)
+				continue
+			}
+
+			// Not all nodes have current versions - some may still have old credentials
+			// Block deletion to prevent breaking nodes that haven't been updated
+			info := fmt.Sprintf("nodeset %s/%s: %d/%d nodes updated with current secrets",
+				nodeset.Namespace, nodeset.Name,
+				nodeset.Status.SecretDeployment.UpdatedNodes,
+				nodeset.Status.SecretDeployment.TotalNodes)
+
+			log.Info("Nodeset has nodes with pending secret updates, blocking deletion",
+				"nodeset", nodeset.Name,
+				"namespace", nodeset.Namespace,
+				"updatedNodes", nodeset.Status.SecretDeployment.UpdatedNodes,
+				"totalNodes", nodeset.Status.SecretDeployment.TotalNodes)
+
+			return true, info, nil
+		}
+
+		log.V(1).Info("Nodeset has all nodes updated",
+			"nodeset", nodeset.Name)
+	}
+
+	// Check if any nodesets had empty status
+	if len(nodesetsWithEmptyStatus) > 0 {
+		return true, "", fmt.Errorf("cannot verify credential safety: %d nodeset(s) have empty SecretDeployment status - "+
+			"secret tracking may not be initialized yet. "+
+			"Will retry after grace period allows operators to reconcile and populate status",
+			len(nodesetsWithEmptyStatus))
+	}
+
+	// All nodesets have all nodes updated with current secrets
+	log.Info("All deletion safety checks passed - all nodesets have updated nodes",
+		"user", instance.Name,
+		"nodesetsChecked", len(nodesets.Items))
+	return false, "", nil
+}
+
 func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1.RabbitMQUser, h *helper.Helper) (ctrl.Result, error) {
 	Log := log.FromContext(ctx)
 
-	// If TransportURL finalizer exists, wait for TransportURL to remove it
-	// The TransportURL controller manages this finalizer and removes it when switching users
+	// 1. Wait for TransportURL finalizer
 	if controllerutil.ContainsFinalizer(instance, rabbitmqv1.TransportURLFinalizer) {
 		instance.Status.Conditions.MarkFalse(
 			rabbitmqv1.RabbitMQUserReadyCondition,
@@ -429,21 +541,25 @@ func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *
 		return ctrl.Result{RequeueAfter: time.Duration(2) * time.Second}, nil
 	}
 
-	// Check for external finalizers (not managed by this controller)
-	// Wait for all external finalizers to be removed before proceeding with cleanup
-	// This ensures other controllers (e.g., dataplane) finish using this user before deletion
+	// 2. Wait for cleanup-blocked finalizer (nodeset safety checks)
+	if controllerutil.ContainsFinalizer(instance, rabbitmqv1.RabbitMQUserCleanupBlockedFinalizer) {
+		result, done, err := r.waitForCleanupBlockedFinalizer(ctx, instance)
+		if done || err != nil {
+			return result, err
+		}
+	}
+
+	// 3. Wait for external finalizers (e.g., dataplane)
 	externalFinalizers := []string{}
 	for _, finalizer := range instance.GetFinalizers() {
 		if !rabbitmqv1.IsInternalFinalizer(finalizer) {
 			externalFinalizers = append(externalFinalizers, finalizer)
 		}
 	}
-
 	if len(externalFinalizers) > 0 {
-		Log.Info("Waiting for external finalizers to be removed before deleting user",
+		Log.Info("Waiting for external finalizers to be removed",
 			"user", instance.Name,
 			"finalizers", strings.Join(externalFinalizers, ", "))
-
 		instance.Status.Conditions.MarkFalse(
 			rabbitmqv1.RabbitMQUserReadyCondition,
 			condition.DeletingReason,
@@ -454,172 +570,242 @@ func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *
 		return ctrl.Result{RequeueAfter: time.Duration(2) * time.Second}, nil
 	}
 
-	// All external finalizers removed, mark as ready for deletion
+	// 4. All safety checks passed — clean up RabbitMQ resources and remove finalizer
+	Log.Info("All safety checks passed, proceeding with user deletion",
+		"user", instance.Name,
+		"username", instance.Spec.Username)
+
+	if err := r.cleanupRabbitMQUser(ctx, instance, h); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	controllerutil.RemoveFinalizer(instance, userFinalizer)
+	return ctrl.Result{}, nil
+}
+
+// waitForCleanupBlockedFinalizer checks nodeset secret deployment status and removes the
+// cleanup-blocked finalizer when all nodes have been updated (or the grace period expires).
+// Returns (result, done, err) — when done is true, the caller should return result immediately.
+func (r *RabbitMQUserReconciler) waitForCleanupBlockedFinalizer(
+	ctx context.Context,
+	instance *rabbitmqv1.RabbitMQUser,
+) (ctrl.Result, bool, error) {
+	Log := log.FromContext(ctx)
+
+	stillInUse, nodesetInfo, err := r.isUserStillInUseByNodeSets(ctx, instance)
+	if err != nil {
+		gracePeriod := r.getDeletionGracePeriod(instance)
+		elapsed := time.Since(instance.DeletionTimestamp.Time)
+
+		if elapsed <= gracePeriod {
+			Log.Info("Deletion check failed but within grace period, continuing to block",
+				"user", instance.Name,
+				"elapsed", elapsed,
+				"gracePeriod", gracePeriod,
+				"remaining", gracePeriod-elapsed)
+
+			Log.Error(err, "Failed to check nodeset status, delaying cleanup-blocked finalizer removal",
+				"user", instance.Name)
+
+			instance.Status.Conditions.MarkFalse(
+				rabbitmqv1.RabbitMQUserReadyCondition,
+				condition.DeletingReason,
+				condition.SeverityWarning,
+				"Unable to verify nodeset status: %v",
+				err,
+			)
+			return ctrl.Result{RequeueAfter: ConnectionCheckInterval}, true, nil
+		}
+
+		Log.Info("Deletion check failures exceeded grace period, allowing deletion",
+			"user", instance.Name,
+			"elapsed", elapsed,
+			"gracePeriod", gracePeriod,
+			"checkError", err)
+	}
+
+	if stillInUse {
+		Log.Info("Credentials still in use by nodesets, keeping cleanup-blocked finalizer",
+			"user", instance.Name,
+			"nodesetInfo", nodesetInfo)
+
+		instance.Status.Conditions.MarkFalse(
+			rabbitmqv1.RabbitMQUserReadyCondition,
+			condition.DeletingReason,
+			condition.SeverityInfo,
+			"Credentials still in use: %s",
+			nodesetInfo,
+		)
+		return ctrl.Result{RequeueAfter: ConnectionCheckInterval}, true, nil
+	}
+
+	controllerutil.RemoveFinalizer(instance, rabbitmqv1.RabbitMQUserCleanupBlockedFinalizer)
+	Log.Info("Removed cleanup-blocked finalizer, proceeding with deletion", "user", instance.Name)
+	return ctrl.Result{}, false, nil
+}
+
+// getDeletionGracePeriod returns the grace period for deletion safety checks,
+// using the annotation override if present, otherwise the default.
+func (r *RabbitMQUserReconciler) getDeletionGracePeriod(instance *rabbitmqv1.RabbitMQUser) time.Duration {
+	if customPeriod, ok := instance.Annotations[DeletionGracePeriodAnnotation]; ok {
+		if parsed, err := time.ParseDuration(customPeriod); err == nil {
+			return parsed
+		}
+	}
+	return DeletionGracePeriod
+}
+
+// cleanupRabbitMQUser removes the user's vhost finalizer, deletes the user and permissions
+// from RabbitMQ, and deletes auto-generated secrets.
+func (r *RabbitMQUserReconciler) cleanupRabbitMQUser(
+	ctx context.Context,
+	instance *rabbitmqv1.RabbitMQUser,
+	h *helper.Helper,
+) error {
+	Log := log.FromContext(ctx)
+
 	instance.Status.Conditions.MarkTrue(
 		rabbitmqv1.RabbitMQUserReadyCondition,
 		"RabbitMQ user ready for deletion",
 	)
 
-	// Remove per-user finalizer from vhost if it exists
-	// Use VhostRef from status (current) or spec (fallback) to find the vhost
+	// Remove per-user finalizer from vhost
 	vhostRef := instance.Status.VhostRef
 	if vhostRef == "" {
 		vhostRef = instance.Spec.VhostRef
 	}
-
-	// Remove per-user finalizer from vhost if it exists
-	// We retry on transient errors, but skip when vhost is already being deleted
 	if vhostRef != "" {
-		userFinalizer := rabbitmqv1.UserVhostFinalizerPrefix + instance.Spec.Username
-		vhost := &rabbitmqv1.RabbitMQVhost{}
-		err := r.Get(ctx, types.NamespacedName{Name: vhostRef, Namespace: instance.Namespace}, vhost)
-
-		// Check for context cancellation (e.g., pod shutdown)
-		if ctx.Err() != nil {
-			return ctrl.Result{}, ctx.Err()
-		}
-
-		if err == nil {
-			// Vhost exists - try to remove our finalizer (even if vhost is being deleted)
-			if controllerutil.RemoveFinalizer(vhost, userFinalizer) {
-				if err := r.Update(ctx, vhost); err != nil {
-					if k8s_errors.IsNotFound(err) {
-						// Vhost was deleted between Get and Update - that's fine
-						Log.Info("Vhost was deleted before finalizer could be removed", "vhost", vhostRef)
-					} else {
-						// Failed to update vhost - retry with exponential backoff
-						return ctrl.Result{}, fmt.Errorf("failed to remove finalizer %s from vhost %s: %w", userFinalizer, vhostRef, err)
-					}
-				} else {
-					Log.Info("Successfully removed finalizer from vhost", "vhost", vhostRef, "finalizer", userFinalizer)
-				}
-			}
-		} else if k8s_errors.IsNotFound(err) {
-			// Vhost doesn't exist - nothing to clean up
-			Log.Info("Vhost not found during user deletion", "vhost", vhostRef)
-		} else {
-			// Failed to get vhost (other error) - retry
-			return ctrl.Result{}, fmt.Errorf("failed to get vhost %s for finalizer removal: %w", vhostRef, err)
+		if err := r.removeVhostUserFinalizer(ctx, instance, vhostRef); err != nil {
+			return err
 		}
 	}
 
 	username := instance.Status.Username
 	if username == "" {
-		// Username is defaulted by webhook
 		username = instance.Spec.Username
 	}
 
-	// Get vhost name - priority order:
-	// 1. From status.Vhost (the actual vhost name, stored during normal reconciliation)
-	// 2. From the vhost CR if it still exists
-	// 3. Default to "/" if VhostRef is empty
-	vhostName := "/"
-	if instance.Status.Vhost != "" {
-		// Use the vhost name from status - this is the most reliable source during deletion
-		vhostName = instance.Status.Vhost
-	} else if instance.Spec.VhostRef != "" {
-		// Try to get vhost CR to determine the vhost name
-		vhost := &rabbitmqv1.RabbitMQVhost{}
-		err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.VhostRef, Namespace: instance.Namespace}, vhost)
-		if err != nil && !k8s_errors.IsNotFound(err) {
-			// Log non-NotFound errors but continue with deletion
-			Log.Error(err, "Failed to get vhost", "vhost", instance.Spec.VhostRef)
-		} else if err == nil && vhost.Spec.Name != "" {
-			vhostName = vhost.Spec.Name
-		}
-	}
+	vhostName := r.resolveVhostName(ctx, instance)
 
 	// Get RabbitMQ cluster
 	rabbit := &rabbitmqv1.RabbitMq{}
 	err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.RabbitmqClusterName, Namespace: instance.Namespace}, rabbit)
 
-	// If cluster is being deleted or not found, skip cleanup and just remove finalizer
 	if err != nil && !k8s_errors.IsNotFound(err) {
-		// Error getting cluster - return error to retry
-		return ctrl.Result{}, err
+		return err
 	}
 
 	if k8s_errors.IsNotFound(err) || !rabbit.DeletionTimestamp.IsZero() {
-		// Cluster doesn't exist or is being deleted - skip RabbitMQ cleanup
 		Log.Info("RabbitMQ cluster not found or being deleted, skipping RabbitMQ cleanup",
-			"cluster", instance.Spec.RabbitmqClusterName,
-			"notFound", k8s_errors.IsNotFound(err),
-			"beingDeleted", !rabbit.DeletionTimestamp.IsZero(),
-			"vhostRef", vhostRef)
-
+			"cluster", instance.Spec.RabbitmqClusterName)
 		instance.Status.Conditions.MarkTrue(
 			rabbitmqv1.RabbitMQUserReadyCondition,
 			"RabbitMQ cluster deleted, skipping RabbitMQ cleanup",
 		)
-
-		// Vhost finalizer removal was already attempted above (best effort)
-		// We don't block user deletion even if it failed - the vhost controller
-		// will clean up any orphaned finalizers after 10 minutes.
-
-		controllerutil.RemoveFinalizer(instance, userFinalizer)
-		return ctrl.Result{}, nil
+		r.deleteAutoGeneratedSecret(ctx, instance)
+		return nil
 	}
 
-	// Cluster exists and is not being deleted - perform cleanup
 	if rabbit.Status.DefaultUser == nil {
-		// Admin credentials not yet available, requeue
-		return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+		return fmt.Errorf("admin credentials not yet available for cluster %s", instance.Spec.RabbitmqClusterName)
 	}
-	// Get admin credentials
+
 	rabbitSecret, _, err := oko_secret.GetSecret(ctx, h, rabbit.Status.DefaultUser.SecretReference.Name, instance.Namespace)
 	if err != nil {
-		// If cluster exists and is healthy, secret should be available
-		// Return error to retry
-		return ctrl.Result{}, err
+		return err
 	}
 
-	// Create API client
 	baseURL := getManagementURL(rabbit, rabbitSecret)
 	tlsEnabled := rabbit.Spec.TLS.SecretName != ""
 	caCert, err := getTLSCACert(ctx, h, rabbit, instance.Namespace)
 	if err != nil {
-		return ctrl.Result{}, err
+		return err
 	}
 	apiClient, err := rabbitmqapi.NewClient(baseURL, string(rabbitSecret.Data["username"]), string(rabbitSecret.Data["password"]), tlsEnabled, caCert)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to create RabbitMQ API client: %w", err)
+		return fmt.Errorf("failed to create RabbitMQ API client: %w", err)
 	}
 
-	// Delete permissions and user from RabbitMQ
-	// The Delete methods already treat 404 as success
 	if err := apiClient.DeletePermissions(vhostName, username); err != nil {
-		// Return error to trigger retry - see rabbitmqpolicy_controller.go for detailed rationale
-		return ctrl.Result{}, fmt.Errorf("failed to delete permissions for user %s from vhost %s in RabbitMQ: %w", username, vhostName, err)
+		return fmt.Errorf("failed to delete permissions for user %s from vhost %s in RabbitMQ: %w", username, vhostName, err)
 	}
 
 	if err := apiClient.DeleteUser(username); err != nil {
-		// Return error to trigger retry - see rabbitmqpolicy_controller.go for detailed rationale
-		return ctrl.Result{}, fmt.Errorf("failed to delete user %s from RabbitMQ: %w", username, err)
+		return fmt.Errorf("failed to delete user %s from RabbitMQ: %w", username, err)
 	}
 
-	// Only delete auto-generated secret (when spec.secret is not set)
-	// User-provided secrets are NOT deleted
-	if instance.Spec.Secret == nil || *instance.Spec.Secret == "" {
-		secretName := fmt.Sprintf("rabbitmq-user-%s", instance.Name)
-		secret := &corev1.Secret{}
+	r.deleteAutoGeneratedSecret(ctx, instance)
+	return nil
+}
 
-		// Get the secret first to check ownership
-		if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: instance.Namespace}, secret); err == nil {
-			// Check if we are the owner before deleting
-			if object.CheckOwnerRefExist(instance.GetUID(), secret.GetOwnerReferences()) {
-				if err := r.Delete(ctx, secret); err != nil && !k8s_errors.IsNotFound(err) {
-					log.FromContext(ctx).Error(err, "Failed to delete user secret", "secret", secretName)
+// removeVhostUserFinalizer removes this user's per-user finalizer from the referenced vhost.
+func (r *RabbitMQUserReconciler) removeVhostUserFinalizer(
+	ctx context.Context,
+	instance *rabbitmqv1.RabbitMQUser,
+	vhostRef string,
+) error {
+	Log := log.FromContext(ctx)
+	userFinalizer := rabbitmqv1.UserVhostFinalizerPrefix + instance.Spec.Username
+	vhost := &rabbitmqv1.RabbitMQVhost{}
+	err := r.Get(ctx, types.NamespacedName{Name: vhostRef, Namespace: instance.Namespace}, vhost)
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	if err == nil {
+		if controllerutil.RemoveFinalizer(vhost, userFinalizer) {
+			if err := r.Update(ctx, vhost); err != nil {
+				if k8s_errors.IsNotFound(err) {
+					Log.Info("Vhost was deleted before finalizer could be removed", "vhost", vhostRef)
+				} else {
+					return fmt.Errorf("failed to remove finalizer %s from vhost %s: %w", userFinalizer, vhostRef, err)
 				}
 			} else {
-				log.FromContext(ctx).Info("Skipping secret deletion - not owned by this RabbitMQUser", "secret", secretName)
+				Log.Info("Removed finalizer from vhost", "vhost", vhostRef, "finalizer", userFinalizer)
 			}
-		} else if !k8s_errors.IsNotFound(err) {
-			log.FromContext(ctx).Error(err, "Failed to get secret for ownership check", "secret", secretName)
+		}
+	} else if k8s_errors.IsNotFound(err) {
+		Log.Info("Vhost not found during user deletion", "vhost", vhostRef)
+	} else {
+		return fmt.Errorf("failed to get vhost %s for finalizer removal: %w", vhostRef, err)
+	}
+	return nil
+}
+
+// resolveVhostName determines the RabbitMQ vhost name from status, spec, or default.
+func (r *RabbitMQUserReconciler) resolveVhostName(ctx context.Context, instance *rabbitmqv1.RabbitMQUser) string {
+	if instance.Status.Vhost != "" {
+		return instance.Status.Vhost
+	}
+	if instance.Spec.VhostRef != "" {
+		vhost := &rabbitmqv1.RabbitMQVhost{}
+		err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.VhostRef, Namespace: instance.Namespace}, vhost)
+		if err != nil && !k8s_errors.IsNotFound(err) {
+			log.FromContext(ctx).Error(err, "Failed to get vhost", "vhost", instance.Spec.VhostRef)
+		} else if err == nil && vhost.Spec.Name != "" {
+			return vhost.Spec.Name
 		}
 	}
+	return "/"
+}
 
-	controllerutil.RemoveFinalizer(instance, userFinalizer)
-	return ctrl.Result{}, nil
+// deleteAutoGeneratedSecret deletes the auto-generated credential secret if we own it.
+func (r *RabbitMQUserReconciler) deleteAutoGeneratedSecret(ctx context.Context, instance *rabbitmqv1.RabbitMQUser) {
+	if instance.Spec.Secret != nil && *instance.Spec.Secret != "" {
+		return
+	}
+	secretName := fmt.Sprintf("rabbitmq-user-%s", instance.Name)
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: instance.Namespace}, secret); err == nil {
+		if object.CheckOwnerRefExist(instance.GetUID(), secret.GetOwnerReferences()) {
+			if err := r.Delete(ctx, secret); err != nil && !k8s_errors.IsNotFound(err) {
+				log.FromContext(ctx).Error(err, "Failed to delete user secret", "secret", secretName)
+			}
+		}
+	} else if !k8s_errors.IsNotFound(err) {
+		log.FromContext(ctx).Error(err, "Failed to get secret for ownership check", "secret", secretName)
+	}
 }
 
 // vhostToUserMapFunc maps vhost changes to user reconciliation requests
@@ -700,6 +886,33 @@ func (r *RabbitMQUserReconciler) clusterToUserMapFunc(ctx context.Context, obj c
 	return requests
 }
 
+// nodesetToUserMapFunc maps NodeSet status changes to user reconciliation requests.
+// Only enqueues users that are being deleted (have cleanup-blocked finalizer),
+// since NodeSet status is only relevant during deletion safety checks.
+func (r *RabbitMQUserReconciler) nodesetToUserMapFunc(ctx context.Context, obj client.Object) []reconcile.Request {
+	nodesetNamespace := obj.GetNamespace()
+
+	userList := &rabbitmqv1.RabbitMQUserList{}
+	if err := r.List(ctx, userList, client.InNamespace(nodesetNamespace)); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to list users for nodeset watch", "nodeset", obj.GetName())
+		return []reconcile.Request{}
+	}
+
+	requests := []reconcile.Request{}
+	for _, user := range userList.Items {
+		if !user.DeletionTimestamp.IsZero() &&
+			controllerutil.ContainsFinalizer(&user, rabbitmqv1.RabbitMQUserCleanupBlockedFinalizer) {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      user.Name,
+					Namespace: user.Namespace,
+				},
+			})
+		}
+	}
+	return requests
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *RabbitMQUserReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Register field index for efficient secret watching
@@ -726,5 +939,7 @@ func (r *RabbitMQUserReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.findRabbitMQUsersForSecret),
 		).
+		Watches(&dataplanev1.OpenStackDataPlaneNodeSet{},
+			handler.EnqueueRequestsFromMapFunc(r.nodesetToUserMapFunc)).
 		Complete(r)
 }
