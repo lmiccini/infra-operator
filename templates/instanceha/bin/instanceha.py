@@ -476,6 +476,19 @@ class ConfigManager:
         logging.warning(f"Configuration {key} should be boolean, got {type(value).__name__}, using default: {default}")
         return default
 
+    def get_list(self, key: str, default: Optional[List] = None) -> List:
+        """Get a list configuration value with validation."""
+        if default is None:
+            default = []
+        value = self.config.get(key, default)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            return [v.strip() for v in value.split(',') if v.strip()]
+        logging.warning("Configuration key %s should be list, got %s, using default: %s",
+                       key, type(value).__name__, default)
+        return default
+
     # Configuration mapping with defaults and validation
     _config_map: Dict[str, ConfigItem] = {
         'EVACUABLE_TAG': ConfigItem('str', 'evacuable'),
@@ -499,9 +512,10 @@ class ConfigManager:
         'SSL_VERIFY': ConfigItem('bool', True),
         'FENCING_TIMEOUT': ConfigItem('int', 30, 5, 120),
         'HASH_INTERVAL': ConfigItem('int', 60, 30, 300),
+        'SKIP_SERVERS_WITH_NAME': ConfigItem('list', []),
     }
 
-    def get_config_value(self, key: str) -> Union[str, int, bool]:
+    def get_config_value(self, key: str) -> Union[str, int, bool, List]:
         """Get configuration value with automatic type handling and validation."""
         if key not in self._config_map:
             raise ValueError(f"Unknown configuration key: {key}")
@@ -520,6 +534,8 @@ class ConfigManager:
             return self.get_int(key, config_item.default, config_item.min_val, config_item.max_val)
         elif config_item.type == 'bool':
             return self.get_bool(key, config_item.default)
+        elif config_item.type == 'list':
+            return self.get_list(key, config_item.default)
 
         return config_item.default
 
@@ -1306,6 +1322,13 @@ def _update_service_disable_reason(connection, host, service_id=None) -> None:
         return False
 
 
+def _should_skip_server(server, skip_names) -> bool:
+    """Check if a server should be skipped based on name matching."""
+    if not skip_names or not hasattr(server, 'name') or not server.name:
+        return False
+    return any(pattern in server.name for pattern in skip_names)
+
+
 def _get_evacuable_servers(connection, host, service) -> List:
     """Get list of evacuable servers from a host."""
     images = service.get_evacuable_images(connection)
@@ -1313,6 +1336,15 @@ def _get_evacuable_servers(connection, host, service) -> List:
 
     servers = connection.servers.list(search_opts={'host': host, 'all_tenants': 1})
     servers = [s for s in servers if s.status in {'ACTIVE', 'ERROR', 'STOPPED'}]
+
+    skip_names = service.config.get_config_value('SKIP_SERVERS_WITH_NAME')
+    if skip_names:
+        skipped = [s for s in servers if _should_skip_server(s, skip_names)]
+        if skipped:
+            logging.info("Skipping %d server(s) matching name filter %s: %s",
+                        len(skipped), skip_names,
+                        ', '.join(s.id for s in skipped))
+        servers = [s for s in servers if not _should_skip_server(s, skip_names)]
 
     if flavors or images:
         logging.debug("Filtering images and flavors: %s %s", repr(flavors), repr(images))

@@ -229,6 +229,55 @@ class TestConfigManager(unittest.TestCase):
         self.assertEqual(config_manager.get_config_value('DELTA'), 60)
         self.assertTrue(config_manager.get_config_value('SMART_EVACUATION'))
 
+    def test_get_list_from_yaml_list(self):
+        """Test list config value from YAML list."""
+        config_data = {
+            'config': {
+                'SKIP_SERVERS_WITH_NAME': ['amphora-', 'test-lb'],
+            }
+        }
+        with open(self.config_path, 'w') as f:
+            yaml.dump(config_data, f)
+
+        config_manager = instanceha.ConfigManager(self.config_path)
+        config_manager.clouds_path = self.clouds_path
+        config_manager.secure_path = self.secure_path
+        config_manager.fencing_path = self.fencing_path
+        config_manager.__init__(self.config_path)
+
+        result = config_manager.get_config_value('SKIP_SERVERS_WITH_NAME')
+        self.assertEqual(result, ['amphora-', 'test-lb'])
+
+    def test_get_list_from_comma_string(self):
+        """Test list config value from comma-separated string."""
+        config_data = {
+            'config': {
+                'SKIP_SERVERS_WITH_NAME': 'amphora-, test-lb',
+            }
+        }
+        with open(self.config_path, 'w') as f:
+            yaml.dump(config_data, f)
+
+        config_manager = instanceha.ConfigManager(self.config_path)
+        config_manager.clouds_path = self.clouds_path
+        config_manager.secure_path = self.secure_path
+        config_manager.fencing_path = self.fencing_path
+        config_manager.__init__(self.config_path)
+
+        result = config_manager.get_config_value('SKIP_SERVERS_WITH_NAME')
+        self.assertEqual(result, ['amphora-', 'test-lb'])
+
+    def test_get_list_default_empty(self):
+        """Test list config value defaults to empty list."""
+        config_manager = instanceha.ConfigManager(self.config_path)
+        config_manager.clouds_path = self.clouds_path
+        config_manager.secure_path = self.secure_path
+        config_manager.fencing_path = self.fencing_path
+        config_manager.__init__(self.config_path)
+
+        result = config_manager.get_config_value('SKIP_SERVERS_WITH_NAME')
+        self.assertEqual(result, [])
+
 
 class TestMetrics(unittest.TestCase):
     """Test the Metrics class functionality."""
@@ -892,6 +941,9 @@ class TestEvacuationFunctions(unittest.TestCase):
         mock_service.config.get_workers.return_value = 4
         mock_service.config.get_delay.return_value = 0
         mock_service.is_server_evacuable.return_value = True
+        mock_service.config.get_config_value.side_effect = lambda key: {
+            'SKIP_SERVERS_WITH_NAME': [], 'SMART_EVACUATION': True, 'WORKERS': 4, 'DELAY': 0,
+        }.get(key, False)
 
         # Mock servers
         mock_server1 = Mock()
@@ -945,6 +997,9 @@ class TestEvacuationFunctions(unittest.TestCase):
         mock_service.config.get_workers.return_value = 4
         mock_service.config.get_delay.return_value = 0
         mock_service.is_server_evacuable.return_value = True
+        mock_service.config.get_config_value.side_effect = lambda key: {
+            'SKIP_SERVERS_WITH_NAME': [], 'SMART_EVACUATION': True, 'WORKERS': 4, 'DELAY': 0,
+        }.get(key, False)
 
         # Mock servers
         mock_server1 = Mock()
@@ -1005,6 +1060,9 @@ class TestEvacuationFunctions(unittest.TestCase):
         mock_service.config.get_workers.return_value = 4
         mock_service.config.get_delay.return_value = 0
         mock_service.is_server_evacuable.return_value = True
+        mock_service.config.get_config_value.side_effect = lambda key: {
+            'SKIP_SERVERS_WITH_NAME': [], 'SMART_EVACUATION': True, 'WORKERS': 4, 'DELAY': 0,
+        }.get(key, False)
 
         # Mock servers
         mock_server1 = Mock()
@@ -1203,6 +1261,89 @@ class TestEvacuationFunctions(unittest.TestCase):
 
                     # Assert ThreadPoolExecutor was called with the expected max_workers
                     mock_executor_class.assert_called_once_with(max_workers=workers_value)
+
+
+class TestSkipServersByName(unittest.TestCase):
+    """Test name-based server skip filtering."""
+
+    def test_should_skip_server_matching_pattern(self):
+        server = Mock()
+        server.name = 'amphora-abc123'
+        self.assertTrue(instanceha._should_skip_server(server, ['amphora-']))
+
+    def test_should_skip_server_substring_match(self):
+        server = Mock()
+        server.name = 'my-amphora-vm-01'
+        self.assertTrue(instanceha._should_skip_server(server, ['amphora']))
+
+    def test_should_skip_server_no_match(self):
+        server = Mock()
+        server.name = 'my-web-server'
+        self.assertFalse(instanceha._should_skip_server(server, ['amphora-']))
+
+    def test_should_skip_server_multiple_patterns(self):
+        server = Mock()
+        server.name = 'test-lb-vm'
+        self.assertTrue(instanceha._should_skip_server(server, ['amphora-', 'test-lb']))
+
+    def test_should_skip_server_empty_patterns(self):
+        server = Mock()
+        server.name = 'amphora-abc123'
+        self.assertFalse(instanceha._should_skip_server(server, []))
+
+    def test_should_skip_server_no_name(self):
+        server = Mock()
+        server.name = None
+        self.assertFalse(instanceha._should_skip_server(server, ['amphora-']))
+
+    def test_get_evacuable_servers_skips_matching_names(self):
+        mock_conn = Mock()
+        mock_service = Mock()
+
+        active_server = Mock()
+        active_server.status = 'ACTIVE'
+        active_server.name = 'my-web-server'
+        active_server.id = 'server-1'
+
+        amphora_server = Mock()
+        amphora_server.status = 'ACTIVE'
+        amphora_server.name = 'amphora-abc123'
+        amphora_server.id = 'server-2'
+
+        mock_conn.servers.list.return_value = [active_server, amphora_server]
+        mock_service.get_evacuable_images.return_value = []
+        mock_service.get_evacuable_flavors.return_value = []
+        mock_service.config.get_config_value.side_effect = lambda key: {
+            'SKIP_SERVERS_WITH_NAME': ['amphora-'],
+        }.get(key, False)
+
+        result = instanceha._get_evacuable_servers(mock_conn, 'test-host', mock_service)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].name, 'my-web-server')
+
+    def test_get_evacuable_servers_no_skip_when_empty(self):
+        mock_conn = Mock()
+        mock_service = Mock()
+
+        server1 = Mock()
+        server1.status = 'ACTIVE'
+        server1.name = 'amphora-abc123'
+        server1.id = 'server-1'
+
+        server2 = Mock()
+        server2.status = 'ACTIVE'
+        server2.name = 'my-web-server'
+        server2.id = 'server-2'
+
+        mock_conn.servers.list.return_value = [server1, server2]
+        mock_service.get_evacuable_images.return_value = []
+        mock_service.get_evacuable_flavors.return_value = []
+        mock_service.config.get_config_value.side_effect = lambda key: {
+            'SKIP_SERVERS_WITH_NAME': [],
+        }.get(key, False)
+
+        result = instanceha._get_evacuable_servers(mock_conn, 'test-host', mock_service)
+        self.assertEqual(len(result), 2)
 
 
 class TestSecretExposure(unittest.TestCase):
