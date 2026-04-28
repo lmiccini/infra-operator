@@ -422,7 +422,7 @@ cp /tmp/erlang-cookie-secret/.erlang.cookie /var/lib/rabbitmq/.erlang.cookie
 chmod 600 /var/lib/rabbitmq/.erlang.cookie
 cp /tmp/rabbitmq-plugins/enabled_plugins /operator/enabled_plugins
 echo '[default]' > /var/lib/rabbitmq/.rabbitmqadmin.conf
-sed -e 's/default_user/username/' -e 's/default_pass/password/' /tmp/default_user.conf >> /var/lib/rabbitmq/.rabbitmqadmin.conf
+sed -e 's/^default_user = /username = /' -e 's/^default_pass = /password = /' /tmp/default_user.conf >> /var/lib/rabbitmq/.rabbitmqadmin.conf
 chmod 600 /var/lib/rabbitmq/.rabbitmqadmin.conf
 # Allow time for multi-pod clusters to complete peer discovery
 sleep %d`, ptr.Deref(r.Spec.DelayStartSeconds, 30)),

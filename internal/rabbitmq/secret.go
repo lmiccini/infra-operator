@@ -37,7 +37,8 @@ func GenerateErlangCookie(r *rabbitmqv1.RabbitMq) (*corev1.Secret, error) {
 // GenerateDefaultUser generates a secret containing default user credentials.
 // The secret includes username, password, default_user.conf (for RabbitMQ config),
 // host (service DNS name), and port (AMQP or AMQPS based on TLS).
-func GenerateDefaultUser(r *rabbitmqv1.RabbitMq) (*corev1.Secret, error) {
+// configVersion is the effective RabbitMQ version used to determine config format.
+func GenerateDefaultUser(r *rabbitmqv1.RabbitMq, configVersion string) (*corev1.Secret, error) {
 	username := fmt.Sprintf("default_user_%s", r.Name)
 	password, err := util.GeneratePassword(24)
 	if err != nil {
@@ -45,10 +46,13 @@ func GenerateDefaultUser(r *rabbitmqv1.RabbitMq) (*corev1.Secret, error) {
 	}
 
 	// Generate default_user.conf content
-	defaultUserConf := fmt.Sprintf(`default_user = %s
-default_pass = %s
-default_user_tags.administrator = true
-`, username, password)
+	defaultUserConf := fmt.Sprintf("default_user = %s\ndefault_pass = %s\n", username, password)
+	// default_user_tags.administrator breaks rabbitmqadmin on RabbitMQ 4.x
+	// (the sed that builds .rabbitmqadmin.conf transforms it into an
+	// unrecognised key). Only include it for RabbitMQ 3.x.
+	if !IsVersion4OrLater(configVersion) {
+		defaultUserConf += "default_user_tags.administrator = true\n"
+	}
 
 	// Determine host and port
 	host := fmt.Sprintf("%s.%s.svc", r.Name, r.Namespace)
