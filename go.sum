@@ -112,8 +112,6 @@ github.com/kylelemons/godebug v1.1.0 h1:RPNrshWIDI6G2gRW9EHilWtl7Z6Sb1BR0xunSBf0
 github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
 github.com/leodido/go-urn v1.4.0 h1:WT9HwE9SGECu3lg4d/dIA+jxlljEa1/ffXKmRjqdmIQ=
 github.com/leodido/go-urn v1.4.0/go.mod h1:bvxc+MVxLKB4z00jd1z+Dvzr47oO32F/QSNjSBOlFxI=
-github.com/lmiccini/openstack-operator/api v0.0.0-20260424173524-6f974725e7e3 h1:3laYfHfA0AVhX3fCx/zHYh8z63ImcFpA6/EOg8jyy5g=
-github.com/lmiccini/openstack-operator/api v0.0.0-20260424173524-6f974725e7e3/go.mod h1:1h9gm7a7f8r+sd/vsPdkzhAWbwBkWSHsfxBU9NLLI2U=
 github.com/mailru/easyjson v0.9.0 h1:PrnmzHw7262yW8sTBwxi1PdJA3Iw/EKBa8psRf7d9a4=
 github.com/mailru/easyjson v0.9.0/go.mod h1:1+xMtQp2MRNVL/V1bOzuP3aP8VNwRW55fQUto+XFtTU=
 github.com/maruel/natural v1.1.1 h1:Hja7XhhmvEFhcByqDoHz9QZbkWey+COd9xWfCfn1ioo=
@@ -134,8 +132,8 @@ github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee h1:W5t00kpgFd
 github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee/go.mod h1:yWuevngMOJpCy52FWWMvUC8ws7m/LJsjYzDa0/r8luk=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
-github.com/onsi/ginkgo/v2 v2.28.1 h1:S4hj+HbZp40fNKuLUQOYLDgZLwNUVn19N3Atb98NCyI=
-github.com/onsi/ginkgo/v2 v2.28.1/go.mod h1:CLtbVInNckU3/+gC8LzkGUb9oF+e8W8TdUsxPwvdOgE=
+github.com/onsi/ginkgo/v2 v2.28.2 h1:DTrMfpqxiNUyQ3Y0zhn1n3cOO2euFgQPYIpkWwxVFps=
+github.com/onsi/ginkgo/v2 v2.28.2/go.mod h1:CLtbVInNckU3/+gC8LzkGUb9oF+e8W8TdUsxPwvdOgE=
 github.com/onsi/gomega v1.39.1 h1:1IJLAad4zjPn2PsnhH70V4DKRFlrCzGBNrNaru+Vf28=
 github.com/onsi/gomega v1.39.1/go.mod h1:hL6yVALoTOxeWudERyfppUcZXjMwIMLnuSfruD2lcfg=
 github.com/openshift/api v0.0.0-20250711200046-c86d80652a9e h1:E1OdwSpqWuDPCedyUt0GEdoAE+r5TXy7YS21yNEo+2U=
@@ -162,8 +160,8 @@ github.com/openstack-k8s-operators/lib-common/modules/openstack v0.6.1-0.2026041
 github.com/openstack-k8s-operators/lib-common/modules/openstack v0.6.1-0.20260417092244-81c71b39e981/go.mod h1:7yqbVpg0k0vW+kZks+TMU/cd1ovoejyHfVPWcyGYLHI=
 github.com/openstack-k8s-operators/lib-common/modules/storage v0.6.1-0.20260417092244-81c71b39e981 h1:X3/Gc+i0ZxaROExrpLXonz9EPhftlubFnOK4aSkRLvo=
 github.com/openstack-k8s-operators/lib-common/modules/storage v0.6.1-0.20260417092244-81c71b39e981/go.mod h1:3loLaPUDQyvbPekylZd9OCLF+EXH2klRI9IeeQhuMcs=
-github.com/openstack-k8s-operators/lib-common/modules/test v0.6.1-0.20260410120633-3e1007da0cbd h1:IQ6+FnkkcOyTNVmXpXdUlw6bZfVjYMxQgOv+mms8KvI=
-github.com/openstack-k8s-operators/lib-common/modules/test v0.6.1-0.20260410120633-3e1007da0cbd/go.mod h1:dEjz8zHRIlP3vnMmWdHytlLeSZ6BHcIiSTPM7xTQxFg=
+github.com/openstack-k8s-operators/lib-common/modules/test v0.6.1-0.20260417092244-81c71b39e981 h1:KAQ8T+Ri3JWgsyK1D6QybScMh6fpkYUUA+0ntnOiAl4=
+github.com/openstack-k8s-operators/lib-common/modules/test v0.6.1-0.20260417092244-81c71b39e981/go.mod h1:dEjz8zHRIlP3vnMmWdHytlLeSZ6BHcIiSTPM7xTQxFg=
 github.com/openstack-k8s-operators/manila-operator/api v0.6.1-0.20260415214016-523bbc811363 h1:Z8oqhNixI/vOJd9G25g/+rK2bJPVupBeninrMG9wTts=
 github.com/openstack-k8s-operators/manila-operator/api v0.6.1-0.20260415214016-523bbc811363/go.mod h1:oXACXuA39DzQWCXDCjv0WX85mrb4y6/t2QANQuSNb64=
 github.com/openstack-k8s-operators/mariadb-operator/api v0.6.1-0.20260413152655-564a51226a2a h1:1VRHhhCE8U0+Q6jPNppxcklIVfK7gZ2Js9VaLpPR7sw=

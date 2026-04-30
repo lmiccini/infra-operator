@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
+	oko_secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	dataplanev1 "github.com/openstack-k8s-operators/openstack-operator/api/dataplane/v1beta1"
 )
 
@@ -38,10 +39,21 @@ func TestIsUserStillInUseByNodeSets(t *testing.T) {
 
 	baseTime := time.Now()
 
+	// Create cluster secrets and pre-compute their hashes
+	currentSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "nova-cell1-compute-config",
+			Namespace: "test",
+		},
+		Data: map[string][]byte{"transport_url": []byte("rabbit://nova:current-password@rabbitmq:5672/")},
+	}
+	currentHash, _ := oko_secret.Hash(currentSecret)
+
 	tests := []struct {
 		name           string
 		user           *rabbitmqv1.RabbitMQUser
 		nodesets       []*dataplanev1.OpenStackDataPlaneNodeSet
+		secrets        []*corev1.Secret
 		wantStillInUse bool
 		wantInfoSubstr string
 		wantErr        bool
@@ -55,12 +67,11 @@ func TestIsUserStillInUseByNodeSets(t *testing.T) {
 					CreationTimestamp: metav1.Time{Time: baseTime},
 				},
 			},
-
 			wantStillInUse: false,
 			wantErr:        false,
 		},
 		{
-			name: "nodeset with partial update blocks deletion",
+			name: "nodeset with stale secrets blocks deletion",
 			user: &rabbitmqv1.RabbitMQUser{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:              "test-user",
@@ -68,37 +79,32 @@ func TestIsUserStillInUseByNodeSets(t *testing.T) {
 					CreationTimestamp: metav1.Time{Time: baseTime},
 				},
 			},
-
 			nodesets: []*dataplanev1.OpenStackDataPlaneNodeSet{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:              "test-nodeset",
-						Namespace:         "test",
-						CreationTimestamp: metav1.Time{Time: baseTime.Add(1 * time.Second)},
+						Name:      "test-nodeset",
+						Namespace: "test",
 					},
 					Spec: dataplanev1.OpenStackDataPlaneNodeSetSpec{
 						Nodes: map[string]dataplanev1.NodeSection{
 							"compute-0": {},
 							"compute-1": {},
-							"compute-2": {},
 						},
 					},
 					Status: dataplanev1.OpenStackDataPlaneNodeSetStatus{
-						SecretDeployment: &dataplanev1.SecretDeploymentStatus{
-							AllNodesUpdated: false,
-							TotalNodes:      3,
-							UpdatedNodes:    2,
-							ConfigMapName:   "test-nodeset-secret-tracking",
+						SecretHashes: map[string]string{
+							"nova-cell1-compute-config": "old-stale-hash",
 						},
 					},
 				},
 			},
+			secrets:        []*corev1.Secret{currentSecret},
 			wantStillInUse: true,
-			wantInfoSubstr: "2/3 nodes updated",
+			wantInfoSubstr: "has changed since last full deployment",
 			wantErr:        false,
 		},
 		{
-			name: "nodeset with all nodes updated allows deletion",
+			name: "nodeset with current secrets allows deletion",
 			user: &rabbitmqv1.RabbitMQUser{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:              "test-user",
@@ -106,78 +112,10 @@ func TestIsUserStillInUseByNodeSets(t *testing.T) {
 					CreationTimestamp: metav1.Time{Time: baseTime},
 				},
 			},
-
 			nodesets: []*dataplanev1.OpenStackDataPlaneNodeSet{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:              "test-nodeset",
-						Namespace:         "test",
-						CreationTimestamp: metav1.Time{Time: baseTime.Add(1 * time.Second)},
-					},
-					Spec: dataplanev1.OpenStackDataPlaneNodeSetSpec{
-						Nodes: map[string]dataplanev1.NodeSection{
-							"compute-0": {},
-							"compute-1": {},
-							"compute-2": {},
-						},
-					},
-					Status: dataplanev1.OpenStackDataPlaneNodeSetStatus{
-						SecretDeployment: &dataplanev1.SecretDeploymentStatus{
-							AllNodesUpdated: true,
-							TotalNodes:      3,
-							UpdatedNodes:    3,
-							ConfigMapName:   "test-nodeset-secret-tracking",
-						},
-					},
-				},
-			},
-			wantStillInUse: false,
-			wantErr:        false,
-		},
-		{
-			name: "nodeset with no deployment status blocks deletion",
-			user: &rabbitmqv1.RabbitMQUser{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:              "test-user",
-					Namespace:         "test",
-					CreationTimestamp: metav1.Time{Time: baseTime},
-				},
-			},
-
-			nodesets: []*dataplanev1.OpenStackDataPlaneNodeSet{
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:              "older-nodeset",
-						Namespace:         "test",
-						CreationTimestamp: metav1.Time{Time: baseTime.Add(-1 * time.Hour)},
-					},
-					Spec: dataplanev1.OpenStackDataPlaneNodeSetSpec{
-						Nodes: map[string]dataplanev1.NodeSection{
-							"compute-0": {},
-						},
-					},
-					Status: dataplanev1.OpenStackDataPlaneNodeSetStatus{
-						SecretDeployment: nil, // No tracking yet
-					},
-				},
-			},
-			wantStillInUse: true,
-			wantErr:        true, // Cannot verify safety
-		},
-		{
-			name: "multiple nodesets - one incomplete blocks deletion",
-			user: &rabbitmqv1.RabbitMQUser{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:              "test-user",
-					Namespace:         "test",
-					CreationTimestamp: metav1.Time{Time: baseTime},
-				},
-			},
-
-			nodesets: []*dataplanev1.OpenStackDataPlaneNodeSet{
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "complete-nodeset",
+						Name:      "test-nodeset",
 						Namespace: "test",
 					},
 					Spec: dataplanev1.OpenStackDataPlaneNodeSetSpec{
@@ -186,16 +124,105 @@ func TestIsUserStillInUseByNodeSets(t *testing.T) {
 						},
 					},
 					Status: dataplanev1.OpenStackDataPlaneNodeSetStatus{
-						SecretDeployment: &dataplanev1.SecretDeploymentStatus{
-							AllNodesUpdated: true,
-							TotalNodes:      1,
-							UpdatedNodes:    1,
+						SecretHashes: map[string]string{
+							"nova-cell1-compute-config": currentHash,
+						},
+					},
+				},
+			},
+			secrets:        []*corev1.Secret{currentSecret},
+			wantStillInUse: false,
+			wantErr:        false,
+		},
+		{
+			name: "nodeset with empty SecretHashes allows deletion",
+			user: &rabbitmqv1.RabbitMQUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "test-user",
+					Namespace:         "test",
+					CreationTimestamp: metav1.Time{Time: baseTime},
+				},
+			},
+			nodesets: []*dataplanev1.OpenStackDataPlaneNodeSet{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "never-deployed-nodeset",
+						Namespace: "test",
+					},
+					Spec: dataplanev1.OpenStackDataPlaneNodeSetSpec{
+						Nodes: map[string]dataplanev1.NodeSection{
+							"compute-0": {},
+						},
+					},
+					Status: dataplanev1.OpenStackDataPlaneNodeSetStatus{
+						SecretHashes: map[string]string{},
+					},
+				},
+			},
+			wantStillInUse: false,
+			wantErr:        false,
+		},
+		{
+			name: "deployed secret deleted blocks deletion",
+			user: &rabbitmqv1.RabbitMQUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "test-user",
+					Namespace:         "test",
+					CreationTimestamp: metav1.Time{Time: baseTime},
+				},
+			},
+			nodesets: []*dataplanev1.OpenStackDataPlaneNodeSet{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-nodeset",
+						Namespace: "test",
+					},
+					Spec: dataplanev1.OpenStackDataPlaneNodeSetSpec{
+						Nodes: map[string]dataplanev1.NodeSection{
+							"compute-0": {},
+						},
+					},
+					Status: dataplanev1.OpenStackDataPlaneNodeSetStatus{
+						SecretHashes: map[string]string{
+							"deleted-secret": "some-hash",
+						},
+					},
+				},
+			},
+			secrets:        []*corev1.Secret{},
+			wantStillInUse: true,
+			wantInfoSubstr: "no longer exists",
+			wantErr:        false,
+		},
+		{
+			name: "multiple nodesets - one stale blocks deletion",
+			user: &rabbitmqv1.RabbitMQUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "test-user",
+					Namespace:         "test",
+					CreationTimestamp: metav1.Time{Time: baseTime},
+				},
+			},
+			nodesets: []*dataplanev1.OpenStackDataPlaneNodeSet{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "up-to-date-nodeset",
+						Namespace: "test",
+					},
+					Spec: dataplanev1.OpenStackDataPlaneNodeSetSpec{
+						Nodes: map[string]dataplanev1.NodeSection{
+							"compute-0": {},
+						},
+					},
+					Status: dataplanev1.OpenStackDataPlaneNodeSetStatus{
+						SecretHashes: map[string]string{
+							"nova-cell1-compute-config": currentHash,
 						},
 					},
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "incomplete-nodeset",
+						Name:      "stale-nodeset",
 						Namespace: "test",
 					},
 					Spec: dataplanev1.OpenStackDataPlaneNodeSetSpec{
@@ -205,29 +232,29 @@ func TestIsUserStillInUseByNodeSets(t *testing.T) {
 						},
 					},
 					Status: dataplanev1.OpenStackDataPlaneNodeSetStatus{
-						SecretDeployment: &dataplanev1.SecretDeploymentStatus{
-							AllNodesUpdated: false,
-							TotalNodes:      2,
-							UpdatedNodes:    1,
+						SecretHashes: map[string]string{
+							"nova-cell1-compute-config": "old-hash-from-previous-deployment",
 						},
 					},
 				},
 			},
+			secrets:        []*corev1.Secret{currentSecret},
 			wantStillInUse: true,
-			wantInfoSubstr: "1/2 nodes updated",
+			wantInfoSubstr: "has changed since last full deployment",
 			wantErr:        false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Build list of runtime objects
 			objs := []runtime.Object{tt.user}
 			for _, ns := range tt.nodesets {
 				objs = append(objs, ns)
 			}
+			for _, s := range tt.secrets {
+				objs = append(objs, s)
+			}
 
-			// Create fake client
 			client := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithRuntimeObjects(objs...).
@@ -248,7 +275,7 @@ func TestIsUserStillInUseByNodeSets(t *testing.T) {
 			}
 
 			if stillInUse != tt.wantStillInUse {
-				t.Errorf("isUserStillInUseByNodeSets() stillInUse = %v, want %v", stillInUse, tt.wantStillInUse)
+				t.Errorf("isUserStillInUseByNodeSets() stillInUse = %v, want %v (info: %s)", stillInUse, tt.wantStillInUse, info)
 			}
 
 			if tt.wantInfoSubstr != "" {

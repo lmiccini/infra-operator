@@ -434,27 +434,22 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 	return ctrl.Result{}, nil
 }
 
-// isUserStillInUseByNodeSets checks if any nodeset still has nodes that haven't been
-// updated with new secrets yet. This prevents premature deletion of old credentials when
-// nodes are offline or when partial deployments (AnsibleLimit) haven't covered all nodes.
-//
-// With the new generic secret tracking, we check if all nodes in all nodesets have been
-// updated with their current secret versions. If any nodeset has AllNodesUpdated=false,
-// it means some nodes may still be using old credentials, so we block deletion.
+// isUserStillInUseByNodeSets checks whether any nodeset's deployed secret
+// hashes are stale compared to the current cluster secrets. If any tracked
+// secret has changed since the last full (unscoped) deployment, nodes may
+// still be using old credentials and deletion must be blocked.
 func (r *RabbitMQUserReconciler) isUserStillInUseByNodeSets(
 	ctx context.Context,
 	instance *rabbitmqv1.RabbitMQUser,
 ) (stillInUse bool, nodesetInfo string, err error) {
 	log := log.FromContext(ctx)
 
-	log.Info("Checking nodesets for secret deployment status",
+	log.Info("Checking nodesets for stale secrets",
 		"user", instance.Name,
 		"namespace", instance.Namespace)
 
-	// List OpenStackDataPlaneNodeSets in the same namespace
 	nodesets := &dataplanev1.OpenStackDataPlaneNodeSetList{}
 	if err := r.List(ctx, nodesets, client.InNamespace(instance.Namespace)); err != nil {
-		// Conservative: if we can't list nodesets, block deletion
 		return true, "", fmt.Errorf("failed to list OpenStackDataPlaneNodeSets: %w", err)
 	}
 
@@ -464,63 +459,55 @@ func (r *RabbitMQUserReconciler) isUserStillInUseByNodeSets(
 		return false, "", nil
 	}
 
-	log.V(1).Info("Checking secret deployment status across nodesets",
-		"nodesetCount", len(nodesets.Items),
-		"namespace", instance.Namespace)
-
-	var nodesetsWithEmptyStatus []string
-
-	// Check each nodeset's secret deployment status
 	for i := range nodesets.Items {
 		nodeset := &nodesets.Items[i]
 
-		// Check for context cancellation
 		if err := ctx.Err(); err != nil {
 			return true, "", fmt.Errorf("context cancelled during nodeset check: %w", err)
 		}
 
-		// Check if all nodes in this nodeset have been updated using helper function
-		if !nodeset.AreAllNodesUpdated() {
-			// Either tracking not initialized OR not all nodes have current versions
-			// Check which case it is for better error messaging
-			if nodeset.Status.SecretDeployment == nil {
-				log.Info("Nodeset has no secret deployment status - cannot verify safety",
-					"nodeset", nodeset.Name,
-					"namespace", nodeset.Namespace)
-				nodesetsWithEmptyStatus = append(nodesetsWithEmptyStatus, nodeset.Name)
-				continue
-			}
-
-			// Not all nodes have current versions - some may still have old credentials
-			// Block deletion to prevent breaking nodes that haven't been updated
-			info := fmt.Sprintf("nodeset %s/%s: %d/%d nodes updated with current secrets",
-				nodeset.Namespace, nodeset.Name,
-				nodeset.Status.SecretDeployment.UpdatedNodes,
-				nodeset.Status.SecretDeployment.TotalNodes)
-
-			log.Info("Nodeset has nodes with pending secret updates, blocking deletion",
-				"nodeset", nodeset.Name,
-				"namespace", nodeset.Namespace,
-				"updatedNodes", nodeset.Status.SecretDeployment.UpdatedNodes,
-				"totalNodes", nodeset.Status.SecretDeployment.TotalNodes)
-
-			return true, info, nil
+		if len(nodeset.Status.SecretHashes) == 0 {
+			log.V(1).Info("Nodeset has no deployed secrets, skipping",
+				"nodeset", nodeset.Name)
+			continue
 		}
 
-		log.V(1).Info("Nodeset has all nodes updated",
+		for secretName, deployedHash := range nodeset.Status.SecretHashes {
+			currentSecret := &corev1.Secret{}
+			err := r.Get(ctx, types.NamespacedName{
+				Name:      secretName,
+				Namespace: instance.Namespace,
+			}, currentSecret)
+			if err != nil {
+				if k8s_errors.IsNotFound(err) {
+					info := fmt.Sprintf("nodeset %s/%s: deployed secret %s no longer exists",
+						nodeset.Namespace, nodeset.Name, secretName)
+					log.Info("Deployed secret not found, blocking deletion",
+						"nodeset", nodeset.Name, "secret", secretName)
+					return true, info, nil
+				}
+				return true, "", fmt.Errorf("failed to get secret %s: %w", secretName, err)
+			}
+
+			currentHash, hashErr := oko_secret.Hash(currentSecret)
+			if hashErr != nil {
+				return true, "", fmt.Errorf("failed to hash secret %s: %w", secretName, hashErr)
+			}
+
+			if currentHash != deployedHash {
+				info := fmt.Sprintf("nodeset %s/%s: secret %s has changed since last full deployment",
+					nodeset.Namespace, nodeset.Name, secretName)
+				log.Info("Secret hash mismatch, blocking deletion",
+					"nodeset", nodeset.Name, "secret", secretName)
+				return true, info, nil
+			}
+		}
+
+		log.V(1).Info("Nodeset secrets are up to date",
 			"nodeset", nodeset.Name)
 	}
 
-	// Check if any nodesets had empty status
-	if len(nodesetsWithEmptyStatus) > 0 {
-		return true, "", fmt.Errorf("cannot verify credential safety: %d nodeset(s) have empty SecretDeployment status - "+
-			"secret tracking may not be initialized yet. "+
-			"Will retry after grace period allows operators to reconcile and populate status",
-			len(nodesetsWithEmptyStatus))
-	}
-
-	// All nodesets have all nodes updated with current secrets
-	log.Info("All deletion safety checks passed - all nodesets have updated nodes",
+	log.Info("All deletion safety checks passed",
 		"user", instance.Name,
 		"nodesetsChecked", len(nodesets.Items))
 	return false, "", nil
