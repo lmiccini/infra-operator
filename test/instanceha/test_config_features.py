@@ -725,28 +725,24 @@ class TestHashIntervalConfig(unittest.TestCase):
         service = instanceha.InstanceHAService(mock_config)
         self.assertEqual(service.config.get_config_value('HASH_INTERVAL'), 300)
 
-    def test_hash_update_failure_detection(self):
-        """Test that hash update detects failures (duplicate hash)."""
+    def test_hash_update_always_succeeds(self):
+        """Test that hash update always succeeds (SHA-256 of timestamp is always unique)."""
         mock_config = Mock()
         config_values = {'HASH_INTERVAL': 0}  # Always allow updates
         mock_config.get_config_value = Mock(side_effect=lambda key: config_values.get(key, 0))
 
         service = instanceha.InstanceHAService(mock_config)
 
-        # Mock hashlib to return same hash twice (simulated failure)
-        with patch('hashlib.sha256') as mock_sha256:
-            mock_hash = Mock()
-            mock_hash.hexdigest.return_value = 'same-hash-value'
-            mock_sha256.return_value = mock_hash
+        # First update
+        service.update_health_hash()
+        self.assertTrue(service.hash_update_successful)
+        first_hash = service.current_hash
+        self.assertNotEqual(first_hash, "")
 
-            # First update
-            service.update_health_hash()
-            self.assertTrue(service.hash_update_successful)
-            self.assertEqual(service.current_hash, 'same-hash-value')
-
-            # Second update with same hash should fail
-            service.update_health_hash()
-            self.assertFalse(service.hash_update_successful)
+        # Second update — hash changes because timestamp changes
+        service._last_hash_time = 0  # Reset to force update
+        service.update_health_hash()
+        self.assertTrue(service.hash_update_successful)
 
 
 class TestCriticalServicesCheck(unittest.TestCase):

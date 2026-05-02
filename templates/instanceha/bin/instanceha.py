@@ -149,11 +149,16 @@ _SECRET_PATTERNS = {
 }
 
 
+def _sanitize_message(msg: str) -> str:
+    """Strip credentials from a message string."""
+    for secret_word, pattern in _SECRET_PATTERNS.items():
+        msg = pattern.sub(f'{secret_word}=***', msg)
+    return msg
+
+
 def _safe_log_exception(msg: str, e: Exception, include_traceback: bool = False) -> None:
     """Log exception without exposing secrets in messages or tracebacks."""
-    safe_msg = str(e)
-    for secret_word, pattern in _SECRET_PATTERNS.items():
-        safe_msg = pattern.sub(f'{secret_word}=***', safe_msg)
+    safe_msg = _sanitize_message(str(e))
     logging.error("%s: %s", msg, safe_msg)
     if include_traceback:
         logging.debug("Exception traceback (sanitized): %s", type(e).__name__)
@@ -253,6 +258,10 @@ def validate_inputs(validations: dict, context: str) -> bool:
 def _make_ssl_request(method: str, url: str, auth: tuple, timeout: int,
                       config_mgr: 'ConfigManager', **kwargs):
     """Make HTTP request with SSL configuration from config manager."""
+    _ALLOWED_HTTP_METHODS = frozenset({'get', 'post', 'patch', 'put', 'delete'})
+    if method not in _ALLOWED_HTTP_METHODS:
+        raise ValueError(f"Unsupported HTTP method: {method}")
+
     ssl_config = config_mgr.get_requests_ssl_config()
     request_kwargs = {'auth': auth, 'timeout': timeout, **kwargs}
 
@@ -601,6 +610,7 @@ class InstanceHAService(CloudConnectionProvider):
         self.hash_update_successful = True
         self._last_hash_time = 0
         self._previous_hash = ""
+        self.ready = False
 
     def _initialize_cache(self) -> None:
         """Initialize caching infrastructure and cached configuration values."""
@@ -646,15 +656,10 @@ class InstanceHAService(CloudConnectionProvider):
         current_timestamp = time.time()
 
         if current_timestamp - self._last_hash_time > hash_interval:
-            new_hash = hashlib.sha256(str(current_timestamp).encode()).hexdigest()
-            if new_hash == self._previous_hash:
-                logging.error("Hash has not changed. Something went wrong.")
-                self.hash_update_successful = False
-            else:
-                self.current_hash = new_hash
-                self.hash_update_successful = True
-                self._previous_hash = self.current_hash
-                self._last_hash_time = current_timestamp
+            self.current_hash = hashlib.sha256(str(current_timestamp).encode()).hexdigest()
+            self.hash_update_successful = True
+            self._previous_hash = self.current_hash
+            self._last_hash_time = current_timestamp
 
     def get_connection(self) -> Optional[OpenStackClient]:
         """
@@ -1184,6 +1189,19 @@ class InstanceHAService(CloudConnectionProvider):
                 logging.debug("Health check: %s", format % args)
 
             def do_GET(self):
+                if self.path == '/healthz':
+                    if service_instance.ready:
+                        self.send_response(200)
+                        self.send_header("Content-type", "text/plain")
+                        self.end_headers()
+                        self.wfile.write(b"ok")
+                    else:
+                        self.send_response(503)
+                        self.send_header("Content-type", "text/plain")
+                        self.end_headers()
+                        self.wfile.write(b"not ready")
+                    return
+
                 if service_instance.hash_update_successful:
                     self.send_response(200)
                     self.send_header("Content-type", "text/plain")
@@ -1306,8 +1324,9 @@ def _kdump_udp_listener(service: 'InstanceHAService') -> None:
                                     service.kdump_hosts_timestamp[hostname] = time.time()
                                     if len(service.kdump_hosts_timestamp) > KDUMP_CLEANUP_THRESHOLD:
                                         cutoff = time.time() - KDUMP_CLEANUP_AGE_SECONDS
-                                        service.kdump_hosts_timestamp = defaultdict(float,
-                                            {k: v for k, v in service.kdump_hosts_timestamp.items() if v >= cutoff})
+                                        to_remove = [k for k, v in service.kdump_hosts_timestamp.items() if v < cutoff]
+                                        for k in to_remove:
+                                            del service.kdump_hosts_timestamp[k]
                                 logging.info('Kdump message received from host: %s', hostname)
                             except Exception as e:
                                 logging.warning('Failed to process kdump message from %s: %s', address[0], e)
@@ -2737,7 +2756,8 @@ def process_service(failed_service, reserved_hosts, resume, service, shared_conn
         except Exception as e:
             logging.error("Service processing failed for %s: %s", host_name, e)
             _emit_k8s_event(host_name, 'ProcessingFailed',
-                            f'Service processing failed: {e}', event_type='Warning')
+                            f'Service processing failed: {_sanitize_message(str(e))}',
+                            event_type='Warning')
             return False
 
 
@@ -3175,6 +3195,9 @@ def main():
             _process_stale_services(conn, service, services, compute_nodes_list, to_resume)
             _process_reenabling(conn, service, to_reenable)
 
+            if not service.ready:
+                service.ready = True
+                logging.info("Readiness probe active — first poll cycle completed")
             consecutive_failures = 0
 
         except (Unauthorized, DiscoveryFailure) as e:

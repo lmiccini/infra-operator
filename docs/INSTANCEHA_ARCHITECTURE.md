@@ -1463,7 +1463,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
 
 ### Test Statistics
 
-- **Total Tests**: 559 across 15 test suites
+- **Total Tests**: 576 across 15 test suites
 
 ### Test Categories
 

@@ -480,15 +480,12 @@ class TestInstanceHAService(unittest.TestCase):
         self.assertNotEqual(self.service.current_hash, "")
         self.assertTrue(self.service.hash_update_successful)
 
-        # Same hash should trigger failure
-        old_hash = self.service.current_hash
-        self.service._previous_hash = old_hash  # Simulate same hash scenario
-
-        import unittest.mock
-        with unittest.mock.patch('hashlib.sha256') as mock_sha:
-            mock_sha.return_value.hexdigest.return_value = old_hash
-            self.service.update_health_hash(hash_interval=0)
-            self.assertFalse(self.service.hash_update_successful)
+        # Second update should produce a different hash (SHA-256 of different timestamp)
+        first_hash = self.service.current_hash
+        self.service._last_hash_time = 0  # Reset to force update
+        self.service.update_health_hash(hash_interval=0)
+        self.assertTrue(self.service.hash_update_successful)
+        self.assertNotEqual(self.service.current_hash, first_hash)
 
     def test_new_configuration_values(self):
         """Test new configuration values are accessible."""

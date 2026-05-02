@@ -50,7 +50,6 @@ func Deployment(
 	volumeMounts := instancehaPodVolumeMounts()
 
 	livenessProbe := &corev1.Probe{
-		// TODO might need tuning
 		TimeoutSeconds:      30,
 		PeriodSeconds:       30,
 		InitialDelaySeconds: 10,
@@ -58,6 +57,17 @@ func Deployment(
 
 	livenessProbe.HTTPGet = &corev1.HTTPGetAction{
 		Path: "/",
+		Port: intstr.IntOrString{Type: intstr.Int, IntVal: 8080},
+	}
+
+	readinessProbe := &corev1.Probe{
+		TimeoutSeconds:      10,
+		PeriodSeconds:       10,
+		InitialDelaySeconds: 5,
+	}
+
+	readinessProbe.HTTPGet = &corev1.HTTPGetAction{
+		Path: "/healthz",
 		Port: intstr.IntOrString{Type: intstr.Int, IntVal: 8080},
 	}
 
@@ -88,7 +98,7 @@ func Deployment(
 				Spec: corev1.PodSpec{
 					ServiceAccountName:            instance.RbacResourceName(),
 					Volumes:                       volumes,
-					TerminationGracePeriodSeconds: ptr.To[int64](0),
+					TerminationGracePeriodSeconds: ptr.To[int64](30),
 					Containers: []corev1.Container{{
 						Name:    "instanceha",
 						Image:   containerImage,
@@ -110,8 +120,9 @@ func Deployment(
 							Protocol:      "UDP",
 							Name:          "instanceha",
 						}},
-						VolumeMounts:  volumeMounts,
-						LivenessProbe: livenessProbe,
+						VolumeMounts:   volumeMounts,
+						LivenessProbe:  livenessProbe,
+						ReadinessProbe: readinessProbe,
 					}},
 				},
 			},
@@ -189,7 +200,8 @@ func instancehaPodVolumes(
 			Name: "openstack-config-secret",
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
-					SecretName: instance.Spec.OpenStackConfigSecret,
+					SecretName:  instance.Spec.OpenStackConfigSecret,
+					DefaultMode: ptr.To[int32](0o400),
 				},
 			},
 		},
@@ -197,7 +209,8 @@ func instancehaPodVolumes(
 			Name: "fencing-secret",
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
-					SecretName: instance.Spec.FencingSecret,
+					SecretName:  instance.Spec.FencingSecret,
+					DefaultMode: ptr.To[int32](0o400),
 				},
 			},
 		},

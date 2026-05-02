@@ -326,8 +326,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			Log.Error(err, fmt.Sprintf("could not fetch configmap %s", instance.Spec.InstanceHaConfigMap))
 			return ctrl.Result{}, err
 		}
+	} else {
+		configVars[instance.Spec.InstanceHaConfigMap] = env.SetValue(configMapHash)
 	}
-	configVars[instance.Spec.InstanceHaConfigMap] = env.SetValue(configMapHash)
 
 	instance.Status.Conditions.MarkTrue(condition.InputReadyCondition, condition.InputReadyMessage)
 
