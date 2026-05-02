@@ -717,14 +717,14 @@ clouds:
 ```yaml
 FencingConfig:
   compute-01.example.com:
-    agent: fence_ipmilan
+    agent: ipmi
     ipaddr: 192.168.1.10
     ipport: '623'
     login: admin
     passwd: ipmi_password
 
   compute-02.example.com:
-    agent: fence_redfish
+    agent: redfish
     ipaddr: 192.168.1.11
     ipport: '443'
     login: root
@@ -733,7 +733,7 @@ FencingConfig:
     uuid: System.Embedded.1
 
   compute-03.example.com:
-    agent: fence_metal3
+    agent: bmh
     host: metal3-0
     namespace: openshift-machine-api
     token: eyJhbGciOi...
@@ -943,12 +943,12 @@ def _execute_fence_operation(host, action, fencing_data, service):
 
 ### 1. IPMI (Intelligent Platform Management Interface)
 
-**Agent**: `fence_ipmilan`
+**Agent**: `ipmi`
 
 **Configuration**:
 ```yaml
 compute-01:
-  agent: fence_ipmilan
+  agent: ipmi
   ipaddr: 192.168.1.10
   ipport: '623'
   login: admin
@@ -964,12 +964,12 @@ compute-01:
 
 ### 2. Redfish
 
-**Agent**: `fence_redfish`
+**Agent**: `redfish`
 
 **Configuration**:
 ```yaml
 compute-02:
-  agent: fence_redfish
+  agent: redfish
   ipaddr: 192.168.1.11
   ipport: '443'
   login: root
@@ -988,12 +988,12 @@ compute-02:
 
 ### 3. BMH (BareMetal Host - Metal3)
 
-**Agent**: `fence_metal3` (BMH)
+**Agent**: `bmh`
 
 **Configuration**:
 ```yaml
 compute-03:
-  agent: fence_metal3
+  agent: bmh
   host: metal3-0
   namespace: openshift-machine-api
   token: eyJhbGciOi...

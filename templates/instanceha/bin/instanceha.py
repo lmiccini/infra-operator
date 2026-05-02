@@ -3133,6 +3133,13 @@ def main():
     service = _initialize_service(config_manager)
     conn = _establish_nova_connection(service)
 
+    # Crash recovery: if the previous instance fenced a host but crashed before
+    # setting forced_down/disabled_reason in Nova, that host will appear as
+    # down + not-disabled in the next poll. _categorize_services places it in
+    # compute_nodes, so it gets fenced again (idempotent) and evacuated normally.
+    logging.info("InstanceHA daemon started — orphaned fenced hosts (if any) "
+                 "will be recovered in the first poll cycle")
+
     consecutive_failures = 0
 
     while True:

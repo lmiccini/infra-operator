@@ -96,7 +96,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	Log := r.GetLogger(ctx)
 
 	instance := &instancehav1.InstanceHa{}
-	err := r.Get(context.TODO(), req.NamespacedName, instance)
+	err := r.Get(ctx, req.NamespacedName, instance)
 	if err != nil {
 		if k8s_errors.IsNotFound(err) {
 			Log.Info("InstanceHa CR not found")
@@ -440,7 +440,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			instance.Spec.NetworkAttachments, err)
 	}
 
-	// TODO add check to make sure there is only a single copy of instanceha using the same OpenStackCloud
 	cloud := instance.Spec.OpenStackCloud
 
 	containerImage, err := r.GetContainerImage(ctx, instance.Spec.ContainerImage, instance)
