@@ -81,6 +81,9 @@ func (spec *InstanceHaSpec) Default() {
         if spec.InstanceHaKdumpPort == 0 {
                 spec.InstanceHaKdumpPort = 7410
         }
+        if spec.InstanceHaHeartbeatPort == 0 {
+                spec.InstanceHaHeartbeatPort = 7411
+        }
 }
 
 // ValidateCreate validates the InstanceHa resource on creation.

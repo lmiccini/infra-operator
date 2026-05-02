@@ -70,6 +70,11 @@ type InstanceHaSpec struct {
 	InstanceHaKdumpPort int32 `json:"instanceHaKdumpPort"`
 
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=7411
+	// InstanceHaHeartbeatPort is the UDP port for compute node heartbeat packets
+	InstanceHaHeartbeatPort int32 `json:"instanceHaHeartbeatPort"`
+
+	// +kubebuilder:validation:Optional
 	// NodeSelector to target subset of worker nodes running control plane services
 	NodeSelector *map[string]string `json:"nodeSelector,omitempty"`
 

@@ -18,9 +18,11 @@ import (
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	env "github.com/openstack-k8s-operators/lib-common/modules/common/env"
 
+	"fmt"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 )
@@ -46,6 +48,9 @@ func Deployment(
 	envVars["POD_NAME"] = env.DownwardAPI("metadata.name")
 	envVars["POD_NAMESPACE"] = env.DownwardAPI("metadata.namespace")
 	envVars["INSTANCEHA_CR_NAME"] = env.SetValue(instance.Name)
+	if instance.Spec.InstanceHaHeartbeatPort > 0 {
+		envVars["HEARTBEAT_PORT"] = env.SetValue(fmt.Sprintf("%d", instance.Spec.InstanceHaHeartbeatPort))
+	}
 
 	// create Volume and VolumeMounts
 	volumes := instancehaPodVolumes(instance)
@@ -119,12 +124,8 @@ func Deployment(
 								},
 							},
 						},
-						Env: env.MergeEnvs([]corev1.EnvVar{}, envVars),
-						Ports: []corev1.ContainerPort{{
-							ContainerPort: instance.Spec.InstanceHaKdumpPort,
-							Protocol:      "UDP",
-							Name:          "instanceha",
-						}},
+						Env:            env.MergeEnvs([]corev1.EnvVar{}, envVars),
+						Ports:          instancehaPorts(instance),
 						VolumeMounts:   volumeMounts,
 						LivenessProbe:  livenessProbe,
 						ReadinessProbe: readinessProbe,
@@ -152,6 +153,24 @@ func Deployment(
 	}
 
 	return dep
+}
+
+func instancehaPorts(instance *instancehav1.InstanceHa) []corev1.ContainerPort {
+	ports := []corev1.ContainerPort{
+		{
+			ContainerPort: instance.Spec.InstanceHaKdumpPort,
+			Protocol:      "UDP",
+			Name:          "kdump",
+		},
+	}
+	if instance.Spec.InstanceHaHeartbeatPort > 0 {
+		ports = append(ports, corev1.ContainerPort{
+			ContainerPort: instance.Spec.InstanceHaHeartbeatPort,
+			Protocol:      "UDP",
+			Name:          "heartbeat",
+		})
+	}
+	return ports
 }
 
 func instancehaPodVolumeMounts() []corev1.VolumeMount {

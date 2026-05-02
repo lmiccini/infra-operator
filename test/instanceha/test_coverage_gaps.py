@@ -905,6 +905,7 @@ class TestProcessStaleServicesSafety(unittest.TestCase):
         svc.config = Mock()
         svc.config.get_config_value = Mock(side_effect=lambda key: {
             'DISABLED': False, 'THRESHOLD': 50, 'CHECK_KDUMP': False,
+            'CHECK_HEARTBEAT': False,
             'WORKERS': 2, 'POLL': 5, 'FENCING_TIMEOUT': 30,
             'TAGGED_IMAGES': False, 'TAGGED_FLAVORS': False,
             'TAGGED_AGGREGATES': False, 'RESERVED_HOSTS': False,
@@ -948,6 +949,7 @@ class TestProcessStaleServicesSafety(unittest.TestCase):
         service = self._make_service()
         service.config.get_config_value = Mock(side_effect=lambda key: {
             'DISABLED': True, 'THRESHOLD': 50, 'CHECK_KDUMP': False,
+            'CHECK_HEARTBEAT': False,
             'WORKERS': 2, 'POLL': 5, 'FENCING_TIMEOUT': 30,
             'TAGGED_IMAGES': False, 'TAGGED_FLAVORS': False,
             'TAGGED_AGGREGATES': False, 'RESERVED_HOSTS': False,

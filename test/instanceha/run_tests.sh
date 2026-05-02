@@ -86,6 +86,8 @@ coverage_gaps_tests_passed=0
 orchestrated_evacuation_tests_passed=0
 k8s_events_tests_passed=0
 thread_safety_tests_passed=0
+heartbeat_detection_tests_passed=0
+heartbeat_scale_tests_passed=0
 
 # Run core unit tests
 echo -e "${BLUE}Running Core Unit Tests...${NC}"
@@ -219,13 +221,31 @@ fi
 echo
 echo
 
+# Run heartbeat detection tests
+echo -e "${BLUE}Running Heartbeat Detection Tests...${NC}"
+if run_test_file "test_heartbeat_detection.py" "Heartbeat Detection Tests"; then
+    heartbeat_detection_tests_passed=1
+fi
+
+echo
+echo
+
+# Run heartbeat scale tests
+echo -e "${BLUE}Running Heartbeat Scale Tests...${NC}"
+if run_test_file "test_heartbeat_scale.py" "Heartbeat Scale Tests"; then
+    heartbeat_scale_tests_passed=1
+fi
+
+echo
+echo
+
 # Summary
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}            Test Summary                ${NC}"
 echo -e "${BLUE}========================================${NC}"
 
-total_passed=$((unit_core_tests_passed + fencing_tests_passed + kdump_tests_passed + security_tests_passed + critical_error_tests_passed + evacuation_workflow_tests_passed + config_features_tests_passed + helper_functions_tests_passed + functional_tests_passed + integration_tests_passed + region_isolation_tests_passed + coverage_gaps_tests_passed + orchestrated_evacuation_tests_passed + k8s_events_tests_passed + thread_safety_tests_passed))
-total_tests=15
+total_passed=$((unit_core_tests_passed + fencing_tests_passed + kdump_tests_passed + security_tests_passed + critical_error_tests_passed + evacuation_workflow_tests_passed + config_features_tests_passed + helper_functions_tests_passed + functional_tests_passed + integration_tests_passed + region_isolation_tests_passed + coverage_gaps_tests_passed + orchestrated_evacuation_tests_passed + k8s_events_tests_passed + thread_safety_tests_passed + heartbeat_detection_tests_passed + heartbeat_scale_tests_passed))
+total_tests=17
 
 if [ $unit_core_tests_passed -eq 1 ]; then
     echo -e "${GREEN}[PASS] Core Unit Tests: PASSED${NC}"
@@ -315,6 +335,18 @@ if [ $thread_safety_tests_passed -eq 1 ]; then
     echo -e "${GREEN}[PASS] Thread Safety Tests: PASSED${NC}"
 else
     echo -e "${RED}[FAIL] Thread Safety Tests: FAILED${NC}"
+fi
+
+if [ $heartbeat_detection_tests_passed -eq 1 ]; then
+    echo -e "${GREEN}[PASS] Heartbeat Detection Tests: PASSED${NC}"
+else
+    echo -e "${RED}[FAIL] Heartbeat Detection Tests: FAILED${NC}"
+fi
+
+if [ $heartbeat_scale_tests_passed -eq 1 ]; then
+    echo -e "${GREEN}[PASS] Heartbeat Scale Tests: PASSED${NC}"
+else
+    echo -e "${RED}[FAIL] Heartbeat Scale Tests: FAILED${NC}"
 fi
 
 echo
