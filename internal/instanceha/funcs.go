@@ -25,6 +25,8 @@ import (
 	"k8s.io/utils/ptr"
 )
 
+const instanceHaUID int64 = 42401
+
 // Deployment creates a Kubernetes Deployment for the InstanceHa resource
 func Deployment(
 	instance *instancehav1.InstanceHa,
@@ -104,8 +106,8 @@ func Deployment(
 						Image:   containerImage,
 						Command: []string{"/usr/bin/python3", "-u", "/var/lib/instanceha/instanceha.py"},
 						SecurityContext: &corev1.SecurityContext{
-							RunAsUser:                ptr.To[int64](42401),
-							RunAsGroup:               ptr.To[int64](42401),
+							RunAsUser:                ptr.To(instanceHaUID),
+							RunAsGroup:               ptr.To(instanceHaUID),
 							RunAsNonRoot:             ptr.To(true),
 							AllowPrivilegeEscalation: ptr.To(false),
 							Capabilities: &corev1.Capabilities{

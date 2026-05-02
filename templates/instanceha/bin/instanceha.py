@@ -17,6 +17,7 @@ import subprocess
 from yaml.loader import SafeLoader
 import socket
 import struct
+import signal
 import threading
 import hashlib
 import json
@@ -626,7 +627,8 @@ class InstanceHAService(CloudConnectionProvider):
     def _initialize_threading(self) -> None:
         """Initialize threading infrastructure."""
         self.health_check_thread = None
-        self.UDP_IP = ''  # UDP listener IP
+        self.udp_ip = ''  # UDP listener IP
+        self.shutdown_event = threading.Event()
 
     def _initialize_kdump_state(self) -> None:
         """Initialize kdump detection and management state.
@@ -1292,7 +1294,7 @@ class UDPSocketManager:
 
 def _kdump_udp_listener(service: 'InstanceHAService') -> None:
     """Background UDP listener for kdump messages."""
-    udp_ip = service.UDP_IP if service.UDP_IP else '0.0.0.0'
+    udp_ip = service.udp_ip if service.udp_ip else '0.0.0.0'
     udp_port = service.config.get_udp_port()
 
     try:
@@ -1838,7 +1840,7 @@ def _handle_nova_exception(operation: str, service_info: str, e: Exception, is_c
     if error_msg:
         logging.error("Failed to %s for %s. %s: %s", operation, service_info, error_msg, type(e).__name__)
     else:
-        _safe_log_exception("Failed to %s for %s. Unexpected error" % (operation, service_info), e, include_traceback=True)
+        _safe_log_exception(f"Failed to {operation} for {service_info}. Unexpected error", e, include_traceback=True)
 
     if not is_critical:
         logging.warning("Service %s operation partially failed. Manual cleanup may be needed.", service_info)
@@ -2119,10 +2121,10 @@ def _redfish_reset(url, user, passwd, timeout, action, config_mgr):
                 time.sleep(FENCING_RETRY_DELAY_SECONDS * (attempt + 1))
                 continue
             else:
-                _safe_log_exception("Redfish reset failed for %s" % safe_url, e)
+                _safe_log_exception(f"Redfish reset failed for {safe_url}", e)
                 return False
         except Exception as e:
-            _safe_log_exception("Redfish reset failed for %s" % safe_url, e)
+            _safe_log_exception(f"Redfish reset failed for {safe_url}", e)
             return False
 
     return False
@@ -2174,7 +2176,7 @@ def _bmh_fence(token, namespace, host, action, service):
             return True
 
     except Exception as e:
-        _safe_log_exception("BMH fencing failed for %s" % host, e)
+        _safe_log_exception(f"BMH fencing failed for {host}", e)
         return False
 
 
@@ -2281,8 +2283,7 @@ def _execute_ipmi_fence(host, action, fencing_data, timeout) -> bool:
                               action, host, attempt + 1, MAX_FENCING_RETRIES)
                 time.sleep(FENCING_RETRY_DELAY_SECONDS * (attempt + 1))
             else:
-                _safe_log_exception("IPMI %s failed for %s: timeout after %d attempts" %
-                                  (action, host, MAX_FENCING_RETRIES), e)
+                _safe_log_exception(f"IPMI {action} failed for {host}: timeout after {MAX_FENCING_RETRIES} attempts", e)
                 return False
         except subprocess.CalledProcessError as e:
             if attempt < MAX_FENCING_RETRIES - 1:
@@ -2290,8 +2291,7 @@ def _execute_ipmi_fence(host, action, fencing_data, timeout) -> bool:
                               action, host, e.returncode, attempt + 1, MAX_FENCING_RETRIES)
                 time.sleep(FENCING_RETRY_DELAY_SECONDS * (attempt + 1))
             else:
-                _safe_log_exception("IPMI %s failed for %s: command failed with return code %d after %d attempts" %
-                                  (action, host, e.returncode, MAX_FENCING_RETRIES), e)
+                _safe_log_exception(f"IPMI {action} failed for {host}: command failed with return code {e.returncode} after {MAX_FENCING_RETRIES} attempts", e)
                 return False
 
     if action == 'off':
@@ -3168,23 +3168,25 @@ def main():
     service = _initialize_service(config_manager)
     conn = _establish_nova_connection(service)
 
-    # Crash recovery: if the previous instance fenced a host but crashed before
-    # setting forced_down/disabled_reason in Nova, that host will appear as
-    # down + not-disabled in the next poll. _categorize_services places it in
-    # compute_nodes, so it gets fenced again (idempotent) and evacuated normally.
+    def _sigterm_handler(signum, frame):
+        logging.info("SIGTERM received, finishing in-flight work before shutdown")
+        service.shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
     logging.info("InstanceHA daemon started — orphaned fenced hosts (if any) "
                  "will be recovered in the first poll cycle")
 
     consecutive_failures = 0
 
-    while True:
+    while not service.shutdown_event.is_set():
         service.update_health_hash()
         poll_interval = service.config.get_config_value('POLL')
 
         try:
             services = conn.services.list(binary="nova-compute")
             if not services:
-                time.sleep(poll_interval)
+                service.shutdown_event.wait(poll_interval)
                 continue
 
             target_date = datetime.now() - timedelta(seconds=service.config.get_config_value('DELTA'))
@@ -3205,7 +3207,7 @@ def main():
             backoff = min(poll_interval * (2 ** consecutive_failures), MAX_NOVA_BACKOFF_SECONDS)
             logging.warning("Nova session expired or discovery failed (attempt %d): %s. "
                            "Reconnecting in %ds...", consecutive_failures, type(e).__name__, backoff)
-            time.sleep(backoff)
+            service.shutdown_event.wait(backoff)
             try:
                 conn = _establish_nova_connection(service)
             except SystemExit:
@@ -3219,10 +3221,12 @@ def main():
             logging.warning("Failed to query Nova API (attempt %d): %s. Retrying in %ds.",
                            consecutive_failures, e, backoff)
             logging.debug('Exception traceback:', exc_info=True)
-            time.sleep(backoff)
+            service.shutdown_event.wait(backoff)
             continue
 
-        time.sleep(poll_interval)
+        service.shutdown_event.wait(poll_interval)
+
+    logging.info("Graceful shutdown complete")
 
 
 if __name__ == "__main__":

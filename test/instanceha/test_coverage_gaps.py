@@ -18,53 +18,13 @@ Covers:
 - _process_stale_services: safety branches for empty/threshold/disabled paths
 """
 
-import os
-import sys
+import threading
 import unittest
 import logging
 from unittest.mock import Mock, patch, MagicMock, call
 
-# Mock OpenStack dependencies before importing instanceha
-if 'novaclient' not in sys.modules:
-    sys.modules['novaclient'] = MagicMock()
-    sys.modules['novaclient.client'] = MagicMock()
-    class NotFound(Exception):
-        pass
-    class Conflict(Exception):
-        pass
-    class Forbidden(Exception):
-        pass
-    class Unauthorized(Exception):
-        pass
-    novaclient_exceptions = MagicMock()
-    novaclient_exceptions.NotFound = NotFound
-    novaclient_exceptions.Conflict = Conflict
-    novaclient_exceptions.Forbidden = Forbidden
-    novaclient_exceptions.Unauthorized = Unauthorized
-    sys.modules['novaclient.exceptions'] = novaclient_exceptions
-
-if 'keystoneauth1' not in sys.modules:
-    sys.modules['keystoneauth1'] = MagicMock()
-    sys.modules['keystoneauth1.loading'] = MagicMock()
-    sys.modules['keystoneauth1.session'] = MagicMock()
-
-    class DiscoveryFailure(Exception):
-        pass
-
-    discovery_module = MagicMock()
-    discovery_module.DiscoveryFailure = DiscoveryFailure
-
-    exceptions_module = MagicMock()
-    exceptions_module.discovery = discovery_module
-
-    sys.modules['keystoneauth1.exceptions'] = exceptions_module
-    sys.modules['keystoneauth1.exceptions.discovery'] = discovery_module
-
-test_dir = os.path.dirname(os.path.abspath(__file__))
-instanceha_path = os.path.join(test_dir, '../../templates/instanceha/bin/')
-sys.path.insert(0, os.path.abspath(instanceha_path))
-
 logging.getLogger().setLevel(logging.CRITICAL)
+import conftest  # noqa: F401
 import instanceha
 logging.getLogger().setLevel(logging.CRITICAL)
 
@@ -814,88 +774,121 @@ class TestMainLoopBackoff(unittest.TestCase):
         }.get(key, Mock()))
         svc.update_health_hash = Mock()
         svc.processing_lock = Mock()
+        svc.ready = False
+        # Use a real Event; tests set it to break the main loop
+        svc.shutdown_event = threading.Event()
         return svc
 
     @patch('instanceha.DiscoveryFailure', _TestDiscoveryFailure)
-    @patch('instanceha.time.sleep', side_effect=[None, SystemExit('stop')])
+    @patch('instanceha.signal.signal')
     @patch('instanceha._establish_nova_connection')
     @patch('instanceha._initialize_service')
     @patch('instanceha.ConfigManager')
-    def test_unauthorized_triggers_reconnection(self, mock_cm, mock_init, mock_conn, mock_sleep):
+    def test_unauthorized_triggers_reconnection(self, mock_cm, mock_init, mock_conn, mock_signal):
         mock_cm.return_value.get_config_value = Mock(return_value='INFO')
         service = self._make_service_mock()
         mock_init.return_value = service
         conn = Mock()
         mock_conn.return_value = conn
-        conn.services.list.side_effect = instanceha.Unauthorized('expired')
 
-        with self.assertRaises(SystemExit):
-            instanceha.main()
+        call_count = [0]
+        def unauthorized_then_stop(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                service.shutdown_event.set()
+            raise instanceha.Unauthorized('expired')
+        conn.services.list.side_effect = unauthorized_then_stop
+
+        instanceha.main()
 
         mock_conn.assert_called()
 
     @patch('instanceha.DiscoveryFailure', _TestDiscoveryFailure)
-    @patch('instanceha.time.sleep', side_effect=[None, SystemExit('stop')])
+    @patch('instanceha.signal.signal')
     @patch('instanceha._establish_nova_connection')
     @patch('instanceha._initialize_service')
     @patch('instanceha.ConfigManager')
-    def test_generic_exception_increments_consecutive_failures(self, mock_cm, mock_init, mock_conn, mock_sleep):
+    def test_generic_exception_increments_consecutive_failures(self, mock_cm, mock_init, mock_conn, mock_signal):
         mock_cm.return_value.get_config_value = Mock(return_value='INFO')
         service = self._make_service_mock()
         mock_init.return_value = service
         conn = Mock()
         mock_conn.return_value = conn
-        conn.services.list.side_effect = RuntimeError('API down')
 
-        with self.assertRaises(SystemExit):
-            instanceha.main()
+        call_count = [0]
+        def error_then_stop(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                service.shutdown_event.set()
+            raise RuntimeError('API down')
+        conn.services.list.side_effect = error_then_stop
 
-        calls = mock_sleep.call_args_list
-        self.assertGreater(len(calls), 0)
+        instanceha.main()
+
+        self.assertGreaterEqual(call_count[0], 2)
 
     @patch('instanceha.DiscoveryFailure', _TestDiscoveryFailure)
+    @patch('instanceha.signal.signal')
     @patch('instanceha._process_reenabling')
     @patch('instanceha._process_stale_services')
     @patch('instanceha._categorize_services')
-    @patch('instanceha.time.sleep', side_effect=[None, SystemExit('stop')])
     @patch('instanceha._establish_nova_connection')
     @patch('instanceha._initialize_service')
     @patch('instanceha.ConfigManager')
     def test_successful_poll_resets_consecutive_failures(self, mock_cm, mock_init, mock_conn,
-                                                         mock_sleep, mock_cat, mock_proc, mock_reen):
+                                                         mock_cat, mock_proc, mock_reen, mock_signal):
         mock_cm.return_value.get_config_value = Mock(return_value='INFO')
         service = self._make_service_mock()
         mock_init.return_value = service
         conn = Mock()
         mock_conn.return_value = conn
         svc_mock = Mock()
-        conn.services.list.return_value = [svc_mock]
+
+        call_count = [0]
+        def services_then_stop(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                service.shutdown_event.set()
+            return [svc_mock]
+        conn.services.list.side_effect = services_then_stop
         mock_cat.return_value = ([], [], [])
 
-        with self.assertRaises(SystemExit):
-            instanceha.main()
+        instanceha.main()
 
         mock_cat.assert_called()
 
     @patch('instanceha.DiscoveryFailure', _TestDiscoveryFailure)
-    @patch('instanceha.time.sleep', side_effect=[None, None, SystemExit('stop')])
+    @patch('instanceha.signal.signal')
     @patch('instanceha._establish_nova_connection')
     @patch('instanceha._initialize_service')
     @patch('instanceha.ConfigManager')
-    def test_backoff_capped_at_max(self, mock_cm, mock_init, mock_conn, mock_sleep):
+    def test_backoff_capped_at_max(self, mock_cm, mock_init, mock_conn, mock_signal):
         mock_cm.return_value.get_config_value = Mock(return_value='INFO')
         service = self._make_service_mock()
         mock_init.return_value = service
         conn = Mock()
         mock_conn.return_value = conn
-        conn.services.list.side_effect = RuntimeError('API down')
 
-        with self.assertRaises(SystemExit):
-            instanceha.main()
+        backoff_values = []
+        original_wait = service.shutdown_event.wait
+        def capture_wait(timeout=None):
+            if timeout is not None:
+                backoff_values.append(timeout)
+            original_wait(0)
+        service.shutdown_event.wait = capture_wait
 
-        for c in mock_sleep.call_args_list:
-            if c[0]:
-                self.assertLessEqual(c[0][0], instanceha.MAX_NOVA_BACKOFF_SECONDS)
+        call_count = [0]
+        def error_then_stop(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] >= 3:
+                service.shutdown_event.set()
+            raise RuntimeError('API down')
+        conn.services.list.side_effect = error_then_stop
+
+        instanceha.main()
+
+        for v in backoff_values:
+            self.assertLessEqual(v, instanceha.MAX_NOVA_BACKOFF_SECONDS)
 
 
 # ============================================================================

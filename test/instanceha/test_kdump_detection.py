@@ -11,7 +11,6 @@ Tests for kdump crash detection functionality:
 #!/usr/bin/env python3
 
 import os
-import sys
 import unittest
 import tempfile
 import yaml
@@ -28,54 +27,10 @@ from unittest.mock import Mock, patch, MagicMock, call
 from datetime import datetime, timedelta
 from io import StringIO
 
-# Mock OpenStack dependencies before importing instanceha
-# This allows tests to run without novaclient, keystoneauth1, etc.
-if 'novaclient' not in sys.modules:
-    sys.modules['novaclient'] = MagicMock()
-    sys.modules['novaclient.client'] = MagicMock()
-    # Create actual exception classes for novaclient
-    class NotFound(Exception):
-        pass
-    class Conflict(Exception):
-        pass
-    class Forbidden(Exception):
-        pass
-    class Unauthorized(Exception):
-        pass
-    novaclient_exceptions = MagicMock()
-    novaclient_exceptions.NotFound = NotFound
-    novaclient_exceptions.Conflict = Conflict
-    novaclient_exceptions.Forbidden = Forbidden
-    novaclient_exceptions.Unauthorized = Unauthorized
-    sys.modules['novaclient.exceptions'] = novaclient_exceptions
-
-if 'keystoneauth1' not in sys.modules:
-    sys.modules['keystoneauth1'] = MagicMock()
-    sys.modules['keystoneauth1.loading'] = MagicMock()
-    sys.modules['keystoneauth1.session'] = MagicMock()
-
-    class DiscoveryFailure(Exception):
-        pass
-
-    discovery_module = MagicMock()
-    discovery_module.DiscoveryFailure = DiscoveryFailure
-
-    exceptions_module = MagicMock()
-    exceptions_module.discovery = discovery_module
-
-    sys.modules['keystoneauth1.exceptions'] = exceptions_module
-    sys.modules['keystoneauth1.exceptions.discovery'] = discovery_module
-
-# Add the module path for testing
-# Calculate the path to instanceha.py relative to this test file
-test_dir = os.path.dirname(os.path.abspath(__file__))
-instanceha_path = os.path.join(test_dir, '../../templates/instanceha/bin/')
-sys.path.insert(0, os.path.abspath(instanceha_path))
-
 # Suppress configuration warnings during testing
 logging.getLogger().setLevel(logging.CRITICAL)
 
-# Import the module under test
+import conftest  # noqa: F401
 import instanceha
 
 # Re-suppress logging after import (instanceha sets its own level)
@@ -91,7 +46,7 @@ class TestKdumpFunctionality(unittest.TestCase):
         self.mock_service = Mock()
         self.mock_service.config.get_config_value.return_value = 10  # KDUMP_TIMEOUT
         self.mock_service.config.get_workers.return_value = 4
-        self.mock_service.UDP_IP = '0.0.0.0'
+        self.mock_service.udp_ip = '0.0.0.0'
         self.mock_service.config.get_udp_port.return_value = 7410
 
         # Create a mock service for kdump testing with proper config
@@ -401,7 +356,7 @@ class TestKdumpIntegration(unittest.TestCase):
         self.mock_service = Mock()
         self.mock_service.config.get_config_value.return_value = 10
         self.mock_service.config.get_workers.return_value = 2
-        self.mock_service.UDP_IP = '127.0.0.1'
+        self.mock_service.udp_ip = '127.0.0.1'
         self.mock_service.config.get_udp_port.return_value = 7411  # Different port for testing
 
     def tearDown(self):

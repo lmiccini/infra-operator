@@ -10,55 +10,13 @@ Tests critical error handling including:
 """
 
 import os
-import sys
 import unittest
 import tempfile
 import yaml
 from unittest.mock import Mock, patch, MagicMock, call
 from datetime import datetime
 
-# Mock OpenStack dependencies
-if 'novaclient' not in sys.modules:
-    sys.modules['novaclient'] = MagicMock()
-    sys.modules['novaclient.client'] = MagicMock()
-    class NotFound(Exception):
-        pass
-    class Conflict(Exception):
-        pass
-    class Forbidden(Exception):
-        pass
-    class Unauthorized(Exception):
-        pass
-    novaclient_exceptions = MagicMock()
-    novaclient_exceptions.NotFound = NotFound
-    novaclient_exceptions.Conflict = Conflict
-    novaclient_exceptions.Forbidden = Forbidden
-    novaclient_exceptions.Unauthorized = Unauthorized
-    sys.modules['novaclient.exceptions'] = novaclient_exceptions
-
-if 'keystoneauth1' not in sys.modules:
-    sys.modules['keystoneauth1'] = MagicMock()
-    sys.modules['keystoneauth1.loading'] = MagicMock()
-    sys.modules['keystoneauth1.session'] = MagicMock()
-
-    # Create discovery failure exception
-    class DiscoveryFailure(Exception):
-        pass
-
-    discovery_module = MagicMock()
-    discovery_module.DiscoveryFailure = DiscoveryFailure
-
-    exceptions_module = MagicMock()
-    exceptions_module.discovery = discovery_module
-
-    sys.modules['keystoneauth1.exceptions'] = exceptions_module
-    sys.modules['keystoneauth1.exceptions.discovery'] = discovery_module
-
-# Add module path
-test_dir = os.path.dirname(os.path.abspath(__file__))
-instanceha_path = os.path.join(test_dir, '../../templates/instanceha/bin/')
-sys.path.insert(0, os.path.abspath(instanceha_path))
-
+import conftest  # noqa: F401
 import instanceha
 
 
