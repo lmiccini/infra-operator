@@ -235,9 +235,8 @@ class TestNovaAPIExceptions(unittest.TestCase):
                         auth_url='http://auth', user_domain_name='default', project_domain_name='default',
                         region_name='test-region'
                     )
-                    result = instanceha.nova_login(credentials)
-
-                    self.assertIsNone(result)
+                    with self.assertRaises(instanceha.NovaConnectionError):
+                        instanceha.nova_login(credentials)
 
     def test_nova_login_unauthorized(self):
         """Test Nova login with unauthorized exception."""
@@ -258,9 +257,8 @@ class TestNovaAPIExceptions(unittest.TestCase):
                         auth_url='http://auth', user_domain_name='default', project_domain_name='default',
                         region_name='test-region'
                     )
-                    result = instanceha.nova_login(credentials)
-
-                    self.assertIsNone(result)
+                    with self.assertRaises(instanceha.NovaConnectionError):
+                        instanceha.nova_login(credentials)
 
 
 class TestServiceDisableValidation(unittest.TestCase):

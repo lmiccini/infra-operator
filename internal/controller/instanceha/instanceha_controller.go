@@ -130,10 +130,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 
 	// Always patch the instance status when exiting this function so we can persist any changes.
 	defer func() {
-		// Don't update the status, if reconciler Panics
-		if r := recover(); r != nil {
-			Log.Info(fmt.Sprintf("panic during reconcile %v\n", r))
-			panic(r)
+		if panicVal := recover(); panicVal != nil {
+			Log.Error(fmt.Errorf("panic: %v", panicVal), "panic during reconcile, not updating status")
+			panic(panicVal)
 		}
 		condition.RestoreLastTransitionTimes(&instance.Status.Conditions, savedConditions)
 		// update the Ready condition based on the sub conditions
@@ -695,5 +694,5 @@ func (r *Reconciler) GetContainerImage(
 		return cmImage, nil
 	}
 
-	return "", nil
+	return "", fmt.Errorf("no container image found: key 'instanceha-image' not in ConfigMap %s and RELATED_IMAGE_INFRA_INSTANCE_HA_IMAGE_URL_DEFAULT not set", instanceHaConfigMapName)
 }

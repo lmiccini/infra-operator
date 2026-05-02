@@ -65,6 +65,7 @@ USERNAME_MAX_LENGTH = 64
 FENCING_RETRY_DELAY_SECONDS = 1
 KDUMP_REENABLE_DELAY_SECONDS = 60
 MAX_NOVA_BACKOFF_SECONDS = 300
+MAX_TOTAL_EVACUATION_THREADS = 32
 
 # Disabled reason markers
 DISABLED_REASON_EVACUATION = "instanceha evacuation"
@@ -684,7 +685,7 @@ class InstanceHAService(CloudConnectionProvider):
                 project_domain_name=auth["project_domain_name"],
                 region_name=region_name
             )
-            return nova_login(credentials)
+            return nova_login(credentials, ca_bundle=self.config.ssl_ca_bundle)
         except Exception as e:
             _safe_log_exception("Failed to create Nova connection", e, include_traceback=True)
             raise NovaConnectionError("Nova connection failed")
@@ -1293,8 +1294,14 @@ def _kdump_udp_listener(service: 'InstanceHAService') -> None:
                         if magic_native == KDUMP_MAGIC_NUMBER or magic_network == KDUMP_MAGIC_NUMBER:
                             try:
                                 hostname = _extract_hostname(socket.gethostbyaddr(address[0])[0])
-                                # Record kdump timestamp under lock — the main thread
-                                # reads this in _check_kdump() to decide fencing strategy
+                            except socket.herror:
+                                logging.warning(
+                                    'Kdump packet from %s but reverse DNS lookup failed. '
+                                    'Ensure PTR records exist for compute node management IPs. '
+                                    'This host will fall back to timeout-based detection.',
+                                    address[0])
+                                continue
+                            try:
                                 with service.kdump_lock:
                                     service.kdump_hosts_timestamp[hostname] = time.time()
                                     if len(service.kdump_hosts_timestamp) > KDUMP_CLEANUP_THRESHOLD:
@@ -1468,8 +1475,9 @@ def _orchestrated_evacuate(connection, evacuables, service, host, service_id, ta
         logging.info("Starting evacuation phase %d/%d (%d servers)",
                     phase_num, total_phases, len(phase_servers))
 
+        inner_workers = max(1, MAX_TOTAL_EVACUATION_THREADS // service.config.get_config_value('WORKERS'))
         with concurrent.futures.ThreadPoolExecutor(
-                max_workers=service.config.get_config_value('WORKERS')) as executor:
+                max_workers=inner_workers) as executor:
             future_to_server = {
                 executor.submit(_server_evacuate_future, connection, s, target_host): s
                 for s in phase_servers
@@ -1520,7 +1528,8 @@ def _smart_evacuate(connection, evacuables, service, host, service_id, target_ho
     else:
         logging.debug("Using smart evacuation with %d workers", service.config.get_config_value('WORKERS'))
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=service.config.get_config_value('WORKERS')) as executor:
+    inner_workers = max(1, MAX_TOTAL_EVACUATION_THREADS // service.config.get_config_value('WORKERS'))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=inner_workers) as executor:
         future_to_server = {executor.submit(_server_evacuate_future, connection, s, target_host): s for s in evacuables}
 
         for future in concurrent.futures.as_completed(future_to_server):
@@ -1767,8 +1776,11 @@ def _server_evacuate_future(connection, server, target_host=None) -> bool:
         return False
 
 
-def nova_login(credentials: NovaLoginCredentials) -> Optional[OpenStackClient]:
-    """Create and return Nova client connection."""
+def nova_login(credentials: NovaLoginCredentials, ca_bundle: Optional[str] = None) -> OpenStackClient:
+    """Create and return Nova client connection.
+
+    Raises NovaConnectionError on any failure.
+    """
     try:
         loader = loading.get_plugin_loader("password")
         auth = loader.load_from_options(
@@ -1780,16 +1792,18 @@ def nova_login(credentials: NovaLoginCredentials) -> Optional[OpenStackClient]:
             project_domain_name=credentials.project_domain_name,
         )
 
-        session = ksc_session.Session(auth=auth)
+        verify = ca_bundle if ca_bundle else True
+        session = ksc_session.Session(auth=auth, verify=verify)
         nova = client.Client("2.59", session=session, region_name=credentials.region_name)
         nova.versions.get_current()
         logging.info("Nova login successful")
         return nova
     except (DiscoveryFailure, Unauthorized) as e:
         _safe_log_exception(f"Nova login failed: {type(e).__name__}", e)
+        raise NovaConnectionError(f"Nova login failed: {type(e).__name__}") from e
     except Exception as e:
         _safe_log_exception("Nova login failed", e, include_traceback=True)
-    return None
+        raise NovaConnectionError("Nova login failed") from e
 
 
 NOVA_EXCEPTION_MESSAGES = {
@@ -2384,10 +2398,7 @@ def _host_fence(host, action, service):
 def _get_nova_connection(service):
     """Establish a connection to Nova using service configuration."""
     try:
-        conn = service.create_connection()
-        if not conn:
-            logging.error("Nova connection failed")
-        return conn
+        return service.create_connection()
     except NovaConnectionError:
         logging.error("Nova connection failed")
         return None
@@ -2648,7 +2659,7 @@ def _execute_step(step_name, step_func, host_name, *args, **kwargs):
         return False
 
 
-def process_service(failed_service, reserved_hosts, resume, service) -> bool:
+def process_service(failed_service, reserved_hosts, resume, service, shared_conn=None) -> bool:
     """Process a failed compute service through the complete recovery workflow."""
     if not failed_service or not hasattr(failed_service, 'host'):
         logging.error("Invalid service object provided")
@@ -2662,8 +2673,7 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
 
     with track_host_processing(service, hostname):
         try:
-            # Get Nova connection first
-            conn = _get_nova_connection(service)
+            conn = shared_conn or _get_nova_connection(service)
             if not conn:
                 logging.error("Nova connection failed for %s", host_name)
                 return False
@@ -2756,12 +2766,8 @@ def _initialize_service(config_mgr):
 def _establish_nova_connection(service):
     """Establish Nova connection using service configuration."""
     try:
-        conn = service.create_connection()
-        if conn is None:
-            logging.error("Failed: Unable to connect to Nova - connection is None")
-            sys.exit(1)
-        return conn
-    except NovaConnectionError as e:
+        return service.create_connection()
+    except NovaConnectionError:
         logging.error("Failed: Unable to connect to Nova")
         sys.exit(1)
     except Exception as e:
@@ -2790,9 +2796,9 @@ def _is_service_stale(svc, target_date: datetime) -> bool:
     try:
         return datetime.fromisoformat(svc.updated_at) < target_date
     except (ValueError, TypeError, AttributeError):
-        logging.warning("Service %s has invalid updated_at: %r, treating as stale",
+        logging.warning("Service %s has invalid updated_at: %r, skipping (not treating as stale)",
                        getattr(svc, 'host', 'unknown'), getattr(svc, 'updated_at', None))
-        return True
+        return False
 
 
 def _categorize_services(services: List[Any], target_date: datetime) -> tuple:
@@ -2880,7 +2886,7 @@ def _filter_processing_hosts(service, compute_nodes, to_resume):
     return compute_nodes_filtered, to_resume_filtered, marked_hostnames, current_time
 
 
-def _prepare_evacuation_resources(conn, service, services, compute_nodes):
+def _prepare_evacuation_resources(conn, service, services, compute_nodes, aggregates=None):
     """Prepare and filter resources for evacuation."""
     if not compute_nodes:
         return compute_nodes, [], [], []
@@ -2918,7 +2924,7 @@ def _prepare_evacuation_resources(conn, service, services, compute_nodes):
 
     # Apply aggregate filtering if enabled
     if service.config.get_config_value('TAGGED_AGGREGATES'):
-        compute_nodes = _filter_by_aggregates(conn, service, compute_nodes, services)
+        compute_nodes = _filter_by_aggregates(conn, service, compute_nodes, services, aggregates=aggregates)
 
     return compute_nodes, reserved_hosts, images, flavors
 
@@ -2945,14 +2951,23 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
             _emit_k8s_event(svc.host, 'HostDown',
                             'Compute host detected as down', event_type='Warning')
 
+    # Fetch aggregates once per poll cycle to avoid redundant API calls
+    aggregates = None
+    if service.config.get_config_value('TAGGED_AGGREGATES'):
+        try:
+            aggregates = conn.aggregates.list()
+        except Exception as e:
+            logging.warning("Failed to fetch aggregates: %s", e)
+
     # Prepare resources for evacuation
-    compute_nodes, reserved_hosts, images, flavors = _prepare_evacuation_resources(conn, service, services, compute_nodes)
+    compute_nodes, reserved_hosts, images, flavors = _prepare_evacuation_resources(
+        conn, service, services, compute_nodes, aggregates=aggregates)
 
     # Check evacuation threshold
     if services and compute_nodes:
         # When TAGGED_AGGREGATES is enabled, calculate threshold against evacuable hosts only
         if service.config.get_config_value('TAGGED_AGGREGATES'):
-            total_evacuable = _count_evacuable_hosts(conn, service, services)
+            total_evacuable = _count_evacuable_hosts(conn, service, services, aggregates=aggregates)
             threshold_percent = (len(compute_nodes) / total_evacuable * 100) if total_evacuable > 0 else 0
         else:
             threshold_percent = (len(compute_nodes) / len(services)) * 100
@@ -2992,7 +3007,7 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
                 if not batch:
                     continue
                 futures = {
-                    executor.submit(process_service, svc, reserved_hosts, resume, service): svc
+                    executor.submit(process_service, svc, reserved_hosts, resume, service, shared_conn=conn): svc
                     for svc in batch
                 }
                 for future in concurrent.futures.as_completed(futures):
@@ -3013,43 +3028,43 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
         logging.info('InstanceHA DISABLED is true, not evacuating')
         _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
 
-def _count_evacuable_hosts(conn, service, services):
-    """Count total number of compute services in evacuable aggregates."""
-    try:
-        aggregates = conn.aggregates.list()
-        evacuable_hosts = set()
+def _get_evacuable_hosts_from_aggregates(conn, service, aggregates=None):
+    """Build set of hosts in evacuable aggregates.
 
+    If aggregates is None, fetches from Nova. Pass a cached list to avoid
+    redundant API calls within the same poll cycle.
+    """
+    try:
+        if aggregates is None:
+            aggregates = conn.aggregates.list()
+        evacuable_hosts = set()
         for agg in aggregates:
             if service._is_resource_evacuable(agg, service.evacuable_tag, ['metadata']):
                 evacuable_hosts.update(agg.hosts)
-
-        # Count services that are in evacuable aggregates
-        return sum(1 for svc in services if svc.host in evacuable_hosts)
-
+        return evacuable_hosts
     except Exception as e:
-        logging.warning("Failed to count evacuable hosts: %s", e)
-        return len(services)  # Fallback to all services on error
+        logging.warning("Failed to get evacuable hosts from aggregates: %s", e)
+        return None
 
 
-def _filter_by_aggregates(conn, service, compute_nodes, services):
+def _count_evacuable_hosts(conn, service, services, aggregates=None):
+    """Count total number of compute services in evacuable aggregates."""
+    evacuable_hosts = _get_evacuable_hosts_from_aggregates(conn, service, aggregates)
+    if evacuable_hosts is None:
+        return len(services)
+    return sum(1 for svc in services if svc.host in evacuable_hosts)
+
+
+def _filter_by_aggregates(conn, service, compute_nodes, services, aggregates=None):
     """Filter compute nodes by aggregate evacuability."""
-    try:
-        aggregates = conn.aggregates.list()
-        evacuable_hosts = set()
-
-        for agg in aggregates:
-            if service._is_resource_evacuable(agg, service.evacuable_tag, ['metadata']):
-                evacuable_hosts.update(agg.hosts)
-
+    evacuable_hosts = _get_evacuable_hosts_from_aggregates(conn, service, aggregates)
+    if evacuable_hosts is not None:
         compute_nodes_down = list(compute_nodes)
         compute_nodes = [svc for svc in compute_nodes if svc.host in evacuable_hosts]
 
         down_not_tagged = [svc.host for svc in compute_nodes_down if svc not in compute_nodes]
         if down_not_tagged:
             logging.warning('Computes not part of evacuable aggregate: %s', down_not_tagged)
-
-    except Exception as e:
-        logging.warning("Failed to check aggregate evacuability: %s", e)
 
     return compute_nodes
 

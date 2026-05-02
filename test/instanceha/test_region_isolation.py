@@ -397,7 +397,7 @@ class TestRegionIsolation(unittest.TestCase):
                     mock_client_r2.region_name = 'RegionTwo'
 
                     # Make nova_login return the appropriate client based on region
-                    def nova_login_side_effect(credentials):
+                    def nova_login_side_effect(credentials, ca_bundle=None):
                         if credentials.region_name == 'RegionOne':
                             return mock_client_r1
                         elif credentials.region_name == 'RegionTwo':

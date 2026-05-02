@@ -727,18 +727,18 @@ class TestIsServiceStale(unittest.TestCase):
     def test_none_updated_at(self):
         from datetime import datetime
         svc = self._make_svc(None)
-        self.assertTrue(instanceha._is_service_stale(svc, datetime.now()))
+        self.assertFalse(instanceha._is_service_stale(svc, datetime.now()))
 
     def test_malformed_updated_at(self):
         from datetime import datetime
         svc = self._make_svc('not-a-date')
-        self.assertTrue(instanceha._is_service_stale(svc, datetime.now()))
+        self.assertFalse(instanceha._is_service_stale(svc, datetime.now()))
 
     def test_missing_updated_at_attribute(self):
         from datetime import datetime
         svc = Mock(spec=['host'])
         svc.host = 'test-host'
-        self.assertTrue(instanceha._is_service_stale(svc, datetime.now()))
+        self.assertFalse(instanceha._is_service_stale(svc, datetime.now()))
 
 
 # ============================================================================

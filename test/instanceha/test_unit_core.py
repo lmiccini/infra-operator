@@ -886,8 +886,7 @@ class TestEvacuationFunctions(unittest.TestCase):
 
     @patch('instanceha._server_evacuate_future')
     @patch('time.sleep')
-    @patch('concurrent.futures.ThreadPoolExecutor')
-    def test_smart_evacuation_all_success(self, mock_executor_class, mock_sleep, mock_evacuate_future):
+    def test_smart_evacuation_all_success(self, mock_sleep, mock_evacuate_future):
         """Test smart evacuation returns True when all evacuations succeed."""
         # Mock failed service
         mock_failed_service = Mock()
@@ -901,6 +900,9 @@ class TestEvacuationFunctions(unittest.TestCase):
         mock_service.config.is_smart_evacuation_enabled.return_value = True
         mock_service.config.get_workers.return_value = 4
         mock_service.config.get_delay.return_value = 0
+        mock_service.config.get_config_value.side_effect = lambda key: {
+            'WORKERS': 4, 'SMART_EVACUATION': True, 'DELAY': 0, 'ORCHESTRATED_RESTART': False
+        }.get(key, 0)
         mock_service.is_server_evacuable.return_value = True
 
         # Mock servers
@@ -913,26 +915,29 @@ class TestEvacuationFunctions(unittest.TestCase):
 
         self.mock_connection.servers.list.return_value = [mock_server1, mock_server2]
 
-        # Mock ThreadPoolExecutor
-        mock_executor = Mock()
-        mock_executor.__enter__ = Mock(return_value=mock_executor)
-        mock_executor.__exit__ = Mock(return_value=None)
-        mock_executor_class.return_value = mock_executor
-
         # Mock futures to return True (success)
         mock_future1 = Mock()
         mock_future1.result.return_value = True
         mock_future2 = Mock()
         mock_future2.result.return_value = True
 
-        mock_executor.submit.side_effect = [mock_future1, mock_future2]
+        # Mock ThreadPoolExecutor
+        with patch('instanceha.concurrent.futures.ThreadPoolExecutor') as mock_executor_class:
+            mock_executor = MagicMock()
+            mock_executor.submit.side_effect = [mock_future1, mock_future2]
 
-        with patch('instanceha.concurrent.futures.as_completed') as mock_as_completed:
-            mock_as_completed.return_value = [mock_future1, mock_future2]
+            context_manager = MagicMock()
+            context_manager.__enter__ = Mock(return_value=mock_executor)
+            context_manager.__exit__ = Mock(return_value=None)
+            mock_executor_class.return_value = context_manager
 
-            result = instanceha._host_evacuate(
-                self.mock_connection, mock_failed_service, mock_service
-            )
+            def mock_as_completed_side_effect(future_to_server):
+                return iter(future_to_server.keys())
+
+            with patch('instanceha.concurrent.futures.as_completed', side_effect=mock_as_completed_side_effect):
+                result = instanceha._host_evacuate(
+                    self.mock_connection, mock_failed_service, mock_service
+                )
 
         # The fix ensures this returns True when all succeed
         self.assertTrue(result, "Smart evacuation should return True when all evacuations succeed")
@@ -954,6 +959,9 @@ class TestEvacuationFunctions(unittest.TestCase):
         mock_service.config.is_smart_evacuation_enabled.return_value = True
         mock_service.config.get_workers.return_value = 4
         mock_service.config.get_delay.return_value = 0
+        mock_service.config.get_config_value.side_effect = lambda key: {
+            'WORKERS': 4, 'SMART_EVACUATION': True, 'DELAY': 0, 'ORCHESTRATED_RESTART': False
+        }.get(key, 0)
         mock_service.is_server_evacuable.return_value = True
 
         # Mock servers
@@ -1014,6 +1022,9 @@ class TestEvacuationFunctions(unittest.TestCase):
         mock_service.config.is_smart_evacuation_enabled.return_value = True
         mock_service.config.get_workers.return_value = 4
         mock_service.config.get_delay.return_value = 0
+        mock_service.config.get_config_value.side_effect = lambda key: {
+            'WORKERS': 4, 'SMART_EVACUATION': True, 'DELAY': 0, 'ORCHESTRATED_RESTART': False
+        }.get(key, 0)
         mock_service.is_server_evacuable.return_value = True
 
         # Mock servers
@@ -1106,8 +1117,8 @@ class TestEvacuationFunctions(unittest.TestCase):
                         'test-host', 'service-123'
                     )
 
-            # Verify ThreadPoolExecutor was called with max_workers=4
-            mock_executor_class.assert_called_once_with(max_workers=4)
+            # Inner pool workers = max(1, MAX_TOTAL_EVACUATION_THREADS // WORKERS) = max(1, 32 // 4) = 8
+            mock_executor_class.assert_called_once_with(max_workers=8)
             self.assertTrue(result, "Smart evacuation should succeed")
 
     def test_workers_actual_concurrent_limit(self):
@@ -1157,15 +1168,15 @@ class TestEvacuationFunctions(unittest.TestCase):
                           "At least some evacuations should have run concurrently")
 
     def test_workers_different_values(self):
-        """Test that different WORKERS values create ThreadPoolExecutor with correct max_workers."""
+        """Test that different WORKERS values create ThreadPoolExecutor with correct inner max_workers."""
         test_cases = [
-            (1, "Single worker"),
-            (4, "Default workers"),
-            (8, "High worker count"),
-            (50, "Max workers"),
+            (1, "Single worker", max(1, instanceha.MAX_TOTAL_EVACUATION_THREADS // 1)),
+            (4, "Default workers", max(1, instanceha.MAX_TOTAL_EVACUATION_THREADS // 4)),
+            (8, "High worker count", max(1, instanceha.MAX_TOTAL_EVACUATION_THREADS // 8)),
+            (50, "Max workers", max(1, instanceha.MAX_TOTAL_EVACUATION_THREADS // 50)),
         ]
 
-        for workers_value, description in test_cases:
+        for workers_value, description, expected_inner in test_cases:
             with self.subTest(workers=workers_value, description=description):
                 # Mock failed service
                 mock_failed_service = Mock()
@@ -1176,9 +1187,9 @@ class TestEvacuationFunctions(unittest.TestCase):
                 mock_service = Mock()
                 mock_service.config.get_evacuable_images.return_value = []
                 mock_service.config.get_evacuable_flavors.return_value = []
-                mock_service.config.get_config_value.side_effect = lambda key: {
+                mock_service.config.get_config_value.side_effect = lambda key, w=workers_value: {
                     'SMART_EVACUATION': True,
-                    'WORKERS': workers_value,
+                    'WORKERS': w,
                     'DELAY': 0
                 }.get(key, 0)
                 mock_service.is_server_evacuable.return_value = True
@@ -1211,8 +1222,8 @@ class TestEvacuationFunctions(unittest.TestCase):
                                 'test-host', 'service-123'
                             )
 
-                    # Assert ThreadPoolExecutor was called with the expected max_workers
-                    mock_executor_class.assert_called_once_with(max_workers=workers_value)
+                    # Inner pool workers = max(1, MAX_TOTAL_EVACUATION_THREADS // WORKERS)
+                    mock_executor_class.assert_called_once_with(max_workers=expected_inner)
 
 
 class TestSecretExposure(unittest.TestCase):
@@ -1360,9 +1371,9 @@ class TestSecretExposure(unittest.TestCase):
                 project_domain_name='Default',
                 region_name='test-region'
             )
-            result = instanceha.nova_login(credentials)
+            with self.assertRaises(instanceha.NovaConnectionError):
+                instanceha.nova_login(credentials)
 
-            self.assertIsNone(result)
             self._assert_no_secrets_in_logs()
 
     def test_create_connection_exception_no_secret_exposure(self):
