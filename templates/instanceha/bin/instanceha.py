@@ -68,6 +68,10 @@ KDUMP_REENABLE_DELAY_SECONDS = 60
 MAX_NOVA_BACKOFF_SECONDS = 300
 NOVA_API_TIMEOUT_SECONDS = 30
 MAX_TOTAL_EVACUATION_THREADS = 32
+HEARTBEAT_MAGIC_NUMBER = 0x48425631
+DEFAULT_HEARTBEAT_PORT = 7411
+HEARTBEAT_CLEANUP_THRESHOLD = 100
+HEARTBEAT_CLEANUP_AGE_SECONDS = 600
 
 # Disabled reason markers
 LOCK_REASON_EVACUATION = "instanceha-evacuation"
@@ -519,6 +523,8 @@ class ConfigManager:
         'FORCE_ENABLE': ConfigItem('bool', False),
         'CHECK_KDUMP': ConfigItem('bool', False),
         'KDUMP_TIMEOUT': ConfigItem('int', 30, 5, 300),
+        'CHECK_HEARTBEAT': ConfigItem('bool', False),
+        'HEARTBEAT_TIMEOUT': ConfigItem('int', 120, 30, 600),
         'DISABLED': ConfigItem('bool', False),
         'SSL_VERIFY': ConfigItem('bool', True),
         'FENCING_TIMEOUT': ConfigItem('int', 30, 5, 120),
@@ -560,6 +566,17 @@ class ConfigManager:
         if not 1 <= port <= 65535:
             logging.warning("UDP_PORT %d out of range, using default %d", port, DEFAULT_UDP_PORT)
             return DEFAULT_UDP_PORT
+        return port
+
+    def get_heartbeat_port(self) -> int:
+        try:
+            port = int(os.getenv('HEARTBEAT_PORT', DEFAULT_HEARTBEAT_PORT))
+        except (ValueError, TypeError):
+            logging.warning("Invalid HEARTBEAT_PORT, using default %d", DEFAULT_HEARTBEAT_PORT)
+            return DEFAULT_HEARTBEAT_PORT
+        if not 1 <= port <= 65535:
+            logging.warning("HEARTBEAT_PORT %d out of range, using default %d", port, DEFAULT_HEARTBEAT_PORT)
+            return DEFAULT_HEARTBEAT_PORT
         return port
 
     @property
@@ -637,6 +654,12 @@ class InstanceHAService(CloudConnectionProvider):
         self.kdump_hosts_checking = defaultdict(float)
         self.kdump_listener_stop_event = threading.Event()
         self.kdump_fenced_hosts = set()
+
+        # Heartbeat state (protected by heartbeat_lock — UDP listener writes concurrently)
+        self.heartbeat_lock = threading.Lock()
+        self.heartbeat_hosts_timestamp = defaultdict(float)
+        self.heartbeat_listener_stop_event = threading.Event()
+        self.heartbeat_listener_start_time = 0.0
 
         # Host processing tracking
         self.hosts_processing = defaultdict(float)
@@ -1260,16 +1283,17 @@ class InstanceHAService(CloudConnectionProvider):
 class UDPSocketManager:
     """Context manager for UDP socket handling with proper resource cleanup."""
 
-    def __init__(self, udp_ip, udp_port):
+    def __init__(self, udp_ip, udp_port, label='UDP'):
         self.udp_ip = udp_ip
         self.udp_port = udp_port
+        self.label = label
         self.socket = None
 
     def __enter__(self):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.settimeout(1.0)
         self.socket.bind((self.udp_ip, self.udp_port))
-        logging.info('Kdump UDP listener started on %s:%s', self.udp_ip, self.udp_port)
+        logging.info('%s listener started on %s:%s', self.label, self.udp_ip, self.udp_port)
         return self.socket
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -1278,58 +1302,124 @@ class UDPSocketManager:
                 self.socket.close()
             except (OSError, AttributeError):
                 pass
-        logging.info('Kdump UDP listener stopped')
+        logging.info('%s listener stopped', self.label)
 
-def _kdump_udp_listener(service: 'InstanceHAService') -> None:
-    """Background UDP listener for kdump messages."""
+def _resolve_hostname_dns(data, address, label):
+    """Resolve hostname via reverse DNS lookup (kdump listener)."""
+    try:
+        return _extract_hostname(socket.gethostbyaddr(address[0])[0])
+    except socket.herror:
+        logging.warning(
+            '%s packet from %s but reverse DNS lookup failed. '
+            'Ensure PTR records exist for compute node management IPs. '
+            'This host will fall back to timeout-based detection.',
+            label, address[0])
+        return None
+
+
+def _resolve_hostname_packet(data, address, label):
+    """Extract hostname from packet payload (heartbeat listener)."""
+    try:
+        raw_hostname = data[4:].decode('utf-8').strip('\x00').strip()
+    except UnicodeDecodeError:
+        logging.warning('%s from %s has invalid hostname encoding', label, address[0])
+        return None
+    if not raw_hostname or len(raw_hostname) > USERNAME_MAX_LENGTH:
+        logging.warning('%s from %s has invalid hostname length', label, address[0])
+        return None
+    return _extract_hostname(raw_hostname)
+
+
+def _udp_listener(service, port, label, magic_number, min_packet_size,
+                  lock, timestamps, stop_event,
+                  cleanup_threshold, cleanup_age_seconds,
+                  resolve_hostname, log_level=logging.INFO, on_start=None):
+    """Generic UDP listener for magic-number-based host detection messages."""
     udp_ip = service.udp_ip if service.udp_ip else '0.0.0.0'
-    udp_port = service.config.get_udp_port()
 
     try:
-        with UDPSocketManager(udp_ip, udp_port) as sock:
-            while not service.kdump_listener_stop_event.is_set():
+        with UDPSocketManager(udp_ip, port, label=f'{label} UDP') as sock:
+            if on_start:
+                on_start()
+
+            while not stop_event.is_set():
                 try:
-                    # recvmsg returns: (data, ancdata, msg_flags, address)
-                    # ancdata and msg_flags unused, only data and address needed
                     data, _, _, address = sock.recvmsg(4096, 1024, 0)
-                    logging.debug('Received UDP message from %s, length: %d', address[0], len(data))
 
-                    if len(data) >= 8:
-                        # Try both byte orders for magic number (fence_kdump compatibility)
-                        magic_native = struct.unpack('I', data[:4])[0]
-                        magic_network = struct.unpack('!I', data[:4])[0]
+                    if len(data) < min_packet_size:
+                        continue
 
-                        if magic_native == KDUMP_MAGIC_NUMBER or magic_network == KDUMP_MAGIC_NUMBER:
-                            try:
-                                hostname = _extract_hostname(socket.gethostbyaddr(address[0])[0])
-                            except socket.herror:
-                                logging.warning(
-                                    'Kdump packet from %s but reverse DNS lookup failed. '
-                                    'Ensure PTR records exist for compute node management IPs. '
-                                    'This host will fall back to timeout-based detection.',
-                                    address[0])
-                                continue
-                            try:
-                                with service.kdump_lock:
-                                    service.kdump_hosts_timestamp[hostname] = time.time()
-                                    if len(service.kdump_hosts_timestamp) > KDUMP_CLEANUP_THRESHOLD:
-                                        cutoff = time.time() - KDUMP_CLEANUP_AGE_SECONDS
-                                        to_remove = [k for k, v in service.kdump_hosts_timestamp.items() if v < cutoff]
-                                        for k in to_remove:
-                                            del service.kdump_hosts_timestamp[k]
-                                logging.info('Kdump message received from host: %s', hostname)
-                            except Exception as e:
-                                logging.warning('Failed to process kdump message from %s: %s', address[0], e)
-                        else:
-                            logging.warning('Invalid magic number from %s: 0x%x / 0x%x', address[0], magic_native, magic_network)
+                    magic_native = struct.unpack('I', data[:4])[0]
+                    magic_network = struct.unpack('!I', data[:4])[0]
+
+                    if magic_native != magic_number and magic_network != magic_number:
+                        continue
+
+                    hostname = resolve_hostname(data, address, label)
+                    if not hostname:
+                        continue
+
+                    try:
+                        with lock:
+                            timestamps[hostname] = time.time()
+                            if len(timestamps) > cleanup_threshold:
+                                cutoff = time.time() - cleanup_age_seconds
+                                to_remove = [k for k, v in timestamps.items() if v < cutoff]
+                                for k in to_remove:
+                                    del timestamps[k]
+                        logging.log(log_level, '%s message received from host: %s', label, hostname)
+                    except Exception as e:
+                        logging.warning('Failed to process %s message from %s: %s', label.lower(), address[0], e)
+
                 except socket.timeout:
                     continue
                 except OSError as e:
-                    if not service.kdump_listener_stop_event.is_set():
-                        logging.debug('UDP listener socket error: %s', e)
+                    if not stop_event.is_set():
+                        logging.debug('%s listener socket error: %s', label, e)
                     continue
     except Exception as e:
-        logging.error('Kdump listener failed to start: %s', e)
+        logging.error('%s listener failed to start: %s', label, e)
+
+
+def _kdump_udp_listener(service: 'InstanceHAService') -> None:
+    """Background UDP listener for kdump messages."""
+    _udp_listener(
+        service,
+        port=service.config.get_udp_port(),
+        label='Kdump',
+        magic_number=KDUMP_MAGIC_NUMBER,
+        min_packet_size=8,
+        lock=service.kdump_lock,
+        timestamps=service.kdump_hosts_timestamp,
+        stop_event=service.kdump_listener_stop_event,
+        cleanup_threshold=KDUMP_CLEANUP_THRESHOLD,
+        cleanup_age_seconds=KDUMP_CLEANUP_AGE_SECONDS,
+        resolve_hostname=_resolve_hostname_dns,
+    )
+
+
+def _heartbeat_udp_listener(service: 'InstanceHAService') -> None:
+    """Background UDP listener for host heartbeat messages."""
+    def on_start():
+        with service.heartbeat_lock:
+            service.heartbeat_listener_start_time = time.time()
+
+    _udp_listener(
+        service,
+        port=service.config.get_heartbeat_port(),
+        label='Heartbeat',
+        magic_number=HEARTBEAT_MAGIC_NUMBER,
+        min_packet_size=5,
+        lock=service.heartbeat_lock,
+        timestamps=service.heartbeat_hosts_timestamp,
+        stop_event=service.heartbeat_listener_stop_event,
+        cleanup_threshold=HEARTBEAT_CLEANUP_THRESHOLD,
+        cleanup_age_seconds=HEARTBEAT_CLEANUP_AGE_SECONDS,
+        resolve_hostname=_resolve_hostname_packet,
+        log_level=logging.DEBUG,
+        on_start=on_start,
+    )
+
 
 def _aggregate_ids(conn, service, aggregates=None) -> List[int]:
     """Get aggregate IDs for a service's host."""
@@ -2659,6 +2749,12 @@ def _initialize_service(config_mgr):
         kdump_thread.daemon = True
         kdump_thread.start()
 
+    # Start heartbeat listener if enabled
+    if service.config.get_config_value('CHECK_HEARTBEAT'):
+        heartbeat_thread = threading.Thread(target=_heartbeat_udp_listener, args=(service,))
+        heartbeat_thread.daemon = True
+        heartbeat_thread.start()
+
     return service
 
 def _establish_nova_connection(service):
@@ -2817,6 +2913,41 @@ def _prepare_evacuation_resources(conn, service, services, compute_nodes, aggreg
     return compute_nodes, reserved_hosts, images, flavors
 
 
+def _filter_reachable_hosts(service, compute_nodes):
+    """Filter out hosts still sending heartbeats (host OS alive, only nova-compute down)."""
+    if not compute_nodes:
+        return compute_nodes, []
+
+    heartbeat_timeout = service.config.get_config_value('HEARTBEAT_TIMEOUT')
+    current_time = time.time()
+
+    with service.heartbeat_lock:
+        listener_start_time = service.heartbeat_listener_start_time
+
+        # Grace period: can't trust absence of heartbeats until listener has run
+        # for at least HEARTBEAT_TIMEOUT seconds
+        if listener_start_time == 0.0 or (current_time - listener_start_time) < heartbeat_timeout:
+            return compute_nodes, []
+
+        unreachable = []
+        skipped = []
+
+        for svc in compute_nodes:
+            hostname = _extract_hostname(svc.host)
+            last_heartbeat = service.heartbeat_hosts_timestamp.get(hostname, 0)
+
+            if last_heartbeat > 0 and (current_time - last_heartbeat) <= heartbeat_timeout:
+                skipped.append(svc)
+                logging.warning(
+                    'Host %s reported down by Nova but heartbeat received %.1fs ago — '
+                    'skipping fencing (likely nova-compute crash)',
+                    svc.host, current_time - last_heartbeat)
+            else:
+                unreachable.append(svc)
+
+    return unreachable, skipped
+
+
 def _process_stale_services(conn, service, services, compute_nodes, to_resume):
     """Process stale compute services for evacuation."""
     # Convert generators to lists - needed for multiple iterations and length checks
@@ -2832,6 +2963,19 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
     if not (compute_nodes or to_resume):
         _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
         return
+
+    # Filter out hosts still reachable via heartbeat
+    if service.config.get_config_value('CHECK_HEARTBEAT'):
+        compute_nodes, heartbeat_skipped = _filter_reachable_hosts(service, compute_nodes)
+        for svc in heartbeat_skipped:
+            _emit_k8s_event(svc.host, 'HostReachable',
+                            'Host reported down by Nova but still sending heartbeats — '
+                            'skipping fencing (likely nova-compute crash)',
+                            event_type='Warning')
+
+        if not (compute_nodes or to_resume):
+            _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
+            return
 
     if compute_nodes:
         logging.warning('The following computes are down: %s', [svc.host for svc in compute_nodes])
