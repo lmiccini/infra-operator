@@ -971,5 +971,95 @@ class TestProcessStaleServicesSafety(unittest.TestCase):
             instanceha._process_stale_services(conn, service, [svc1], [svc1], [])
 
 
+class TestReconcileOrphanedHosts(unittest.TestCase):
+    """Tests for _reconcile_orphaned_hosts startup reconciliation."""
+
+    def _make_service(self, host, forced_down, state, status, disabled_reason=''):
+        svc = Mock()
+        svc.host = host
+        svc.id = f'svc-{host}'
+        svc.forced_down = forced_down
+        svc.state = state
+        svc.status = status
+        svc.disabled_reason = disabled_reason
+        return svc
+
+    @patch('instanceha._emit_k8s_event')
+    def test_recovers_orphaned_host(self, mock_event):
+        conn = MagicMock()
+        orphan = self._make_service('host-1', forced_down=True, state='down', status='enabled')
+        conn.services.list.return_value = [orphan]
+
+        instanceha._reconcile_orphaned_hosts(conn)
+
+        conn.services.disable_log_reason.assert_called_once()
+        call_args = conn.services.disable_log_reason.call_args
+        self.assertEqual(call_args[0][0], 'svc-host-1')
+        self.assertIn('instanceha evacuation (recovered)', call_args[0][1])
+        mock_event.assert_called_once()
+
+    @patch('instanceha._emit_k8s_event')
+    def test_skips_already_disabled(self, mock_event):
+        conn = MagicMock()
+        svc = self._make_service('host-1', forced_down=True, state='down', status='disabled',
+                                 disabled_reason='instanceha evacuation')
+        conn.services.list.return_value = [svc]
+
+        instanceha._reconcile_orphaned_hosts(conn)
+
+        conn.services.disable_log_reason.assert_not_called()
+
+    @patch('instanceha._emit_k8s_event')
+    def test_skips_healthy_hosts(self, mock_event):
+        conn = MagicMock()
+        svc = self._make_service('host-1', forced_down=False, state='up', status='enabled')
+        conn.services.list.return_value = [svc]
+
+        instanceha._reconcile_orphaned_hosts(conn)
+
+        conn.services.disable_log_reason.assert_not_called()
+
+    @patch('instanceha._emit_k8s_event')
+    def test_skips_forced_down_but_up(self, mock_event):
+        conn = MagicMock()
+        svc = self._make_service('host-1', forced_down=True, state='up', status='enabled')
+        conn.services.list.return_value = [svc]
+
+        instanceha._reconcile_orphaned_hosts(conn)
+
+        conn.services.disable_log_reason.assert_not_called()
+
+    @patch('instanceha._emit_k8s_event')
+    def test_handles_api_failure(self, mock_event):
+        conn = MagicMock()
+        conn.services.list.side_effect = Exception("Nova unavailable")
+
+        instanceha._reconcile_orphaned_hosts(conn)
+
+        conn.services.disable_log_reason.assert_not_called()
+
+    @patch('instanceha._emit_k8s_event')
+    def test_handles_per_host_failure(self, mock_event):
+        conn = MagicMock()
+        orphan1 = self._make_service('host-1', forced_down=True, state='down', status='enabled')
+        orphan2 = self._make_service('host-2', forced_down=True, state='down', status='enabled')
+        conn.services.list.return_value = [orphan1, orphan2]
+        conn.services.disable_log_reason.side_effect = [Exception("fail"), None]
+
+        instanceha._reconcile_orphaned_hosts(conn)
+
+        self.assertEqual(conn.services.disable_log_reason.call_count, 2)
+
+    @patch('instanceha._emit_k8s_event')
+    def test_no_orphans_no_action(self, mock_event):
+        conn = MagicMock()
+        conn.services.list.return_value = []
+
+        instanceha._reconcile_orphaned_hosts(conn)
+
+        conn.services.disable_log_reason.assert_not_called()
+        mock_event.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

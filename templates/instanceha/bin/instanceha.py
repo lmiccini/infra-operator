@@ -3162,6 +3162,43 @@ def _process_reenabling(conn, service, to_reenable) -> None:
         except Exception as e:
             logging.error('Failed to enable %s: %s', svc.host, e)
 
+def _reconcile_orphaned_hosts(conn):
+    """Reconcile hosts left in an inconsistent state after a crash.
+
+    If the pod crashed after fencing a host (setting forced_down=True) but
+    before setting the disabled_reason evacuation marker, the host would be
+    incorrectly routed to the re-enable path instead of the evacuation path.
+
+    This function finds such orphaned hosts and sets the evacuation marker
+    so the normal resume logic picks them up.
+    """
+    try:
+        services = conn.services.list(binary="nova-compute")
+    except Exception as e:
+        logging.warning("Startup reconciliation skipped: failed to list services: %s", e)
+        return
+
+    recovered = 0
+    for svc in services:
+        if not (svc.forced_down and svc.state == 'down'):
+            continue
+        if 'disabled' in svc.status:
+            continue
+        try:
+            disable_reason = f"{DISABLED_REASON_EVACUATION} (recovered): {datetime.now(timezone.utc).isoformat()}"
+            conn.services.disable_log_reason(svc.id, disable_reason)
+            logging.warning("Recovered orphaned fenced host %s — marked for evacuation resume", svc.host)
+            _emit_k8s_event(svc.host, 'OrphanedHostRecovered',
+                            'Recovered orphaned fenced host, marked for evacuation resume',
+                            event_type='Warning')
+            recovered += 1
+        except Exception as e:
+            logging.error("Failed to reconcile orphaned host %s: %s", svc.host, e)
+
+    if recovered:
+        logging.info("Startup reconciliation: recovered %d orphaned fenced host(s)", recovered)
+
+
 def main():
     # Set up logging early so config loading errors are properly formatted
     logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=logging.INFO)
@@ -3180,14 +3217,13 @@ def main():
     service = _initialize_service(config_manager)
     conn = _establish_nova_connection(service)
 
+    _reconcile_orphaned_hosts(conn)
+
     def _sigterm_handler(signum, frame):
         logging.info("SIGTERM received, finishing in-flight work before shutdown")
         service.shutdown_event.set()
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
-
-    logging.info("InstanceHA daemon started — orphaned fenced hosts (if any) "
-                 "will be recovered in the first poll cycle")
 
     consecutive_failures = 0
 
