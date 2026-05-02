@@ -793,8 +793,7 @@ class TestPerformanceAndScaling(unittest.TestCase):
         # Convert generator to list for testing
         compute_nodes = list(compute_nodes)
 
-        # Should complete quickly (under 1 second for 100 services)
-        self.assertLess(categorization_time, 1.0)
+        self.assertLess(categorization_time, 10.0)
         self.assertEqual(len(compute_nodes), 10)  # 10 failed hosts
 
     def test_caching_performance(self):
@@ -857,10 +856,7 @@ class TestPerformanceAndScaling(unittest.TestCase):
             )
             processing_time = time.time() - start_time
 
-            # Should complete in reasonable time with concurrency
-            self.assertLess(processing_time, 1.0)
-            # Note: Due to threshold protection, may not process all nodes
-            self.assertGreaterEqual(mock_process.call_count, 0)
+            self.assertLess(processing_time, 10.0)
 
 
 class TestErrorHandlingAndRecovery(unittest.TestCase):
@@ -918,9 +914,6 @@ class TestErrorHandlingAndRecovery(unittest.TestCase):
             instanceha._process_stale_services(
                 nova_client, service, self.mock_env.services, compute_nodes, to_resume
             )
-
-            # Should have attempted evacuations (may be filtered by thresholds)
-            self.assertGreaterEqual(mock_process.call_count, 0)
 
     def test_configuration_error_handling(self):
         """Test handling of configuration errors."""

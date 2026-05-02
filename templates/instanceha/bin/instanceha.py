@@ -159,12 +159,16 @@ def _sanitize_message(msg: str) -> str:
     return msg
 
 
+def _make_disable_reason(prefix, suffix=""):
+    return f"{prefix}{suffix}: {datetime.now(timezone.utc).isoformat()}"
+
+
 def _safe_log_exception(msg: str, e: Exception, include_traceback: bool = False) -> None:
     """Log exception without exposing secrets in messages or tracebacks."""
     safe_msg = _sanitize_message(str(e))
     logging.error("%s: %s", msg, safe_msg)
     if include_traceback:
-        logging.debug("Exception traceback (sanitized): %s", type(e).__name__)
+        logging.debug("Exception traceback:", exc_info=True)
 
 
 # Security validation patterns
@@ -1366,8 +1370,7 @@ def _update_service_disable_reason(connection, host, service_id=None) -> bool:
                 return False
             service_id = service_obj.id
 
-        disable_reason = f"evacuation FAILED: {datetime.now(timezone.utc).isoformat()}"
-        connection.services.disable_log_reason(service_id, disable_reason)
+        connection.services.disable_log_reason(service_id, _make_disable_reason(DISABLED_REASON_EVACUATION_FAILED))
         logging.debug('Updated disabled reason for host %s after evacuation failure', host)
         return True
     except Exception as e:
@@ -1474,6 +1477,30 @@ def _build_evacuation_groups(evacuables) -> List[List]:
     return [servers for _, _, servers in phases]
 
 
+def _run_concurrent(func, items, max_workers, item_id_func, log_prefix=""):
+    """Run func for each item concurrently, return True if all succeeded."""
+    all_succeeded = True
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_item = {executor.submit(func, item): item for item in items}
+        for future in concurrent.futures.as_completed(future_to_item):
+            item = future_to_item[future]
+            item_id = item_id_func(item)
+            try:
+                if not future.result(timeout=FUTURE_RESULT_TIMEOUT_SECONDS):
+                    logging.error('%s%s failed', log_prefix, item_id)
+                    all_succeeded = False
+                else:
+                    logging.info('%s%s succeeded', log_prefix, item_id)
+            except concurrent.futures.TimeoutError:
+                logging.error('%s%s timed out', log_prefix, item_id)
+                all_succeeded = False
+            except Exception as exc:
+                logging.error('%s%s raised exception: %s', log_prefix, item_id, exc)
+                logging.debug('Exception traceback:', exc_info=True)
+                all_succeeded = False
+    return all_succeeded
+
+
 def _orchestrated_evacuate(connection, evacuables, service, host, service_id, target_host=None) -> bool:
     """Execute orchestrated evacuation with priority-ordered phases.
 
@@ -1499,38 +1526,23 @@ def _orchestrated_evacuate(connection, evacuables, service, host, service_id, ta
                 total_phases, total_servers, host)
 
     all_succeeded = True
+    inner_workers = max(1, MAX_TOTAL_EVACUATION_THREADS // service.config.get_config_value('WORKERS'))
 
     for phase_num, phase_servers in enumerate(phases, 1):
         logging.info("Starting evacuation phase %d/%d (%d servers)",
                     phase_num, total_phases, len(phase_servers))
 
-        inner_workers = max(1, MAX_TOTAL_EVACUATION_THREADS // service.config.get_config_value('WORKERS'))
-        with concurrent.futures.ThreadPoolExecutor(
-                max_workers=inner_workers) as executor:
-            future_to_server = {
-                executor.submit(_server_evacuate_future, connection, s, target_host): s
-                for s in phase_servers
-            }
+        phase_ok = _run_concurrent(
+            lambda s: _server_evacuate_future(connection, s, target_host),
+            phase_servers,
+            inner_workers,
+            lambda s: s.id,
+            log_prefix=f"Phase {phase_num}: ",
+        )
+        if not phase_ok:
+            all_succeeded = False
 
-            for future in concurrent.futures.as_completed(future_to_server):
-                server = future_to_server[future]
-                try:
-                    if not future.result(timeout=FUTURE_RESULT_TIMEOUT_SECONDS):
-                        logging.error('Phase %d: evacuation of %s failed', phase_num, server.id)
-                        all_succeeded = False
-                    else:
-                        logging.info('Phase %d: %r evacuated successfully', phase_num, server.id)
-                except concurrent.futures.TimeoutError:
-                    logging.error('Phase %d: evacuation of %s timed out waiting for result',
-                                phase_num, server.id)
-                    all_succeeded = False
-                except Exception as exc:
-                    logging.error('Phase %d: evacuation generated an exception: %s',
-                                phase_num, exc)
-                    logging.debug('Exception traceback:', exc_info=True)
-                    all_succeeded = False
-
-        if all_succeeded:
+        if phase_ok:
             logging.info("Evacuation phase %d/%d completed successfully", phase_num, total_phases)
         else:
             logging.warning("Evacuation phase %d/%d completed with failures", phase_num, total_phases)
@@ -1561,26 +1573,13 @@ def _smart_evacuate(connection, evacuables, service, host, service_id, target_ho
     else:
         logging.debug("Using smart evacuation with %d workers", service.config.get_config_value('WORKERS'))
 
-    all_succeeded = True
     inner_workers = max(1, MAX_TOTAL_EVACUATION_THREADS // service.config.get_config_value('WORKERS'))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=inner_workers) as executor:
-        future_to_server = {executor.submit(_server_evacuate_future, connection, s, target_host): s for s in evacuables}
-
-        for future in concurrent.futures.as_completed(future_to_server):
-            server = future_to_server[future]
-            try:
-                if not future.result(timeout=FUTURE_RESULT_TIMEOUT_SECONDS):
-                    logging.debug('Evacuation of %s failed', server.id)
-                    all_succeeded = False
-                else:
-                    logging.info('%r evacuated successfully', server.id)
-            except concurrent.futures.TimeoutError:
-                logging.error('Evacuation of %s timed out waiting for result', server.id)
-                all_succeeded = False
-            except Exception as exc:
-                logging.error('Evacuation generated an exception: %s', exc)
-                logging.debug('Exception traceback:', exc_info=True)
-                all_succeeded = False
+    all_succeeded = _run_concurrent(
+        lambda s: _server_evacuate_future(connection, s, target_host),
+        evacuables,
+        inner_workers,
+        lambda s: s.id,
+    )
 
     if not all_succeeded:
         _update_service_disable_reason(connection, host, service_id)
@@ -1978,7 +1977,7 @@ def _host_disable(connection, service, instanceha_service=None):
         else:
             is_kdump = False
         suffix = f" {DISABLED_REASON_KDUMP_MARKER}" if is_kdump else ""
-        disable_reason = f"{DISABLED_REASON_EVACUATION}{suffix}: {datetime.now(timezone.utc).isoformat()}"
+        disable_reason = _make_disable_reason(DISABLED_REASON_EVACUATION, suffix)
         connection.services.disable_log_reason(service.id, disable_reason)
         logging.info("Successfully disabled %s with reason: %s", service_info, disable_reason)
         return True
@@ -2041,7 +2040,7 @@ def _host_enable(connection, nova_service, reenable: bool = False, service=None)
             # Clean up kdump marker and tracking if present
             if 'kdump' in getattr(nova_service, 'disabled_reason', ''):
                 try:
-                    connection.services.disable_log_reason(nova_service.id, f"{DISABLED_REASON_EVACUATION_COMPLETE}: {datetime.now(timezone.utc).isoformat()}")
+                    connection.services.disable_log_reason(nova_service.id, _make_disable_reason(DISABLED_REASON_EVACUATION_COMPLETE))
                     if service:
                         # Clean up kdump tracking under lock — UDP listener
                         # may still be writing timestamps for this host
@@ -2067,6 +2066,7 @@ def _host_enable(connection, nova_service, reenable: bool = False, service=None)
         except Exception as e:
             if attempt < MAX_ENABLE_RETRIES - 1:
                 logging.warning('Failed to enable %s, retrying: %s', nova_service.host, e)
+                time.sleep(FENCING_RETRY_DELAY_SECONDS * (attempt + 1))
             else:
                 logging.error('Failed to enable %s after %d attempts. Last error: %s', nova_service.host, MAX_ENABLE_RETRIES, e)
             continue
@@ -2352,6 +2352,7 @@ def _validate_fencing_inputs(fencing_data, agent_name) -> bool:
 
 def _execute_ipmi_fence(host, action, fencing_data, timeout) -> bool:
     """Execute IPMI fencing operation with retry logic."""
+    timeout = max(5, min(300, int(timeout or 30)))
     ipaddr, ipport, login, passwd = fencing_data["ipaddr"], fencing_data["ipport"], \
                                      fencing_data["login"], fencing_data["passwd"]
 
@@ -2441,10 +2442,6 @@ def _execute_fence_operation(host, action, fencing_data, service):
     agent = fencing_data.get("agent", "").lower()
 
     try:
-        if not validate_input(action, 'power_action', "host fencing"):
-            logging.error("Invalid fence action: %s", action)
-            return False
-
         # Find matching fencing agent (exact match)
         agent_func = FENCING_AGENTS.get(agent)
         if agent_func:
@@ -2530,19 +2527,22 @@ def _enable_matching_reserved_host(conn, failed_service, reserved_hosts, service
     try:
         matching_hosts = []
 
+        with service.reserved_hosts_lock:
+            reserved_snapshot = list(reserved_hosts)
+
         if match_type == MatchType.AGGREGATE:
             # Match by aggregate
             compute_aggregate_ids = _aggregate_ids(conn, failed_service)
             if not compute_aggregate_ids:
                 return ReservedHostResult(success=False)
 
-            for host in reserved_hosts:
+            for host in reserved_snapshot:
                 if (service.is_aggregate_evacuable(conn, host.host) and
                     set(_aggregate_ids(conn, host)).intersection(compute_aggregate_ids)):
                     matching_hosts.append(host)
         else:
             # Match by availability zone
-            matching_hosts = [host for host in reserved_hosts
+            matching_hosts = [host for host in reserved_snapshot
                             if host.zone == failed_service.zone]
 
         if not matching_hosts:
@@ -2648,7 +2648,7 @@ def _post_evacuation_recovery(conn, failed_service, service, resume=False):
         # Preserve kdump marker if present to ensure proper re-enable delay
         try:
             suffix = f" {DISABLED_REASON_KDUMP_MARKER}" if kdump_fenced else ""
-            new_reason = f"{DISABLED_REASON_EVACUATION_COMPLETE}{suffix}: {datetime.now(timezone.utc).isoformat()}"
+            new_reason = _make_disable_reason(DISABLED_REASON_EVACUATION_COMPLETE, suffix)
             conn.services.disable_log_reason(failed_service.id, new_reason)
             logging.debug("Updated disable reason for %s to indicate evacuation complete", failed_service.host)
         except Exception as e:
@@ -2764,7 +2764,7 @@ def _execute_step(step_name, step_func, host_name, *args, **kwargs):
         return False
 
 
-def process_service(failed_service, reserved_hosts, resume, service, shared_conn=None) -> bool:
+def process_service(failed_service, reserved_hosts, resume, service) -> bool:
     """Process a failed compute service through the complete recovery workflow."""
     if not failed_service or not hasattr(failed_service, 'host'):
         logging.error("Invalid service object provided")
@@ -2778,7 +2778,7 @@ def process_service(failed_service, reserved_hosts, resume, service, shared_conn
 
     with track_host_processing(service, hostname):
         try:
-            conn = shared_conn or _get_nova_connection(service)
+            conn = _get_nova_connection(service)
             if not conn:
                 logging.error("Nova connection failed for %s", host_name)
                 return False
@@ -3104,27 +3104,19 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
 
         workers = service.config.get_config_value('WORKERS')
         poll_interval = service.config.get_config_value('POLL')
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            for batch_name, batch, resume in [
-                ('new evacuations', to_evacuate, False),
-                ('kdump-fenced', kdump_fenced, True),
-                ('resumed', to_resume, True),
-            ]:
-                if not batch:
-                    continue
-                futures = {
-                    executor.submit(process_service, svc, reserved_hosts, resume, service, shared_conn=conn): svc
-                    for svc in batch
-                }
-                for future in concurrent.futures.as_completed(futures):
-                    svc = futures[future]
-                    try:
-                        if not future.result(timeout=FUTURE_RESULT_TIMEOUT_SECONDS):
-                            logging.warning('Evacuation failed for %s (%s)', svc.host, batch_name)
-                    except concurrent.futures.TimeoutError:
-                        logging.error('Evacuation timed out waiting for result for %s (%s)', svc.host, batch_name)
-                    except Exception as e:
-                        logging.error('Evacuation raised exception for %s (%s): %s', svc.host, batch_name, e)
+        for batch_name, batch, resume in [
+            ('new evacuations', to_evacuate, False),
+            ('kdump-fenced', kdump_fenced, True),
+            ('resumed', to_resume, True),
+        ]:
+            if not batch:
+                continue
+            _run_concurrent(
+                lambda svc, _resume=resume: process_service(svc, reserved_hosts, _resume, service),
+                batch,
+                workers,
+                lambda svc: f"{svc.host} ({batch_name})",
+            )
 
         # Clean up any hosts that were marked but filtered out before processing
         # (process_service cleans up hosts it processes, so we only need to clean up filtered ones)
@@ -3200,7 +3192,7 @@ def _process_reenabling(conn, service, to_reenable) -> None:
             else:
                 query_time = (datetime.now(timezone.utc) - timedelta(minutes=MIGRATION_QUERY_MINUTES)).isoformat()
                 migrations = conn.migrations.list(source_compute=svc.host, migration_type='evacuation',
-                                                 changes_since=query_time, limit=MIGRATION_QUERY_LIMIT)
+                                                 changes_since=query_time, limit=str(MIGRATION_QUERY_LIMIT))
                 incomplete = [m for m in migrations if m.status not in MIGRATION_STATUS_COMPLETED and m.status not in MIGRATION_STATUS_ERROR]
                 migrations_complete = len(incomplete) == 0
 
@@ -3259,7 +3251,7 @@ def _reconcile_orphaned_hosts(conn):
         if 'disabled' in svc.status:
             continue
         try:
-            disable_reason = f"{DISABLED_REASON_EVACUATION} (recovered): {datetime.now(timezone.utc).isoformat()}"
+            disable_reason = _make_disable_reason(DISABLED_REASON_EVACUATION, " (recovered)")
             conn.services.disable_log_reason(svc.id, disable_reason)
             logging.warning("Recovered orphaned fenced host %s — marked for evacuation resume", svc.host)
             _emit_k8s_event(svc.host, 'OrphanedHostRecovered',

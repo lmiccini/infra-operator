@@ -19,7 +19,7 @@ import instanceha
 
 
 class TestCleanupFilteredHosts(unittest.TestCase):
-    """Test _cleanup_filtered_hosts function (line 2515)."""
+    """Test _cleanup_filtered_hosts function."""
 
     def test_cleanup_filtered_hosts_basic(self):
         """Test basic cleanup of filtered hosts."""
@@ -102,7 +102,7 @@ class TestCleanupFilteredHosts(unittest.TestCase):
 
 
 class TestFilterProcessingHosts(unittest.TestCase):
-    """Test _filter_processing_hosts function (line 2527)."""
+    """Test _filter_processing_hosts function."""
 
     def test_filter_processing_hosts_basic(self):
         """Test basic filtering of hosts already being processed."""
@@ -218,7 +218,7 @@ class TestFilterProcessingHosts(unittest.TestCase):
 
 
 class TestPrepareEvacuationResources(unittest.TestCase):
-    """Test _prepare_evacuation_resources function (line 2568)."""
+    """Test _prepare_evacuation_resources function."""
 
     def test_prepare_evacuation_resources_basic(self):
         """Test basic resource preparation for evacuation."""
@@ -389,7 +389,7 @@ class TestPrepareEvacuationResources(unittest.TestCase):
 
 
 class TestCountEvacuableHosts(unittest.TestCase):
-    """Test _count_evacuable_hosts function (line 2679)."""
+    """Test _count_evacuable_hosts function."""
 
     def test_count_evacuable_hosts_basic(self):
         """Test basic counting of evacuable hosts."""

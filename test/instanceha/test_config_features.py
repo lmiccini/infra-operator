@@ -329,7 +329,7 @@ class TestForceEnableConfig(unittest.TestCase):
             self.assertEqual(call_kwargs['source_compute'], 'test-host.example.com')
             self.assertEqual(call_kwargs['migration_type'], 'evacuation')
             self.assertIn('changes_since', call_kwargs)
-            self.assertEqual(call_kwargs['limit'], 1000)
+            self.assertEqual(call_kwargs['limit'], str(1000))
 
 
 class TestLeaveDisabledConfig(unittest.TestCase):
@@ -394,7 +394,7 @@ class TestLeaveDisabledConfig(unittest.TestCase):
 
 
 class TestTaggedAggregatesConfig(unittest.TestCase):
-    """Test TAGGED_AGGREGATES configuration parameter (line 473)."""
+    """Test TAGGED_AGGREGATES configuration parameter."""
 
     def test_tagged_aggregates_true_filters_by_aggregate(self):
         """Test that TAGGED_AGGREGATES=True filters compute nodes by aggregate metadata."""
