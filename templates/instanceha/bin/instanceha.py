@@ -66,6 +66,7 @@ USERNAME_MAX_LENGTH = 64
 FENCING_RETRY_DELAY_SECONDS = 1
 KDUMP_REENABLE_DELAY_SECONDS = 60
 MAX_NOVA_BACKOFF_SECONDS = 300
+NOVA_API_TIMEOUT_SECONDS = 30
 MAX_TOTAL_EVACUATION_THREADS = 32
 
 # Disabled reason markers
@@ -1791,7 +1792,7 @@ def nova_login(credentials: NovaLoginCredentials, ca_bundle: Optional[str] = Non
         )
 
         verify = ca_bundle if ca_bundle else True
-        session = ksc_session.Session(auth=auth, verify=verify)
+        session = ksc_session.Session(auth=auth, verify=verify, timeout=NOVA_API_TIMEOUT_SECONDS)
         nova = client.Client("2.73", session=session, region_name=credentials.region_name)
         nova.versions.get_current()
         logging.info("Nova login successful")
@@ -2104,7 +2105,6 @@ def _bmh_fence(token, namespace, host, action, service):
         response.raise_for_status()
 
         if action == 'off':
-            fencing_timeout = service.config.get_config_value('FENCING_TIMEOUT')
             return _bmh_wait_for_power_off(base_url, headers, cacert, host, fencing_timeout, 3, service)
         else:
             logging.info("BMH power on successful for %s", host)
@@ -2543,10 +2543,10 @@ def _emit_k8s_event(host, reason, message, event_type='Normal'):
         if response.status_code in (200, 201):
             logging.debug("Emitted K8s event: %s for host %s", reason, host)
         else:
-            logging.debug("Failed to emit K8s event (HTTP %d): %s",
-                          response.status_code, response.text[:200])
+            logging.warning("Failed to emit K8s event (HTTP %d): %s",
+                            response.status_code, response.text[:200])
     except Exception as e:
-        logging.debug("Failed to emit K8s event: %s", e)
+        logging.warning("Failed to emit K8s event: %s", e)
 
 
 def _execute_step(step_name, step_func, host_name, *args, **kwargs):
