@@ -112,6 +112,7 @@ class EvacuationResult:
     uuid: str
     accepted: bool
     reason: str
+    status_code: Optional[int] = None
 
 
 @dataclass
@@ -1647,19 +1648,31 @@ def _host_evacuate(connection, failed_service, service, target_host=None) -> boo
         return _traditional_evacuate(connection, evacuables, host, target_host=target_host)
 
 
-def _server_evacuate(connection, server, target_host=None) -> EvacuationResult:
+def _server_evacuate(connection, server, target_host=None, server_obj=None) -> EvacuationResult:
     """Evacuate a server instance.
 
     Args:
         connection: Nova client connection
         server: Server ID to evacuate
         target_host: Optional target host to evacuate to. If None, Nova scheduler chooses.
+        server_obj: Optional full server object for pre-evacuation checks.
 
     Returns:
         EvacuationResult with evacuation status
     """
     success = False
     error_message = ""
+    resp_status_code = None
+
+    if server_obj is not None:
+        task_state = getattr(server_obj, 'OS-EXT-STS:task_state', None)
+        if task_state is not None:
+            logging.warning("Server %s has stuck task_state=%s, resetting to error",
+                            server, task_state)
+            try:
+                connection.servers.reset_state(server, 'error')
+            except Exception as e:
+                logging.warning("Failed to reset task_state for %s: %s", server, e)
 
     try:
         if target_host:
@@ -1671,19 +1684,23 @@ def _server_evacuate(connection, server, target_host=None) -> EvacuationResult:
 
         if response is None:
             error_message = "No response received while evacuating instance"
-        elif response.status_code == 200:
-            success = True
-            if target_host:
-                error_message = response.reason or f"Evacuation to {target_host} initiated successfully"
-            else:
-                error_message = response.reason or "Evacuation initiated successfully"
         else:
-            error_message = response.reason or f"Evacuation failed with status {response.status_code}"
+            resp_status_code = response.status_code
+            if response.status_code == 200:
+                success = True
+                if target_host:
+                    error_message = response.reason or f"Evacuation to {target_host} initiated successfully"
+                else:
+                    error_message = response.reason or "Evacuation initiated successfully"
+            else:
+                error_message = response.reason or f"Evacuation failed with status {response.status_code}"
     except NotFound:
         error_message = f"Instance {server} not found"
     except Forbidden:
+        resp_status_code = 403
         error_message = f"Access denied while evacuating instance {server}"
     except Unauthorized:
+        resp_status_code = 401
         error_message = f"Authentication failed while evacuating instance {server}"
     except Exception as e:
         error_message = f"Error while evacuating instance {server}: {e}"
@@ -1692,6 +1709,7 @@ def _server_evacuate(connection, server, target_host=None) -> EvacuationResult:
         uuid=server,
         accepted=success,
         reason=error_message,
+        status_code=resp_status_code,
     )
 
 
@@ -1790,23 +1808,73 @@ def _server_evacuate_future(connection, server, target_host=None) -> bool:
         logging.info("Processing evacuation for server %s", server.id)
 
     try:
-        response = _server_evacuate(connection, server.id, target_host=target_host)
+        connection.servers.lock(server.id)
+    except Exception:
+        logging.debug("Could not lock server %s (may already be locked)", server.id)
+
+    original_status = getattr(server, 'status', None)
+    source_host = getattr(server, 'OS-EXT-SRV-ATTR:host', 'unknown')
+
+    try:
+        _emit_k8s_event(source_host, 'InstanceEvacuationStarted',
+                        f'Evacuating instance {server.id}')
+
+        response = _server_evacuate(connection, server.id, target_host=target_host, server_obj=server)
+
+        if not response.accepted and response.status_code in (409, 500) and target_host:
+            logging.warning("Evacuation of %s to %s failed with %s, retrying without target host",
+                            server.id, target_host, response.status_code)
+            response = _server_evacuate(connection, server.id, server_obj=server)
 
         if not response.accepted:
             logging.warning("Evacuation of %s on %s failed: %s",
                            response.uuid, server.id, response.reason)
+            _emit_k8s_event(source_host, 'InstanceEvacuationFailed',
+                            f'Instance {server.id} evacuation failed: {response.reason}',
+                            event_type='Warning')
             return False
 
         logging.debug("Starting evacuation of %s", response.uuid)
         time.sleep(INITIAL_EVACUATION_WAIT_SECONDS)
 
-        return _monitor_evacuation(connection, server.id, response.uuid, start_time)
+        result = _monitor_evacuation(connection, server.id, response.uuid, start_time)
+
+        if result:
+            _emit_k8s_event(source_host, 'InstanceEvacuationSucceeded',
+                            f'Instance {server.id} evacuated successfully')
+
+            if original_status == 'STOPPED':
+                try:
+                    connection.servers.stop(server.id)
+                    logging.info("Restored server %s to STOPPED state", server.id)
+                except Exception as e:
+                    logging.warning("Failed to restore STOPPED state for %s: %s", server.id, e)
+            elif original_status == 'ERROR':
+                try:
+                    connection.servers.reset_state(server.id, 'error')
+                    logging.info("Restored server %s to ERROR state", server.id)
+                except Exception as e:
+                    logging.warning("Failed to restore ERROR state for %s: %s", server.id, e)
+        else:
+            _emit_k8s_event(source_host, 'InstanceEvacuationFailed',
+                            f'Instance {server.id} evacuation failed',
+                            event_type='Warning')
+
+        return result
 
     except Exception as e:
         logging.error("Unexpected error during evacuation of server %s: %s",
                      server.id, str(e))
         logging.debug('Exception traceback:', exc_info=True)
+        _emit_k8s_event(source_host, 'InstanceEvacuationFailed',
+                        f'Instance {server.id} evacuation error: {e}',
+                        event_type='Warning')
         return False
+    finally:
+        try:
+            connection.servers.unlock(server.id)
+        except Exception:
+            logging.debug("Could not unlock server %s (may have been deleted)", server.id)
 
 
 def nova_login(credentials: NovaLoginCredentials, ca_bundle: Optional[str] = None) -> OpenStackClient:
@@ -3198,6 +3266,24 @@ def _reconcile_orphaned_hosts(conn):
     if recovered:
         logging.info("Startup reconciliation: recovered %d orphaned fenced host(s)", recovered)
 
+    # Unlock VMs left locked by a crashed instanceha
+    unlocked = 0
+    for svc in services:
+        if not (svc.forced_down and svc.state == 'down'):
+            continue
+        try:
+            servers = conn.servers.list(search_opts={'host': svc.host, 'all_tenants': 1})
+            for s in servers:
+                if getattr(s, 'locked', False):
+                    conn.servers.unlock(s.id)
+                    logging.warning("Unlocked orphaned locked VM %s on host %s", s.id, svc.host)
+                    unlocked += 1
+        except Exception as e:
+            logging.warning("Failed to check/unlock VMs on host %s: %s", svc.host, e)
+
+    if unlocked:
+        logging.info("Startup reconciliation: unlocked %d orphaned locked VM(s)", unlocked)
+
 
 def main():
     # Set up logging early so config loading errors are properly formatted
@@ -3212,6 +3298,12 @@ def main():
     except ConfigurationError as e:
         logging.error("Configuration failed: %s", e)
         sys.exit(1)
+
+    if not config_manager.get_config_value('SMART_EVACUATION') and \
+       not config_manager.get_config_value('ORCHESTRATED_RESTART'):
+        logging.warning("Traditional evacuation mode is active (fire-and-forget). "
+                        "Consider enabling SMART_EVACUATION or ORCHESTRATED_RESTART "
+                        "for production use.")
 
     # Initialize service and establish connections
     service = _initialize_service(config_manager)

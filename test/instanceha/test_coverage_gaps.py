@@ -1061,5 +1061,399 @@ class TestReconcileOrphanedHosts(unittest.TestCase):
         mock_event.assert_not_called()
 
 
+# ============================================================================
+# Task state reset before evacuation (G2a)
+# ============================================================================
+
+class TestTaskStateReset(unittest.TestCase):
+    """Tests for resetting stuck task_state before evacuation."""
+
+    def _make_server(self, task_state=None):
+        server = Mock()
+        server.id = 'server-1'
+        # openstacksdk uses attribute-style access with dashes
+        setattr(server, 'OS-EXT-STS:task_state', task_state)
+        return server
+
+    def test_stuck_task_state_triggers_reset(self):
+        conn = MagicMock()
+        resp = Mock(status_code=200, reason='OK')
+        conn.servers.evacuate.return_value = (resp, None)
+        server_obj = self._make_server(task_state='migrating')
+
+        result = instanceha._server_evacuate(conn, 'server-1', server_obj=server_obj)
+
+        conn.servers.reset_state.assert_called_once_with('server-1', 'error')
+        conn.servers.evacuate.assert_called_once()
+        self.assertTrue(result.accepted)
+
+    def test_none_task_state_skips_reset(self):
+        conn = MagicMock()
+        resp = Mock(status_code=200, reason='OK')
+        conn.servers.evacuate.return_value = (resp, None)
+        server_obj = self._make_server(task_state=None)
+
+        result = instanceha._server_evacuate(conn, 'server-1', server_obj=server_obj)
+
+        conn.servers.reset_state.assert_not_called()
+        conn.servers.evacuate.assert_called_once()
+        self.assertTrue(result.accepted)
+
+    def test_no_server_obj_skips_reset(self):
+        conn = MagicMock()
+        resp = Mock(status_code=200, reason='OK')
+        conn.servers.evacuate.return_value = (resp, None)
+
+        result = instanceha._server_evacuate(conn, 'server-1')
+
+        conn.servers.reset_state.assert_not_called()
+        self.assertTrue(result.accepted)
+
+    def test_reset_state_failure_still_attempts_evacuate(self):
+        conn = MagicMock()
+        conn.servers.reset_state.side_effect = Exception("API error")
+        resp = Mock(status_code=200, reason='OK')
+        conn.servers.evacuate.return_value = (resp, None)
+        server_obj = self._make_server(task_state='resizing')
+
+        result = instanceha._server_evacuate(conn, 'server-1', server_obj=server_obj)
+
+        conn.servers.reset_state.assert_called_once_with('server-1', 'error')
+        conn.servers.evacuate.assert_called_once()
+        self.assertTrue(result.accepted)
+
+
+# ============================================================================
+# Instance locking during evacuation (G1)
+# ============================================================================
+
+class TestInstanceLocking(unittest.TestCase):
+    """Tests for lock/unlock around evacuation."""
+
+    def _make_server(self):
+        server = Mock()
+        server.id = 'server-lock-1'
+        setattr(server, 'OS-EXT-STS:task_state', None)
+        setattr(server, 'OS-EXT-SRV-ATTR:host', 'compute-0')
+        server.status = 'ACTIVE'
+        return server
+
+    @patch('instanceha._emit_k8s_event')
+    @patch('instanceha._monitor_evacuation', return_value=True)
+    @patch('instanceha.time')
+    def test_lock_before_evacuate_unlock_after(self, mock_time, mock_monitor, mock_event):
+        mock_time.monotonic.return_value = 0
+        conn = MagicMock()
+        resp = Mock(status_code=200, reason='OK')
+        conn.servers.evacuate.return_value = (resp, None)
+        server = self._make_server()
+        call_order = []
+        conn.servers.lock.side_effect = lambda sid: call_order.append('lock')
+        conn.servers.evacuate.side_effect = lambda **kw: (call_order.append('evacuate'), (resp, None))[1]
+        conn.servers.unlock.side_effect = lambda sid: call_order.append('unlock')
+
+        result = instanceha._server_evacuate_future(conn, server)
+
+        self.assertTrue(result)
+        self.assertEqual(call_order[:2], ['lock', 'evacuate'])
+        self.assertEqual(call_order[-1], 'unlock')
+
+    @patch('instanceha._emit_k8s_event')
+    @patch('instanceha._monitor_evacuation', return_value=True)
+    @patch('instanceha.time')
+    def test_lock_failure_does_not_block_evacuation(self, mock_time, mock_monitor, mock_event):
+        mock_time.monotonic.return_value = 0
+        conn = MagicMock()
+        conn.servers.lock.side_effect = Exception("lock failed")
+        resp = Mock(status_code=200, reason='OK')
+        conn.servers.evacuate.return_value = (resp, None)
+        server = self._make_server()
+
+        result = instanceha._server_evacuate_future(conn, server)
+
+        self.assertTrue(result)
+        conn.servers.evacuate.assert_called_once()
+
+    @patch('instanceha._emit_k8s_event')
+    @patch('instanceha.time')
+    def test_unlock_after_failed_evacuation(self, mock_time, mock_event):
+        mock_time.monotonic.return_value = 0
+        conn = MagicMock()
+        resp = Mock(status_code=500, reason='Internal Server Error')
+        conn.servers.evacuate.return_value = (resp, None)
+        server = self._make_server()
+
+        result = instanceha._server_evacuate_future(conn, server)
+
+        self.assertFalse(result)
+        conn.servers.unlock.assert_called_once_with('server-lock-1')
+
+    @patch('instanceha._emit_k8s_event')
+    def test_reconcile_unlocks_orphaned_vms(self, mock_event):
+        conn = MagicMock()
+        svc = Mock()
+        svc.forced_down = True
+        svc.state = 'down'
+        svc.status = 'disabled'
+        svc.host = 'compute-0'
+        svc.id = 'svc-1'
+        conn.services.list.return_value = [svc]
+
+        locked_vm = Mock()
+        locked_vm.id = 'vm-locked'
+        locked_vm.locked = True
+        unlocked_vm = Mock()
+        unlocked_vm.id = 'vm-unlocked'
+        unlocked_vm.locked = False
+        conn.servers.list.return_value = [locked_vm, unlocked_vm]
+
+        instanceha._reconcile_orphaned_hosts(conn)
+
+        conn.servers.unlock.assert_called_once_with('vm-locked')
+
+
+# ============================================================================
+# Post-evacuation state restoration (G2b)
+# ============================================================================
+
+class TestStateRestoration(unittest.TestCase):
+    """Tests for restoring VM state after successful evacuation."""
+
+    def _make_server(self, status='ACTIVE'):
+        server = Mock()
+        server.id = 'server-state-1'
+        server.status = status
+        setattr(server, 'OS-EXT-STS:task_state', None)
+        setattr(server, 'OS-EXT-SRV-ATTR:host', 'compute-0')
+        return server
+
+    @patch('instanceha._emit_k8s_event')
+    @patch('instanceha._monitor_evacuation', return_value=True)
+    @patch('instanceha.time')
+    def test_stopped_vm_restored_after_evacuation(self, mock_time, mock_monitor, mock_event):
+        mock_time.monotonic.return_value = 0
+        conn = MagicMock()
+        resp = Mock(status_code=200, reason='OK')
+        conn.servers.evacuate.return_value = (resp, None)
+        server = self._make_server(status='STOPPED')
+
+        result = instanceha._server_evacuate_future(conn, server)
+
+        self.assertTrue(result)
+        conn.servers.stop.assert_called_once_with('server-state-1')
+
+    @patch('instanceha._emit_k8s_event')
+    @patch('instanceha._monitor_evacuation', return_value=True)
+    @patch('instanceha.time')
+    def test_error_vm_restored_after_evacuation(self, mock_time, mock_monitor, mock_event):
+        mock_time.monotonic.return_value = 0
+        conn = MagicMock()
+        resp = Mock(status_code=200, reason='OK')
+        conn.servers.evacuate.return_value = (resp, None)
+        server = self._make_server(status='ERROR')
+
+        result = instanceha._server_evacuate_future(conn, server)
+
+        self.assertTrue(result)
+        conn.servers.reset_state.assert_called_with('server-state-1', 'error')
+
+    @patch('instanceha._emit_k8s_event')
+    @patch('instanceha._monitor_evacuation', return_value=True)
+    @patch('instanceha.time')
+    def test_active_vm_no_restoration(self, mock_time, mock_monitor, mock_event):
+        mock_time.monotonic.return_value = 0
+        conn = MagicMock()
+        resp = Mock(status_code=200, reason='OK')
+        conn.servers.evacuate.return_value = (resp, None)
+        server = self._make_server(status='ACTIVE')
+
+        result = instanceha._server_evacuate_future(conn, server)
+
+        self.assertTrue(result)
+        conn.servers.stop.assert_not_called()
+        # reset_state may be called for task_state check, but not for state restoration
+        # so we check it wasn't called with 'error' as second arg after evacuation
+        for c in conn.servers.reset_state.call_args_list:
+            if c == call('server-state-1', 'error'):
+                self.fail("reset_state called for ACTIVE server state restoration")
+
+    @patch('instanceha._emit_k8s_event')
+    @patch('instanceha._monitor_evacuation', return_value=True)
+    @patch('instanceha.time')
+    def test_restoration_failure_does_not_fail_evacuation(self, mock_time, mock_monitor, mock_event):
+        mock_time.monotonic.return_value = 0
+        conn = MagicMock()
+        resp = Mock(status_code=200, reason='OK')
+        conn.servers.evacuate.return_value = (resp, None)
+        conn.servers.stop.side_effect = Exception("stop failed")
+        server = self._make_server(status='STOPPED')
+
+        result = instanceha._server_evacuate_future(conn, server)
+
+        self.assertTrue(result)
+        conn.servers.stop.assert_called_once_with('server-state-1')
+
+    @patch('instanceha._emit_k8s_event')
+    @patch('instanceha._monitor_evacuation', return_value=False)
+    @patch('instanceha.time')
+    def test_no_restoration_on_failed_evacuation(self, mock_time, mock_monitor, mock_event):
+        mock_time.monotonic.return_value = 0
+        conn = MagicMock()
+        resp = Mock(status_code=200, reason='OK')
+        conn.servers.evacuate.return_value = (resp, None)
+        server = self._make_server(status='STOPPED')
+
+        result = instanceha._server_evacuate_future(conn, server)
+
+        self.assertFalse(result)
+        conn.servers.stop.assert_not_called()
+
+
+# ============================================================================
+# Evacuation retry on retryable errors (G5)
+# ============================================================================
+
+class TestEvacuationRetry(unittest.TestCase):
+    """Tests for retrying evacuation without target host on retryable errors."""
+
+    def _make_server(self):
+        server = Mock()
+        server.id = 'server-retry-1'
+        server.status = 'ACTIVE'
+        setattr(server, 'OS-EXT-STS:task_state', None)
+        setattr(server, 'OS-EXT-SRV-ATTR:host', 'compute-0')
+        return server
+
+    @patch('instanceha._emit_k8s_event')
+    @patch('instanceha._monitor_evacuation', return_value=True)
+    @patch('instanceha.time')
+    def test_retry_on_409_without_target(self, mock_time, mock_monitor, mock_event):
+        mock_time.monotonic.return_value = 0
+        conn = MagicMock()
+        fail_resp = Mock(status_code=409, reason='Conflict')
+        ok_resp = Mock(status_code=200, reason='OK')
+        conn.servers.evacuate.side_effect = [
+            (fail_resp, None),
+            (ok_resp, None),
+        ]
+        server = self._make_server()
+
+        result = instanceha._server_evacuate_future(conn, server, target_host='reserved-0')
+
+        self.assertTrue(result)
+        self.assertEqual(conn.servers.evacuate.call_count, 2)
+        # First call with target host, second without
+        first_call = conn.servers.evacuate.call_args_list[0]
+        self.assertEqual(first_call, call(server='server-retry-1', host='reserved-0'))
+        second_call = conn.servers.evacuate.call_args_list[1]
+        self.assertEqual(second_call, call(server='server-retry-1'))
+
+    @patch('instanceha._emit_k8s_event')
+    @patch('instanceha.time')
+    def test_no_retry_on_403(self, mock_time, mock_event):
+        mock_time.monotonic.return_value = 0
+        conn = MagicMock()
+        fail_resp = Mock(status_code=403, reason='Forbidden')
+        conn.servers.evacuate.return_value = (fail_resp, None)
+        server = self._make_server()
+
+        result = instanceha._server_evacuate_future(conn, server, target_host='reserved-0')
+
+        self.assertFalse(result)
+        self.assertEqual(conn.servers.evacuate.call_count, 1)
+
+    @patch('instanceha._emit_k8s_event')
+    @patch('instanceha.time')
+    def test_retry_fails_returns_false(self, mock_time, mock_event):
+        mock_time.monotonic.return_value = 0
+        conn = MagicMock()
+        fail_resp = Mock(status_code=409, reason='Conflict')
+        fail_resp2 = Mock(status_code=500, reason='Internal Server Error')
+        conn.servers.evacuate.side_effect = [
+            (fail_resp, None),
+            (fail_resp2, None),
+        ]
+        server = self._make_server()
+
+        result = instanceha._server_evacuate_future(conn, server, target_host='reserved-0')
+
+        self.assertFalse(result)
+        self.assertEqual(conn.servers.evacuate.call_count, 2)
+
+    @patch('instanceha._emit_k8s_event')
+    @patch('instanceha.time')
+    def test_no_retry_when_no_target_host(self, mock_time, mock_event):
+        mock_time.monotonic.return_value = 0
+        conn = MagicMock()
+        fail_resp = Mock(status_code=409, reason='Conflict')
+        conn.servers.evacuate.return_value = (fail_resp, None)
+        server = self._make_server()
+
+        result = instanceha._server_evacuate_future(conn, server)
+
+        self.assertFalse(result)
+        self.assertEqual(conn.servers.evacuate.call_count, 1)
+
+
+# ============================================================================
+# Traditional mode warning (G4)
+# ============================================================================
+
+class TestTraditionalModeWarning(unittest.TestCase):
+    """Tests for startup warning when traditional mode is active."""
+
+    @patch('instanceha._reconcile_orphaned_hosts')
+    @patch('instanceha._establish_nova_connection')
+    @patch('instanceha._initialize_service')
+    @patch('instanceha.signal')
+    def test_warning_when_traditional_mode(self, mock_signal, mock_init, mock_conn, mock_reconcile):
+        mock_config = MagicMock()
+        mock_config.get_config_value.side_effect = lambda key: {
+            'LOGLEVEL': 'INFO',
+            'SMART_EVACUATION': False,
+            'ORCHESTRATED_RESTART': False,
+        }.get(key, Mock())
+        service = Mock()
+        service.shutdown_event = Mock()
+        service.shutdown_event.is_set.return_value = True
+        mock_init.return_value = service
+
+        with patch('instanceha.ConfigManager', return_value=mock_config), \
+             patch('instanceha.logging') as mock_logging:
+            mock_logging.INFO = logging.INFO
+            mock_logging.getLogger.return_value = Mock()
+            instanceha.main()
+
+            warning_calls = [c for c in mock_logging.warning.call_args_list
+                           if 'Traditional evacuation mode' in str(c)]
+            self.assertTrue(len(warning_calls) > 0, "Expected traditional mode warning")
+
+    @patch('instanceha._reconcile_orphaned_hosts')
+    @patch('instanceha._establish_nova_connection')
+    @patch('instanceha._initialize_service')
+    @patch('instanceha.signal')
+    def test_no_warning_when_smart_enabled(self, mock_signal, mock_init, mock_conn, mock_reconcile):
+        mock_config = MagicMock()
+        mock_config.get_config_value.side_effect = lambda key: {
+            'LOGLEVEL': 'INFO',
+            'SMART_EVACUATION': True,
+            'ORCHESTRATED_RESTART': False,
+        }.get(key, Mock())
+        service = Mock()
+        service.shutdown_event = Mock()
+        service.shutdown_event.is_set.return_value = True
+        mock_init.return_value = service
+
+        with patch('instanceha.ConfigManager', return_value=mock_config), \
+             patch('instanceha.logging') as mock_logging:
+            mock_logging.INFO = logging.INFO
+            mock_logging.getLogger.return_value = Mock()
+            instanceha.main()
+
+            warning_calls = [c for c in mock_logging.warning.call_args_list
+                           if 'Traditional evacuation mode' in str(c)]
+            self.assertEqual(len(warning_calls), 0, "Should not warn when smart is enabled")
+
+
 if __name__ == '__main__':
     unittest.main()

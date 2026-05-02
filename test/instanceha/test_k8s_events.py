@@ -338,6 +338,72 @@ class TestProcessServiceEvents(unittest.TestCase):
                 self.assertEqual(call_obj.kwargs.get('event_type', call_obj.args[3] if len(call_obj.args) > 3 else 'Normal'), 'Warning')
 
 
+class TestPerInstanceEvacuationEvents(unittest.TestCase):
+    """Tests for per-instance K8s events in _server_evacuate_future."""
+
+    def _make_server(self, status='ACTIVE'):
+        server = Mock()
+        server.id = 'vm-123'
+        server.status = status
+        setattr(server, 'OS-EXT-STS:task_state', None)
+        setattr(server, 'OS-EXT-SRV-ATTR:host', 'compute-0')
+        return server
+
+    @patch('instanceha._emit_k8s_event')
+    @patch('instanceha._monitor_evacuation', return_value=True)
+    @patch('instanceha.time')
+    def test_per_instance_evacuation_started_event(self, mock_time, mock_monitor, mock_event):
+        mock_time.monotonic.return_value = 0
+        conn = MagicMock()
+        resp = Mock(status_code=200, reason='OK')
+        conn.servers.evacuate.return_value = (resp, None)
+        server = self._make_server()
+
+        instanceha._server_evacuate_future(conn, server)
+
+        reasons = [c.args[1] for c in mock_event.call_args_list]
+        self.assertIn('InstanceEvacuationStarted', reasons)
+        started_call = [c for c in mock_event.call_args_list
+                        if c.args[1] == 'InstanceEvacuationStarted'][0]
+        self.assertIn('vm-123', started_call.args[2])
+
+    @patch('instanceha._emit_k8s_event')
+    @patch('instanceha._monitor_evacuation', return_value=True)
+    @patch('instanceha.time')
+    def test_per_instance_evacuation_succeeded_event(self, mock_time, mock_monitor, mock_event):
+        mock_time.monotonic.return_value = 0
+        conn = MagicMock()
+        resp = Mock(status_code=200, reason='OK')
+        conn.servers.evacuate.return_value = (resp, None)
+        server = self._make_server()
+
+        result = instanceha._server_evacuate_future(conn, server)
+
+        self.assertTrue(result)
+        reasons = [c.args[1] for c in mock_event.call_args_list]
+        self.assertIn('InstanceEvacuationSucceeded', reasons)
+
+    @patch('instanceha._emit_k8s_event')
+    @patch('instanceha.time')
+    def test_per_instance_evacuation_failed_event(self, mock_time, mock_event):
+        mock_time.monotonic.return_value = 0
+        conn = MagicMock()
+        resp = Mock(status_code=500, reason='Internal Server Error')
+        conn.servers.evacuate.return_value = (resp, None)
+        server = self._make_server()
+
+        result = instanceha._server_evacuate_future(conn, server)
+
+        self.assertFalse(result)
+        reasons = [c.args[1] for c in mock_event.call_args_list]
+        self.assertIn('InstanceEvacuationFailed', reasons)
+        failed_call = [c for c in mock_event.call_args_list
+                       if c.args[1] == 'InstanceEvacuationFailed'][0]
+        self.assertEqual(failed_call.kwargs.get('event_type',
+                         failed_call.args[3] if len(failed_call.args) > 3 else 'Normal'),
+                         'Warning')
+
+
 if __name__ == '__main__':
     logging.basicConfig(level=logging.WARNING)
     unittest.main(verbosity=2)
