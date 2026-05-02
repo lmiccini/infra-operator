@@ -69,6 +69,7 @@ MAX_NOVA_BACKOFF_SECONDS = 300
 MAX_TOTAL_EVACUATION_THREADS = 32
 
 # Disabled reason markers
+LOCK_REASON_EVACUATION = "instanceha-evacuation"
 DISABLED_REASON_EVACUATION = "instanceha evacuation"
 DISABLED_REASON_EVACUATION_COMPLETE = "instanceha evacuation complete"
 DISABLED_REASON_EVACUATION_FAILED = "evacuation FAILED"
@@ -1816,7 +1817,7 @@ def _server_evacuate_future(connection, server, target_host=None) -> bool:
     source_host = getattr(server, 'OS-EXT-SRV-ATTR:host', 'unknown')
 
     try:
-        connection.servers.lock(server.id)
+        connection.servers.lock(server.id, reason=LOCK_REASON_EVACUATION)
     except Exception:
         logging.debug("Could not lock server %s (may already be locked)", server.id)
 
@@ -1900,7 +1901,7 @@ def nova_login(credentials: NovaLoginCredentials, ca_bundle: Optional[str] = Non
 
         verify = ca_bundle if ca_bundle else True
         session = ksc_session.Session(auth=auth, verify=verify)
-        nova = client.Client("2.59", session=session, region_name=credentials.region_name)
+        nova = client.Client("2.73", session=session, region_name=credentials.region_name)
         nova.versions.get_current()
         logging.info("Nova login successful")
         return nova
@@ -3271,7 +3272,7 @@ def _reconcile_orphaned_hosts(conn):
     if recovered:
         logging.info("Startup reconciliation: recovered %d orphaned fenced host(s)", recovered)
 
-    # Unlock VMs left locked by a crashed instanceha
+    # Unlock VMs left locked by a crashed instanceha (only our own locks)
     unlocked = 0
     for svc in services:
         if not (svc.forced_down and svc.state == 'down'):
@@ -3279,7 +3280,8 @@ def _reconcile_orphaned_hosts(conn):
         try:
             servers = conn.servers.list(search_opts={'host': svc.host, 'all_tenants': 1})
             for s in servers:
-                if getattr(s, 'locked', False):
+                locked_reason = getattr(s, 'locked_reason', None)
+                if locked_reason == LOCK_REASON_EVACUATION:
                     conn.servers.unlock(s.id)
                     logging.warning("Unlocked orphaned locked VM %s on host %s", s.id, svc.host)
                     unlocked += 1

@@ -1148,7 +1148,7 @@ class TestInstanceLocking(unittest.TestCase):
         conn.servers.evacuate.return_value = (resp, None)
         server = self._make_server()
         call_order = []
-        conn.servers.lock.side_effect = lambda sid: call_order.append('lock')
+        conn.servers.lock.side_effect = lambda sid, **kw: call_order.append('lock')
         conn.servers.evacuate.side_effect = lambda **kw: (call_order.append('evacuate'), (resp, None))[1]
         conn.servers.unlock.side_effect = lambda sid: call_order.append('unlock')
 
@@ -1157,6 +1157,7 @@ class TestInstanceLocking(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(call_order[:2], ['lock', 'evacuate'])
         self.assertEqual(call_order[-1], 'unlock')
+        conn.servers.lock.assert_called_once_with('server-lock-1', reason='instanceha-evacuation')
 
     @patch('instanceha._emit_k8s_event')
     @patch('instanceha._monitor_evacuation', return_value=True)
@@ -1199,17 +1200,20 @@ class TestInstanceLocking(unittest.TestCase):
         svc.id = 'svc-1'
         conn.services.list.return_value = [svc]
 
-        locked_vm = Mock()
-        locked_vm.id = 'vm-locked'
-        locked_vm.locked = True
+        our_locked_vm = Mock()
+        our_locked_vm.id = 'vm-our-lock'
+        our_locked_vm.locked_reason = 'instanceha-evacuation'
+        user_locked_vm = Mock()
+        user_locked_vm.id = 'vm-user-lock'
+        user_locked_vm.locked_reason = 'maintenance window'
         unlocked_vm = Mock()
         unlocked_vm.id = 'vm-unlocked'
-        unlocked_vm.locked = False
-        conn.servers.list.return_value = [locked_vm, unlocked_vm]
+        unlocked_vm.locked_reason = None
+        conn.servers.list.return_value = [our_locked_vm, user_locked_vm, unlocked_vm]
 
         instanceha._reconcile_orphaned_hosts(conn)
 
-        conn.servers.unlock.assert_called_once_with('vm-locked')
+        conn.servers.unlock.assert_called_once_with('vm-our-lock')
 
 
 # ============================================================================
