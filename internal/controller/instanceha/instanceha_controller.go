@@ -406,7 +406,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// Create netattachment
 	nadList := []networkv1.NetworkAttachmentDefinition{}
 	for _, netAtt := range instance.Spec.NetworkAttachments {
-		nad, err := nad.GetNADWithName(ctx, helper, netAtt, instance.Namespace)
+		nadObj, err := nad.GetNADWithName(ctx, helper, netAtt, instance.Namespace)
 		if err != nil {
 			if k8s_errors.IsNotFound(err) {
 				// Since the net-attach-def CR should have been manually created by the user and referenced in the spec,
@@ -429,8 +429,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			return ctrl.Result{}, err
 		}
 
-		if nad != nil {
-			nadList = append(nadList, *nad)
+		if nadObj != nil {
+			nadList = append(nadList, *nadObj)
 		}
 	}
 

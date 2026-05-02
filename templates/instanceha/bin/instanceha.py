@@ -1056,19 +1056,21 @@ class InstanceHAService(CloudConnectionProvider):
             logging.debug("Error checking image evacuability for server %s: %s", server.id, e)
             return False
 
-    def is_aggregate_evacuable(self, connection: OpenStackClient, host: str) -> bool:
+    def is_aggregate_evacuable(self, connection: OpenStackClient, host: str, aggregates=None) -> bool:
         """
         Check if a host is part of an aggregate that has been tagged as evacuable.
 
         Args:
             connection: Nova connection
             host: Host name to check
+            aggregates: Optional cached aggregate list to avoid redundant API calls
 
         Returns:
             bool: True if host is in evacuable aggregate, False otherwise
         """
         try:
-            aggregates = connection.aggregates.list()
+            if aggregates is None:
+                aggregates = connection.aggregates.list()
 
             # Use unified resource checking logic
             return any(host in agg.hosts for agg in aggregates
@@ -1101,7 +1103,7 @@ class InstanceHAService(CloudConnectionProvider):
                     host_servers[service.host] = servers
                     if servers:
                         server_info = [(s.id, s.name, s.status) for s in servers]
-                        logging.info("Found %d servers on host %s: %s", len(servers), service.host, server_info)
+                        logging.debug("Found %d servers on host %s: %s", len(servers), service.host, server_info)
                     else:
                         logging.info("No servers found on host %s", service.host)
                 except Exception as e:
@@ -1303,7 +1305,7 @@ def _kdump_udp_listener(service: 'InstanceHAService') -> None:
                 try:
                     # recvmsg returns: (data, ancdata, msg_flags, address)
                     # ancdata and msg_flags unused, only data and address needed
-                    data, _, _, address = sock.recvmsg(65535, 1024, 0)
+                    data, _, _, address = sock.recvmsg(4096, 1024, 0)
                     logging.debug('Received UDP message from %s, length: %d', address[0], len(data))
 
                     if len(data) >= 8:
@@ -1343,9 +1345,11 @@ def _kdump_udp_listener(service: 'InstanceHAService') -> None:
     except Exception as e:
         logging.error('Kdump listener failed to start: %s', e)
 
-def _aggregate_ids(conn, service) -> List[int]:
+def _aggregate_ids(conn, service, aggregates=None) -> List[int]:
     """Get aggregate IDs for a service's host."""
-    return [ag.id for ag in conn.aggregates.list() if service.host in ag.hosts]
+    if aggregates is None:
+        aggregates = conn.aggregates.list()
+    return [ag.id for ag in aggregates if service.host in ag.hosts]
 
 
 def _update_service_disable_reason(connection, host, service_id=None) -> bool:
@@ -1360,7 +1364,7 @@ def _update_service_disable_reason(connection, host, service_id=None) -> bool:
                 return False
             service_id = service_obj.id
 
-        disable_reason = f"evacuation FAILED: {datetime.now().isoformat()}"
+        disable_reason = f"evacuation FAILED: {datetime.now(timezone.utc).isoformat()}"
         connection.services.disable_log_reason(service_id, disable_reason)
         logging.debug('Updated disabled reason for host %s after evacuation failure', host)
         return True
@@ -1697,7 +1701,7 @@ def _server_evacuation_status(connection, server) -> EvacuationStatus:
         return EvacuationStatus(completed=False, error=True)
 
     try:
-        query_time = (datetime.now() - timedelta(minutes=MIGRATION_QUERY_MINUTES)).isoformat()
+        query_time = (datetime.now(timezone.utc) - timedelta(minutes=MIGRATION_QUERY_MINUTES)).isoformat()
         migrations = connection.migrations.list(
             instance_uuid=str(server),
             migration_type='evacuation',
@@ -1900,7 +1904,7 @@ def _host_disable(connection, service, instanceha_service=None):
         else:
             is_kdump = False
         suffix = f" {DISABLED_REASON_KDUMP_MARKER}" if is_kdump else ""
-        disable_reason = f"{DISABLED_REASON_EVACUATION}{suffix}: {datetime.now().isoformat()}"
+        disable_reason = f"{DISABLED_REASON_EVACUATION}{suffix}: {datetime.now(timezone.utc).isoformat()}"
         connection.services.disable_log_reason(service.id, disable_reason)
         logging.info("Successfully disabled %s with reason: %s", service_info, disable_reason)
         return True
@@ -1963,7 +1967,7 @@ def _host_enable(connection, nova_service, reenable: bool = False, service=None)
             # Clean up kdump marker and tracking if present
             if 'kdump' in getattr(nova_service, 'disabled_reason', ''):
                 try:
-                    connection.services.disable_log_reason(nova_service.id, f"{DISABLED_REASON_EVACUATION_COMPLETE}: {datetime.now().isoformat()}")
+                    connection.services.disable_log_reason(nova_service.id, f"{DISABLED_REASON_EVACUATION_COMPLETE}: {datetime.now(timezone.utc).isoformat()}")
                     if service:
                         # Clean up kdump tracking under lock — UDP listener
                         # may still be writing timestamps for this host
@@ -2570,7 +2574,7 @@ def _post_evacuation_recovery(conn, failed_service, service, resume=False):
         # Preserve kdump marker if present to ensure proper re-enable delay
         try:
             suffix = f" {DISABLED_REASON_KDUMP_MARKER}" if kdump_fenced else ""
-            new_reason = f"{DISABLED_REASON_EVACUATION_COMPLETE}{suffix}: {datetime.now().isoformat()}"
+            new_reason = f"{DISABLED_REASON_EVACUATION_COMPLETE}{suffix}: {datetime.now(timezone.utc).isoformat()}"
             conn.services.disable_log_reason(failed_service.id, new_reason)
             logging.debug("Updated disable reason for %s to indicate evacuation complete", failed_service.host)
         except Exception as e:
@@ -3120,7 +3124,7 @@ def _process_reenabling(conn, service, to_reenable) -> None:
             if force_enable:
                 migrations_complete = True
             else:
-                query_time = (datetime.now() - timedelta(minutes=MIGRATION_QUERY_MINUTES)).isoformat()
+                query_time = (datetime.now(timezone.utc) - timedelta(minutes=MIGRATION_QUERY_MINUTES)).isoformat()
                 migrations = conn.migrations.list(source_compute=svc.host, migration_type='evacuation',
                                                  changes_since=query_time, limit=MIGRATION_QUERY_LIMIT)
                 incomplete = [m for m in migrations if m.status not in MIGRATION_STATUS_COMPLETED and m.status not in MIGRATION_STATUS_ERROR]
@@ -3197,7 +3201,7 @@ def main():
                 service.shutdown_event.wait(poll_interval)
                 continue
 
-            target_date = datetime.now() - timedelta(seconds=service.config.get_config_value('DELTA'))
+            target_date = datetime.now(timezone.utc) - timedelta(seconds=service.config.get_config_value('DELTA'))
             compute_nodes, to_resume, to_reenable = _categorize_services(services, target_date)
 
             compute_nodes_list = list(compute_nodes)
