@@ -199,7 +199,8 @@ VALIDATION_PATTERNS = {
                       'ForceOn', 'PushPowerButton'], None),
     'ip_address': ('ip', None),  # Special marker for IP address validation
     'port': ('port', None),  # Special marker for port validation
-    'username': (r'^[a-zA-Z0-9_-]{1,64}$', USERNAME_MAX_LENGTH)
+    'username': (r'^[a-zA-Z0-9_-]{1,64}$', USERNAME_MAX_LENGTH),
+    'hostname': (r'^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$', USERNAME_MAX_LENGTH)
 }
 
 def _try_validate(validator_func: Callable[[], bool], error_msg: str, context: str, log_error: bool = True) -> bool:
@@ -1326,6 +1327,10 @@ def _resolve_hostname_packet(data, address, label):
         return None
     if not raw_hostname or len(raw_hostname) > USERNAME_MAX_LENGTH:
         logging.warning('%s from %s has invalid hostname length', label, address[0])
+        return None
+    pattern, _ = VALIDATION_PATTERNS['hostname']
+    if not re.match(pattern, raw_hostname):
+        logging.warning('%s from %s has invalid hostname characters', label, address[0])
         return None
     return _extract_hostname(raw_hostname)
 
