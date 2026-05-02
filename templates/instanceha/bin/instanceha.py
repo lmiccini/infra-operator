@@ -1555,6 +1555,7 @@ def _smart_evacuate(connection, evacuables, service, host, service_id, target_ho
     else:
         logging.debug("Using smart evacuation with %d workers", service.config.get_config_value('WORKERS'))
 
+    all_succeeded = True
     inner_workers = max(1, MAX_TOTAL_EVACUATION_THREADS // service.config.get_config_value('WORKERS'))
     with concurrent.futures.ThreadPoolExecutor(max_workers=inner_workers) as executor:
         future_to_server = {executor.submit(_server_evacuate_future, connection, s, target_host): s for s in evacuables}
@@ -1564,20 +1565,21 @@ def _smart_evacuate(connection, evacuables, service, host, service_id, target_ho
             try:
                 if not future.result(timeout=FUTURE_RESULT_TIMEOUT_SECONDS):
                     logging.debug('Evacuation of %s failed', server.id)
-                    _update_service_disable_reason(connection, host, service_id)
-                    return False
-                logging.info('%r evacuated successfully', server.id)
+                    all_succeeded = False
+                else:
+                    logging.info('%r evacuated successfully', server.id)
             except concurrent.futures.TimeoutError:
                 logging.error('Evacuation of %s timed out waiting for result', server.id)
-                _update_service_disable_reason(connection, host, service_id)
-                return False
+                all_succeeded = False
             except Exception as exc:
                 logging.error('Evacuation generated an exception: %s', exc)
                 logging.debug('Exception traceback:', exc_info=True)
-                _update_service_disable_reason(connection, host, service_id)
-                return False
+                all_succeeded = False
 
-    return True
+    if not all_succeeded:
+        _update_service_disable_reason(connection, host, service_id)
+
+    return all_succeeded
 
 def _traditional_evacuate(connection, evacuables, host, target_host=None) -> bool:
     """Execute traditional fire-and-forget evacuation.
