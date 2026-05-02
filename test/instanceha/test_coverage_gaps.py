@@ -553,7 +553,7 @@ class TestTraditionalEvacuate(unittest.TestCase):
         conn = Mock()
 
         instanceha._traditional_evacuate(conn, servers, 'host1', target_host='reserved-01')
-        mock_evac.assert_called_once_with(conn, 'srv1', target_host='reserved-01')
+        mock_evac.assert_called_once_with(conn, 'srv1', target_host='reserved-01', server_obj=servers[0])
 
     @patch('instanceha._server_evacuate')
     def test_all_fail_returns_false(self, mock_evac):

@@ -1607,7 +1607,7 @@ def _traditional_evacuate(connection, evacuables, host, target_host=None) -> boo
     for server in evacuables:
         logging.debug("Processing %s", server)
         if hasattr(server, 'id'):
-            response = _server_evacuate(connection, server.id, target_host=target_host)
+            response = _server_evacuate(connection, server.id, target_host=target_host, server_obj=server)
             if response.accepted:
                 logging.debug("Evacuated %s from %s: %s", response.uuid, host, response.reason)
             else:
@@ -1695,7 +1695,11 @@ def _server_evacuate(connection, server, target_host=None, server_obj=None) -> E
             else:
                 error_message = response.reason or f"Evacuation failed with status {response.status_code}"
     except NotFound:
+        resp_status_code = 404
         error_message = f"Instance {server} not found"
+    except Conflict as e:
+        resp_status_code = 409
+        error_message = f"Conflict while evacuating instance {server}: {e}"
     except Forbidden:
         resp_status_code = 403
         error_message = f"Access denied while evacuating instance {server}"
@@ -1703,6 +1707,7 @@ def _server_evacuate(connection, server, target_host=None, server_obj=None) -> E
         resp_status_code = 401
         error_message = f"Authentication failed while evacuating instance {server}"
     except Exception as e:
+        resp_status_code = getattr(e, 'http_status', None)
         error_message = f"Error while evacuating instance {server}: {e}"
 
     return EvacuationResult(
@@ -1807,13 +1812,13 @@ def _server_evacuate_future(connection, server, target_host=None) -> bool:
     else:
         logging.info("Processing evacuation for server %s", server.id)
 
+    original_status = getattr(server, 'status', None)
+    source_host = getattr(server, 'OS-EXT-SRV-ATTR:host', 'unknown')
+
     try:
         connection.servers.lock(server.id)
     except Exception:
         logging.debug("Could not lock server %s (may already be locked)", server.id)
-
-    original_status = getattr(server, 'status', None)
-    source_host = getattr(server, 'OS-EXT-SRV-ATTR:host', 'unknown')
 
     try:
         _emit_k8s_event(source_host, 'InstanceEvacuationStarted',
