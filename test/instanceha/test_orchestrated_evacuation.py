@@ -234,7 +234,7 @@ class TestOrchestratedEvacuate(unittest.TestCase):
     @patch('instanceha._update_service_disable_reason')
     @patch('instanceha._server_evacuate_future')
     @patch('instanceha._build_evacuation_groups')
-    def test_first_phase_failure_stops(self, mock_groups, mock_future, mock_update):
+    def test_first_phase_failure_continues(self, mock_groups, mock_future, mock_update):
         phase1 = [_make_server('db-1')]
         phase2 = [_make_server('app-1')]
         mock_groups.return_value = [phase1, phase2]
@@ -245,8 +245,8 @@ class TestOrchestratedEvacuate(unittest.TestCase):
 
         result = instanceha._orchestrated_evacuate(conn, phase1 + phase2, service, 'host1', 'svc-1')
         self.assertFalse(result)
-        # Phase 2 should not have been attempted - only 1 call for phase 1
-        self.assertEqual(mock_future.call_count, 1)
+        # Both phases should be attempted despite phase 1 failure
+        self.assertEqual(mock_future.call_count, 2)
         mock_update.assert_called_once()
 
     @patch('instanceha._update_service_disable_reason')
@@ -279,6 +279,22 @@ class TestOrchestratedEvacuate(unittest.TestCase):
 
         result = instanceha._orchestrated_evacuate(conn, phase1, service, 'host1', 'svc-1')
         self.assertFalse(result)
+        mock_update.assert_called_once()
+
+    @patch('instanceha._update_service_disable_reason')
+    @patch('instanceha._server_evacuate_future')
+    @patch('instanceha._build_evacuation_groups')
+    def test_partial_phase_failure_continues(self, mock_groups, mock_future, mock_update):
+        servers = [_make_server('s-1'), _make_server('s-2'), _make_server('s-3')]
+        mock_groups.return_value = [servers]
+        mock_future.side_effect = [True, False, True]
+
+        conn = MagicMock()
+        service = self._make_service()
+
+        result = instanceha._orchestrated_evacuate(conn, servers, service, 'host1', 'svc-1')
+        self.assertFalse(result)
+        self.assertEqual(mock_future.call_count, 3)
         mock_update.assert_called_once()
 
     @patch('instanceha._update_service_disable_reason')

@@ -1492,6 +1492,8 @@ def _orchestrated_evacuate(connection, evacuables, service, host, service_id, ta
     logging.info("Orchestrated evacuation: %d phases, %d total servers from %s",
                 total_phases, total_servers, host)
 
+    all_succeeded = True
+
     for phase_num, phase_servers in enumerate(phases, 1):
         logging.info("Starting evacuation phase %d/%d (%d servers)",
                     phase_num, total_phases, len(phase_servers))
@@ -1509,24 +1511,28 @@ def _orchestrated_evacuate(connection, evacuables, service, host, service_id, ta
                 try:
                     if not future.result(timeout=FUTURE_RESULT_TIMEOUT_SECONDS):
                         logging.error('Phase %d: evacuation of %s failed', phase_num, server.id)
-                        _update_service_disable_reason(connection, host, service_id)
-                        return False
-                    logging.info('Phase %d: %r evacuated successfully', phase_num, server.id)
+                        all_succeeded = False
+                    else:
+                        logging.info('Phase %d: %r evacuated successfully', phase_num, server.id)
                 except concurrent.futures.TimeoutError:
                     logging.error('Phase %d: evacuation of %s timed out waiting for result',
                                 phase_num, server.id)
-                    _update_service_disable_reason(connection, host, service_id)
-                    return False
+                    all_succeeded = False
                 except Exception as exc:
                     logging.error('Phase %d: evacuation generated an exception: %s',
                                 phase_num, exc)
                     logging.debug('Exception traceback:', exc_info=True)
-                    _update_service_disable_reason(connection, host, service_id)
-                    return False
+                    all_succeeded = False
 
-        logging.info("Evacuation phase %d/%d completed successfully", phase_num, total_phases)
+        if all_succeeded:
+            logging.info("Evacuation phase %d/%d completed successfully", phase_num, total_phases)
+        else:
+            logging.warning("Evacuation phase %d/%d completed with failures", phase_num, total_phases)
 
-    return True
+    if not all_succeeded:
+        _update_service_disable_reason(connection, host, service_id)
+
+    return all_succeeded
 
 
 def _smart_evacuate(connection, evacuables, service, host, service_id, target_host=None) -> bool:
