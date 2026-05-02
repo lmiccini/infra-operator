@@ -222,40 +222,14 @@ class TestNovaAPIExceptions(unittest.TestCase):
 class TestServiceDisableValidation(unittest.TestCase):
     """Test service disable operation validation."""
 
-    def test_host_disable_missing_connection(self):
-        """Test _host_disable with missing connection."""
+    def test_host_disable_force_down_failure(self):
+        """Test _host_disable returns False when force_down raises."""
+        mock_connection = Mock()
+        mock_connection.services.force_down.side_effect = Exception("API error")
         mock_service = Mock()
         mock_service.id = 'svc-123'
         mock_service.host = 'test-host'
-
-        result = instanceha._host_disable(None, mock_service)
-
-        self.assertFalse(result)
-
-    def test_host_disable_missing_service(self):
-        """Test _host_disable with missing service."""
-        mock_connection = Mock()
-
-        result = instanceha._host_disable(mock_connection, None)
-
-        self.assertFalse(result)
-
-    def test_host_disable_service_missing_id(self):
-        """Test _host_disable when service object is missing id attribute."""
-        mock_connection = Mock()
-        mock_service = Mock(spec=[])  # No attributes
-        del mock_service.id  # Ensure no id attribute
-
-        result = instanceha._host_disable(mock_connection, mock_service)
-
-        self.assertFalse(result)
-
-    def test_host_disable_service_missing_host(self):
-        """Test _host_disable when service object is missing host attribute."""
-        mock_connection = Mock()
-        mock_service = Mock()
-        mock_service.id = 'svc-123'
-        delattr(mock_service, 'host')
+        mock_service.binary = 'nova-compute'
 
         result = instanceha._host_disable(mock_connection, mock_service)
 
