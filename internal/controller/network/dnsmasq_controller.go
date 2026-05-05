@@ -49,6 +49,7 @@ import (
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	dnsmasq "github.com/openstack-k8s-operators/infra-operator/internal/dnsmasq"
 	common "github.com/openstack-k8s-operators/lib-common/modules/common"
+	annotations "github.com/openstack-k8s-operators/lib-common/modules/common/annotations"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	configmap "github.com/openstack-k8s-operators/lib-common/modules/common/configmap"
 	deployment "github.com/openstack-k8s-operators/lib-common/modules/common/deployment"
@@ -58,6 +59,7 @@ import (
 	common_rbac "github.com/openstack-k8s-operators/lib-common/modules/common/rbac"
 	service "github.com/openstack-k8s-operators/lib-common/modules/common/service"
 	util "github.com/openstack-k8s-operators/lib-common/modules/common/util"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/webhook"
 )
 
 // DNSMasqReconciler reconciles a DNSMasq object
@@ -374,6 +376,30 @@ func (r *DNSMasqReconciler) reconcileDelete(ctx context.Context, instance *netwo
 func (r *DNSMasqReconciler) reconcileNormal(ctx context.Context, instance *networkv1.DNSMasq, helper *helper.Helper) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info("Reconciling Service")
+
+	// Ensure existing CRs get the default local=/<namespace>.svc/ option on
+	// upgrade by triggering the webhook via a reconcile-trigger annotation.
+	hasLocal := false
+	for _, opt := range instance.Spec.Options {
+		if opt.Key == "local" {
+			hasLocal = true
+			break
+		}
+	}
+	if !hasLocal {
+		result, err := webhook.EnsureWebhookTrigger(
+			ctx,
+			instance,
+			annotations.ReconcileTriggerAnnotation,
+			"DNSMasq local option defaulting",
+			Log,
+			0, // use default 5 minute timeout
+		)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		return result, nil
+	}
 
 	serviceLabels := map[string]string{
 		common.AppSelector: dnsmasq.ServiceName,
