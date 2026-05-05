@@ -65,6 +65,12 @@ type RabbitMQPolicyStatus struct {
 
 	// ObservedGeneration - the most recent generation observed for this resource
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// Vhost - actual vhost name where the policy was last applied
+	Vhost string `json:"vhost,omitempty"`
+
+	// PolicyName - actual policy name used in RabbitMQ
+	PolicyName string `json:"policyName,omitempty"`
 }
 
 //+kubebuilder:object:root=true

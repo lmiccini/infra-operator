@@ -18,6 +18,7 @@ package v1beta1
 
 import (
 	"fmt"
+	"regexp"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -30,8 +31,6 @@ import (
 
 var rabbitmqpolicylog = logf.Log.WithName("rabbitmqpolicy-resource")
 
-//+kubebuilder:webhook:path=/mutate-rabbitmq-openstack-org-v1beta1-rabbitmqpolicy,mutating=true,failurePolicy=fail,sideEffects=None,groups=rabbitmq.openstack.org,resources=rabbitmqpolicies,verbs=create;update,versions=v1beta1,name=mrabbitmqpolicy.kb.io,admissionReviewVersions=v1
-
 // Default implements defaulting for RabbitMQPolicy
 func (r *RabbitMQPolicy) Default(_ client.Client) {
 	rabbitmqpolicylog.Info("default", "name", r.Name)
@@ -41,8 +40,6 @@ func (r *RabbitMQPolicy) Default(_ client.Client) {
 		r.Spec.Name = r.Name
 	}
 }
-
-//+kubebuilder:webhook:path=/validate-rabbitmq-openstack-org-v1beta1-rabbitmqpolicy,mutating=false,failurePolicy=fail,sideEffects=None,groups=rabbitmq.openstack.org,resources=rabbitmqpolicies,verbs=create;update,versions=v1beta1,name=vrabbitmqpolicy.kb.io,admissionReviewVersions=v1
 
 // ValidateCreate validates the RabbitMQPolicy on creation
 func (r *RabbitMQPolicy) ValidateCreate(_ client.Client) (admission.Warnings, error) {
@@ -56,6 +53,10 @@ func (r *RabbitMQPolicy) ValidateCreate(_ client.Client) (admission.Warnings, er
 		)
 	}
 
+	if err := r.validatePattern(); err != nil {
+		return nil, err
+	}
+
 	return nil, nil
 }
 
@@ -66,6 +67,20 @@ func (r *RabbitMQPolicy) ValidateUpdate(_ client.Client, old runtime.Object) (ad
 	oldPolicy, ok := old.(*RabbitMQPolicy)
 	if !ok {
 		return nil, fmt.Errorf("expected RabbitMQPolicy but got %T", old)
+	}
+
+	// Prevent changing the cluster after creation
+	if r.Spec.RabbitmqClusterName != oldPolicy.Spec.RabbitmqClusterName {
+		return nil, apierrors.NewInvalid(
+			schema.GroupKind{Group: "rabbitmq.openstack.org", Kind: "RabbitMQPolicy"},
+			r.Name,
+			field.ErrorList{
+				field.Forbidden(
+					field.NewPath("spec", "rabbitmqClusterName"),
+					"rabbitmqClusterName cannot be changed after creation",
+				),
+			},
+		)
 	}
 
 	// Prevent changing the policy name after creation
@@ -82,10 +97,29 @@ func (r *RabbitMQPolicy) ValidateUpdate(_ client.Client, old runtime.Object) (ad
 		)
 	}
 
+	if err := r.validatePattern(); err != nil {
+		return nil, err
+	}
+
 	return nil, nil
 }
 
 // ValidateDelete validates the RabbitMQPolicy on deletion
 func (r *RabbitMQPolicy) ValidateDelete(_ client.Client) (admission.Warnings, error) {
 	return nil, nil
+}
+
+// validatePattern validates that the Pattern field is a valid regex
+func (r *RabbitMQPolicy) validatePattern() error {
+	if _, err := regexp.Compile(r.Spec.Pattern); err != nil {
+		return apierrors.NewInvalid(
+			schema.GroupKind{Group: "rabbitmq.openstack.org", Kind: "RabbitMQPolicy"},
+			r.Name,
+			field.ErrorList{
+				field.Invalid(field.NewPath("spec", "pattern"), r.Spec.Pattern,
+					fmt.Sprintf("invalid regex pattern: %v", err)),
+			},
+		)
+	}
+	return nil
 }

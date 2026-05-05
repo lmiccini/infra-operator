@@ -57,7 +57,7 @@ type RabbitMQPolicyReconciler struct {
 //+kubebuilder:rbac:groups=rabbitmq.openstack.org,resources=rabbitmqs,verbs=get;list;watch
 
 // Reconcile reconciles a RabbitMQPolicy object
-func (r *RabbitMQPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *RabbitMQPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, _err error) {
 	Log := log.FromContext(ctx)
 
 	instance := &rabbitmqv1.RabbitMQPolicy{}
@@ -84,7 +84,6 @@ func (r *RabbitMQPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		condition.UnknownCondition(rabbitmqv1.RabbitMQPolicyReadyCondition, condition.InitReason, rabbitmqv1.RabbitMQPolicyReadyInitMessage),
 	)
 	instance.Status.Conditions.Init(&cl)
-	instance.Status.ObservedGeneration = instance.Generation
 
 	defer func() {
 		// Restore condition timestamps if they haven't changed
@@ -93,8 +92,10 @@ func (r *RabbitMQPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if instance.Status.Conditions.IsUnknown(condition.ReadyCondition) {
 			instance.Status.Conditions.Set(instance.Status.Conditions.Mirror(condition.ReadyCondition))
 		}
-		if err := h.PatchInstance(ctx, instance); err != nil {
-			Log.Error(err, "Failed to patch instance")
+		err := h.PatchInstance(ctx, instance)
+		if err != nil {
+			_err = err
+			return
 		}
 	}()
 
@@ -185,34 +186,43 @@ func (r *RabbitMQPolicyReconciler) reconcileNormal(ctx context.Context, instance
 		instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.RabbitMQPolicyReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.RabbitMQPolicyReadyErrorMessage, err.Error()))
 		return ctrl.Result{}, err
 	}
-	err = apiClient.CreateOrUpdatePolicy(vhostName, policyName, instance.Spec.Pattern, definition, instance.Spec.Priority, instance.Spec.ApplyTo)
+	err = apiClient.CreateOrUpdatePolicy(ctx, vhostName, policyName, instance.Spec.Pattern, definition, instance.Spec.Priority, instance.Spec.ApplyTo)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.RabbitMQPolicyReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.RabbitMQPolicyReadyErrorMessage, err.Error()))
 		return ctrl.Result{}, err
 	}
 
+	instance.Status.Vhost = vhostName
+	instance.Status.PolicyName = policyName
 	instance.Status.Conditions.MarkTrue(rabbitmqv1.RabbitMQPolicyReadyCondition, rabbitmqv1.RabbitMQPolicyReadyMessage)
 	instance.Status.Conditions.MarkTrue(condition.ReadyCondition, condition.ReadyMessage)
+	instance.Status.ObservedGeneration = instance.Generation
 
 	return ctrl.Result{}, nil
 }
 
 func (r *RabbitMQPolicyReconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1.RabbitMQPolicy, h *helper.Helper) (ctrl.Result, error) {
-	policyName := instance.Spec.Name
+	// Use status values (where the policy was actually created) with spec fallback
+	policyName := instance.Status.PolicyName
 	if policyName == "" {
-		policyName = instance.Name
+		policyName = instance.Spec.Name
+		if policyName == "" {
+			policyName = instance.Name
+		}
 	}
 
-	vhostName := "/"
-	if instance.Spec.VhostRef != "" {
-		vhost := &rabbitmqv1.RabbitMQVhost{}
-		err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.VhostRef, Namespace: instance.Namespace}, vhost)
-		if err != nil && !k8s_errors.IsNotFound(err) {
-			// Log non-NotFound errors but continue with deletion
-			log.FromContext(ctx).Error(err, "Failed to get vhost", "vhost", instance.Spec.VhostRef)
-		}
-		if vhost.Spec.Name != "" {
-			vhostName = vhost.Spec.Name
+	vhostName := instance.Status.Vhost
+	if vhostName == "" {
+		vhostName = "/"
+		if instance.Spec.VhostRef != "" {
+			vhost := &rabbitmqv1.RabbitMQVhost{}
+			err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.VhostRef, Namespace: instance.Namespace}, vhost)
+			if err != nil && !k8s_errors.IsNotFound(err) {
+				log.FromContext(ctx).Error(err, "Failed to get vhost", "vhost", instance.Spec.VhostRef)
+			}
+			if vhost.Spec.Name != "" {
+				vhostName = vhost.Spec.Name
+			}
 		}
 	}
 
@@ -260,7 +270,7 @@ func (r *RabbitMQPolicyReconciler) reconcileDelete(ctx context.Context, instance
 
 	// Delete policy from RabbitMQ
 	// Note: DeletePolicy already treats 404 as success
-	if err := apiClient.DeletePolicy(vhostName, policyName); err != nil {
+	if err := apiClient.DeletePolicy(ctx, vhostName, policyName); err != nil {
 		// Return error to trigger retry - this ensures proper cleanup in normal operations
 		// Trade-off: CR may be stuck in Terminating state if RabbitMQ is persistently unavailable
 		// Rationale:

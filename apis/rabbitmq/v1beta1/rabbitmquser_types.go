@@ -17,6 +17,9 @@ limitations under the License.
 package v1beta1
 
 import (
+	"fmt"
+	"strings"
+
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -168,14 +171,28 @@ const (
 	// RabbitMQUserReadyErrorMessage is the message format for the RabbitMQUserReady condition when an error occurs
 	RabbitMQUserReadyErrorMessage = "RabbitMQ user error occurred %s"
 
+	// RabbitMQUserOrphanedMessage is the message when a user CR is orphaned and awaiting admin approval
+	RabbitMQUserOrphanedMessage = "User has no active consumers. Remove finalizer %s to approve deletion"
+
 	// Internal controller finalizer (from rabbitmquser_controller.go)
 	userControllerFinalizer = "rabbitmquser.openstack.org/finalizer"
 )
 
 // IsInternalFinalizer returns true if the finalizer is managed by RabbitMQ controllers
-// (as opposed to external controllers like dataplane)
+// (as opposed to external controllers like dataplane).
+// Note: RabbitMQUserCleanupBlockedFinalizer is intentionally excluded — it must block
+// user deletion as an external-like finalizer requiring manual admin removal.
 func IsInternalFinalizer(finalizer string) bool {
 	return finalizer == UserFinalizer ||
 		finalizer == TransportURLFinalizer ||
-		finalizer == userControllerFinalizer
+		finalizer == userControllerFinalizer ||
+		strings.HasPrefix(finalizer, TransportURLFinalizerPrefix)
+}
+
+// CanonicalUserName returns the deterministic CR name for a shared user singleton.
+func CanonicalUserName(clusterName, vhostName, username string) string {
+	if vhostName == "/" || vhostName == "" {
+		return fmt.Sprintf("%s-user-%s", clusterName, username)
+	}
+	return fmt.Sprintf("%s-%s-user-%s", clusterName, vhostName, username)
 }

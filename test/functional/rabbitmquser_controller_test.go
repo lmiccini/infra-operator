@@ -164,11 +164,11 @@ var _ = Describe("RabbitMQUser controller", func() {
 			DeferCleanup(th.DeleteInstance, transportURL)
 
 			// Wait for user to be created by TransportURL
-			ownedUserName = types.NamespacedName{Name: transportURLName.Name + "-testuser-user", Namespace: namespace}
+			ownedUserName = types.NamespacedName{Name: rabbitmqv1.CanonicalUserName(rabbitmqClusterName.Name, "/", "testuser"), Namespace: namespace}
 			Eventually(func(g Gomega) {
 				user := &rabbitmqv1.RabbitMQUser{}
 				g.Expect(th.K8sClient.Get(th.Ctx, ownedUserName, user)).To(Succeed())
-				g.Expect(user.Finalizers).To(ContainElement(rabbitmqv1.TransportURLFinalizer))
+				g.Expect(user.Finalizers).To(ContainElement(rabbitmqv1.TransportURLFinalizerFor(transportURLName.Name)))
 			}, timeout, interval).Should(Succeed())
 		})
 
@@ -184,7 +184,7 @@ var _ = Describe("RabbitMQUser controller", func() {
 				u := &rabbitmqv1.RabbitMQUser{}
 				g.Expect(th.K8sClient.Get(th.Ctx, ownedUserName, u)).To(Succeed())
 				g.Expect(u.DeletionTimestamp).NotTo(BeNil())
-				g.Expect(u.Finalizers).To(ContainElement(rabbitmqv1.TransportURLFinalizer))
+				g.Expect(u.Finalizers).To(ContainElement(rabbitmqv1.TransportURLFinalizerFor(transportURLName.Name)))
 			}, "2s", interval).Should(Succeed())
 		})
 
@@ -616,11 +616,11 @@ var _ = Describe("RabbitMQUser controller", func() {
 			DeferCleanup(th.DeleteInstance, transportURL)
 
 			// Wait for user to be created by TransportURL
-			ownedUserName := types.NamespacedName{Name: transportURLName.Name + "-testuser-status-user", Namespace: namespace}
+			ownedUserName := types.NamespacedName{Name: rabbitmqv1.CanonicalUserName(rabbitmqClusterName.Name, "/", "testuser-status"), Namespace: namespace}
 			Eventually(func(g Gomega) {
 				user := &rabbitmqv1.RabbitMQUser{}
 				g.Expect(th.K8sClient.Get(th.Ctx, ownedUserName, user)).To(Succeed())
-				g.Expect(user.Finalizers).To(ContainElement(rabbitmqv1.TransportURLFinalizer))
+				g.Expect(user.Finalizers).To(ContainElement(rabbitmqv1.TransportURLFinalizerFor(transportURLName.Name)))
 			}, timeout, interval).Should(Succeed())
 
 			// Mark cluster for deletion to avoid RabbitMQ API call failures
@@ -642,7 +642,7 @@ var _ = Describe("RabbitMQUser controller", func() {
 				g.Expect(cond).NotTo(BeNil())
 				g.Expect(cond.Status).To(Equal(corev1.ConditionFalse))
 				g.Expect(string(cond.Reason)).To(Equal(string(condition.DeletingReason)))
-				g.Expect(cond.Message).To(ContainSubstring("Waiting for TransportURL to release user"))
+				g.Expect(cond.Message).To(ContainSubstring("Waiting for TransportURL " + transportURLName.Name + " to release user"))
 			}, timeout, interval).Should(Succeed())
 		})
 

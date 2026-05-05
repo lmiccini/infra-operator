@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -38,10 +39,8 @@ const rabbitMQVarNameFmt = "[-_.:A-Za-z0-9]+"
 
 var rabbitMQVarNameFmtRegexp = regexp.MustCompile("^" + rabbitMQVarNameFmt + "$")
 
-//+kubebuilder:webhook:path=/mutate-rabbitmq-openstack-org-v1beta1-rabbitmquser,mutating=true,failurePolicy=fail,sideEffects=None,groups=rabbitmq.openstack.org,resources=rabbitmqusers,verbs=create;update,versions=v1beta1,name=mrabbitmquser.kb.io,admissionReviewVersions=v1
-
 // Default implements defaulting for RabbitMQUser
-func (r *RabbitMQUser) Default(k8sClient client.Client) {
+func (r *RabbitMQUser) Default(ctx context.Context, k8sClient client.Client) {
 	rabbitmquserlog.Info("default", "name", r.Name)
 
 	// If using a secret, extract and set username from secret
@@ -55,7 +54,9 @@ func (r *RabbitMQUser) Default(k8sClient client.Client) {
 		}
 
 		secret := &corev1.Secret{}
-		if err := k8sClient.Get(context.TODO(),
+		getCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := k8sClient.Get(getCtx,
 			client.ObjectKey{Name: *r.Spec.Secret, Namespace: r.Namespace},
 			secret); err == nil {
 			// Extract username from secret and set in spec
@@ -74,8 +75,6 @@ func (r *RabbitMQUser) Default(k8sClient client.Client) {
 		r.Spec.Username = r.Name
 	}
 }
-
-//+kubebuilder:webhook:path=/validate-rabbitmq-openstack-org-v1beta1-rabbitmquser,mutating=false,failurePolicy=fail,sideEffects=None,groups=rabbitmq.openstack.org,resources=rabbitmqusers,verbs=create;update,versions=v1beta1,name=vrabbitmquser.kb.io,admissionReviewVersions=v1
 
 // ValidateCreate validates the RabbitMQUser on creation
 func (r *RabbitMQUser) ValidateCreate(k8sClient client.Client) (admission.Warnings, error) {
@@ -132,6 +131,20 @@ func (r *RabbitMQUser) ValidateUpdate(k8sClient client.Client, old runtime.Objec
 	// Validate secret and credentials
 	if err := r.validateSecretAndExtractCredentials(k8sClient); err != nil {
 		return nil, err
+	}
+
+	// Prevent changing the cluster after creation
+	if r.Spec.RabbitmqClusterName != oldUser.Spec.RabbitmqClusterName {
+		return nil, apierrors.NewInvalid(
+			schema.GroupKind{Group: "rabbitmq.openstack.org", Kind: "RabbitMQUser"},
+			r.Name,
+			field.ErrorList{
+				field.Forbidden(
+					field.NewPath("spec", "rabbitmqClusterName"),
+					"rabbitmqClusterName cannot be changed after creation",
+				),
+			},
+		)
 	}
 
 	// Prevent changing the username after creation
@@ -202,7 +215,41 @@ func (r *RabbitMQUser) ValidateUpdate(k8sClient client.Client, old runtime.Objec
 		}
 	}
 
-	return nil, r.validateUniqueUsername(k8sClient, r.Spec.Username)
+	// Skip uniqueness check for legacy CRs (those with a TransportURL owner reference).
+	// During migration, both legacy and canonical CRs may coexist temporarily.
+	isLegacyCR := false
+	for _, ref := range r.GetOwnerReferences() {
+		if ref.Kind == "TransportURL" {
+			isLegacyCR = true
+			break
+		}
+	}
+	if !isLegacyCR {
+		if err := r.validateUniqueUsername(k8sClient, r.Spec.Username); err != nil {
+			return nil, err
+		}
+	}
+
+	// Reject permission changes if other TransportURLs have per-consumer finalizers on this user.
+	// Shared users must keep consistent permissions while any consumer references them.
+	if oldUser.Spec.Permissions != r.Spec.Permissions {
+		for _, fin := range r.GetFinalizers() {
+			if strings.HasPrefix(fin, TransportURLFinalizerPrefix) {
+				return nil, apierrors.NewInvalid(
+					schema.GroupKind{Group: "rabbitmq.openstack.org", Kind: "RabbitMQUser"},
+					r.Name,
+					field.ErrorList{
+						field.Forbidden(
+							field.NewPath("spec", "permissions"),
+							"permissions cannot be changed while other TransportURLs reference this shared user",
+						),
+					},
+				)
+			}
+		}
+	}
+
+	return nil, nil
 }
 
 // ValidateDelete validates the RabbitMQUser on deletion
@@ -237,7 +284,9 @@ func (r *RabbitMQUser) validateSecretAndExtractCredentials(k8sClient client.Clie
 	}
 
 	secret := &corev1.Secret{}
-	if err := k8sClient.Get(context.TODO(),
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := k8sClient.Get(ctx,
 		client.ObjectKey{Name: secretName, Namespace: r.Namespace},
 		secret); err != nil {
 		return apierrors.NewInvalid(
@@ -332,6 +381,23 @@ func (r *RabbitMQUser) validateUniqueUsername(k8sClient client.Client, username 
 	for _, user := range userList.Items {
 		// Skip self
 		if user.Name == r.Name {
+			continue
+		}
+
+		// Skip CRs that are being deleted
+		if !user.DeletionTimestamp.IsZero() {
+			continue
+		}
+
+		// Skip legacy CRs owned by a TransportURL (migration to shared singletons)
+		isLegacy := false
+		for _, ref := range user.GetOwnerReferences() {
+			if ref.Kind == "TransportURL" {
+				isLegacy = true
+				break
+			}
+		}
+		if isLegacy {
 			continue
 		}
 

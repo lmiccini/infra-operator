@@ -109,5 +109,13 @@ func checkClusterReadiness(rabbit *rabbitmqv1.RabbitMq) *ClusterReadinessError {
 		}
 	}
 
+	if rabbit.Status.DefaultUser.SecretReference == nil {
+		return &ClusterReadinessError{
+			ClusterName: rabbit.Name,
+			Reason:      fmt.Sprintf("RabbitMQ cluster %s admin secret reference not yet available", rabbit.Name),
+			IsWaiting:   true,
+		}
+	}
+
 	return nil
 }

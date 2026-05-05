@@ -17,6 +17,8 @@ limitations under the License.
 package v1beta1
 
 import (
+	"fmt"
+
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -108,4 +110,12 @@ const (
 
 	// RabbitMQVhostReadyErrorMessage is the message format for the RabbitMQVhostReady condition when an error occurs
 	RabbitMQVhostReadyErrorMessage = "RabbitMQ vhost error occurred %s"
+
+	// RabbitMQVhostDeletionWaitingMessage is the message when vhost deletion is blocked by external finalizers
+	RabbitMQVhostDeletionWaitingMessage = "Waiting for external finalizers to be removed: %s"
 )
+
+// CanonicalVhostName returns the deterministic CR name for a shared vhost singleton.
+func CanonicalVhostName(clusterName, vhostName string) string {
+	return fmt.Sprintf("%s-vhost-%s", clusterName, vhostName)
+}

@@ -40,11 +40,23 @@ commands:
       echo "PASS: User 'glance' exists in RabbitMQ"
   - script: |
       set -e
-      # Old user CR should still exist (blocked by cleanup-blocked finalizer)
-      # but TransportURL finalizer should have been removed by the controller
-      FINALIZERS=$(oc get rabbitmquser -n $NAMESPACE cred-rot-url-nova-user -o jsonpath='{.metadata.finalizers}')
-      if echo "$FINALIZERS" | grep -q "transporturl.rabbitmq.openstack.org/finalizer"; then
-        echo "FAIL: TransportURL finalizer still present on old user"
+      # Old user CR should be marked as orphaned (label set) but NOT deleted,
+      # because cleanup-blocked finalizer requires admin approval before deletion.
+      # The per-consumer finalizer should have been removed by the controller.
+      ORPHANED=$(oc get rabbitmquser -n $NAMESPACE rabbitmq-cred-rot-user-nova -o jsonpath='{.metadata.labels.rabbitmq\.openstack\.org/orphaned}')
+      if [ "$ORPHANED" != "true" ]; then
+        echo "FAIL: Old user CR not marked as orphaned"
+        oc get rabbitmquser -n $NAMESPACE rabbitmq-cred-rot-user-nova -o yaml
+        exit 1
+      fi
+      DELTS=$(oc get rabbitmquser -n $NAMESPACE rabbitmq-cred-rot-user-nova -o jsonpath='{.metadata.deletionTimestamp}')
+      if [ -n "$DELTS" ]; then
+        echo "FAIL: Old user CR should NOT have DeletionTimestamp (orphaned label design)"
+        exit 1
+      fi
+      FINALIZERS=$(oc get rabbitmquser -n $NAMESPACE rabbitmq-cred-rot-user-nova -o jsonpath='{.metadata.finalizers}')
+      if echo "$FINALIZERS" | grep -q "turl.openstack.org/t-cred-rot-url"; then
+        echo "FAIL: Per-consumer finalizer still present on old user"
         echo "Finalizers: $FINALIZERS"
         exit 1
       fi
@@ -53,4 +65,4 @@ commands:
         echo "Finalizers: $FINALIZERS"
         exit 1
       fi
-      echo "PASS: Old user has cleanup-blocked finalizer, TransportURL finalizer removed"
+      echo "PASS: Old user is orphaned, blocked by cleanup-blocked finalizer"

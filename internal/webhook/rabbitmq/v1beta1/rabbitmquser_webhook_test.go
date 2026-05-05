@@ -39,7 +39,7 @@ var _ = Describe("RabbitMQUser webhook", func() {
 				},
 			}
 
-			user.Default(k8sClient)
+			user.Default(ctx, k8sClient)
 
 			Expect(user.Spec.Username).To(Equal("test-user"))
 		})
@@ -56,7 +56,7 @@ var _ = Describe("RabbitMQUser webhook", func() {
 				},
 			}
 
-			user.Default(k8sClient)
+			user.Default(ctx, k8sClient)
 
 			Expect(user.Spec.Username).To(Equal("custom-username"))
 		})
