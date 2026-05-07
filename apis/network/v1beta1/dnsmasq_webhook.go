@@ -17,13 +17,16 @@ limitations under the License.
 package v1beta1
 
 import (
+	"fmt"
+
+	annotations "github.com/openstack-k8s-operators/lib-common/modules/common/annotations"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
 // DNSMasqDefaults -
@@ -48,20 +51,38 @@ var _ webhook.Defaulter = &DNSMasq{}
 func (r *DNSMasq) Default() {
 	dnsmasqlog.Info("default", "name", r.Name)
 
-	r.Spec.Default()
+	r.Spec.Default(r.Namespace)
+
+	ann := r.GetAnnotations()
+	if _, exists := ann[annotations.ReconcileTriggerAnnotation]; exists {
+		delete(ann, annotations.ReconcileTriggerAnnotation)
+		r.SetAnnotations(ann)
+	}
 }
 
 // Default - set defaults for this DNSMasq spec
-func (spec *DNSMasqSpec) Default() {
+func (spec *DNSMasqSpec) Default(namespace string) {
 	if spec.ContainerImage == "" {
 		spec.ContainerImage = dnsMasqDefaults.ContainerImageURL
 	}
-	spec.DNSMasqSpecCore.Default()
+	spec.DNSMasqSpecCore.Default(namespace)
 }
 
 // Default - common defaults go here (for the OpenStackControlplane which uses this one)
-func (spec *DNSMasqSpecCore) Default() {
-	// nothing here
+func (spec *DNSMasqSpecCore) Default(namespace string) {
+	hasLocal := false
+	for _, opt := range spec.Options {
+		if opt.Key == "local" {
+			hasLocal = true
+			break
+		}
+	}
+	if !hasLocal {
+		spec.Options = append(spec.Options, DNSMasqOption{
+			Key:    "local",
+			Values: []string{fmt.Sprintf("/%s.svc/", namespace)},
+		})
+	}
 }
 
 var _ webhook.Validator = &DNSMasq{}

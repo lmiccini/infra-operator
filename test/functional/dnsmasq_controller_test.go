@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	networkv1 "github.com/openstack-k8s-operators/infra-operator/apis/network/v1beta1"
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
@@ -141,6 +142,8 @@ var _ = Describe("DNSMasq controller", func() {
 				ContainSubstring("server=1.1.1.1"))
 			Expect(configData.Data[dnsMasqName.Name]).Should(
 				ContainSubstring("no-negcache\n"))
+			Expect(configData.Data[dnsMasqName.Name]).Should(
+				ContainSubstring(fmt.Sprintf("local=/%s.svc/", namespace)))
 			Expect(configData.Labels["dnsmasq.openstack.org/name"]).To(Equal(dnsMasqName.Name))
 		})
 
@@ -270,6 +273,64 @@ var _ = Describe("DNSMasq controller", func() {
 					return th.ListConfigMaps(dnsMasqName.Name).Items
 				}, timeout, interval).Should(BeEmpty())
 			})
+		})
+	})
+
+	When("A DNSMasq is created with a custom local option", func() {
+		BeforeEach(func() {
+			spec := GetDefaultDNSMasqSpec()
+			spec["options"] = any([]networkv1.DNSMasqOption{
+				{
+					Key:    "server",
+					Values: []string{"1.1.1.1"},
+				},
+				{
+					Key:    "no-negcache",
+					Values: []string{},
+				},
+				{
+					Key:    "local",
+					Values: []string{"/custom.svc/"},
+				},
+			})
+			instance := CreateDNSMasq(namespace, spec)
+			dnsMasqName = types.NamespacedName{
+				Name:      instance.GetName(),
+				Namespace: namespace,
+			}
+
+			dnsDataCM = types.NamespacedName{
+				Namespace: namespace,
+				Name:      "some-dnsdata",
+			}
+
+			th.CreateConfigMap(dnsDataCM, map[string]any{
+				dnsDataCM.Name: "172.20.0.80 keystone-internal.openstack.svc",
+			})
+			cm := th.GetConfigMap(dnsDataCM)
+			cm.Labels = util.MergeStringMaps(cm.Labels, map[string]string{
+				"dnsmasqhosts": "dnsdata",
+			})
+			Expect(th.K8sClient.Update(ctx, cm)).Should(Succeed())
+
+			DeferCleanup(th.DeleteConfigMap, dnsDataCM)
+			DeferCleanup(th.DeleteInstance, instance)
+		})
+
+		It("uses the custom local value and does not add the default", func() {
+			th.ExpectCondition(
+				dnsMasqName,
+				ConditionGetterFunc(DNSMasqConditionGetter),
+				condition.ServiceConfigReadyCondition,
+				corev1.ConditionTrue,
+			)
+
+			configData := th.GetConfigMap(dnsMasqName)
+			Expect(configData).ShouldNot(BeNil())
+			Expect(configData.Data[dnsMasqName.Name]).Should(
+				ContainSubstring("local=/custom.svc/"))
+			Expect(configData.Data[dnsMasqName.Name]).ShouldNot(
+				ContainSubstring(fmt.Sprintf("local=/%s.svc/", namespace)))
 		})
 	})
 
