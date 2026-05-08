@@ -34,6 +34,18 @@ const (
 	OpenStackCloud = "default"
 )
 
+// AuthSpec defines authentication parameters for InstanceHA.
+// Compatible with the AuthSpec interface used by other openstack-k8s-operators.
+type AuthSpec struct {
+	// +kubebuilder:validation:Optional
+	// +operator-sdk:csv:customresourcedefinitions:type=spec
+	// ApplicationCredentialSecret - name of an existing Secret containing
+	// Application Credential ID and Secret (AC_ID, AC_SECRET keys).
+	// When set, the controller mounts this secret and enables AC-based
+	// authentication instead of password-based clouds.yaml/secure.yaml.
+	ApplicationCredentialSecret string `json:"applicationCredentialSecret,omitempty"`
+}
+
 // InstanceHaSpec defines the desired state of InstanceHa
 type InstanceHaSpec struct {
 	// +kubebuilder:validation:Optional
@@ -99,6 +111,10 @@ type InstanceHaSpec struct {
 	// TopologyRef to apply the Topology defined by the associated CR referenced
 	// by name
 	TopologyRef *topologyv1.TopoRef `json:"topologyRef,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// Auth - Parameters related to authentication
+	Auth AuthSpec `json:"auth,omitempty"`
 }
 
 // InstanceHaStatus defines the observed state of InstanceHa

@@ -38,6 +38,7 @@ func Deployment(
 	configHash string,
 	containerImage string,
 	topology *topologyv1.Topology,
+	acSecretName string,
 ) *appsv1.Deployment {
 	replicas := int32(1)
 
@@ -55,6 +56,24 @@ func Deployment(
 	// create Volume and VolumeMounts
 	volumes := instancehaPodVolumes(instance)
 	volumeMounts := instancehaPodVolumeMounts()
+
+	if acSecretName != "" {
+		envVars["AC_ENABLED"] = env.SetValue("True")
+		volumes = append(volumes, corev1.Volume{
+			Name: "ac-credentials",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  acSecretName,
+					DefaultMode: ptr.To[int32](0o440),
+				},
+			},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      "ac-credentials",
+			MountPath: "/secrets/ac-credentials",
+			ReadOnly:  true,
+		})
+	}
 
 	livenessProbe := &corev1.Probe{
 		TimeoutSeconds:      30,

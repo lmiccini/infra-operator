@@ -332,6 +332,31 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 
 	instance.Status.Conditions.MarkTrue(condition.InputReadyCondition, condition.InputReadyMessage)
 
+	// Application Credential handling (passive mode: user provides the AC secret)
+	acSecretName := ""
+	if instance.Spec.Auth.ApplicationCredentialSecret != "" {
+		acSecretName = instance.Spec.Auth.ApplicationCredentialSecret
+		_, acSecretHash, err := secret.GetSecret(ctx, helper, acSecretName, instance.Namespace)
+		if err != nil {
+			if k8s_errors.IsNotFound(err) {
+				instance.Status.Conditions.Set(condition.FalseCondition(
+					condition.InputReadyCondition,
+					condition.RequestedReason,
+					condition.SeverityInfo,
+					instancehav1.InstanceHaACSecretWaitingMessage))
+				return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+			}
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				condition.InputReadyCondition,
+				condition.ErrorReason,
+				condition.SeverityWarning,
+				condition.InputReadyErrorMessage,
+				err.Error()))
+			return ctrl.Result{}, err
+		}
+		configVars[acSecretName] = env.SetValue(acSecretHash)
+	}
+
 	if instance.Spec.CaBundleSecretName != "" {
 		secretHash, err := tls.ValidateCACertSecret(
 			ctx,
@@ -479,7 +504,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		// remove LastAppliedTopology from the .Status
 		instance.Status.LastAppliedTopology = nil
 	}
-	deployment := commondeployment.NewDeployment(instanceha.Deployment(instance, deploymentLabels, serviceAnnotations, cloud, configVarsHash, containerImage, topology), time.Duration(5)*time.Second)
+	deployment := commondeployment.NewDeployment(instanceha.Deployment(instance, deploymentLabels, serviceAnnotations, cloud, configVarsHash, containerImage, topology, acSecretName), time.Duration(5)*time.Second)
 	sfres, sferr := deployment.CreateOrPatch(ctx, helper)
 	if sferr != nil {
 		return sfres, sferr
@@ -531,6 +556,7 @@ const (
 	fencingSecretField         = ".spec.fencingSecret"
 	instanceHaConfigMapField   = ".spec.instanceHaConfigMap"
 	topologyField              = ".spec.topologyRef.Name"
+	acSecretField              = ".spec.auth.acSecretName" // #nosec G101
 )
 
 var allWatchFields = []string{
@@ -540,6 +566,7 @@ var allWatchFields = []string{
 	fencingSecretField,
 	instanceHaConfigMapField,
 	topologyField,
+	acSecretField,
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -606,6 +633,17 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return nil
 		}
 		return []string{cr.Spec.TopologyRef.Name}
+	}); err != nil {
+		return err
+	}
+
+	// index acSecretField
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &instancehav1.InstanceHa{}, acSecretField, func(rawObj client.Object) []string {
+		cr := rawObj.(*instancehav1.InstanceHa)
+		if cr.Spec.Auth.ApplicationCredentialSecret == "" {
+			return nil
+		}
+		return []string{cr.Spec.Auth.ApplicationCredentialSecret}
 	}); err != nil {
 		return err
 	}

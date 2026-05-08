@@ -52,6 +52,17 @@ spec:
           spec:
             description: InstanceHaSpec defines the desired state of InstanceHa
             properties:
+              auth:
+                description: Auth - Parameters related to authentication
+                properties:
+                  applicationCredentialSecret:
+                    description: |-
+                      ApplicationCredentialSecret - name of an existing Secret containing
+                      Application Credential ID and Secret (AC_ID, AC_SECRET keys).
+                      When set, the controller mounts this secret and enables AC-based
+                      authentication instead of password-based clouds.yaml/secure.yaml.
+                    type: string
+                type: object
               caBundleSecretName:
                 description: CaBundleSecretName - holding the CA certs in a pre-created
                   bundle file

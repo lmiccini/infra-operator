@@ -84,6 +84,7 @@ func (spec *InstanceHaSpec) Default() {
         if spec.InstanceHaHeartbeatPort == 0 {
                 spec.InstanceHaHeartbeatPort = 7411
         }
+
 }
 
 // ValidateCreate validates the InstanceHa resource on creation.
@@ -162,6 +163,6 @@ func (r *InstanceHa) validateUniqueOpenStackCloud(
 func (r *InstanceHa) ValidateDelete() (admission.Warnings, error) {
 	instancehalog.Info("validate delete", "name", r.Name)
 
-	// TODO(user): fill in your validation logic upon object deletion.
 	return nil, nil
 }
+

@@ -142,6 +142,15 @@ class NovaLoginCredentials:
 
 
 @dataclass
+class ACLoginCredentials:
+    """Credentials for Application Credential based login."""
+    auth_url: str
+    application_credential_id: str
+    application_credential_secret: str
+    region_name: str
+
+
+@dataclass
 class ReservedHostResult:
     """Result of reserved host management operation."""
     success: bool
@@ -154,6 +163,8 @@ _SECRET_PATTERNS = {
     'token': re.compile(r'\btoken=[^\s)\'\"]+', re.IGNORECASE),
     'secret': re.compile(r'\bsecret=[^\s)\'\"]+', re.IGNORECASE),
     'credential': re.compile(r'\bcredential=[^\s)\'\"]+', re.IGNORECASE),
+    'application_credential_secret': re.compile(r'\bapplication_credential_secret=[^\s)\'\"]+', re.IGNORECASE),
+    'application_credential_id': re.compile(r'\bapplication_credential_id=[^\s)\'\"]+', re.IGNORECASE),
     'auth': re.compile(r'\bauth=[^\s)\'\"]+', re.IGNORECASE),
 }
 
@@ -373,6 +384,32 @@ class CloudConnectionProvider(ABC):
     def create_connection(self) -> Optional[OpenStackClient]:
         """Create a new connection to the cloud provider."""
         pass
+
+
+AC_CREDENTIALS_PATH = "/secrets/ac-credentials"
+
+
+def _load_ac_credentials(auth_url: str, region_name: str) -> Optional[ACLoginCredentials]:
+    """Load Application Credential from the mounted secret directory."""
+    ac_id_path = os.path.join(AC_CREDENTIALS_PATH, "AC_ID")
+    ac_secret_path = os.path.join(AC_CREDENTIALS_PATH, "AC_SECRET")
+    try:
+        with open(ac_id_path) as f:
+            ac_id = f.read().strip()
+        with open(ac_secret_path) as f:
+            ac_secret = f.read().strip()
+        if not ac_id or not ac_secret:
+            logging.error("AC credentials files are empty")
+            return None
+        return ACLoginCredentials(
+            auth_url=auth_url,
+            application_credential_id=ac_id,
+            application_credential_secret=ac_secret,
+            region_name=region_name,
+        )
+    except FileNotFoundError:
+        logging.error("AC credentials not found at %s", AC_CREDENTIALS_PATH)
+        return None
 
 
 class ConfigManager:
@@ -720,9 +757,15 @@ class InstanceHAService(CloudConnectionProvider):
         try:
             cloud_name = self.config.get_cloud_name()
             auth = self.config.clouds[cloud_name]["auth"]
-            password = self.config.secure[cloud_name]["auth"]["password"]
             region_name = self.config.clouds[cloud_name]["region_name"]
 
+            if os.environ.get("AC_ENABLED") == "True":
+                ac_creds = _load_ac_credentials(auth["auth_url"], region_name)
+                if ac_creds:
+                    return nova_login_ac(ac_creds, ca_bundle=self.config.ssl_ca_bundle)
+                logging.warning("AC_ENABLED but credentials not found, falling back to password auth")
+
+            password = self.config.secure[cloud_name]["auth"]["password"]
             credentials = NovaLoginCredentials(
                 username=auth["username"],
                 password=password,
@@ -1952,6 +1995,30 @@ def nova_login(credentials: NovaLoginCredentials, ca_bundle: Optional[str] = Non
     except Exception as e:
         _safe_log_exception("Nova login failed", e, include_traceback=True)
         raise NovaConnectionError("Nova login failed") from e
+
+
+def nova_login_ac(credentials: ACLoginCredentials, ca_bundle: Optional[str] = None) -> OpenStackClient:
+    """Create and return Nova client using Application Credential auth."""
+    try:
+        loader = loading.get_plugin_loader("v3applicationcredential")
+        auth = loader.load_from_options(
+            auth_url=credentials.auth_url,
+            application_credential_id=credentials.application_credential_id,
+            application_credential_secret=credentials.application_credential_secret,
+        )
+
+        verify = ca_bundle if ca_bundle else True
+        session = ksc_session.Session(auth=auth, verify=verify, timeout=NOVA_API_TIMEOUT_SECONDS)
+        nova = client.Client("2.73", session=session, region_name=credentials.region_name)
+        nova.versions.get_current()
+        logging.info("Nova login successful (application credential)")
+        return nova
+    except (DiscoveryFailure, Unauthorized) as e:
+        _safe_log_exception(f"Nova AC login failed: {type(e).__name__}", e)
+        raise NovaConnectionError(f"Nova AC login failed: {type(e).__name__}") from e
+    except Exception as e:
+        _safe_log_exception("Nova AC login failed", e, include_traceback=True)
+        raise NovaConnectionError("Nova AC login failed") from e
 
 
 NOVA_EXCEPTION_MESSAGES = {
