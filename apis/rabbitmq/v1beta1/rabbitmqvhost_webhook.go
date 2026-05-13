@@ -30,8 +30,6 @@ import (
 
 var rabbitmqvhostlog = logf.Log.WithName("rabbitmqvhost-resource")
 
-//+kubebuilder:webhook:path=/mutate-rabbitmq-openstack-org-v1beta1-rabbitmqvhost,mutating=true,failurePolicy=fail,sideEffects=None,groups=rabbitmq.openstack.org,resources=rabbitmqvhosts,verbs=create;update,versions=v1beta1,name=mrabbitmqvhost.kb.io,admissionReviewVersions=v1
-
 // Default implements defaulting for RabbitMQVhost
 func (r *RabbitMQVhost) Default(_ client.Client) {
 	rabbitmqvhostlog.Info("default", "name", r.Name)
@@ -41,8 +39,6 @@ func (r *RabbitMQVhost) Default(_ client.Client) {
 		r.Spec.Name = "/"
 	}
 }
-
-//+kubebuilder:webhook:path=/validate-rabbitmq-openstack-org-v1beta1-rabbitmqvhost,mutating=false,failurePolicy=fail,sideEffects=None,groups=rabbitmq.openstack.org,resources=rabbitmqvhosts,verbs=create;update,versions=v1beta1,name=vrabbitmqvhost.kb.io,admissionReviewVersions=v1
 
 // ValidateCreate validates the RabbitMQVhost on creation
 func (r *RabbitMQVhost) ValidateCreate(_ client.Client) (admission.Warnings, error) {
@@ -69,6 +65,20 @@ func (r *RabbitMQVhost) ValidateUpdate(_ client.Client, old runtime.Object) (adm
 	oldVhost, ok := old.(*RabbitMQVhost)
 	if !ok {
 		return nil, fmt.Errorf("expected RabbitMQVhost but got %T", old)
+	}
+
+	// Prevent changing the cluster after creation
+	if r.Spec.RabbitmqClusterName != oldVhost.Spec.RabbitmqClusterName {
+		return nil, apierrors.NewInvalid(
+			schema.GroupKind{Group: "rabbitmq.openstack.org", Kind: "RabbitMQVhost"},
+			r.Name,
+			field.ErrorList{
+				field.Forbidden(
+					field.NewPath("spec", "rabbitmqClusterName"),
+					"rabbitmqClusterName cannot be changed after creation",
+				),
+			},
+		)
 	}
 
 	// Prevent changing the vhost name after creation

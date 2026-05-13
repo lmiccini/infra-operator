@@ -8,11 +8,11 @@ commands:
   - script: |
       set -e
       # Verify old user CR is gone
-      if oc get rabbitmquser -n $NAMESPACE cred-rot-url-nova-user 2>/dev/null; then
-        echo "FAIL: Old user CR cred-rot-url-nova-user still exists"
+      if oc get rabbitmquser -n $NAMESPACE rabbitmq-cred-rot-user-nova 2>/dev/null; then
+        echo "FAIL: Old user CR rabbitmq-cred-rot-user-nova still exists"
         exit 1
       fi
-      echo "PASS: Old user CR cred-rot-url-nova-user deleted"
+      echo "PASS: Old user CR rabbitmq-cred-rot-user-nova deleted"
   - script: |
       set -e
       # Verify old user was deleted from RabbitMQ

@@ -37,6 +37,7 @@ import (
 	rabbitmqapi "github.com/openstack-k8s-operators/infra-operator/pkg/rabbitmq/api"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	helper "github.com/openstack-k8s-operators/lib-common/modules/common/helper"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/object"
 	oko_secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
@@ -82,7 +83,7 @@ type RabbitMQUserReconciler struct {
 //+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile reconciles a RabbitMQUser object
-func (r *RabbitMQUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *RabbitMQUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, _err error) {
 	Log := log.FromContext(ctx)
 
 	instance := &rabbitmqv1.RabbitMQUser{}
@@ -109,7 +110,6 @@ func (r *RabbitMQUserReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		condition.UnknownCondition(rabbitmqv1.RabbitMQUserReadyCondition, condition.InitReason, rabbitmqv1.RabbitMQUserReadyInitMessage),
 	)
 	instance.Status.Conditions.Init(&cl)
-	instance.Status.ObservedGeneration = instance.Generation
 
 	defer func() {
 		// Restore condition timestamps if they haven't changed
@@ -118,8 +118,10 @@ func (r *RabbitMQUserReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if instance.Status.Conditions.IsUnknown(condition.ReadyCondition) {
 			instance.Status.Conditions.Set(instance.Status.Conditions.Mirror(condition.ReadyCondition))
 		}
-		if err := h.PatchInstance(ctx, instance); err != nil {
-			Log.Error(err, "Failed to patch instance")
+		err := h.PatchInstance(ctx, instance)
+		if err != nil {
+			_err = err
+			return
 		}
 	}()
 
@@ -201,6 +203,24 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 			// If we get an error other than NotFound, return it to requeue
 			return ctrl.Result{}, fmt.Errorf("failed to get old vhost %s for finalizer removal: %w", instance.Status.VhostRef, err)
 		}
+	}
+
+	// Check if this user CR has been marked as orphaned (no active consumers)
+	if instance.Labels[rabbitmqv1.RabbitMQUserOrphanedLabel] == "true" {
+		if controllerutil.ContainsFinalizer(instance, rabbitmqv1.RabbitMQUserCleanupBlockedFinalizer) {
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				rabbitmqv1.RabbitMQUserReadyCondition,
+				condition.RequestedReason,
+				condition.SeverityInfo,
+				rabbitmqv1.RabbitMQUserOrphanedMessage,
+				rabbitmqv1.RabbitMQUserCleanupBlockedFinalizer))
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		Log.Info("Orphaned user approved for deletion (cleanup-blocked removed)", "user", instance.Name)
+		if err := r.Delete(ctx, instance); err != nil && !k8s_errors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("failed to delete orphaned user %s: %w", instance.Name, err)
+		}
+		return ctrl.Result{}, nil
 	}
 
 	// Get vhost - default to "/" if VhostRef is empty
@@ -324,6 +344,11 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 		}
 
 		_, err = controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
+			secret.Labels = labels.GetLabels(instance, "rabbitmquser", map[string]string{
+				"backup.openstack.org/category":      "controlplane",
+				"backup.openstack.org/restore":       "true",
+				"backup.openstack.org/restore-order": "10",
+			})
 			secret.Data["username"] = []byte(username)
 			secret.Data["password"] = []byte(password)
 			return controllerutil.SetControllerReference(instance, secret, r.Scheme)
@@ -369,7 +394,7 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 	oldPermissionsDeleted := true
 	if vhostChanged && instance.Status.Vhost != "" {
 		Log.Info("Vhost changed, deleting permissions from old vhost", "old_vhost", instance.Status.Vhost, "new_vhost", vhostName, "username", username)
-		if err := apiClient.DeletePermissions(instance.Status.Vhost, username); err != nil {
+		if err := apiClient.DeletePermissions(ctx, instance.Status.Vhost, username); err != nil {
 			// Track that old permissions weren't deleted - we'll retry on next reconciliation
 			// We continue to set new permissions so the user works in the new vhost,
 			// but we won't update status.Vhost until old permissions are cleaned up
@@ -383,7 +408,7 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 	if tags == nil {
 		tags = []string{}
 	}
-	err = apiClient.CreateOrUpdateUser(username, password, tags)
+	err = apiClient.CreateOrUpdateUser(ctx, username, password, tags)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.RabbitMQUserReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.RabbitMQUserReadyErrorMessage, err.Error()))
 		return ctrl.Result{}, err
@@ -393,7 +418,7 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 	// Note: instance.Spec.Permissions is never nil because the field doesn't use omitempty.
 	// Individual permission fields (Configure/Write/Read) are guaranteed to have values
 	// either from user input or from kubebuilder defaults (".*" for full permissions).
-	err = apiClient.SetPermissions(vhostName, username,
+	err = apiClient.SetPermissions(ctx, vhostName, username,
 		instance.Spec.Permissions.Configure,
 		instance.Spec.Permissions.Write,
 		instance.Spec.Permissions.Read)
@@ -406,9 +431,18 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 	// This ensures we keep track of the old vhost and retry cleanup on next reconciliation
 	if oldPermissionsDeleted {
 		instance.Status.Vhost = vhostName
+	} else {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			rabbitmqv1.RabbitMQUserReadyCondition,
+			condition.ErrorReason,
+			condition.SeverityWarning,
+			rabbitmqv1.RabbitMQUserReadyErrorMessage,
+			fmt.Sprintf("failed to delete permissions from old vhost %s, will retry", instance.Status.Vhost)))
+		return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
 	}
 	instance.Status.Conditions.MarkTrue(rabbitmqv1.RabbitMQUserReadyCondition, rabbitmqv1.RabbitMQUserReadyMessage)
 	instance.Status.Conditions.MarkTrue(condition.ReadyCondition, condition.ReadyMessage)
+	instance.Status.ObservedGeneration = instance.Generation
 
 	return ctrl.Result{}, nil
 }
@@ -416,8 +450,7 @@ func (r *RabbitMQUserReconciler) reconcileNormal(ctx context.Context, instance *
 func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1.RabbitMQUser, h *helper.Helper) (ctrl.Result, error) {
 	Log := log.FromContext(ctx)
 
-	// If TransportURL finalizer exists, wait for TransportURL to remove it
-	// The TransportURL controller manages this finalizer and removes it when switching users
+	// Wait for legacy TransportURL finalizer (backward compatibility)
 	if controllerutil.ContainsFinalizer(instance, rabbitmqv1.TransportURLFinalizer) {
 		instance.Status.Conditions.MarkFalse(
 			rabbitmqv1.RabbitMQUserReadyCondition,
@@ -427,6 +460,21 @@ func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *
 			rabbitmqv1.TransportURLFinalizer,
 		)
 		return ctrl.Result{RequeueAfter: time.Duration(2) * time.Second}, nil
+	}
+
+	// Wait for all per-TransportURL consumer finalizers to be removed
+	for _, finalizer := range instance.GetFinalizers() {
+		if strings.HasPrefix(finalizer, rabbitmqv1.TransportURLFinalizerPrefix) {
+			turlName := finalizer[len(rabbitmqv1.TransportURLFinalizerPrefix):]
+			instance.Status.Conditions.MarkFalse(
+				rabbitmqv1.RabbitMQUserReadyCondition,
+				condition.DeletingReason,
+				condition.SeverityInfo,
+				"Waiting for TransportURL %s to release user",
+				turlName,
+			)
+			return ctrl.Result{}, nil
+		}
 	}
 
 	// Check for external finalizers (not managed by this controller)
@@ -493,6 +541,10 @@ func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *
 				} else {
 					Log.Info("Successfully removed finalizer from vhost", "vhost", vhostRef, "finalizer", userFinalizer)
 				}
+			}
+			// Delete the vhost CR if no consumers or users reference it anymore
+			if err := r.deleteOrphanedVhost(ctx, vhostRef, instance.Namespace); err != nil {
+				return ctrl.Result{}, err
 			}
 		} else if k8s_errors.IsNotFound(err) {
 			// Vhost doesn't exist - nothing to clean up
@@ -585,16 +637,31 @@ func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *
 		return ctrl.Result{}, fmt.Errorf("failed to create RabbitMQ API client: %w", err)
 	}
 
-	// Delete permissions and user from RabbitMQ
-	// The Delete methods already treat 404 as success
-	if err := apiClient.DeletePermissions(vhostName, username); err != nil {
-		// Return error to trigger retry - see rabbitmqpolicy_controller.go for detailed rationale
-		return ctrl.Result{}, fmt.Errorf("failed to delete permissions for user %s from vhost %s in RabbitMQ: %w", username, vhostName, err)
+	// Safety check: skip RabbitMQ API delete if another CR manages the same user
+	skipRabbitMQDelete := false
+	userList := &rabbitmqv1.RabbitMQUserList{}
+	if err := r.List(ctx, userList, client.InNamespace(instance.Namespace)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to list users for safety check: %w", err)
+	}
+	for _, other := range userList.Items {
+		if other.Name != instance.Name &&
+			other.Spec.Username == instance.Spec.Username &&
+			other.Spec.RabbitmqClusterName == instance.Spec.RabbitmqClusterName &&
+			other.DeletionTimestamp.IsZero() {
+			Log.Info("Skipping user deletion from RabbitMQ -- another CR manages the same user",
+				"username", username, "otherCR", other.Name)
+			skipRabbitMQDelete = true
+			break
+		}
 	}
 
-	if err := apiClient.DeleteUser(username); err != nil {
-		// Return error to trigger retry - see rabbitmqpolicy_controller.go for detailed rationale
-		return ctrl.Result{}, fmt.Errorf("failed to delete user %s from RabbitMQ: %w", username, err)
+	if !skipRabbitMQDelete {
+		if err := apiClient.DeletePermissions(ctx, vhostName, username); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to delete permissions for user %s from vhost %s in RabbitMQ: %w", username, vhostName, err)
+		}
+		if err := apiClient.DeleteUser(ctx, username); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to delete user %s from RabbitMQ: %w", username, err)
+		}
 	}
 
 	// Only delete auto-generated secret (when spec.secret is not set)
@@ -620,6 +687,34 @@ func (r *RabbitMQUserReconciler) reconcileDelete(ctx context.Context, instance *
 
 	controllerutil.RemoveFinalizer(instance, userFinalizer)
 	return ctrl.Result{}, nil
+}
+
+// deleteOrphanedVhost deletes a vhost CR if no TransportURL or user finalizers remain on it.
+func (r *RabbitMQUserReconciler) deleteOrphanedVhost(ctx context.Context, name, namespace string) error {
+	Log := log.FromContext(ctx)
+	vhost := &rabbitmqv1.RabbitMQVhost{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, vhost); err != nil {
+		if k8s_errors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get vhost %s: %w", name, err)
+	}
+	if !vhost.GetDeletionTimestamp().IsZero() {
+		return nil
+	}
+	for _, f := range vhost.GetFinalizers() {
+		if strings.HasPrefix(f, rabbitmqv1.TransportURLFinalizerPrefix) {
+			return nil
+		}
+		if strings.HasPrefix(f, rabbitmqv1.UserVhostFinalizerPrefix) {
+			return nil
+		}
+	}
+	Log.Info("Deleting orphaned vhost CR (no remaining consumers or users)", "name", name)
+	if err := r.Delete(ctx, vhost); err != nil && !k8s_errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete orphaned vhost CR %s: %w", name, err)
+	}
+	return nil
 }
 
 // vhostToUserMapFunc maps vhost changes to user reconciliation requests

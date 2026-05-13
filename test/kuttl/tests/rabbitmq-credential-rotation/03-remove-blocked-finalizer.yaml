@@ -1,7 +1,7 @@
 #
-# Step 3: Remove the cleanup-blocked finalizer from the old user to unblock deletion.
-# In production, an external controller or operator would do this after confirming
-# the owning service has fully switched to the new credentials.
+# Step 3: Remove the cleanup-blocked finalizer from the orphaned user to approve deletion.
+# In production, an admin would do this after confirming the owning service has fully
+# switched to the new credentials. The user controller will then auto-delete the CR.
 #
 apiVersion: kuttl.dev/v1beta1
 kind: TestStep
@@ -9,11 +9,11 @@ commands:
 - script: |
     set -e
     # Get current finalizers and remove only cleanup-blocked
-    FINALIZERS=$(oc get rabbitmquser cred-rot-url-nova-user -n $NAMESPACE -o jsonpath='{.metadata.finalizers}')
+    FINALIZERS=$(oc get rabbitmquser rabbitmq-cred-rot-user-nova -n $NAMESPACE -o jsonpath='{.metadata.finalizers}')
     echo "Current finalizers: $FINALIZERS"
 
     # Build new finalizer list excluding cleanup-blocked
-    NEW_FINALIZERS=$(oc get rabbitmquser cred-rot-url-nova-user -n $NAMESPACE -o json | \
+    NEW_FINALIZERS=$(oc get rabbitmquser rabbitmq-cred-rot-user-nova -n $NAMESPACE -o json | \
       python3 -c "
     import sys, json
     obj = json.load(sys.stdin)
@@ -21,6 +21,6 @@ commands:
     print(json.dumps(finalizers))
     ")
 
-    oc patch rabbitmquser cred-rot-url-nova-user -n $NAMESPACE --type=merge \
+    oc patch rabbitmquser rabbitmq-cred-rot-user-nova -n $NAMESPACE --type=merge \
       -p "{\"metadata\":{\"finalizers\":$NEW_FINALIZERS}}"
     echo "PASS: Removed cleanup-blocked finalizer from old user"

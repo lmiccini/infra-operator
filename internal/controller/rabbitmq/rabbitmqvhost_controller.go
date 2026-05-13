@@ -19,6 +19,7 @@ package rabbitmq
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -64,7 +65,7 @@ type RabbitMQVhostReconciler struct {
 //+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 
 // Reconcile reconciles a RabbitMQVhost object
-func (r *RabbitMQVhostReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *RabbitMQVhostReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, _err error) {
 	Log := log.FromContext(ctx)
 
 	instance := &rabbitmqv1.RabbitMQVhost{}
@@ -91,7 +92,6 @@ func (r *RabbitMQVhostReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		condition.UnknownCondition(rabbitmqv1.RabbitMQVhostReadyCondition, condition.InitReason, rabbitmqv1.RabbitMQVhostReadyInitMessage),
 	)
 	instance.Status.Conditions.Init(&cl)
-	instance.Status.ObservedGeneration = instance.Generation
 
 	defer func() {
 		// Restore condition timestamps if they haven't changed
@@ -100,8 +100,10 @@ func (r *RabbitMQVhostReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if instance.Status.Conditions.IsUnknown(condition.ReadyCondition) {
 			instance.Status.Conditions.Set(instance.Status.Conditions.Mirror(condition.ReadyCondition))
 		}
-		if err := h.PatchInstance(ctx, instance); err != nil {
-			Log.Error(err, "Failed to patch instance")
+		err := h.PatchInstance(ctx, instance)
+		if err != nil {
+			_err = err
+			return
 		}
 	}()
 
@@ -178,7 +180,7 @@ func (r *RabbitMQVhostReconciler) reconcileNormal(ctx context.Context, instance 
 	}
 
 	if vhostName != "/" {
-		err = apiClient.CreateOrUpdateVhost(vhostName)
+		err = apiClient.CreateOrUpdateVhost(ctx, vhostName)
 		if err != nil {
 			instance.Status.Conditions.Set(condition.FalseCondition(rabbitmqv1.RabbitMQVhostReadyCondition, condition.ErrorReason, condition.SeverityWarning, rabbitmqv1.RabbitMQVhostReadyErrorMessage, err.Error()))
 			return ctrl.Result{}, err
@@ -187,6 +189,7 @@ func (r *RabbitMQVhostReconciler) reconcileNormal(ctx context.Context, instance 
 
 	instance.Status.Conditions.MarkTrue(rabbitmqv1.RabbitMQVhostReadyCondition, rabbitmqv1.RabbitMQVhostReadyMessage)
 	instance.Status.Conditions.MarkTrue(condition.ReadyCondition, condition.ReadyMessage)
+	instance.Status.ObservedGeneration = instance.Generation
 
 	return ctrl.Result{}, nil
 }
@@ -194,11 +197,19 @@ func (r *RabbitMQVhostReconciler) reconcileNormal(ctx context.Context, instance 
 func (r *RabbitMQVhostReconciler) reconcileDelete(ctx context.Context, instance *rabbitmqv1.RabbitMQVhost, h *helper.Helper) (ctrl.Result, error) {
 	Log := log.FromContext(ctx)
 
-	// If TransportURL finalizer exists, wait for TransportURL to remove it
-	// The TransportURL controller manages this finalizer
-	// The watch on TransportURL will trigger reconciliation when the finalizer is removed
+	// Wait for legacy TransportURL finalizer (backward compatibility)
 	if controllerutil.ContainsFinalizer(instance, rabbitmqv1.TransportURLFinalizer) {
+		Log.Info("Vhost deletion blocked by legacy TransportURL finalizer", "vhost", instance.Name)
 		return ctrl.Result{}, nil
+	}
+
+	// Wait for all per-TransportURL consumer finalizers to be removed
+	for _, finalizer := range instance.Finalizers {
+		if strings.HasPrefix(finalizer, rabbitmqv1.TransportURLFinalizerPrefix) {
+			turlName := finalizer[len(rabbitmqv1.TransportURLFinalizerPrefix):]
+			Log.Info("Vhost deletion blocked by TransportURL consumer", "vhost", instance.Name, "transportURL", turlName)
+			return ctrl.Result{}, nil
+		}
 	}
 
 	// Wait for user-managed finalizers to be removed before deleting vhost
@@ -265,11 +276,17 @@ func (r *RabbitMQVhostReconciler) reconcileDelete(ctx context.Context, instance 
 				// Active user still references this vhost - wait
 				// The watch on RabbitMQUser will trigger reconciliation when the user is deleted
 				Log.Info("Vhost deletion blocked by active user", "vhost", instance.Name, "user", matchingUser.Name, "username", username)
+				instance.Status.Conditions.Set(condition.FalseCondition(
+					rabbitmqv1.RabbitMQVhostReadyCondition, condition.RequestedReason, condition.SeverityInfo,
+					rabbitmqv1.RabbitMQVhostDeletionWaitingMessage, finalizer))
 				return ctrl.Result{}, nil
 			}
 			// User is being deleted - wait for it to remove its finalizer
 			// The watch on RabbitMQUser will trigger reconciliation when the user deletion completes
 			Log.Info("Vhost deletion waiting for user deletion to complete", "vhost", instance.Name, "user", matchingUser.Name, "username", username)
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				rabbitmqv1.RabbitMQVhostReadyCondition, condition.RequestedReason, condition.SeverityInfo,
+				rabbitmqv1.RabbitMQVhostDeletionWaitingMessage, finalizer))
 			return ctrl.Result{}, nil
 		}
 	}
@@ -335,10 +352,28 @@ func (r *RabbitMQVhostReconciler) reconcileDelete(ctx context.Context, instance 
 		vhostName = "/"
 	}
 	if vhostName != "/" {
-		// DeleteVhost already treats 404 as success
-		if err := apiClient.DeleteVhost(vhostName); err != nil {
-			// Return error to trigger retry - see rabbitmqpolicy_controller.go for detailed rationale
-			return ctrl.Result{}, fmt.Errorf("failed to delete vhost %s from RabbitMQ: %w", vhostName, err)
+		// Safety check: skip RabbitMQ API delete if another CR manages the same vhost
+		skipDelete := false
+		vhostList := &rabbitmqv1.RabbitMQVhostList{}
+		if err := r.List(ctx, vhostList, client.InNamespace(instance.Namespace)); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to list vhosts for safety check: %w", err)
+		}
+		for _, other := range vhostList.Items {
+			if other.Name != instance.Name &&
+				other.Spec.Name == instance.Spec.Name &&
+				other.Spec.RabbitmqClusterName == instance.Spec.RabbitmqClusterName &&
+				other.DeletionTimestamp.IsZero() {
+				Log.Info("Skipping vhost deletion from RabbitMQ -- another CR manages the same vhost",
+					"vhost", vhostName, "otherCR", other.Name)
+				skipDelete = true
+				break
+			}
+		}
+
+		if !skipDelete {
+			if err := apiClient.DeleteVhost(ctx, vhostName); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to delete vhost %s from RabbitMQ: %w", vhostName, err)
+			}
 		}
 	}
 
@@ -368,16 +403,15 @@ func (r *RabbitMQVhostReconciler) userToVhostMapFunc(_ context.Context, obj clie
 func (r *RabbitMQVhostReconciler) transportURLToVhostMapFunc(_ context.Context, obj client.Object) []reconcile.Request {
 	turl := obj.(*rabbitmqv1.TransportURL)
 
-	// Reconcile the vhost if it's specified in the spec or tracked in the status
 	requests := []reconcile.Request{}
 	vhostName := turl.Spec.Vhost
 	if vhostName == "" {
 		vhostName = turl.Status.RabbitmqVhost
 	}
-	if vhostName != "" && vhostName != "/" {
+	if vhostName != "" && vhostName != "/" && turl.Spec.RabbitmqClusterName != "" {
 		requests = append(requests, reconcile.Request{
 			NamespacedName: types.NamespacedName{
-				Name:      vhostName,
+				Name:      rabbitmqv1.CanonicalVhostName(turl.Spec.RabbitmqClusterName, vhostName),
 				Namespace: turl.Namespace,
 			},
 		})

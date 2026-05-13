@@ -18,6 +18,7 @@ limitations under the License.
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -80,7 +81,7 @@ func TestCreateOrUpdateUser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
-	err = client.CreateOrUpdateUser("testuser", "testpass", []string{"monitoring"})
+	err = client.CreateOrUpdateUser(context.Background(), "testuser", "testpass", []string{"monitoring"})
 	if err != nil {
 		t.Errorf("CreateOrUpdateUser failed: %v", err)
 	}
@@ -102,7 +103,7 @@ func TestDeleteUser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
-	err = client.DeleteUser("testuser")
+	err = client.DeleteUser(context.Background(), "testuser")
 	if err != nil {
 		t.Errorf("DeleteUser failed: %v", err)
 	}
@@ -124,7 +125,7 @@ func TestCreateOrUpdateVhost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
-	err = client.CreateOrUpdateVhost("testvhost")
+	err = client.CreateOrUpdateVhost(context.Background(), "testvhost")
 	if err != nil {
 		t.Errorf("CreateOrUpdateVhost failed: %v", err)
 	}
@@ -146,7 +147,7 @@ func TestDeleteVhost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
-	err = client.DeleteVhost("testvhost")
+	err = client.DeleteVhost(context.Background(), "testvhost")
 	if err != nil {
 		t.Errorf("DeleteVhost failed: %v", err)
 	}
@@ -177,7 +178,7 @@ func TestSetPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
-	err = client.SetPermissions("/", "testuser", ".*", ".*", ".*")
+	err = client.SetPermissions(context.Background(), "/", "testuser", ".*", ".*", ".*")
 	if err != nil {
 		t.Errorf("SetPermissions failed: %v", err)
 	}
@@ -199,7 +200,7 @@ func TestDeletePermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
-	err = client.DeletePermissions("/", "testuser")
+	err = client.DeletePermissions(context.Background(), "/", "testuser")
 	if err != nil {
 		t.Errorf("DeletePermissions failed: %v", err)
 	}
@@ -231,7 +232,7 @@ func TestCreateOrUpdatePolicy(t *testing.T) {
 		t.Fatalf("NewClient failed: %v", err)
 	}
 	definition := map[string]interface{}{"max-length": 10000}
-	err = client.CreateOrUpdatePolicy("/", "testpolicy", ".*", definition, 1, "all")
+	err = client.CreateOrUpdatePolicy(context.Background(), "/", "testpolicy", ".*", definition, 1, "all")
 	if err != nil {
 		t.Errorf("CreateOrUpdatePolicy failed: %v", err)
 	}
@@ -253,7 +254,7 @@ func TestDeletePolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
-	err = client.DeletePolicy("/", "testpolicy")
+	err = client.DeletePolicy(context.Background(), "/", "testpolicy")
 	if err != nil {
 		t.Errorf("DeletePolicy failed: %v", err)
 	}

@@ -59,14 +59,14 @@ type RabbitMQUserCustomDefaulter struct {
 var _ webhook.CustomDefaulter = &RabbitMQUserCustomDefaulter{}
 
 // Default implements webhook.CustomDefaulter so a webhook will be registered for the type RabbitMQUser.
-func (d *RabbitMQUserCustomDefaulter) Default(_ context.Context, obj runtime.Object) error {
+func (d *RabbitMQUserCustomDefaulter) Default(ctx context.Context, obj runtime.Object) error {
 	rabbitmquser, ok := obj.(*rabbitmqv1beta1.RabbitMQUser)
 	if !ok {
 		return fmt.Errorf("expected a RabbitMQUser object but got %T", obj)
 	}
 	log.Info("Defaulting for RabbitMQUser", "name", rabbitmquser.GetName())
 
-	rabbitmquser.Default(d.Client)
+	rabbitmquser.Default(ctx, d.Client)
 	return nil
 }
 

@@ -17,11 +17,18 @@ limitations under the License.
 package functional_test
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+
 	. "github.com/onsi/ginkgo/v2" //nolint:revive
 	. "github.com/onsi/gomega"    //nolint:revive
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
+	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 var _ = Describe("RabbitMQVhost controller", func() {
@@ -121,11 +128,11 @@ var _ = Describe("RabbitMQVhost controller", func() {
 			DeferCleanup(th.DeleteInstance, transportURL)
 
 			// Wait for vhost to be created by TransportURL
-			ownedVhostName = types.NamespacedName{Name: transportURLName.Name + "-testvhost-vhost", Namespace: namespace}
+			ownedVhostName = types.NamespacedName{Name: rabbitmqv1.CanonicalVhostName(rabbitmqClusterName.Name, "testvhost"), Namespace: namespace}
 			Eventually(func(g Gomega) {
 				vhost := &rabbitmqv1.RabbitMQVhost{}
 				g.Expect(th.K8sClient.Get(th.Ctx, ownedVhostName, vhost)).To(Succeed())
-				g.Expect(vhost.Finalizers).To(ContainElement(rabbitmqv1.TransportURLFinalizer))
+				g.Expect(vhost.Finalizers).To(ContainElement(rabbitmqv1.TransportURLFinalizerFor(transportURLName.Name)))
 			}, timeout, interval).Should(Succeed())
 		})
 
@@ -141,7 +148,7 @@ var _ = Describe("RabbitMQVhost controller", func() {
 				v := &rabbitmqv1.RabbitMQVhost{}
 				g.Expect(th.K8sClient.Get(th.Ctx, ownedVhostName, v)).To(Succeed())
 				g.Expect(v.DeletionTimestamp).NotTo(BeNil())
-				g.Expect(v.Finalizers).To(ContainElement(rabbitmqv1.TransportURLFinalizer))
+				g.Expect(v.Finalizers).To(ContainElement(rabbitmqv1.TransportURLFinalizerFor(transportURLName.Name)))
 			}, "2s", interval).Should(Succeed())
 		})
 	})
@@ -532,6 +539,95 @@ var _ = Describe("RabbitMQVhost controller", func() {
 			Eventually(func(g Gomega) {
 				v := GetRabbitMQVhost(recreateVhostName)
 				g.Expect(v.Status.Conditions.IsTrue(condition.ReadyCondition)).To(BeTrue())
+			}, timeout, interval).Should(Succeed())
+		})
+	})
+
+	When("a duplicate RabbitMQVhost CR references the same vhost name", func() {
+		var safetyClusterName types.NamespacedName
+		var canonicalVhostName types.NamespacedName
+		var duplicateVhostName types.NamespacedName
+		var vhostDeleteCount atomic.Int32
+
+		BeforeEach(func() {
+			safetyClusterName = types.NamespacedName{Name: "rabbitmq-vhost-safety", Namespace: namespace}
+			canonicalVhostName = types.NamespacedName{Name: "canonical-vhost", Namespace: namespace}
+			duplicateVhostName = types.NamespacedName{Name: "duplicate-vhost", Namespace: namespace}
+			vhostDeleteCount.Store(0)
+
+			// Custom mock that tracks DELETE /api/vhosts/ calls
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/vhosts/") {
+					vhostDeleteCount.Add(1)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			hostPort := strings.TrimPrefix(server.URL, "http://")
+			parts := strings.Split(hostPort, ":")
+			mockRabbitMQServer = server
+			mockRabbitMQHost = parts[0]
+			mockRabbitMQPort = parts[1]
+			DeferCleanup(StopMockRabbitMQAPI)
+
+			CreateRabbitMQCluster(safetyClusterName, GetDefaultRabbitMQClusterSpec(false))
+			SimulateRabbitMQClusterReady(safetyClusterName)
+			DeferCleanup(DeleteRabbitMQCluster, safetyClusterName)
+
+			// Create the canonical vhost CR
+			CreateRabbitMQVhost(canonicalVhostName, map[string]any{
+				"rabbitmqClusterName": safetyClusterName.Name,
+				"name":                "shared-vhost",
+			})
+
+			// Wait for it to become ready
+			Eventually(func(g Gomega) {
+				v := GetRabbitMQVhost(canonicalVhostName)
+				g.Expect(v.Status.Conditions.IsTrue(rabbitmqv1.RabbitMQVhostReadyCondition)).To(BeTrue())
+			}, timeout, interval).Should(Succeed())
+
+			// Create a duplicate CR pointing to the same vhost
+			CreateRabbitMQVhost(duplicateVhostName, map[string]any{
+				"rabbitmqClusterName": safetyClusterName.Name,
+				"name":                "shared-vhost",
+			})
+
+			// Wait for it to become ready
+			Eventually(func(g Gomega) {
+				v := GetRabbitMQVhost(duplicateVhostName)
+				g.Expect(v.Status.Conditions.IsTrue(rabbitmqv1.RabbitMQVhostReadyCondition)).To(BeTrue())
+			}, timeout, interval).Should(Succeed())
+
+			// Reset counter after setup (creation calls PUT, not DELETE)
+			vhostDeleteCount.Store(0)
+		})
+
+		It("should not call the RabbitMQ API to delete the vhost when the duplicate CR is deleted", func() {
+			// Verify both CRs reference the same vhost name
+			canonical := GetRabbitMQVhost(canonicalVhostName)
+			duplicate := GetRabbitMQVhost(duplicateVhostName)
+			Expect(canonical.Spec.Name).To(Equal("shared-vhost"))
+			Expect(duplicate.Spec.Name).To(Equal("shared-vhost"))
+
+			// Delete the duplicate CR
+			Expect(th.K8sClient.Delete(th.Ctx, duplicate)).To(Succeed())
+
+			// Verify the duplicate CR is fully deleted
+			Eventually(func(g Gomega) {
+				v := &rabbitmqv1.RabbitMQVhost{}
+				err := th.K8sClient.Get(th.Ctx, duplicateVhostName, v)
+				g.Expect(k8s_errors.IsNotFound(err)).To(BeTrue())
+			}, timeout, interval).Should(Succeed())
+
+			// Verify no DELETE /api/vhosts/ call was made
+			Expect(vhostDeleteCount.Load()).To(Equal(int32(0)),
+				"Safety check should have prevented the DELETE vhost API call")
+
+			// Verify the canonical CR is still present and ready
+			Eventually(func(g Gomega) {
+				v := GetRabbitMQVhost(canonicalVhostName)
+				g.Expect(v.Status.Conditions.IsTrue(rabbitmqv1.RabbitMQVhostReadyCondition)).To(BeTrue())
+				g.Expect(v.DeletionTimestamp).To(BeNil())
+				g.Expect(controllerutil.ContainsFinalizer(v, "rabbitmqvhost.openstack.org/finalizer")).To(BeTrue())
 			}, timeout, interval).Should(Succeed())
 		})
 	})
