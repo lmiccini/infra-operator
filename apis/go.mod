@@ -5,7 +5,7 @@ go 1.24.4
 require (
 	github.com/go-logr/logr v1.4.3
 	github.com/onsi/gomega v1.40.0
-	github.com/openstack-k8s-operators/lib-common/modules/common v0.6.1-0.20260506154724-30a976ba8ef0
+	github.com/openstack-k8s-operators/lib-common/modules/common v0.6.1-0.20260512122920-c197ec23eaf6
 	k8s.io/api v0.31.14
 	k8s.io/apiextensions-apiserver v0.33.2
 	k8s.io/apimachinery v0.31.14
