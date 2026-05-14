@@ -120,9 +120,28 @@ spec:
                   the opentack-operator in the top-level CR (e.g. the ContainerImage)
                 format: int64
                 type: integer
+              pendingUserDeploymentDetected:
+                description: |-
+                  PendingUserDeploymentDetected - set to "true" when AreSecretHashesInSync
+                  returns false after a credential rotation, indicating that a deployment
+                  with new credentials has started and we are waiting for it to complete.
+                enum:
+                - "true"
+                - "false"
+                type: string
+              pendingUserRelease:
+                description: |-
+                  PendingUserRelease - the name of a previous RabbitMQUser CR whose finalizer
+                  removal was deferred during a credential rotation, pending deployment verification.
+                type: string
               queueType:
                 description: QueueType - the queue type from the associated RabbitMq
                   instance
+                type: string
+              rabbitmqClusterName:
+                description: |-
+                  RabbitmqClusterName - the cluster name used to build canonical vhost/user CR names.
+                  Stored in status so that spec changes can be compared against the previously reconciled value.
                 type: string
               rabbitmqUserRef:
                 description: |-

@@ -58,9 +58,24 @@ type TransportURLStatus struct {
 	// RabbitmqVhost - the actual vhost name used
 	RabbitmqVhost string `json:"rabbitmqVhost,omitempty"`
 
+	// RabbitmqClusterName - the cluster name used to build canonical vhost/user CR names.
+	// Stored in status so that spec changes can be compared against the previously reconciled value.
+	RabbitmqClusterName string `json:"rabbitmqClusterName,omitempty"`
+
 	// RabbitmqUserRef - the name of the RabbitMQUser CR that was created or referenced by this TransportURL.
 	// Empty if using default cluster admin credentials (no dedicated RabbitMQUser CR)
 	RabbitmqUserRef string `json:"rabbitmqUserRef,omitempty"`
+
+	// PendingUserRelease - the name of a previous RabbitMQUser CR whose finalizer
+	// removal was deferred during a credential rotation, pending deployment verification.
+	PendingUserRelease string `json:"pendingUserRelease,omitempty"`
+
+	// PendingUserDeploymentDetected - set to "true" when AreSecretHashesInSync
+	// returns false after a credential rotation, indicating that a deployment
+	// with new credentials has started and we are waiting for it to complete.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum="true";"false"
+	PendingUserDeploymentDetected string `json:"pendingUserDeploymentDetected,omitempty"`
 
 	// ObservedGeneration - the most recent generation observed for this
 	// service. If the observed generation is less than the spec generation,
