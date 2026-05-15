@@ -177,6 +177,11 @@ func Deployment(
 func instancehaPorts(instance *instancehav1.InstanceHa) []corev1.ContainerPort {
 	ports := []corev1.ContainerPort{
 		{
+			ContainerPort: 8080,
+			Protocol:      "TCP",
+			Name:          "metrics",
+		},
+		{
 			ContainerPort: instance.Spec.InstanceHaKdumpPort,
 			Protocol:      "UDP",
 			Name:          "kdump",

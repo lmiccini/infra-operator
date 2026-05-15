@@ -33,6 +33,8 @@ from keystoneauth1 import loading
 from keystoneauth1 import session as ksc_session
 from keystoneauth1.exceptions.discovery import DiscoveryFailure
 
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
+
 
 class ConfigurationError(Exception):
     """Raised when configuration loading or validation fails."""
@@ -80,6 +82,75 @@ DISABLED_REASON_EVACUATION = "instanceha evacuation"
 DISABLED_REASON_EVACUATION_COMPLETE = "instanceha evacuation complete"
 DISABLED_REASON_EVACUATION_FAILED = "evacuation FAILED"
 DISABLED_REASON_KDUMP_MARKER = "(kdump)"
+
+# Prometheus metrics
+FENCING_TOTAL = Counter(
+    'instanceha_fencing_total',
+    'Total fencing operations',
+    ['host', 'result'],
+)
+EVACUATION_TOTAL = Counter(
+    'instanceha_evacuation_total',
+    'Total host-level evacuation operations',
+    ['host', 'result'],
+)
+INSTANCE_EVACUATION_TOTAL = Counter(
+    'instanceha_instance_evacuation_total',
+    'Total per-instance evacuation operations',
+    ['host', 'result'],
+)
+INSTANCE_EVACUATION_DURATION = Histogram(
+    'instanceha_instance_evacuation_duration_seconds',
+    'Duration of individual instance evacuations',
+    ['host'],
+    buckets=[10, 30, 60, 120, 180, 300, 600],
+)
+HOST_DOWN_TOTAL = Counter(
+    'instanceha_host_down_total',
+    'Total host-down detections',
+    ['host'],
+)
+HOST_REACHABLE_TOTAL = Counter(
+    'instanceha_host_reachable_total',
+    'Hosts reported down by Nova but still reachable via heartbeat',
+    ['host'],
+)
+HOST_REENABLED_TOTAL = Counter(
+    'instanceha_host_reenabled_total',
+    'Hosts re-enabled after evacuation',
+    ['host'],
+)
+THRESHOLD_EXCEEDED_TOTAL = Counter(
+    'instanceha_threshold_exceeded_total',
+    'Times evacuation was skipped due to threshold',
+)
+RECOVERY_COMPLETED_TOTAL = Counter(
+    'instanceha_recovery_completed_total',
+    'Full recovery workflows completed',
+    ['host'],
+)
+PROCESSING_FAILED_TOTAL = Counter(
+    'instanceha_processing_failed_total',
+    'Service processing failures',
+    ['host'],
+)
+ORPHANED_HOST_RECOVERED_TOTAL = Counter(
+    'instanceha_orphaned_host_recovered_total',
+    'Orphaned fenced hosts recovered at startup',
+)
+POLL_CONSECUTIVE_FAILURES = Gauge(
+    'instanceha_poll_consecutive_failures',
+    'Current consecutive Nova API poll failures',
+)
+HOSTS_PROCESSING = Gauge(
+    'instanceha_hosts_processing',
+    'Number of hosts currently being processed',
+)
+POLL_CYCLE_TOTAL = Counter(
+    'instanceha_poll_cycles_total',
+    'Total poll cycles executed',
+    ['result'],
+)
 
 
 # Enums
@@ -344,9 +415,11 @@ def _build_redfish_url(fencing_data: dict) -> Optional[str]:
 @contextmanager
 def track_host_processing(service: 'InstanceHAService', hostname: str):
     """Context manager for tracking host processing state with automatic cleanup."""
+    HOSTS_PROCESSING.inc()
     try:
         yield
     finally:
+        HOSTS_PROCESSING.dec()
         with service.processing_lock:
             service.hosts_processing.pop(hostname, None)
             logging.debug('Cleaned up processing tracking for %s', hostname)
@@ -1289,6 +1362,14 @@ class InstanceHAService(CloudConnectionProvider):
                         self.wfile.write(b"not ready")
                     return
 
+                if self.path == '/metrics':
+                    data = generate_latest()
+                    self.send_response(200)
+                    self.send_header("Content-type", CONTENT_TYPE_LATEST)
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+
                 if service_instance.hash_update_successful:
                     self.send_response(200)
                     self.send_header("Content-type", "text/plain")
@@ -1906,6 +1987,7 @@ def _server_evacuate_future(connection, server, target_host=None) -> bool:
     try:
         _emit_k8s_event(source_host, 'InstanceEvacuationStarted',
                         f'Evacuating instance {server.id}')
+        INSTANCE_EVACUATION_TOTAL.labels(host=source_host, result='started').inc()
 
         response = _server_evacuate(connection, server.id, target_host=target_host, server_obj=server)
 
@@ -1920,6 +2002,7 @@ def _server_evacuate_future(connection, server, target_host=None) -> bool:
             _emit_k8s_event(source_host, 'InstanceEvacuationFailed',
                             f'Instance {server.id} evacuation failed: {response.reason}',
                             event_type='Warning')
+            INSTANCE_EVACUATION_TOTAL.labels(host=source_host, result='failed').inc()
             return False
 
         logging.debug("Starting evacuation of %s", response.uuid)
@@ -1930,6 +2013,8 @@ def _server_evacuate_future(connection, server, target_host=None) -> bool:
         if result:
             _emit_k8s_event(source_host, 'InstanceEvacuationSucceeded',
                             f'Instance {server.id} evacuated successfully')
+            INSTANCE_EVACUATION_TOTAL.labels(host=source_host, result='succeeded').inc()
+            INSTANCE_EVACUATION_DURATION.labels(host=source_host).observe(time.monotonic() - start_time)
 
             if original_status in ('SHUTOFF', 'ERROR'):
                 current = connection.servers.get(server.id)
@@ -1952,6 +2037,7 @@ def _server_evacuate_future(connection, server, target_host=None) -> bool:
             _emit_k8s_event(source_host, 'InstanceEvacuationFailed',
                             f'Instance {server.id} evacuation failed',
                             event_type='Warning')
+            INSTANCE_EVACUATION_TOTAL.labels(host=source_host, result='failed').inc()
 
         return result
 
@@ -1962,6 +2048,7 @@ def _server_evacuate_future(connection, server, target_host=None) -> bool:
         _emit_k8s_event(source_host, 'InstanceEvacuationFailed',
                         f'Instance {server.id} evacuation error: {e}',
                         event_type='Warning')
+        INSTANCE_EVACUATION_TOTAL.labels(host=source_host, result='failed').inc()
         return False
     finally:
         try:
@@ -2817,12 +2904,15 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
                 # Fence (power off) the host before evacuation
                 _emit_k8s_event(host_name, 'FencingStarted',
                                 'Fencing host (power off)')
+                FENCING_TOTAL.labels(host=host_name, result='started').inc()
                 if not _execute_step("Fencing", _host_fence, host_name, host_name, 'off', service):
                     _emit_k8s_event(host_name, 'FencingFailed',
                                     'Fencing failed', event_type='Warning')
+                    FENCING_TOTAL.labels(host=host_name, result='failed').inc()
                     return False
                 _emit_k8s_event(host_name, 'FencingSucceeded',
                                 'Host fenced successfully')
+                FENCING_TOTAL.labels(host=host_name, result='succeeded').inc()
 
             # Disable the host (skip if already disabled from previous evacuation attempt)
             # Note: kdump-fenced hosts use resume=True but are NOT yet disabled, so we still disable them
@@ -2844,6 +2934,7 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
             # Evacuate instances, optionally targeting the enabled reserved host
             _emit_k8s_event(host_name, 'EvacuationStarted',
                             'Starting VM evacuation')
+            EVACUATION_TOTAL.labels(host=host_name, result='started').inc()
             evac_target = target_host if target_host and service.config.get_config_value('FORCE_RESERVED_HOST_EVACUATION') else None
             if evac_target:
                 logging.info("Forcing evacuation to reserved host: %s", evac_target)
@@ -2851,6 +2942,7 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
                                 conn, failed_service, service, evac_target):
                 _emit_k8s_event(host_name, 'EvacuationFailed',
                                 'VM evacuation failed', event_type='Warning')
+                EVACUATION_TOTAL.labels(host=host_name, result='failed').inc()
                 if target_host:
                     try:
                         servers_on_target = conn.servers.list(
@@ -2869,6 +2961,7 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
                 return False
             _emit_k8s_event(host_name, 'EvacuationSucceeded',
                             'VM evacuation completed successfully')
+            EVACUATION_TOTAL.labels(host=host_name, result='succeeded').inc()
 
             if not _execute_step("Recovery", _post_evacuation_recovery, host_name,
                                 conn, failed_service, service, resume):
@@ -2876,6 +2969,7 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
 
             _emit_k8s_event(host_name, 'RecoveryCompleted',
                             'Host recovery workflow completed')
+            RECOVERY_COMPLETED_TOTAL.labels(host=host_name).inc()
             return True
 
         except Exception as e:
@@ -2883,6 +2977,7 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
             _emit_k8s_event(host_name, 'ProcessingFailed',
                             f'Service processing failed: {_sanitize_message(str(e))}',
                             event_type='Warning')
+            PROCESSING_FAILED_TOTAL.labels(host=host_name).inc()
             return False
 
 
@@ -3138,6 +3233,7 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
                             'Host reported down by Nova but still sending heartbeats — '
                             'skipping fencing (likely nova-compute crash)',
                             event_type='Warning')
+            HOST_REACHABLE_TOTAL.labels(host=svc.host).inc()
 
         if not (compute_nodes or to_resume):
             _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
@@ -3148,6 +3244,7 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
         for svc in compute_nodes:
             _emit_k8s_event(svc.host, 'HostDown',
                             'Compute host detected as down', event_type='Warning')
+            HOST_DOWN_TOTAL.labels(host=svc.host).inc()
 
     # Fetch aggregates once per poll cycle to avoid redundant API calls
     aggregates = None
@@ -3177,6 +3274,7 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
             _emit_k8s_event('cluster', 'ThresholdExceeded',
                             f'Impacted computes ({threshold_percent:.1f}%) exceed threshold ({threshold}%%), evacuation skipped',
                             event_type='Warning')
+            THRESHOLD_EXCEEDED_TOTAL.inc()
             _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
             return
 
@@ -3313,6 +3411,7 @@ def _process_reenabling(conn, service, to_reenable) -> None:
                     logging.info('Enabled %s (migrations complete, service is up)', svc.host)
                     _emit_k8s_event(svc.host, 'HostReenabled',
                                     'Host re-enabled after successful evacuation')
+                    HOST_REENABLED_TOTAL.labels(host=svc.host).inc()
                 else:
                     logging.debug('%s still down, will enable once up', svc.host)
         except Exception as e:
@@ -3347,6 +3446,7 @@ def _reconcile_orphaned_hosts(conn):
             _emit_k8s_event(svc.host, 'OrphanedHostRecovered',
                             'Recovered orphaned fenced host, marked for evacuation resume',
                             event_type='Warning')
+            ORPHANED_HOST_RECOVERED_TOTAL.inc()
             recovered += 1
         except Exception as e:
             logging.error("Failed to reconcile orphaned host %s: %s", svc.host, e)
@@ -3430,9 +3530,13 @@ def main():
                 service.ready = True
                 logging.info("Readiness probe active — first poll cycle completed")
             consecutive_failures = 0
+            POLL_CONSECUTIVE_FAILURES.set(0)
+            POLL_CYCLE_TOTAL.labels(result='success').inc()
 
         except (Unauthorized, DiscoveryFailure) as e:
             consecutive_failures += 1
+            POLL_CONSECUTIVE_FAILURES.set(consecutive_failures)
+            POLL_CYCLE_TOTAL.labels(result='error').inc()
             backoff = min(poll_interval * (2 ** consecutive_failures), MAX_NOVA_BACKOFF_SECONDS)
             logging.warning("Nova session expired or discovery failed (attempt %d): %s. "
                            "Reconnecting in %ds...", consecutive_failures, type(e).__name__, backoff)
@@ -3444,6 +3548,8 @@ def main():
 
         except Exception as e:
             consecutive_failures += 1
+            POLL_CONSECUTIVE_FAILURES.set(consecutive_failures)
+            POLL_CYCLE_TOTAL.labels(result='error').inc()
             backoff = min(poll_interval * (2 ** consecutive_failures), MAX_NOVA_BACKOFF_SECONDS)
             logging.warning("Failed to query Nova API (attempt %d): %s. Retrying in %ds.",
                            consecutive_failures, e, backoff)

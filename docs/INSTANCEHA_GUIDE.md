@@ -38,6 +38,7 @@ InstanceHA runs as a Kubernetes-managed workload alongside the OpenStack control
 │  │  │  UDP Listener ◄── Kdump messages from compute nodes  │ │   │
 │  │  │  UDP Listener ◄── Heartbeat packets from computes    │ │   │
 │  │  │  Health Server ──► :8080 liveness + readiness probes │ │   │
+│  │  │                 ──► :8080/metrics (Prometheus)       │ │   │
 │  │  └──────────────────────────────────────────────────────┘ │   │
 │  └───────────────────────────────────────────────────────────┘   │
 │                                                                  │
@@ -104,16 +105,104 @@ InstanceHA emits Kubernetes events on the InstanceHa CR to provide observability
 | `FencingStarted` | Normal | Host fencing initiated |
 | `FencingSucceeded` | Normal | Host fenced successfully |
 | `FencingFailed` | Warning | Fencing operation failed |
-| `EvacuationStarted` | Normal | Instance evacuation started |
-| `EvacuationSucceeded` | Normal | All instances evacuated |
-| `EvacuationFailed` | Warning | Evacuation failed |
+| `EvacuationStarted` | Normal | Host-level VM evacuation started |
+| `EvacuationSucceeded` | Normal | All VMs evacuated from host |
+| `EvacuationFailed` | Warning | Host-level evacuation failed |
+| `InstanceEvacuationStarted` | Normal | Individual VM evacuation started (smart/orchestrated mode) |
+| `InstanceEvacuationSucceeded` | Normal | Individual VM evacuated successfully |
+| `InstanceEvacuationFailed` | Warning | Individual VM evacuation failed |
 | `HostReenabled` | Normal | Host re-enabled after recovery |
-| `HostReachable` | Normal | Host detected as back online |
+| `HostReachable` | Warning | Host reported down by Nova but still reachable via heartbeat |
 | `RecoveryCompleted` | Normal | Full recovery cycle complete |
+| `ProcessingFailed` | Warning | Unhandled exception during service processing |
 | `ThresholdExceeded` | Warning | Too many hosts down simultaneously |
 | `OrphanedHostRecovered` | Warning | Recovered fenced host from prior crash |
 
 Events can be viewed with `oc describe instanceha <name>` or `oc get events --field-selector involvedObject.name=<name>`.
+
+### Prometheus Metrics
+
+In addition to Kubernetes Events, the agent exposes Prometheus metrics at `http://<pod-ip>:8080/metrics`. These provide time-series data suitable for dashboards, alerting, and capacity planning. See [INSTANCEHA_PROMETHEUS.md](INSTANCEHA_PROMETHEUS.md) for a complete operations guide covering scraping setup, alert rules, testing, and Grafana dashboards.
+
+#### Counters
+
+| Metric | Labels | Description |
+|--------|--------|-------------|
+| `instanceha_fencing_total` | `host`, `result` | Total fencing operations (result: `started`, `succeeded`, `failed`) |
+| `instanceha_evacuation_total` | `host`, `result` | Host-level evacuation operations |
+| `instanceha_instance_evacuation_total` | `host`, `result` | Per-instance evacuation operations (smart/orchestrated mode) |
+| `instanceha_host_down_total` | `host` | Host-down detections |
+| `instanceha_host_reachable_total` | `host` | Hosts reported down by Nova but still reachable via heartbeat |
+| `instanceha_host_reenabled_total` | `host` | Hosts re-enabled after evacuation |
+| `instanceha_threshold_exceeded_total` | | Evacuations skipped due to threshold |
+| `instanceha_recovery_completed_total` | `host` | Full recovery workflows completed |
+| `instanceha_processing_failed_total` | `host` | Service processing failures |
+| `instanceha_orphaned_host_recovered_total` | | Orphaned hosts recovered at startup |
+| `instanceha_poll_cycles_total` | `result` | Poll cycles executed (result: `success`, `error`) |
+
+#### Gauges
+
+| Metric | Description |
+|--------|-------------|
+| `instanceha_poll_consecutive_failures` | Current consecutive Nova API poll failures (resets to 0 on success) |
+| `instanceha_hosts_processing` | Number of hosts currently being processed |
+
+#### Histograms
+
+| Metric | Labels | Buckets (seconds) | Description |
+|--------|--------|-------------------|-------------|
+| `instanceha_instance_evacuation_duration_seconds` | `host` | 10, 30, 60, 120, 180, 300, 600 | Duration of individual instance evacuations |
+
+#### Example Alert Rules
+
+```yaml
+groups:
+  - name: instanceha
+    rules:
+      - alert: InstanceHAFencingFailure
+        expr: increase(instanceha_fencing_total{result="failed"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fencing failed for host {{ $labels.host }}"
+
+      - alert: InstanceHANovaAPIDown
+        expr: instanceha_poll_consecutive_failures > 3
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "InstanceHA cannot reach Nova API"
+
+      - alert: InstanceHAEvacuationSlow
+        expr: histogram_quantile(0.95, rate(instanceha_instance_evacuation_duration_seconds_bucket[15m])) > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Instance evacuations taking longer than 5 minutes (p95)"
+```
+
+#### Scraping Configuration
+
+The InstanceHA pod exposes metrics on TCP port 8080. To scrape with Prometheus, create a `PodMonitor` or `ServiceMonitor`:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: instanceha-metrics
+  namespace: openstack
+spec:
+  selector:
+    matchLabels:
+      service: instanceha
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+```
 
 ### Graceful Shutdown
 
@@ -730,18 +819,22 @@ openstack compute service set --unset-forced-down <host> nova-compute
 
 ### Checking InstanceHA Health
 
-The agent exposes two HTTP health endpoints on port 8080:
+The agent exposes three HTTP endpoints on port 8080:
 
 - **Liveness** (`/`): Returns the latest health-check hash, updated every `HASH_INTERVAL` seconds. Used by the Kubernetes liveness probe.
 - **Readiness** (`/healthz`): Reports whether the agent has completed its first successful Nova API poll. The pod is not marked ready until this check passes.
+- **Metrics** (`/metrics`): Prometheus-format metrics covering fencing, evacuation, host state transitions, and poll loop health. See [Prometheus Metrics](#prometheus-metrics) for the full metric catalog.
 
 ```bash
 # Check pod health
-oc get pods -n openstack -l app=instanceha
+oc get pods -n openstack -l service=instanceha
 
 # View agent logs
 oc logs -n openstack deployment/instanceha-instanceha
 
 # View K8s events
 oc describe instanceha instanceha -n openstack
+
+# Scrape Prometheus metrics
+oc exec deployment/instanceha-instanceha -- curl -s http://localhost:8080/metrics
 ```

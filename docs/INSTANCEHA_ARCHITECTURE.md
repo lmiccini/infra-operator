@@ -5,7 +5,7 @@
 InstanceHA is a high-availability service for OpenStack that automatically detects and evacuates instances from failed compute nodes.
 
 **Version**: 2.5
-**Code Size**: 3,449 lines
+**Code Size**: 3,572 lines
 **Test Suite**: 656 tests across 17 test suites
 
 ## Table of Contents
@@ -17,7 +17,7 @@ InstanceHA is a high-availability service for OpenStack that automatically detec
 5. [Configuration System](#configuration-system)
 6. [Evacuation Mechanisms](#evacuation-mechanisms)
 7. [Fencing Agents](#fencing-agents)
-8. [Kubernetes Events](#kubernetes-events)
+8. [Kubernetes Events and Prometheus Metrics](#kubernetes-events-and-prometheus-metrics)
 9. [Advanced Features](#advanced-features)
 10. [Region Handling](#region-handling)
 11. [Authentication](#authentication)
@@ -1059,9 +1059,11 @@ compute-03:
 
 ---
 
-## Kubernetes Events
+## Kubernetes Events and Prometheus Metrics
 
 InstanceHA emits Kubernetes Events on the InstanceHa CR to provide observability into the evacuation lifecycle. Events are created via the K8s API using the pod's ServiceAccount token.
+
+In addition, each event emission site also increments a corresponding Prometheus counter, exposed at `http://<pod-ip>:8080/metrics`. See the [Prometheus Metrics](#prometheus-metrics) section below for the full metric catalog.
 
 ### Prerequisites
 
@@ -1088,6 +1090,7 @@ InstanceHA emits Kubernetes Events on the InstanceHa CR to provide observability
 | `RecoveryCompleted` | Normal | compute host | Post-evacuation recovery workflow completed |
 | `ProcessingFailed` | Warning | compute host | Unhandled exception during service processing |
 | `ThresholdExceeded` | Warning | `cluster` | Failed host percentage exceeds THRESHOLD, evacuation skipped |
+| `HostReachable` | Warning | compute host | Host reported down by Nova but still reachable via heartbeat (CHECK_HEARTBEAT) |
 | `HostReenabled` | Normal | compute host | Host re-enabled after successful evacuation |
 | `OrphanedHostRecovered` | Warning | compute host | Startup reconciliation recovered a fenced host left without evacuation marker |
 
@@ -1159,6 +1162,41 @@ kubectl get events -n openstack --field-selector involvedObject.kind=InstanceHa,
 # Events for a specific reason
 kubectl get events -n openstack --field-selector involvedObject.kind=InstanceHa,reason=FencingFailed
 ```
+
+### Prometheus Metrics
+
+The agent exposes Prometheus-format metrics at `:8080/metrics` on the same HTTP server used for health checks. Metrics are served using the `prometheus_client` Python library.
+
+**Counters** (monotonically increasing, reset on pod restart):
+
+| Metric | Labels | Description |
+|--------|--------|-------------|
+| `instanceha_fencing_total` | `host`, `result` | Fencing operations (`started`/`succeeded`/`failed`) |
+| `instanceha_evacuation_total` | `host`, `result` | Host-level evacuations |
+| `instanceha_instance_evacuation_total` | `host`, `result` | Per-instance evacuations (smart/orchestrated) |
+| `instanceha_host_down_total` | `host` | Host-down detections |
+| `instanceha_host_reachable_total` | `host` | Hosts still reachable via heartbeat despite Nova reporting down |
+| `instanceha_host_reenabled_total` | `host` | Hosts re-enabled after evacuation |
+| `instanceha_threshold_exceeded_total` | | Evacuations blocked by threshold |
+| `instanceha_recovery_completed_total` | `host` | Full recovery workflows completed |
+| `instanceha_processing_failed_total` | `host` | Service processing failures |
+| `instanceha_orphaned_host_recovered_total` | | Orphaned hosts recovered at startup |
+| `instanceha_poll_cycles_total` | `result` | Poll cycles (`success`/`error`) |
+
+**Gauges** (current value):
+
+| Metric | Description |
+|--------|-------------|
+| `instanceha_poll_consecutive_failures` | Current consecutive Nova API failures |
+| `instanceha_hosts_processing` | Hosts currently being processed |
+
+**Histograms**:
+
+| Metric | Labels | Buckets (s) | Description |
+|--------|--------|-------------|-------------|
+| `instanceha_instance_evacuation_duration_seconds` | `host` | 10, 30, 60, 120, 180, 300, 600 | Per-instance evacuation duration |
+
+Each metric increment is co-located with the corresponding `_emit_k8s_event()` call, so the event catalog and metric catalog map 1:1.
 
 ---
 
@@ -2880,6 +2918,7 @@ requests.post(url, timeout=20)  # Retry up to 3 times
 - Hash exposed via HTTP health check server on port 8080:
   - `GET /` — **Liveness probe**: returns 200 with current hash if `hash_update_successful`, 500 otherwise
   - `GET /healthz` — **Readiness probe**: returns 200 if `ready` flag is set (after first successful poll), 503 otherwise
+  - `GET /metrics` — **Prometheus metrics**: returns all registered metrics in Prometheus text format
 - `hash_update_successful` flag indicates service liveness
 - `ready` flag set to `True` after first successful poll cycle completes
 - Hash updated at most once per `HASH_INTERVAL` seconds
@@ -2924,7 +2963,10 @@ config:
   - `test_orchestrated_evacuation.py` (orchestrated evacuation tests)
   - `test_heartbeat_detection.py` (heartbeat detection tests)
   - `test_heartbeat_scale.py` (heartbeat scale tests)
-- **Documentation**: This file (INSTANCEHA_ARCHITECTURE.md)
+- **Documentation**:
+  - This file (INSTANCEHA_ARCHITECTURE.md)
+  - [INSTANCEHA_GUIDE.md](INSTANCEHA_GUIDE.md) — Operator deployment and configuration guide
+  - [INSTANCEHA_PROMETHEUS.md](INSTANCEHA_PROMETHEUS.md) — Prometheus monitoring, alerting, and dashboards
 - **OpenStack API**: https://docs.openstack.org/api-ref/compute/
 - **Redfish**: https://www.dmtf.org/standards/redfish
 - **Metal3**: https://metal3.io/
