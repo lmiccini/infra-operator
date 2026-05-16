@@ -417,7 +417,7 @@ class TestIsServiceResumeCandidate(unittest.TestCase):
         self.assertFalse(instanceha._is_service_resume_candidate(svc))
 
     def test_failed_marker_excludes_candidate(self):
-        svc = self._make_svc(disabled_reason='evacuation FAILED: 2024-01-01T00:00:00')
+        svc = self._make_svc(disabled_reason='instanceha evacuation FAILED: 2024-01-01T00:00:00')
         self.assertFalse(instanceha._is_service_resume_candidate(svc))
 
     def test_no_evacuation_marker_not_candidate(self):

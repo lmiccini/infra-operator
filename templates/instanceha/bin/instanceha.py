@@ -80,7 +80,7 @@ HEARTBEAT_CLEANUP_AGE_SECONDS = 600
 LOCK_REASON_EVACUATION = "instanceha-evacuation"
 DISABLED_REASON_EVACUATION = "instanceha evacuation"
 DISABLED_REASON_EVACUATION_COMPLETE = "instanceha evacuation complete"
-DISABLED_REASON_EVACUATION_FAILED = "evacuation FAILED"
+DISABLED_REASON_EVACUATION_FAILED = "instanceha evacuation FAILED"
 DISABLED_REASON_KDUMP_MARKER = "(kdump)"
 
 # Prometheus metrics

@@ -52,7 +52,7 @@ InstanceHA runs as a Kubernetes-managed workload alongside the OpenStack control
 
 1. **Detection**: The agent polls the Nova API every `POLL` seconds (default: 45). It queries all `nova-compute` services and checks each one's `updated_at` timestamp and `state` field. A service is considered failed if it is reported as `down` or if its heartbeat is staler than `DELTA` seconds (default: 30). When heartbeat verification is enabled (`CHECK_HEARTBEAT`), both the Nova service-list poll and the UDP heartbeat channel must agree that a host is unreachable before it is marked as failed.
 
-2. **Safety checks**: Before acting, the agent verifies that the percentage of failed hosts does not exceed the `THRESHOLD` (default: 50%) — calculated against only active services, excluding already-disabled hosts — and that at least one `nova-scheduler` is running. These checks prevent cascading evacuations during infrastructure-wide outages. A `ThresholdExceeded` K8s event is emitted when the limit is hit.
+2. **Safety checks**: Before acting, the agent verifies that the percentage of failed hosts does not exceed the `THRESHOLD` (default: 50%) — calculated against only active services, excluding already-disabled and already-forced-down hosts — and that at least one `nova-scheduler` is running. These checks prevent cascading evacuations during infrastructure-wide outages. A `ThresholdExceeded` K8s event is emitted when the limit is hit.
 
 3. **Fencing**: The failed host is powered off via its baseboard management controller (BMC) using IPMI, Redfish, or the Metal3 Kubernetes API. Fencing ensures the host is truly offline before evacuation begins, preventing split-brain scenarios where the old and new copies of an instance run simultaneously. The server is locked in Nova (API microversion 2.73, reason `instanceha-evacuation`) to prevent concurrent operations.
 
@@ -64,7 +64,7 @@ InstanceHA runs as a Kubernetes-managed workload alongside the OpenStack control
 
 When the InstanceHA pod starts (or restarts after a crash), it reconciles orphaned state before entering the main poll loop:
 
-- Finds hosts with `forced_down=True` and `state=down` but missing an evacuation marker (hosts that were fenced but not fully processed before the pod died).
+- Finds hosts with `forced_down=True` and `state=down` that are not disabled (hosts that were fenced but not fully processed before the pod died).
 - Sets the evacuation marker so the normal resume logic picks them up.
 - Unlocks any VMs left with an `instanceha-evacuation` lock from the previous run.
 - Emits an `OrphanedHostRecovered` K8s event for each recovered host.
@@ -339,14 +339,14 @@ clouds:
 ```yaml
 FencingConfig:
   compute-0:
-    agent: fence_ipmilan
+    agent: ipmi
     ipaddr: 10.0.0.10
     ipport: "623"
     login: admin
     passwd: <ipmi-password>
 
   compute-1:
-    agent: fence_redfish
+    agent: redfish
     ipaddr: 10.0.0.11
     ipport: "443"
     login: root
@@ -355,7 +355,7 @@ FencingConfig:
     uuid: System.Embedded.1
 
   compute-2:
-    agent: fence_metal3
+    agent: bmh
     host: compute-2-bmh
     namespace: openshift-machine-api
     token: <service-account-token>
@@ -430,16 +430,16 @@ Fencing (also called STONITH — Shoot The Other Node In The Head) ensures that 
 
 | Agent | Protocol | Use Case |
 |-------|----------|----------|
-| `fence_ipmilan` | IPMI over LAN | Standard BMC on most server hardware |
-| `fence_redfish` | Redfish (HTTPS) | Modern BMCs (iDRAC, iLO, OpenBMC) |
-| `fence_metal3` | Kubernetes API | Bare-metal hosts managed by Metal3/Ironic |
+| `ipmi` | IPMI over LAN | Standard BMC on most server hardware |
+| `redfish` | Redfish (HTTPS) | Modern BMCs (iDRAC, iLO, OpenBMC) |
+| `bmh` | Kubernetes API | Bare-metal hosts managed by Metal3/Ironic |
 | `noop` | None | Testing and development only |
 
 ### IPMI Configuration
 
 ```yaml
 compute-0:
-  agent: fence_ipmilan
+  agent: ipmi
   ipaddr: 10.0.0.10    # BMC IP address
   ipport: "623"         # IPMI port (default: 623)
   login: admin          # BMC username
@@ -450,7 +450,7 @@ compute-0:
 
 ```yaml
 compute-1:
-  agent: fence_redfish
+  agent: redfish
   ipaddr: 10.0.0.11     # BMC IP/hostname
   ipport: "443"          # Redfish port
   login: root            # BMC username
@@ -459,13 +459,13 @@ compute-1:
   uuid: System.Embedded.1  # Redfish system ID
 ```
 
-Redfish operations retry up to 3 times with per-request timeout of `FENCING_TIMEOUT / 3`. All URLs are validated to prevent SSRF attacks (localhost and link-local addresses are blocked).
+Redfish operations retry up to 3 times with per-request timeout of `FENCING_TIMEOUT` (clamped to 5–300 seconds). All URLs are validated to prevent SSRF attacks (localhost and link-local addresses are blocked).
 
 ### Metal3 (BMH) Configuration
 
 ```yaml
 compute-2:
-  agent: fence_metal3
+  agent: bmh
   host: compute-2-bmh      # BareMetalHost CR name
   namespace: openshift-machine-api  # BMH namespace
   token: <sa-token>        # ServiceAccount bearer token
@@ -558,16 +558,16 @@ config:
 Evacuates instances in priority-ordered phases, useful when applications have startup dependencies (e.g., databases before application servers). Phases are defined via instance metadata:
 
 ```bash
-# Assign a server to restart group 1 (databases first)
+# Assign a server to restart group 1 (databases first — highest priority)
 openstack server set --property instanceha:restart_group=1 db-server
-openstack server set --property instanceha:restart_priority=100 db-server
+openstack server set --property instanceha:restart_priority=1000 db-server
 
-# Assign a server to restart group 2 (application servers second)
+# Assign a server to restart group 2 (application servers second — lower priority)
 openstack server set --property instanceha:restart_group=2 app-server
 openstack server set --property instanceha:restart_priority=500 app-server
 ```
 
-Servers within the same group are evacuated concurrently (up to `WORKERS` threads). Groups execute sequentially in ascending order. The default group is 0 and default priority is 500. Like smart evacuation, a failure in one group does not prevent subsequent groups from being processed.
+Servers within the same group are evacuated concurrently (up to `WORKERS` threads). Groups execute sequentially in **descending priority order** (highest priority number first). Servers without metadata are placed in individual phases with default priority 500. Like smart evacuation, a failure in one group does not prevent subsequent groups from being processed.
 
 ---
 
@@ -670,11 +670,11 @@ config:
   TAGGED_AGGREGATES: "true"
 ```
 
-The threshold is calculated against active services only (already-disabled hosts are excluded from the denominator). When `TAGGED_AGGREGATES` is enabled, the percentage is calculated against only the hosts in evacuable aggregates.
+The threshold is calculated against active services only (already-disabled and already-forced-down hosts are excluded from the denominator). When `TAGGED_AGGREGATES` is enabled, the percentage is calculated against only the hosts in evacuable aggregates.
 
 If the threshold is exceeded, InstanceHA logs an error, emits a `ThresholdExceeded` K8s event, and skips evacuation for that poll cycle, waiting for the situation to resolve or for an operator to intervene.
 
-Setting `THRESHOLD` to `0` disables the check entirely.
+Setting `THRESHOLD` to `100` disables the check entirely (allows up to 100% of hosts to fail before blocking). Setting `THRESHOLD` to `0` blocks all evacuations since any failure exceeds a 0% threshold.
 
 ---
 

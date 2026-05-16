@@ -219,11 +219,11 @@ The initialization is split into five methods, each responsible for a specific d
 
 ---
 
-### 3. CloudConnectionProvider (Protocol)
+### 3. CloudConnectionProvider (ABC)
 
 **Purpose**: Abstract interface for cloud connection management.
 
-**Pattern**: Protocol-based dependency injection for testability.
+**Pattern**: ABC-based dependency injection for testability.
 
 **Interface**:
 ```python
@@ -297,14 +297,23 @@ def track_host_processing(service: 'InstanceHAService', hostname: str):
 ```python
 class UDPSocketManager:
     """Context manager for UDP socket with proper resource cleanup."""
+    def __init__(self, udp_ip, udp_port, label='UDP'):
+        self.udp_ip = udp_ip
+        self.udp_port = udp_port
+        self.label = label
+
     def __enter__(self):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.settimeout(1.0)
         self.socket.bind((self.udp_ip, self.udp_port))
         return self.socket
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.socket:
-            self.socket.close()
+        try:
+            if self.socket:
+                self.socket.close()
+        except (OSError, AttributeError):
+            pass
 ```
 
 ---
@@ -377,10 +386,12 @@ def _try_validate(validator_func: Callable[[], bool], error_msg: str, context: s
 
 VALIDATION_PATTERNS = {
     'k8s_namespace': (r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$', 63),
-    'k8s_resource': (r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]...)*$', 253),
+    'k8s_resource': (r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$', 253),
     'power_action': (['on', 'off', 'status', 'ForceOff', ...], None),
     'ip_address': ('ip', None),
     'port': ('port', None),
+    'username': (r'^[a-zA-Z0-9_-]{1,64}$', 64),
+    'hostname': (r'^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$', 64),
 }
 
 def validate_input(value: str, validation_type: str, context: str) -> bool:
@@ -912,7 +923,7 @@ for phase in phases:
     with ThreadPoolExecutor(max_workers=WORKERS) as executor:
         futures = {executor.submit(_server_evacuate_future, conn, s, target): s
                    for s in phase}
-        # Wait for all futures, fail-fast on any failure
+        # Wait for all futures, continue-on-failure
 ```
 
 **Example**:
@@ -947,8 +958,8 @@ Evacuation order:
 **Evaluation Logic**:
 ```python
 def is_server_evacuable(self, server, evac_flavors=None, evac_images=None):
-    images_enabled = self.config.is_tagged_images_enabled()
-    flavors_enabled = self.config.is_tagged_flavors_enabled()
+    images_enabled = self.config.get_config_value('TAGGED_IMAGES')
+    flavors_enabled = self.config.get_config_value('TAGGED_FLAVORS')
 
     # When tagging is disabled, evacuate all servers (default behavior)
     if not (images_enabled or flavors_enabled):
@@ -1257,7 +1268,7 @@ Each metric increment is co-located with the corresponding `_emit_k8s_event()` c
 
 **Packet Format**:
 ```
-Bytes 0-3: Magic number 0x48425631 (unsigned int, native byte order)
+Bytes 0-3: Magic number 0x48425631 (unsigned int, native or network byte order)
 Bytes 4+:  Hostname (UTF-8, short hostname without domain)
 ```
 
@@ -1347,7 +1358,7 @@ Reserved Hosts: reserved-01 (aggregate-A), reserved-02 (aggregate-B)
 active_services = [s for s in services if 'disabled' not in s.status and not s.forced_down]
 threshold_percent = (len(compute_nodes) / len(active_services)) * 100 if active_services else 0
 
-if threshold_percent > service.config.get_threshold():
+if threshold_percent > service.config.get_config_value('THRESHOLD'):
     logging.error('Impacted (%.1f%%) exceeds threshold', threshold_percent)
     return  # Do not evacuate
 ```
@@ -1414,7 +1425,7 @@ def nova_login(credentials: NovaLoginCredentials) -> Optional[OpenStackClient]:
     )
     session = ksc_session.Session(auth=auth)
     # Nova client scoped to region_name
-    nova = client.Client("2.59", session=session, region_name=credentials.region_name)
+    nova = client.Client("2.73", session=session, region_name=credentials.region_name)
     return nova
 ```
 
@@ -1705,7 +1716,7 @@ _SECRET_PATTERNS = {
     'auth': re.compile(r'\bauth=[^\s)\'\"]+', re.IGNORECASE),
 }
 
-def _safe_log_exception(msg: str, e: Exception):
+def _safe_log_exception(msg: str, e: Exception, include_traceback: bool = False) -> None:
     safe_msg = str(e)
     for secret_word, pattern in _SECRET_PATTERNS.items():
         safe_msg = pattern.sub(f'{secret_word}=***', safe_msg)
@@ -1719,7 +1730,7 @@ def _safe_log_exception(msg: str, e: Exception):
 **Requests SSL Config**:
 ```python
 def get_requests_ssl_config(self) -> Union[bool, str, tuple]:
-    if not self.is_ssl_verification_enabled():
+    if not self.get_config_value('SSL_VERIFY'):
         return False  # Insecure
 
     if self.ssl_cert_path and self.ssl_key_path:
@@ -1776,7 +1787,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
 ### 3. Memory Management
 
 **Cleanup Strategies**:
-- Kdump timestamp cleanup (>100 entries)
+- Kdump timestamp cleanup (>2000 entries)
 - Host processing expiration
 - Generic cleanup helper
 
@@ -1786,7 +1797,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
 
 ### Test Statistics
 
-- **Total Tests**: 653 across 17 test suites
+- **Total Tests**: 656 across 17 test suites
 
 ### Test Categories
 
@@ -1832,7 +1843,7 @@ Core unit tests covering:
 
 **7. Configuration Feature Tests** (`test_config_features.py`):
 - DISABLED, FORCE_ENABLE, LEAVE_DISABLED, TAGGED_AGGREGATES, DELAY, HASH_INTERVAL
-- Critical services check: Scheduler and conductor validation
+- Critical services check: Scheduler validation
 
 **8. Helper Functions Tests** (`test_helper_functions.py`):
 - `_cleanup_filtered_hosts`, `_filter_processing_hosts`, `_prepare_evacuation_resources`, `_count_evacuable_hosts`
@@ -2268,7 +2279,7 @@ config:
 - Groups sorted by highest `instanceha:restart_priority` (descending)
 - Each group evacuated concurrently (using WORKERS thread pool)
 - Groups processed sequentially (wait for completion before next group)
-- Fail-fast: stops on first group failure
+- Continue-on-failure: a failed group does not prevent subsequent groups from being processed
 
 **Server Metadata Keys**:
 - `instanceha:restart_priority`: Integer 1-1000 (default 500). Higher = evacuated first.
@@ -2535,8 +2546,8 @@ openstack aggregate set --property ha-enabled=true production-hosts
 - When `false`: Services are automatically re-enabled when they come back up
 
 **Behavior**:
-- Affects service categorization in `_categorize_services()`
-- When `true`: Services with "evacuation complete" marker are excluded from `reenable` list
+- Affects re-enable filtering in `_process_reenabling()`
+- When `true`: Services with "evacuation complete" marker are skipped during re-enable processing
 - When `false`: Services progress through re-enable workflow (unset force-down → wait for up → enable)
 
 **Testing**:
@@ -2616,7 +2627,7 @@ config:
 - Magic number: `0x1B302A40` (4 bytes)
 - UDP port: 7410
 - Reverse DNS lookup to identify host
-- Timestamp tracking with cleanup (>100 entries)
+- Timestamp tracking with cleanup (>2000 entries)
 
 **Testing**:
 - Extensive kdump workflow tests
@@ -2858,9 +2869,9 @@ export SSL_KEY_PATH=/path/to/client-key.pem
 **Behavior**:
 - **IPMI**: Direct timeout for command execution
 - **Redfish**:
-  - Request timeout: `FENCING_TIMEOUT / 3` (allows 3 retries)
-  - Total operation time: up to `FENCING_TIMEOUT`
+  - Request timeout: `FENCING_TIMEOUT` (clamped to 5–300 seconds per request)
   - Retries on timeout or transient errors (max 3 attempts)
+  - Total operation time: up to `3 * FENCING_TIMEOUT`
 - **BMH**:
   - Kubernetes PATCH timeout: `FENCING_TIMEOUT`
   - Power-off verification timeout: `FENCING_TIMEOUT`
@@ -2944,7 +2955,7 @@ config:
 
 ## References
 
-- **Code**: `instanceha.py` (3,449 lines)
+- **Code**: `instanceha.py` (3,572 lines)
 - **Tests**: 656 tests across 17 test suites
   - `test_unit_core.py` (core unit tests)
   - `test_fencing_agents.py` (fencing agent tests)

@@ -1674,7 +1674,7 @@ class TestResumeEvacuation(BaseTestCase):
 
         for svc in services:
             if (svc.forced_down and svc.state == 'down' and 'disabled' in svc.status and
-                'instanceha evacuation' in svc.disabled_reason and 'evacuation FAILED' not in svc.disabled_reason):
+                'instanceha evacuation' in svc.disabled_reason and 'instanceha evacuation FAILED' not in svc.disabled_reason):
                 to_resume.append(svc)
 
         # Verify we found exactly 2 services to resume
@@ -3451,11 +3451,11 @@ class TestHostStateClassification(BaseTestCase):
         self.assertEqual(to_reenable[0].host, host)
 
     def test_failed_evacuation_classification(self):
-        """Test that services with 'evacuation FAILED' reason are not classified for any action."""
+        """Test that services with 'instanceha evacuation FAILED' reason are not classified for any action."""
         host = 'compute-failed-01'
 
         self.env.add_compute_node(host, state='down', status='disabled', forced_down=True,
-                                 disabled_reason=f'evacuation FAILED: {datetime.now().isoformat()}')
+                                 disabled_reason=f'instanceha evacuation FAILED: {datetime.now().isoformat()}')
         self.env.add_server(host, evacuable=True)
 
         services = [s for s in self.env.mock_nova.services.list(binary='nova-compute') if s.host == host]
@@ -3500,7 +3500,7 @@ class TestHostStateClassification(BaseTestCase):
             'compute-reenable-01': {'state': 'down', 'status': 'enabled', 'forced_down': True},
             'compute-reenable-02': {'state': 'down', 'status': 'enabled', 'forced_down': True},
             'compute-failed-01': {'state': 'down', 'status': 'disabled', 'forced_down': True,
-                                 'disabled_reason': f'evacuation FAILED: {datetime.now().isoformat()}'},
+                                 'disabled_reason': f'instanceha evacuation FAILED: {datetime.now().isoformat()}'},
             'compute-healthy-01': {'state': 'up', 'status': 'enabled', 'forced_down': False}
         }
 
