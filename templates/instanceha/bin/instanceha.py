@@ -36,6 +36,23 @@ from keystoneauth1.exceptions.discovery import DiscoveryFailure
 
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
+try:
+    from instanceha_ai.event_bus import get_event_bus, EventType, Event
+    _AI_AVAILABLE = True
+except ImportError:
+    _AI_AVAILABLE = False
+
+
+def _publish_event(event_type, host="", data=None, source="instanceha"):
+    if not _AI_AVAILABLE:
+        return
+    try:
+        get_event_bus().publish(Event(
+            event_type=event_type, host=host,
+            data=data or {}, source=source))
+    except Exception:
+        pass
+
 
 class ConfigurationError(Exception):
     """Raised when configuration loading or validation fails."""
@@ -2208,6 +2225,7 @@ def _check_kdump(stale_services: List[Any], service: InstanceHAService) -> Tuple
                 service.kdump_fenced_hosts.add(hostname)
                 service.kdump_hosts_checking.pop(hostname, None)
                 logging.info('Host %s fenced via kdump - evacuating', svc.host)
+                _publish_event(EventType.KDUMP_DETECTED, svc.host)
             elif check_start == 0:
                 service.kdump_hosts_checking[hostname] = current_time
                 waiting.append(svc.host)
@@ -2257,6 +2275,7 @@ def _host_enable(connection, nova_service, reenable: bool = False, service=None)
             f'Enabling {nova_service.host}',
         )
         logging.info('Host %s is now enabled', nova_service.host)
+        _publish_event(EventType.HOST_ENABLED, nova_service.host)
         return True
     except Exception:
         return False
@@ -2923,25 +2942,31 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
                 return False
 
             # Execute processing steps
+            _publish_event(EventType.PROCESSING_START, host_name)
+
             if not resume:
                 # Fence (power off) the host before evacuation
                 _emit_k8s_event(host_name, 'FencingStarted',
                                 'Fencing host (power off)')
                 FENCING_TOTAL.labels(host=host_name, result='started').inc()
+                _publish_event(EventType.FENCE_START, host_name, {"action": "off"})
                 if not _execute_step("Fencing", _host_fence, host_name, host_name, 'off', service):
                     _emit_k8s_event(host_name, 'FencingFailed',
                                     'Fencing failed', event_type='Warning')
                     FENCING_TOTAL.labels(host=host_name, result='failed').inc()
+                    _publish_event(EventType.FENCE_RESULT, host_name, {"action": "off", "success": False})
                     return False
                 _emit_k8s_event(host_name, 'FencingSucceeded',
                                 'Host fenced successfully')
                 FENCING_TOTAL.labels(host=host_name, result='succeeded').inc()
+                _publish_event(EventType.FENCE_RESULT, host_name, {"action": "off", "success": True})
 
             # Disable the host (skip if already disabled from previous evacuation attempt)
             # Note: kdump-fenced hosts use resume=True but are NOT yet disabled, so we still disable them
             if not (resume and failed_service.forced_down and 'disabled' in failed_service.status):
                 if not _execute_step("Host disable", _host_disable, host_name, conn, failed_service, service):
                     return False
+                _publish_event(EventType.HOST_DISABLED, host_name)
 
             # Manage reserved hosts and capture the enabled host (if any)
             try:
@@ -2961,11 +2986,13 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
             evac_target = target_host if target_host and service.config.get_config_value('FORCE_RESERVED_HOST_EVACUATION') else None
             if evac_target:
                 logging.info("Forcing evacuation to reserved host: %s", evac_target)
+            _publish_event(EventType.EVACUATION_START, host_name, {"target": evac_target})
             if not _execute_step("Evacuation", _host_evacuate, host_name,
                                 conn, failed_service, service, evac_target):
                 _emit_k8s_event(host_name, 'EvacuationFailed',
                                 'VM evacuation failed', event_type='Warning')
                 EVACUATION_TOTAL.labels(host=host_name, result='failed').inc()
+                _publish_event(EventType.EVACUATION_RESULT, host_name, {"success": False})
                 if target_host:
                     try:
                         servers_on_target = conn.servers.list(
@@ -2985,6 +3012,7 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
             _emit_k8s_event(host_name, 'EvacuationSucceeded',
                             'VM evacuation completed successfully')
             EVACUATION_TOTAL.labels(host=host_name, result='succeeded').inc()
+            _publish_event(EventType.EVACUATION_RESULT, host_name, {"success": True})
 
             if not _execute_step("Recovery", _post_evacuation_recovery, host_name,
                                 conn, failed_service, service, resume):
@@ -2993,6 +3021,7 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
             _emit_k8s_event(host_name, 'RecoveryCompleted',
                             'Host recovery workflow completed')
             RECOVERY_COMPLETED_TOTAL.labels(host=host_name).inc()
+            _publish_event(EventType.PROCESSING_COMPLETE, host_name, {"success": True})
             return True
 
         except Exception as e:
@@ -3001,6 +3030,7 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
                             f'Service processing failed: {_sanitize_message(str(e))}',
                             event_type='Warning')
             PROCESSING_FAILED_TOTAL.labels(host=host_name).inc()
+            _publish_event(EventType.PROCESSING_COMPLETE, host_name, {"success": False, "error": str(e)})
             return False
 
 
@@ -3269,6 +3299,7 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
             _emit_k8s_event(svc.host, 'HostDown',
                             'Compute host detected as down', event_type='Warning')
             HOST_DOWN_TOTAL.labels(host=svc.host).inc()
+            _publish_event(EventType.SERVICE_STATE_CHANGE, svc.host, {"state": "down"})
 
     # Fetch aggregates once per poll cycle to avoid redundant API calls
     aggregates = None
@@ -3299,6 +3330,7 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
                             f'Impacted computes ({threshold_percent:.1f}%) exceed threshold ({threshold}%%), evacuation skipped',
                             event_type='Warning')
             THRESHOLD_EXCEEDED_TOTAL.inc()
+            _publish_event(EventType.THRESHOLD_EXCEEDED, "", {"percent": threshold_percent, "threshold": threshold})
             _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
             return
 
@@ -3574,6 +3606,13 @@ def main():
     conn = _establish_nova_connection(service)
 
     _reconcile_orphaned_hosts(conn)
+
+    if _AI_AVAILABLE:
+        try:
+            from instanceha_ai import start_ai_services
+            start_ai_services(conn, service, config_manager)
+        except Exception as e:
+            logging.warning("AI layer failed to start: %s", e)
 
     def _sigterm_handler(signum, frame):
         logging.info("SIGTERM received, finishing in-flight work before shutdown")

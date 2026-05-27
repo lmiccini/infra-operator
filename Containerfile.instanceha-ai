@@ -1,0 +1,82 @@
+# InstanceHA AI-enabled container image
+#
+# Based on CentOS Stream 10 (Python 3.12), includes:
+# - Python 3 + OpenStack clients (novaclient, keystoneauth1)
+# - PyYAML for configuration parsing
+# - llama-cpp-python for local LLM inference (CPU-only)
+# - MCP SDK for Model Context Protocol server
+# - ipmitool for IPMI fencing
+#
+# Build:
+#   podman build -f Containerfile.instanceha-ai -t instanceha-ai:latest .
+#
+# Usage in InstanceHa CR:
+#   spec:
+#     containerImage: <registry>/instanceha-ai:latest
+
+FROM quay.io/centos/centos:stream10
+
+LABEL maintainer="InstanceHA <openstack-k8s-operators>"
+LABEL description="InstanceHA with AI-augmented monitoring and chat interface"
+
+RUN dnf install -y \
+        python3 \
+        python3-pip \
+        python3-devel \
+        gcc \
+        gcc-c++ \
+        cmake \
+        make \
+        ipmitool \
+        openssh-clients \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+RUN CMAKE_ARGS="-DGGML_NATIVE=OFF" pip3 install --no-cache-dir \
+        python-novaclient \
+        python-keystoneclient \
+        keystoneauth1 \
+        python-openstackclient \
+        PyYAML \
+        prometheus_client \
+        llama-cpp-python \
+        "mcp>=1.25,<2"
+
+RUN dnf remove -y \
+        python3-devel \
+        gcc \
+        gcc-c++ \
+        cmake \
+        make \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+RUN mkdir -p \
+        /var/lib/instanceha \
+        /var/run/instanceha \
+        /var/log/instanceha \
+        /home/cloud-admin/.config/openstack \
+    && chown -R 42401:42401 \
+        /var/lib/instanceha \
+        /var/run/instanceha \
+        /var/log/instanceha \
+        /home/cloud-admin
+
+# Install instanceha_ai as a proper Python package in site-packages.
+# The monolith (instanceha.py) is mounted via ConfigMap at runtime.
+COPY templates/instanceha/bin/instanceha_ai/ /usr/lib/python3.12/site-packages/instanceha_ai/
+
+# Bake instanceha.py into image as fallback (ConfigMap overrides at runtime)
+COPY templates/instanceha/bin/instanceha.py /var/lib/instanceha/instanceha.py
+
+RUN printf '#!/bin/sh\nexec /usr/bin/python3 -m instanceha_ai.chat_client "$@"\n' \
+        > /usr/local/bin/instanceha-chat \
+    && chmod +x /usr/local/bin/instanceha-chat
+
+USER 42401
+
+EXPOSE 8080/tcp
+EXPOSE 8081/tcp
+EXPOSE 7410/udp
+
+CMD ["/usr/bin/python3", "-u", "/var/lib/instanceha/instanceha.py"]

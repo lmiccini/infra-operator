@@ -194,6 +194,11 @@ func instancehaPorts(instance *instancehav1.InstanceHa) []corev1.ContainerPort {
 			Name:          "heartbeat",
 		})
 	}
+	ports = append(ports, corev1.ContainerPort{
+		ContainerPort: 8081,
+		Protocol:      "TCP",
+		Name:          "mcp",
+	})
 	return ports
 }
 
@@ -225,6 +230,14 @@ func instancehaPodVolumeMounts() []corev1.VolumeMount {
 			MountPath: "/var/lib/instanceha/config.yaml",
 			SubPath:   "config.yaml",
 			ReadOnly:  true,
+		},
+		{
+			Name:      "instanceha-run",
+			MountPath: "/var/run/instanceha",
+		},
+		{
+			Name:      "instanceha-log",
+			MountPath: "/var/log/instanceha",
 		},
 	}
 }
@@ -281,6 +294,18 @@ func instancehaPodVolumes(
 						Name: instance.Spec.InstanceHaConfigMap,
 					},
 				},
+			},
+		},
+		{
+			Name: "instanceha-run",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		{
+			Name: "instanceha-log",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
 		},
 	}
