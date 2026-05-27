@@ -436,21 +436,23 @@ class TestWriteTools(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("Invalid action", result.error)
 
-    @patch('instanceha_ai.write_tools.instanceha')
-    def test_fence_host_success(self, mock_instanceha):
+    def test_fence_host_success(self):
+        mock_instanceha = MagicMock()
         mock_instanceha._host_fence.return_value = True
-        from instanceha_ai.write_tools import fence_host
-        result = fence_host("h1", "off", Mock())
+        with patch.dict(sys.modules, {"instanceha": mock_instanceha}):
+            from instanceha_ai.write_tools import fence_host
+            result = fence_host("h1", "off", Mock())
         self.assertTrue(result.success)
 
-    @patch('instanceha_ai.write_tools.instanceha')
-    def test_evacuate_server(self, mock_instanceha):
+    def test_evacuate_server(self):
+        mock_instanceha = MagicMock()
         mock_result = Mock()
         mock_result.accepted = True
         mock_result.reason = "OK"
         mock_instanceha._server_evacuate.return_value = mock_result
-        from instanceha_ai.write_tools import evacuate_server
-        result = evacuate_server(Mock(), "server-123")
+        with patch.dict(sys.modules, {"instanceha": mock_instanceha}):
+            from instanceha_ai.write_tools import evacuate_server
+            result = evacuate_server(Mock(), "server-123")
         self.assertTrue(result.success)
 
 

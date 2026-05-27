@@ -1,11 +1,10 @@
 """Write tools that modify cluster state. Require approval.
 
 These tools call functions directly from the instanceha monolith module
-via `import instanceha`. No sys.modules indirection needed — the monolith
-is a regular Python module on sys.path.
+via ``import instanceha``. The import is deferred to call time so that
+the ``instanceha_ai`` package can be loaded without the monolith present
+(e.g. standalone test mode).
 """
-
-import instanceha
 
 from .tools import ApprovalLevel, ToolResult, tool
 
@@ -18,6 +17,7 @@ def fence_host(host: str, action: str, service) -> ToolResult:
         return ToolResult(success=False, error=f"Invalid action: {action}. Must be 'on' or 'off'")
 
     try:
+        import instanceha
         result = instanceha._host_fence(host, action, service)
         return ToolResult(
             success=bool(result),
@@ -34,6 +34,7 @@ def fence_host(host: str, action: str, service) -> ToolResult:
                    "service": "InstanceHAService", "target_host": "str (optional)"})
 def evacuate_host(connection, failed_service, service, target_host=None) -> ToolResult:
     try:
+        import instanceha
         if target_host:
             result = instanceha._host_evacuate(connection, failed_service, service, target_host)
         else:
@@ -53,6 +54,7 @@ def evacuate_host(connection, failed_service, service, target_host=None) -> Tool
                    "service": "InstanceHAService"})
 def disable_host(connection, nova_service, service=None) -> ToolResult:
     try:
+        import instanceha
         result = instanceha._host_disable(connection, nova_service, service)
         return ToolResult(
             success=bool(result),
@@ -69,6 +71,7 @@ def disable_host(connection, nova_service, service=None) -> ToolResult:
                    "reenable": "bool", "service": "InstanceHAService (optional)"})
 def enable_host(connection, nova_service, reenable: bool = False, service=None) -> ToolResult:
     try:
+        import instanceha
         result = instanceha._host_enable(connection, nova_service, reenable=reenable, service=service)
         return ToolResult(
             success=bool(result),
@@ -85,6 +88,7 @@ def enable_host(connection, nova_service, reenable: bool = False, service=None) 
                    "target_host": "str (optional)"})
 def evacuate_server(connection, server_id: str, target_host=None) -> ToolResult:
     try:
+        import instanceha
         result = instanceha._server_evacuate(connection, server_id, target_host=target_host)
         return ToolResult(
             success=result.accepted,
