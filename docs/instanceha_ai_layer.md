@@ -132,7 +132,72 @@ python3 -m instanceha_ai [OPTIONS]
   --mcp-port PORT       MCP server port (default: 8081)
   --no-mcp              Disable the MCP server
   --no-sample-events    Don't inject sample events into the event bus
+  --endpoint URL        Remote LLM endpoint (OpenAI-compatible API)
+  --model NAME          Model name for the remote endpoint
+  --api-key KEY         API key for the remote endpoint (optional)
   --verbose, -v         Enable debug logging
+```
+
+### Natural language queries with an LLM
+
+By default the standalone mode only supports structured commands (e.g.
+`status`, `servers compute-1`).  To enable free-text natural language queries,
+point the standalone mode at an OpenAI-compatible LLM endpoint.
+
+The easiest local option is [ollama](https://ollama.com):
+
+```bash
+# Install and start ollama (see https://ollama.com/download)
+ollama serve &
+ollama pull llama3.1:8b
+
+# Start standalone with LLM
+cd templates/instanceha/bin
+python3 -m instanceha_ai \
+    --endpoint http://localhost:11434 \
+    --model llama3.1:8b \
+    --socket /tmp/iha.sock
+
+# Connect and ask natural language questions
+INSTANCEHA_SOCKET=/tmp/iha.sock python3 -m instanceha_ai.chat_client
+```
+
+Any OpenAI-compatible API works as the endpoint:
+
+| Backend              | Endpoint example                       | Notes                        |
+|----------------------|----------------------------------------|------------------------------|
+| ollama               | `http://localhost:11434`               | Local, no API key needed     |
+| llama.cpp server     | `http://localhost:8080`                | Local, no API key needed     |
+| vLLM                 | `http://localhost:8000`                | Local or remote              |
+| OpenAI               | `https://api.openai.com`              | Requires `--api-key`         |
+| Azure OpenAI         | `https://<name>.openai.azure.com`     | Requires `--api-key`         |
+| Any compatible proxy | varies                                 | Anything with `/v1/chat/completions` |
+
+When an LLM is connected, any input that doesn't match a structured command is
+sent to the LLM as a natural language query.  The LLM can use tools (read-only
+cluster queries, diagnostics) autonomously and will request approval for write
+operations.
+
+Example session:
+
+```
+instanceha> what's the cluster status?
+The cluster has 5 compute nodes: 3 are up and enabled, 1 (compute-3) is
+down and being evacuated, and 1 (compute-4) is in maintenance. There was
+a failed evacuation for vm-011 due to NoValidHost.
+
+instanceha> why did the evacuation of vm-011 fail?
+Looking at the migration history, vm-011's evacuation from compute-3
+failed with NoValidHost. The cluster has 3 available targets (compute-0,
+compute-1, compute-2), so this is likely a resource constraint on the
+specific VM rather than a cluster-wide capacity issue.
+
+instanceha> status compute-3
+Result (get_service_status):
+  host: compute-3
+  state: down
+  status: disabled
+  ...
 ```
 
 ### Mock cluster

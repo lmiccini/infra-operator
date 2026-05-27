@@ -239,6 +239,18 @@ def main():
         help="Don't inject sample events into the event bus",
     )
     parser.add_argument(
+        "--endpoint", default="",
+        help="Remote LLM endpoint (OpenAI-compatible, e.g. http://localhost:11434/v1)",
+    )
+    parser.add_argument(
+        "--model", default="",
+        help="Model name for the remote LLM endpoint (e.g. llama3.1:8b)",
+    )
+    parser.add_argument(
+        "--api-key", default="",
+        help="API key for the remote LLM endpoint (optional)",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable debug logging",
     )
     args = parser.parse_args()
@@ -270,6 +282,23 @@ def main():
         _inject_sample_events(bus, EventType, Event)
         logging.info("Injected sample events")
 
+    llm_engine = None
+    if args.endpoint:
+        from instanceha_ai.engine import RemoteEngine
+        llm_engine = RemoteEngine(
+            endpoint=args.endpoint,
+            model=args.model or "default",
+            api_key=args.api_key,
+        )
+        if llm_engine.is_available():
+            logging.info("LLM engine connected: %s (model=%s)",
+                         args.endpoint, args.model or "default")
+        else:
+            logging.warning("LLM endpoint not reachable: %s — "
+                            "natural language queries will be unavailable",
+                            args.endpoint)
+            llm_engine = None
+
     audit_logger = AuditLogger(log_path="/tmp/instanceha-standalone-audit.log")
     approval_manager = ApprovalManager(
         auto_approve_level=ApprovalLevel.NONE,
@@ -282,6 +311,7 @@ def main():
         service=service,
         approval_manager=approval_manager,
         socket_path=args.socket,
+        llm_engine=llm_engine,
     )
     chat.start()
 
@@ -313,6 +343,10 @@ def main():
     print(f"  Chat socket:  {args.socket}")
     if mcp_thread:
         print(f"  MCP server:   http://0.0.0.0:{args.mcp_port}")
+    if llm_engine:
+        print(f"  LLM backend:  {args.endpoint} (model={args.model or 'default'})")
+    else:
+        print("  LLM backend:  none (structured commands only)")
     print("  Audit log:    /tmp/instanceha-standalone-audit.log")
     print("  Dry-run mode: enabled (write operations are simulated)")
     print()
