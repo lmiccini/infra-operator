@@ -15,6 +15,17 @@ from .tools import ToolResult, registry as tool_registry
 MAX_TOOL_ITERATIONS = 5
 
 
+def _infer_json_type(type_hint: str) -> str:
+    hint = type_hint.lower().split("(")[0].strip()
+    if hint in ("int", "integer"):
+        return "integer"
+    if hint in ("float", "number"):
+        return "number"
+    if hint in ("bool", "boolean"):
+        return "boolean"
+    return "string"
+
+
 @dataclass
 class AgentResponse:
     message: str
@@ -145,7 +156,8 @@ class Agent:
             properties = {}
             required = []
             for pname, ptype in params.items():
-                prop = {"type": "string", "description": ptype}
+                json_type = _infer_json_type(ptype)
+                prop = {"type": json_type, "description": ptype}
                 if "optional" not in ptype.lower():
                     required.append(pname)
                 properties[pname] = prop
