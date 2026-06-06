@@ -158,6 +158,14 @@ spec:
                 description: OpenStackConfigSecret is the name of the Secret containing
                   the secure.yaml
                 type: string
+              rabbitMQPodSelector:
+                additionalProperties:
+                  type: string
+                description: |-
+                  RabbitMQPodSelector defines the label selector for RabbitMQ pods to monitor.
+                  When any matching pod is not Ready, fencing is suppressed via an annotation
+                  on the InstanceHA CR. Defaults to {"app.kubernetes.io/name": "rabbitmq"} if not specified.
+                type: object
               topologyRef:
                 description: |-
                   TopologyRef to apply the Topology defined by the associated CR referenced

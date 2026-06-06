@@ -90,6 +90,10 @@ thread_safety_tests_passed=0
 heartbeat_detection_tests_passed=0
 heartbeat_scale_tests_passed=0
 aggregate_threshold_tests_passed=0
+recovery_cooldown_tests_passed=0
+correlated_staleness_tests_passed=0
+fencing_suppression_tests_passed=0
+nova_freshness_tests_passed=0
 
 # Run core unit tests
 echo -e "${BLUE}Running Core Unit Tests...${NC}"
@@ -259,13 +263,49 @@ fi
 echo
 echo
 
+# Run recovery cooldown tests
+echo -e "${BLUE}Running Recovery Cooldown Tests...${NC}"
+if run_test_file "test_recovery_cooldown.py" "Recovery Cooldown Tests"; then
+    recovery_cooldown_tests_passed=1
+fi
+
+echo
+echo
+
+# Run correlated staleness tests
+echo -e "${BLUE}Running Correlated Staleness Tests...${NC}"
+if run_test_file "test_correlated_staleness.py" "Correlated Staleness Tests"; then
+    correlated_staleness_tests_passed=1
+fi
+
+echo
+echo
+
+# Run fencing suppression tests
+echo -e "${BLUE}Running Fencing Suppression Tests...${NC}"
+if run_test_file "test_fencing_suppression.py" "Fencing Suppression Tests"; then
+    fencing_suppression_tests_passed=1
+fi
+
+echo
+echo
+
+# Run Nova freshness tests
+echo -e "${BLUE}Running Nova Freshness Tests...${NC}"
+if run_test_file "test_nova_freshness.py" "Nova Freshness Tests"; then
+    nova_freshness_tests_passed=1
+fi
+
+echo
+echo
+
 # Summary
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}            Test Summary                ${NC}"
 echo -e "${BLUE}========================================${NC}"
 
-total_passed=$((unit_core_tests_passed + fencing_tests_passed + kdump_tests_passed + security_tests_passed + critical_error_tests_passed + evacuation_workflow_tests_passed + config_features_tests_passed + helper_functions_tests_passed + functional_tests_passed + integration_tests_passed + region_isolation_tests_passed + coverage_gaps_tests_passed + orchestrated_evacuation_tests_passed + k8s_events_tests_passed + k8s_partition_tests_passed + thread_safety_tests_passed + heartbeat_detection_tests_passed + heartbeat_scale_tests_passed + aggregate_threshold_tests_passed))
-total_tests=19
+total_passed=$((unit_core_tests_passed + fencing_tests_passed + kdump_tests_passed + security_tests_passed + critical_error_tests_passed + evacuation_workflow_tests_passed + config_features_tests_passed + helper_functions_tests_passed + functional_tests_passed + integration_tests_passed + region_isolation_tests_passed + coverage_gaps_tests_passed + orchestrated_evacuation_tests_passed + k8s_events_tests_passed + k8s_partition_tests_passed + thread_safety_tests_passed + heartbeat_detection_tests_passed + heartbeat_scale_tests_passed + aggregate_threshold_tests_passed + recovery_cooldown_tests_passed + correlated_staleness_tests_passed + fencing_suppression_tests_passed + nova_freshness_tests_passed))
+total_tests=23
 
 if [ $unit_core_tests_passed -eq 1 ]; then
     echo -e "${GREEN}[PASS] Core Unit Tests: PASSED${NC}"
@@ -379,6 +419,30 @@ if [ $aggregate_threshold_tests_passed -eq 1 ]; then
     echo -e "${GREEN}[PASS] Aggregate Threshold Tests: PASSED${NC}"
 else
     echo -e "${RED}[FAIL] Aggregate Threshold Tests: FAILED${NC}"
+fi
+
+if [ $recovery_cooldown_tests_passed -eq 1 ]; then
+    echo -e "${GREEN}[PASS] Recovery Cooldown Tests: PASSED${NC}"
+else
+    echo -e "${RED}[FAIL] Recovery Cooldown Tests: FAILED${NC}"
+fi
+
+if [ $correlated_staleness_tests_passed -eq 1 ]; then
+    echo -e "${GREEN}[PASS] Correlated Staleness Tests: PASSED${NC}"
+else
+    echo -e "${RED}[FAIL] Correlated Staleness Tests: FAILED${NC}"
+fi
+
+if [ $fencing_suppression_tests_passed -eq 1 ]; then
+    echo -e "${GREEN}[PASS] Fencing Suppression Tests: PASSED${NC}"
+else
+    echo -e "${RED}[FAIL] Fencing Suppression Tests: FAILED${NC}"
+fi
+
+if [ $nova_freshness_tests_passed -eq 1 ]; then
+    echo -e "${GREEN}[PASS] Nova Freshness Tests: PASSED${NC}"
+else
+    echo -e "${RED}[FAIL] Nova Freshness Tests: FAILED${NC}"
 fi
 
 echo

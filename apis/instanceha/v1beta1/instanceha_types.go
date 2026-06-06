@@ -141,6 +141,12 @@ type InstanceHaSpec struct {
 	//+operator-sdk:csv:customresourcedefinitions:type=spec
 	// MetricsTLS - Parameters related to TLS for the metrics endpoint
 	MetricsTLS InstanceHaMetricsTLS `json:"metricsTLS,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// RabbitMQPodSelector defines the label selector for RabbitMQ pods to monitor.
+	// When any matching pod is not Ready, fencing is suppressed via an annotation
+	// on the InstanceHA CR. Defaults to {"app.kubernetes.io/name": "rabbitmq"} if not specified.
+	RabbitMQPodSelector map[string]string `json:"rabbitMQPodSelector,omitempty"`
 }
 
 // InstanceHaStatus defines the observed state of InstanceHa

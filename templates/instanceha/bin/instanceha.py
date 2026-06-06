@@ -169,6 +169,22 @@ HEARTBEAT_CLIFF_TOTAL = Counter(
     'instanceha_heartbeat_cliff_total',
     'Times fencing was skipped due to sudden heartbeat loss',
 )
+K8S_RECOVERY_COOLDOWN_ACTIVE = Gauge(
+    'instanceha_k8s_recovery_cooldown_active',
+    'Whether the K8s API recovery cooldown is active (1=yes, 0=no)',
+)
+CORRELATED_STALENESS_TOTAL = Counter(
+    'instanceha_correlated_staleness_total',
+    'Times fencing was skipped due to correlated staleness detection',
+)
+FENCING_SUPPRESSED = Gauge(
+    'instanceha_fencing_suppressed',
+    'Whether fencing is suppressed by controller annotation (1=yes, 0=no)',
+)
+NOVA_DATA_FRESHNESS = Gauge(
+    'instanceha_nova_data_freshness_percent',
+    'Percentage of Nova compute services with fresh timestamps',
+)
 
 
 # Enums
@@ -667,6 +683,10 @@ class ConfigManager:
         'EVACUATION_RETRIES': ConfigItem('int', DEFAULT_EVACUATION_RETRIES, 1, 20),
         'HEARTBEAT_CLIFF_THRESHOLD': ConfigItem('int', 50, 10, 100),
         'K8S_API_CHECK_INTERVAL': ConfigItem('int', 15, 5, 120),
+        'K8S_API_RECOVERY_COOLDOWN': ConfigItem('int', 120, 0, 600),
+        'STALENESS_CORRELATION_WINDOW': ConfigItem('int', 30, 5, 120),
+        'STALENESS_CORRELATION_MIN_PERCENT': ConfigItem('int', 10, 1, 50),
+        'NOVA_FRESHNESS_THRESHOLD': ConfigItem('int', 50, 0, 100),
     }
 
     def get_config_value(self, key: str) -> Union[str, int, bool, List]:
@@ -758,6 +778,7 @@ class InstanceHAService(CloudConnectionProvider):
         self._last_hash_time = 0
         self.ready = False
         self.k8s_api_reachable = False
+        self.k8s_api_recovery_time = 0.0
 
         # Caching
         self._evacuable_flavors_cache = None
@@ -1192,7 +1213,17 @@ class InstanceHAService(CloudConnectionProvider):
             try:
                 interval = self.config.get_config_value('K8S_API_CHECK_INTERVAL')
                 if _check_k8s_api_reachable():
-                    if consecutive_failures > 0:
+                    if consecutive_failures >= max_failures:
+                        logging.info("K8s API connectivity restored after %d failures, "
+                                     "entering recovery cooldown",
+                                     consecutive_failures)
+                        self.k8s_api_recovery_time = time.monotonic()
+                        K8S_RECOVERY_COOLDOWN_ACTIVE.set(1)
+                        _emit_k8s_event('cluster', 'RecoveryCooldown',
+                                        f'K8s API restored after {consecutive_failures} failures, '
+                                        f'suppressing fencing during cooldown',
+                                        event_type='Warning')
+                    elif consecutive_failures > 0:
                         logging.info("K8s API connectivity restored after %d failures",
                                      consecutive_failures)
                     consecutive_failures = 0
@@ -2719,6 +2750,43 @@ def _check_k8s_api_reachable():
         return False
 
 
+_FENCING_SUPPRESSED_ANNOTATION = 'instanceha.openstack.org/fencing-suppressed'
+
+
+def _check_fencing_suppressed():
+    """Check if the controller has set a fencing suppression annotation on the CR.
+
+    Returns (suppressed: bool, reason: str). Fails open — returns (False, "")
+    on any error so that fencing is not permanently blocked.
+    """
+    token, namespace = _get_k8s_credentials()
+    if not token:
+        return False, ""
+
+    cr_name = os.environ.get('INSTANCEHA_CR_NAME', '')
+    if not cr_name:
+        return False, ""
+
+    headers = {'Authorization': f'Bearer {token}'}
+    try:
+        url = (f"{_K8S_API_BASE}/apis/instanceha.openstack.org/v1beta1"
+               f"/namespaces/{namespace}/instancehas/{cr_name}")
+        response = requests.get(url, headers=headers,
+                                verify=_K8S_CA_PATH, timeout=5)
+        if response.status_code != 200:
+            return False, ""
+
+        cr = response.json()
+        annotations = cr.get('metadata', {}).get('annotations', {})
+        reason = annotations.get(_FENCING_SUPPRESSED_ANNOTATION, '')
+        if reason:
+            return True, reason
+        return False, ""
+    except Exception as e:
+        logging.debug("Failed to check fencing suppression annotation: %s", e)
+        return False, ""
+
+
 def _emit_k8s_event(host, reason, message, event_type='Normal'):
     """Emit a Kubernetes Event on the InstanceHA CR."""
     token, namespace = _get_k8s_credentials()
@@ -2977,6 +3045,51 @@ def _categorize_services(services: List[Any], target_date: datetime) -> tuple:
 
     return compute_nodes, resume, reenable
 
+def _validate_nova_data_freshness(services, target_date, threshold):
+    """Check whether Nova's data pipeline is healthy by measuring freshness of service timestamps.
+
+    Returns (is_fresh, fresh_pct, total, fresh_count).
+    """
+    active_services = [s for s in services
+                       if 'disabled' not in s.status and not s.forced_down]
+    total = len(active_services)
+    if total == 0:
+        return True, 100.0, 0, 0
+
+    fresh_count = sum(1 for svc in active_services
+                      if not _is_service_stale(svc, target_date))
+
+    fresh_pct = (fresh_count / total) * 100
+    return fresh_pct >= threshold, fresh_pct, total, fresh_count
+
+
+def _detect_correlated_staleness(compute_nodes, correlation_window):
+    """Detect if multiple services became stale within a narrow time window.
+
+    Returns True if >=3 services are stale and all their updated_at timestamps
+    fall within correlation_window seconds of each other.
+    """
+    if len(compute_nodes) < 3:
+        return False
+
+    timestamps = []
+    for svc in compute_nodes:
+        try:
+            updated = svc.updated_at
+            ts = datetime.fromisoformat(
+                str(updated).replace('Z', '+00:00')).replace(tzinfo=None)
+            timestamps.append(ts)
+        except (ValueError, TypeError, AttributeError):
+            continue
+
+    if len(timestamps) < 3:
+        return False
+
+    ts_sorted = sorted(timestamps)
+    spread = (ts_sorted[-1] - ts_sorted[0]).total_seconds()
+    return spread <= correlation_window
+
+
 def _check_critical_services(services):
     """Check if critical Nova services are operational for evacuation."""
     # Check if at least one scheduler is up
@@ -3167,6 +3280,49 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
     if not (compute_nodes or to_resume):
         _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
         return
+
+    # Correlated staleness detection — if many services went stale simultaneously,
+    # it's likely a control plane issue, not multiple compute failures.
+    # Requires heartbeat checking to distinguish control plane issues from
+    # genuine multi-node failures: suppress fencing only if heartbeats confirm
+    # hosts are alive; proceed if heartbeats are also absent.
+    # The minimum count scales with cluster size: max(3, total * min_pct / 100).
+    if service.config.get_config_value('CHECK_HEARTBEAT'):
+        correlation_window = service.config.get_config_value('STALENESS_CORRELATION_WINDOW')
+        min_pct = service.config.get_config_value('STALENESS_CORRELATION_MIN_PERCENT')
+        total_services = len(services) if services else 0
+        correlation_min = max(3, total_services * min_pct // 100)
+        if len(compute_nodes) >= correlation_min and _detect_correlated_staleness(compute_nodes, correlation_window):
+            suppress = True
+            heartbeat_timeout = service.config.get_config_value('HEARTBEAT_TIMEOUT')
+            with service.heartbeat_lock:
+                timestamps_snapshot = dict(service.heartbeat_hosts_timestamp)
+            hosts_with_heartbeat = 0
+            for svc in compute_nodes:
+                hostname = _extract_hostname(svc.host)
+                last_hb = timestamps_snapshot.get(hostname, 0)
+                if last_hb > 0 and (current_time - last_hb) <= heartbeat_timeout:
+                    hosts_with_heartbeat += 1
+            if hosts_with_heartbeat == 0:
+                suppress = False
+                logging.warning(
+                    'Correlated staleness detected (%d services within %ds) but no '
+                    'heartbeats received — proceeding with fencing (possible genuine multi-node failure)',
+                    len(compute_nodes), correlation_window)
+
+            if suppress:
+                logging.warning(
+                    'Correlated staleness detected: %d/%d services went stale within %ds window '
+                    '(threshold %d) — possible control plane disruption, skipping fencing this cycle',
+                    len(compute_nodes), total_services, correlation_window, correlation_min)
+                _emit_k8s_event('cluster', 'CorrelatedStaleness',
+                                f'{len(compute_nodes)}/{total_services} services went stale within '
+                                f'{correlation_window}s (threshold {correlation_min}) — '
+                                f'skipping fencing (possible control plane disruption)',
+                                event_type='Warning')
+                CORRELATED_STALENESS_TOTAL.inc()
+                _cleanup_filtered_hosts(service, marked_hostnames, set(), current_time)
+                return
 
     # Filter out hosts still reachable via heartbeat
     if service.config.get_config_value('CHECK_HEARTBEAT'):
@@ -3528,12 +3684,60 @@ def main():
                 service.shutdown_event.wait(poll_interval)
                 continue
 
+            if service.k8s_api_recovery_time > 0:
+                cooldown = service.config.get_config_value('K8S_API_RECOVERY_COOLDOWN')
+                elapsed = time.monotonic() - service.k8s_api_recovery_time
+                if elapsed < cooldown:
+                    logging.warning(
+                        "Skipping fencing — K8s API recovered %.0fs ago, "
+                        "cooldown %ds (Nova data may still be stale)",
+                        elapsed, cooldown)
+                    K8S_RECOVERY_COOLDOWN_ACTIVE.set(1)
+                    service.shutdown_event.wait(poll_interval)
+                    continue
+                else:
+                    logging.info("K8s API recovery cooldown expired after %ds", cooldown)
+                    K8S_RECOVERY_COOLDOWN_ACTIVE.set(0)
+                    _emit_k8s_event('cluster', 'RecoveryCooldownExpired',
+                                    f'Recovery cooldown expired ({cooldown}s), '
+                                    f'resuming normal fencing operations')
+                    service.k8s_api_recovery_time = 0.0
+
+            suppressed, suppression_reason = _check_fencing_suppressed()
+            if suppressed:
+                logging.warning(
+                    "Skipping fencing — suppressed by controller: %s",
+                    suppression_reason)
+                FENCING_SUPPRESSED.set(1)
+                service.shutdown_event.wait(poll_interval)
+                continue
+            else:
+                FENCING_SUPPRESSED.set(0)
+
             services = conn.services.list(binary="nova-compute")
             if not services:
                 service.shutdown_event.wait(poll_interval)
                 continue
 
             target_date = datetime.now(timezone.utc) - timedelta(seconds=service.config.get_config_value('DELTA'))
+
+            freshness_threshold = service.config.get_config_value('NOVA_FRESHNESS_THRESHOLD')
+            if freshness_threshold > 0:
+                is_fresh, fresh_pct, total, fresh_count = _validate_nova_data_freshness(
+                    services, target_date, freshness_threshold)
+                NOVA_DATA_FRESHNESS.set(fresh_pct)
+                if not is_fresh:
+                    logging.warning(
+                        "Skipping fencing — Nova data freshness %.1f%% below threshold %d%% "
+                        "(%d/%d services fresh, possible RabbitMQ disruption)",
+                        fresh_pct, freshness_threshold, fresh_count, total)
+                    _emit_k8s_event('cluster', 'NovaDataStale',
+                                    f'Nova data freshness {fresh_pct:.1f}% below threshold '
+                                    f'{freshness_threshold}% ({fresh_count}/{total} fresh)',
+                                    event_type='Warning')
+                    service.shutdown_event.wait(poll_interval)
+                    continue
+
             compute_nodes, to_resume, to_reenable = _categorize_services(services, target_date)
 
             compute_nodes_list = list(compute_nodes)

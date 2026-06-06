@@ -1111,6 +1111,10 @@ In addition, each event emission site also increments a corresponding Prometheus
 | `HostReachable` | Warning | compute host | Host reported down by Nova but still reachable via heartbeat (CHECK_HEARTBEAT) |
 | `HostReenabled` | Normal | compute host | Host re-enabled after successful evacuation |
 | `HeartbeatCliff` | Warning | `cluster` | Sudden heartbeat loss detected — possible network partition, fencing skipped for this cycle |
+| `CorrelatedStaleness` | Warning | `cluster` | Multiple services went stale within the correlation window — possible control plane disruption, fencing skipped (requires CHECK_HEARTBEAT) |
+| `RecoveryCooldown` | Warning | `cluster` | K8s API restored after failures, suppressing fencing during recovery cooldown |
+| `RecoveryCooldownExpired` | Normal | `cluster` | Recovery cooldown expired, normal fencing operations resumed |
+| `NovaDataStale` | Warning | `cluster` | Nova data freshness below NOVA_FRESHNESS_THRESHOLD — possible RabbitMQ disruption, fencing skipped |
 | `OrphanedHostRecovered` | Warning | compute host | Startup reconciliation recovered a fenced host left without evacuation marker |
 
 ### Event Structure
@@ -1315,7 +1319,82 @@ Minimum packet size: 45 bytes (4 magic + 8 timestamp + 1 hostname + 32 HMAC).
 
 ---
 
-### 5. Reserved Hosts
+### 5. K8s API Recovery Cooldown
+
+**Purpose**: Suppress fencing for a configurable window after the K8s API recovers from a partition. Nova data may still reflect the pre-partition state — acting on stale data could trigger false evacuations.
+
+**Configuration**: `K8S_API_RECOVERY_COOLDOWN: 120` (default 120s, range 0–600; set 0 to disable)
+
+**Behavior**:
+1. When the K8s API background checker restores connectivity after ≥3 consecutive failures, `k8s_api_recovery_time` is recorded and `K8S_RECOVERY_COOLDOWN_ACTIVE` gauge is set to 1
+2. A `RecoveryCooldown` K8s event (Warning) is emitted
+3. Each poll cycle checks `elapsed < K8S_API_RECOVERY_COOLDOWN` — if true, fencing is skipped
+4. When the cooldown expires, `RecoveryCooldownExpired` K8s event (Normal) is emitted, the gauge is set to 0, and normal operations resume
+
+**Prometheus**: `instanceha_k8s_recovery_cooldown_active` gauge (1=active, 0=inactive)
+
+---
+
+### 6. Correlated Staleness Detection
+
+**Purpose**: Detect when multiple compute services go stale simultaneously — a pattern more consistent with a control plane disruption (e.g., RabbitMQ outage, Nova API overload) than independent host failures.
+
+**Requires**: `CHECK_HEARTBEAT: true` — without heartbeat data, the feature cannot distinguish control plane issues from genuine multi-node failures and is skipped entirely.
+
+**Configuration**:
+- `STALENESS_CORRELATION_WINDOW: 30` (default 30s, range 5–120) — time window for timestamp spread
+- `STALENESS_CORRELATION_MIN_PERCENT: 10` (default 10%, range 1–50) — minimum percentage of services that must be stale; actual minimum count is `max(3, total_services × pct / 100)`
+
+**Behavior**:
+1. Before processing stale services, check if the count meets `max(3, total × min_pct / 100)` and `_detect_correlated_staleness()` confirms all timestamps fall within the correlation window
+2. If correlated: cross-check heartbeats for each stale host
+3. If heartbeats confirm hosts are alive → suppress fencing (control plane issue), emit `CorrelatedStaleness` K8s event, increment `instanceha_correlated_staleness_total`
+4. If no heartbeats received → proceed with fencing (genuine multi-node failure)
+
+**Prometheus**: `instanceha_correlated_staleness_total` counter
+
+---
+
+### 7. Nova Data Freshness Validation
+
+**Purpose**: Detect when an upstream disruption (typically RabbitMQ) causes Nova to stop receiving service heartbeats, making many or all compute services appear stale simultaneously.
+
+**Configuration**: `NOVA_FRESHNESS_THRESHOLD: 50` (default 50%, range 0–100; set 0 to disable)
+
+**Behavior**:
+1. Before categorizing stale services, calculate what percentage of all Nova compute services have fresh `updated_at` timestamps (not older than `DELTA` seconds)
+2. If freshness falls below the threshold, skip fencing and emit a `NovaDataStale` K8s event (Warning)
+3. The `instanceha_nova_data_freshness_percent` gauge tracks the current value each cycle
+
+**Prometheus**: `instanceha_nova_data_freshness_percent` gauge
+
+---
+
+### 8. Controller-Driven Fencing Suppression
+
+**Purpose**: Allow the Go controller to suppress fencing based on infrastructure health signals that are visible to the controller but not to the Python agent (Node status, RabbitMQ pod readiness).
+
+**Architecture**:
+- The controller runs `reconcileFencingSuppression()` on every reconcile
+- It checks two signals:
+  1. **Node health**: lists all Nodes, flags any with `Ready != True`
+  2. **RabbitMQ pod health**: lists pods matching `spec.rabbitMQPodSelector` (default `{"app.kubernetes.io/name": "rabbitmq"}`), flags any that aren't Ready
+- If problems are found, the annotation `instanceha.openstack.org/fencing-suppressed` is set on the CR with pipe-delimited reasons (e.g., `"node:worker-2 False|rabbitmq:rabbitmq-server-0 not ready"`)
+- When all checks pass, the annotation is removed
+- The controller watches Node and RabbitMQ pod changes to trigger immediate reconciliation
+
+**Configuration**: `spec.rabbitMQPodSelector` on the InstanceHa CR — a `map[string]string` label selector where all labels must match (AND logic). Defaults to `{"app.kubernetes.io/name": "rabbitmq"}`.
+
+**Python agent side**:
+- `_check_fencing_suppressed()` reads the CR annotation via the K8s API each poll cycle
+- If the annotation is present, fencing is skipped and `instanceha_fencing_suppressed` gauge is set to 1
+- Fails open: any error reading the annotation allows fencing to proceed
+
+**Prometheus**: `instanceha_fencing_suppressed` gauge (1=suppressed, 0=normal)
+
+---
+
+### 9. Reserved Hosts
 
 **Purpose**: Maintain spare capacity by auto-enabling reserved hosts and optionally forcing evacuation to them.
 
@@ -1361,7 +1440,7 @@ Reserved Hosts: reserved-01 (aggregate-A), reserved-02 (aggregate-B)
 
 ---
 
-### 6. Caching System
+### 10. Caching System
 
 **Purpose**: Cache evacuable resources to reduce Nova API calls.
 
@@ -1379,7 +1458,7 @@ Reserved Hosts: reserved-01 (aggregate-A), reserved-02 (aggregate-B)
 
 ---
 
-### 7. Threshold Protection
+### 11. Threshold Protection
 
 **Purpose**: Prevent mass evacuations during datacenter-level failures.
 
@@ -2867,6 +2946,8 @@ POLL=45, KDUMP_TIMEOUT=300
 **Usage**:
 - Controls whether heartbeat UDP listener thread is started (port 7411)
 - Affects host filtering in `_filter_reachable_hosts()` before evacuation
+- Required for correlated staleness detection (`STALENESS_CORRELATION_WINDOW`, `STALENESS_CORRELATION_MIN_PERCENT`)
+- Required for heartbeat cliff detection (`HEARTBEAT_CLIFF_THRESHOLD`)
 
 **Behavior**:
 - **Enabled**:
@@ -2876,10 +2957,12 @@ POLL=45, KDUMP_TIMEOUT=300
   - If heartbeat recent: skip fencing (nova-compute crash, not host failure)
   - If no heartbeat: proceed with normal evacuation
   - Grace period: first `HEARTBEAT_TIMEOUT` seconds after listener startup, all hosts bypass heartbeat filtering
+  - Enable correlated staleness detection and heartbeat cliff detection
 
 - **Disabled**:
   - No heartbeat listener thread
   - All down hosts processed through normal fencing/evacuation
+  - Correlated staleness detection and heartbeat cliff detection are skipped
 
 **Compute-Side Requirements**:
 - Deploy `edpm_instanceha_monitoring` role via edpm-ansible
@@ -3107,6 +3190,107 @@ config:
 
 ---
 
+#### K8S_API_RECOVERY_COOLDOWN
+**Type**: Integer
+**Default**: `120`
+**Range**: `0-600` seconds
+
+**Description**: Suppression window after the K8s API recovers from a partition. During the cooldown, fencing is blocked because Nova data may still reflect the pre-partition state and could trigger false evacuations.
+
+**Usage**:
+- After the K8s API background checker restores connectivity following ≥3 consecutive failures, `k8s_api_recovery_time` is recorded
+- Each poll cycle checks `elapsed < K8S_API_RECOVERY_COOLDOWN` — if true, fencing is skipped
+- When the cooldown expires, a `RecoveryCooldownExpired` K8s event is emitted and normal operations resume
+- Set to `0` to disable the cooldown entirely
+
+**Testing**:
+- Test files: `test_recovery_cooldown.py`
+
+**Example**:
+```yaml
+config:
+  K8S_API_RECOVERY_COOLDOWN: 180  # 3-minute cooldown after K8s API recovery
+```
+
+---
+
+#### STALENESS_CORRELATION_WINDOW
+**Type**: Integer
+**Default**: `30`
+**Range**: `5-120` seconds
+
+**Description**: Time window for correlated staleness detection. When multiple compute services go stale and their `updated_at` timestamps all fall within this window, it suggests a control plane disruption rather than independent host failures.
+
+**Requires**: `CHECK_HEARTBEAT: true` — without heartbeat data, the feature cannot distinguish control plane issues from genuine multi-node failures and is skipped entirely.
+
+**Usage**:
+- Used by `_detect_correlated_staleness()` to check whether the spread of stale `updated_at` timestamps is within the window
+- If correlated staleness is detected and heartbeats confirm hosts are alive, fencing is suppressed for that cycle
+- If heartbeats are also absent, fencing proceeds (genuine multi-node failure)
+
+**Testing**:
+- Test files: `test_correlated_staleness.py`
+
+**Example**:
+```yaml
+config:
+  CHECK_HEARTBEAT: "true"
+  STALENESS_CORRELATION_WINDOW: 60  # Wider window for large clusters
+```
+
+---
+
+#### STALENESS_CORRELATION_MIN_PERCENT
+**Type**: Integer
+**Default**: `10`
+**Range**: `1-50` (percentage)
+
+**Description**: Minimum percentage of total services that must be stale to trigger correlated staleness detection. The actual minimum count is `max(3, total_services * min_pct / 100)`, so for small clusters the floor of 3 dominates.
+
+**Requires**: `CHECK_HEARTBEAT: true`
+
+**Usage**:
+- At 10 nodes with 10%, the floor of 3 dominates (3 stale services needed)
+- At 100 nodes with 10%, 10 stale services are needed
+- At 1000 nodes with 10%, 100 stale services are needed
+- Prevents the fixed threshold of 3 from being too sensitive in large clusters
+
+**Testing**:
+- Test files: `test_correlated_staleness.py` (TestCorrelatedStalenessScaling)
+
+**Example**:
+```yaml
+config:
+  CHECK_HEARTBEAT: "true"
+  STALENESS_CORRELATION_MIN_PERCENT: 15  # Require 15% of services stale
+```
+
+---
+
+#### NOVA_FRESHNESS_THRESHOLD
+**Type**: Integer
+**Default**: `50`
+**Range**: `0-100` (percentage)
+
+**Description**: Minimum percentage of Nova compute services that must have fresh timestamps (not stale) for fencing to proceed. Detects situations where RabbitMQ disruptions cause Nova to stop updating service timestamps, making many services appear stale simultaneously.
+
+**Usage**:
+- Calculated as `(fresh_count / total_services) * 100` where fresh means `updated_at >= target_date`
+- If freshness percentage falls below threshold, fencing is skipped and a `NovaDataStale` K8s event is emitted
+- The `instanceha_nova_data_freshness_percent` gauge tracks the current value
+- Set to `0` to disable the check
+
+**Testing**:
+- Test files: `test_nova_freshness.py`
+
+**Example**:
+```yaml
+config:
+  NOVA_FRESHNESS_THRESHOLD: 60  # Require 60% of services to have fresh data
+```
+
+---
+
 ## References
 
 - **Code**: `instanceha.py`
@@ -3130,6 +3314,10 @@ config:
   - `test_heartbeat_scale.py` (heartbeat scale tests)
   - `test_aggregate_threshold.py` (per-aggregate failure threshold tests)
   - `test_ipv6_udp.py` (IPv6 UDP listener tests)
+  - `test_recovery_cooldown.py` (K8s API recovery cooldown tests)
+  - `test_correlated_staleness.py` (correlated staleness detection tests)
+  - `test_fencing_suppression.py` (controller fencing suppression tests)
+  - `test_nova_freshness.py` (Nova data freshness tests)
 - **Documentation**:
   - This file (instanceha_architecture.md)
   - [instanceha_guide.md](instanceha_guide.md) — Operator deployment and configuration guide

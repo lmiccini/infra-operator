@@ -157,6 +157,7 @@ Counters increase monotonically and reset to zero on pod restart.
 | `instanceha_orphaned_host_recovered_total` | — | Orphaned fenced hosts recovered during startup reconciliation |
 | `instanceha_heartbeat_rejected_total` | `reason` | Heartbeat packets rejected. `reason`: `hmac_failed`, `timestamp_invalid` |
 | `instanceha_heartbeat_cliff_total` | — | Fencing skipped due to sudden heartbeat loss (possible network partition) |
+| `instanceha_correlated_staleness_total` | — | Fencing skipped due to correlated staleness detection (requires CHECK_HEARTBEAT) |
 | `instanceha_poll_cycles_total` | `result` | Poll cycles executed. `result`: `success`, `error` |
 
 ### Gauges
@@ -168,6 +169,9 @@ Gauges represent current values that can go up or down.
 | `instanceha_poll_consecutive_failures` | Current count of consecutive Nova API poll failures. Resets to 0 on success. |
 | `instanceha_hosts_processing` | Number of hosts currently being fenced/evacuated. |
 | `instanceha_k8s_api_reachable` | Whether the Kubernetes API is reachable (1=yes, 0=no). |
+| `instanceha_k8s_recovery_cooldown_active` | Whether the K8s API recovery cooldown is active (1=yes, 0=no). |
+| `instanceha_fencing_suppressed` | Whether fencing is suppressed by controller annotation (1=yes, 0=no). |
+| `instanceha_nova_data_freshness_percent` | Percentage of Nova compute services with fresh timestamps. |
 
 ### Histograms
 
@@ -323,6 +327,49 @@ spec:
               suggesting the pod's network is partitioned rather than
               multiple hosts failing simultaneously. Fencing was skipped.
 
+        # --- Warning: Recovery cooldown active ---
+        # K8s API recovered from partition, fencing suppressed during cooldown.
+        - alert: InstanceHARecoveryCooldown
+          expr: instanceha_k8s_recovery_cooldown_active == 1
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "InstanceHA recovery cooldown active — fencing suppressed"
+            description: >-
+              The K8s API recovered from a partition and fencing is suppressed
+              during the recovery cooldown (K8S_API_RECOVERY_COOLDOWN seconds)
+              to allow Nova data to stabilize.
+
+        # --- Warning: Correlated staleness detected ---
+        # Multiple services went stale simultaneously — control plane issue.
+        - alert: InstanceHACorrelatedStaleness
+          expr: increase(instanceha_correlated_staleness_total[5m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Correlated staleness detected — possible control plane disruption"
+            description: >-
+              InstanceHA detected multiple compute services going stale within
+              the correlation window, suggesting a control plane disruption
+              rather than independent host failures. Fencing was skipped.
+
+        # --- Warning: Nova data freshness low ---
+        # Not enough services have fresh timestamps — possible RabbitMQ issue.
+        - alert: InstanceHANovaDataStale
+          expr: instanceha_nova_data_freshness_percent < 50
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Nova data freshness low ({{ $value | humanizePercentage }})"
+            description: >-
+              Less than 50% of Nova compute services have fresh timestamps.
+              This may indicate a RabbitMQ disruption preventing Nova from
+              updating service heartbeats. Fencing is blocked while freshness
+              is below the NOVA_FRESHNESS_THRESHOLD.
+
         # --- Warning: Processing failures ---
         # Unhandled exceptions in the service processing pipeline.
         - alert: InstanceHAProcessingFailure
@@ -441,9 +488,13 @@ Expected output:
 # TYPE instanceha_orphaned_host_recovered_total counter
 # TYPE instanceha_heartbeat_rejected_total counter
 # TYPE instanceha_heartbeat_cliff_total counter
+# TYPE instanceha_correlated_staleness_total counter
 # TYPE instanceha_poll_consecutive_failures gauge
 # TYPE instanceha_hosts_processing gauge
 # TYPE instanceha_k8s_api_reachable gauge
+# TYPE instanceha_k8s_recovery_cooldown_active gauge
+# TYPE instanceha_fencing_suppressed gauge
+# TYPE instanceha_nova_data_freshness_percent gauge
 # TYPE instanceha_poll_cycles_total counter
 ```
 
@@ -499,7 +550,18 @@ A useful InstanceHA dashboard contains these panels:
 | Threshold Exceeded | Time series | `increase(instanceha_threshold_exceeded_total[5m])` |
 | Aggregate Threshold Exceeded | Time series | `increase(instanceha_aggregate_threshold_exceeded_total[5m])` grouped by `aggregate` |
 
-#### Row 5: Errors
+#### Row 5: Disruption Safety
+
+| Panel | Type | Query |
+|-------|------|-------|
+| K8s API Reachable | Stat | `instanceha_k8s_api_reachable` |
+| Recovery Cooldown Active | Stat | `instanceha_k8s_recovery_cooldown_active` |
+| Fencing Suppressed | Stat | `instanceha_fencing_suppressed` |
+| Nova Data Freshness | Gauge | `instanceha_nova_data_freshness_percent` |
+| Correlated Staleness | Time series | `increase(instanceha_correlated_staleness_total[5m])` |
+| Heartbeat Cliff | Time series | `increase(instanceha_heartbeat_cliff_total[5m])` |
+
+#### Row 6: Errors
 
 | Panel | Type | Query |
 |-------|------|-------|

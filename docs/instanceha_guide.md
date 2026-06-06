@@ -122,6 +122,10 @@ InstanceHA emits Kubernetes events on the InstanceHa CR to provide observability
 | `AggregateThresholdExceeded` | Warning | Per-aggregate failure threshold exceeded |
 | `OrphanedHostRecovered` | Warning | Recovered fenced host from prior crash |
 | `HeartbeatCliff` | Warning | Sudden heartbeat loss detected — possible network partition, fencing skipped |
+| `CorrelatedStaleness` | Warning | Multiple services went stale within correlation window — possible control plane disruption, fencing skipped (requires CHECK_HEARTBEAT) |
+| `RecoveryCooldown` | Warning | K8s API restored after failures, fencing suppressed during recovery cooldown |
+| `RecoveryCooldownExpired` | Normal | Recovery cooldown expired, normal fencing resumed |
+| `NovaDataStale` | Warning | Nova data freshness below threshold — possible RabbitMQ disruption, fencing skipped |
 
 Events can be viewed with `oc describe instanceha <name>` or `oc get events --field-selector involvedObject.name=<name>`.
 
@@ -147,6 +151,7 @@ In addition to Kubernetes Events, the agent exposes Prometheus metrics at `http:
 | `instanceha_poll_cycles_total` | `result` | Poll cycles executed (result: `success`, `error`) |
 | `instanceha_heartbeat_rejected_total` | `reason` | Heartbeat packets rejected (`hmac_failed`, `timestamp_invalid`) |
 | `instanceha_heartbeat_cliff_total` | | Fencing skipped due to sudden heartbeat loss (possible network partition) |
+| `instanceha_correlated_staleness_total` | | Fencing skipped due to correlated staleness detection (requires CHECK_HEARTBEAT) |
 
 #### Gauges
 
@@ -155,6 +160,9 @@ In addition to Kubernetes Events, the agent exposes Prometheus metrics at `http:
 | `instanceha_poll_consecutive_failures` | Current consecutive Nova API poll failures (resets to 0 on success) |
 | `instanceha_hosts_processing` | Number of hosts currently being processed |
 | `instanceha_k8s_api_reachable` | Whether the Kubernetes API is reachable (1=yes, 0=no) |
+| `instanceha_k8s_recovery_cooldown_active` | Whether the K8s API recovery cooldown is active (1=yes, 0=no) |
+| `instanceha_fencing_suppressed` | Whether fencing is suppressed by controller annotation (1=yes, 0=no) |
+| `instanceha_nova_data_freshness_percent` | Percentage of Nova compute services with fresh timestamps |
 
 #### Histograms
 
@@ -190,14 +198,30 @@ spec:
 
 When the pod receives SIGTERM (during scaling, rolling updates, or node drain), InstanceHA finishes any in-flight fencing or evacuation work before exiting. The Deployment is configured with a 30-second termination grace period. The agent's poll loop and evacuation workers check a shutdown flag between cycles, allowing timely response to shutdown signals.
 
-### Network Partition Detection
+### Disruption Safety
 
-Two complementary mechanisms prevent the agent from fencing healthy hosts when the pod's worker node is network-isolated:
+Multiple defense-in-depth safety gates prevent false fencing of compute nodes during OpenShift cluster disruptions:
 
 **K8s API connectivity check:**
 - A background thread pings the K8s API every `K8S_API_CHECK_INTERVAL` seconds (default: 15) using the in-cluster service account.
 - After 3 consecutive failures, the agent marks itself not-ready and blocks all fencing until connectivity restores and a Nova poll succeeds.
 - The `instanceha_k8s_api_reachable` Prometheus gauge tracks the current state (1=ok, 0=isolated).
+
+**K8s API recovery cooldown:**
+- After the K8s API recovers from a partition (≥3 consecutive failures), fencing is suppressed for `K8S_API_RECOVERY_COOLDOWN` seconds (default: 120) to allow Nova data to stabilize.
+- A `RecoveryCooldown` K8s event is emitted when the cooldown starts, and `RecoveryCooldownExpired` when it ends.
+- The `instanceha_k8s_recovery_cooldown_active` gauge tracks whether the cooldown is active.
+
+**Correlated staleness detection** (requires `CHECK_HEARTBEAT: true`):
+- When multiple compute services go stale and their timestamps fall within `STALENESS_CORRELATION_WINDOW` seconds (default: 30), it suggests a control plane issue rather than independent failures.
+- The minimum stale count scales with cluster size: `max(3, total_services × STALENESS_CORRELATION_MIN_PERCENT / 100)`.
+- Heartbeats are cross-checked: if heartbeats confirm hosts are alive, fencing is suppressed (control plane issue). If heartbeats are also absent, fencing proceeds (genuine multi-node failure).
+- Without heartbeat checking enabled, this detection is skipped entirely — there is no way to distinguish control plane issues from real failures.
+
+**Nova data freshness check:**
+- Before processing stale services, the agent checks what percentage of all Nova compute services have fresh timestamps.
+- If freshness drops below `NOVA_FRESHNESS_THRESHOLD`% (default: 50), fencing is skipped — a low freshness percentage typically indicates a RabbitMQ disruption causing Nova to stop updating timestamps.
+- A `NovaDataStale` K8s event is emitted and the `instanceha_nova_data_freshness_percent` gauge tracks the current value.
 
 **Heartbeat cliff detection:**
 - The agent tracks the count of active heartbeat hosts between poll cycles.
@@ -208,6 +232,11 @@ Two complementary mechanisms prevent the agent from fencing healthy hosts when t
 ```yaml
 config:
   K8S_API_CHECK_INTERVAL: "15"
+  K8S_API_RECOVERY_COOLDOWN: "120"
+  CHECK_HEARTBEAT: "true"
+  STALENESS_CORRELATION_WINDOW: "30"
+  STALENESS_CORRELATION_MIN_PERCENT: "10"
+  NOVA_FRESHNESS_THRESHOLD: "50"
   HEARTBEAT_CLIFF_THRESHOLD: "50"
 ```
 
@@ -826,6 +855,7 @@ Each instance is fully independent — no cross-region communication or coordina
 | `metricsTLS.minTLSVersion` | string | `"1.2"` | Minimum TLS version for the metrics endpoint (`"1.2"` or `"1.3"`) |
 | `metricsTLS.cipherSuites` | string | `"HIGH:!aNULL:!MD5:!RC4:!3DES:!kRSA"` | Allowed TLS cipher suites (OpenSSL format) |
 | `disabled` | string | `"False"` | `"True"` to disable fencing and evacuation |
+| `rabbitMQPodSelector` | map[string]string | `{"app.kubernetes.io/name": "rabbitmq"}` | Label selector for RabbitMQ pods to monitor. When any matching pod is not Ready, fencing is suppressed. All labels must match (AND logic) |
 | `topologyRef` | object | none | Reference to a Topology CR for pod placement |
 
 ### Agent Configuration (config.yaml)
@@ -881,6 +911,10 @@ All values are strings in the ConfigMap. The agent converts and validates them a
 | `CHECK_HEARTBEAT` | bool | false | Enable heartbeat verification via UDP listener |
 | `HEARTBEAT_CLIFF_THRESHOLD` | int | 50 (range: 10–100) | Percentage drop in active heartbeat hosts that triggers cliff detection (skips fencing for that cycle) |
 | `K8S_API_CHECK_INTERVAL` | int | 15 (range: 5–120) | Seconds between Kubernetes API reachability checks |
+| `K8S_API_RECOVERY_COOLDOWN` | int | 120 (range: 0–600) | Seconds to suppress fencing after K8s API recovers from partition (0 to disable) |
+| `STALENESS_CORRELATION_WINDOW` | int | 30 (range: 5–120) | Seconds within which multiple stale services suggest a control plane disruption (requires CHECK_HEARTBEAT) |
+| `STALENESS_CORRELATION_MIN_PERCENT` | int | 10 (range: 1–50) | Minimum percentage of services that must be stale to trigger correlated detection; actual minimum is max(3, total × pct / 100) |
+| `NOVA_FRESHNESS_THRESHOLD` | int | 50 (range: 0–100) | Minimum percentage of services with fresh data for fencing to proceed (0 to disable) |
 
 #### Security
 

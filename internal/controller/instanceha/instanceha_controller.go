@@ -22,6 +22,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -94,6 +95,7 @@ func (r *Reconciler) GetLogger(ctx context.Context) logr.Logger {
 // service account permissions that are needed to grant permission to the above
 // +kubebuilder:rbac:groups="security.openshift.io",resourceNames=anyuid,resources=securitycontextconstraints,verbs=use
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=topology.openstack.org,resources=topologies,verbs=get;list;watch;update
 
@@ -691,6 +693,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		}
 	}
 
+	// Check infrastructure health and manage fencing suppression annotation
+	if err := r.reconcileFencingSuppression(ctx, Log, instance); err != nil {
+		Log.Error(err, "Failed to reconcile fencing suppression, continuing")
+	}
+
 	deployment := commondeployment.NewDeployment(instanceha.Deployment(instance, deploymentLabels, serviceAnnotations, cloud, configVarsHash, containerImage, topology, acSecretName, heartbeatHMACSecretName, metricsTLS), time.Duration(5)*time.Second)
 	sfres, sferr := deployment.CreateOrPatch(ctx, helper)
 	if sferr != nil {
@@ -733,6 +740,193 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 
 	return ctrl.Result{}, nil
+}
+
+const (
+	// FencingSuppressedAnnotation is set by the controller when infrastructure
+	// health checks detect conditions that make fencing unsafe. The Python agent
+	// reads this annotation each poll cycle and skips fencing when present.
+	FencingSuppressedAnnotation = "instanceha.openstack.org/fencing-suppressed"
+)
+
+// reconcileFencingSuppression checks Node and RabbitMQ pod health and manages
+// the fencing suppression annotation on the InstanceHA CR.
+func (r *Reconciler) reconcileFencingSuppression(
+	ctx context.Context,
+	Log logr.Logger,
+	instance *instancehav1.InstanceHa,
+) error {
+	var reasons []string
+
+	// Check OpenShift node health
+	nodeReasons, err := r.checkNodeHealth(ctx, Log)
+	if err != nil {
+		Log.Info("Node health check failed, skipping", "error", err)
+	} else {
+		reasons = append(reasons, nodeReasons...)
+	}
+
+	// Check RabbitMQ pod health
+	rmqReasons, err := r.checkRabbitMQHealth(ctx, Log, instance)
+	if err != nil {
+		Log.Info("RabbitMQ health check failed, skipping", "error", err)
+	} else {
+		reasons = append(reasons, rmqReasons...)
+	}
+
+	// Update annotation
+	annotations := instance.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+
+	currentVal := annotations[FencingSuppressedAnnotation]
+
+	if len(reasons) > 0 {
+		newVal := strings.Join(reasons, "|")
+		if currentVal != newVal {
+			base := client.MergeFrom(instance.DeepCopy())
+			annotations[FencingSuppressedAnnotation] = newVal
+			instance.SetAnnotations(annotations)
+			if err := r.Patch(ctx, instance, base); err != nil {
+				return fmt.Errorf("failed to set fencing suppression annotation: %w", err)
+			}
+			Log.Info("Fencing suppressed", "reasons", newVal)
+		}
+	} else if currentVal != "" {
+		base := client.MergeFrom(instance.DeepCopy())
+		delete(annotations, FencingSuppressedAnnotation)
+		instance.SetAnnotations(annotations)
+		if err := r.Patch(ctx, instance, base); err != nil {
+			return fmt.Errorf("failed to remove fencing suppression annotation: %w", err)
+		}
+		Log.Info("Fencing suppression cleared — all infrastructure checks healthy")
+	}
+
+	return nil
+}
+
+// checkNodeHealth returns suppression reasons for any NotReady nodes.
+func (r *Reconciler) checkNodeHealth(ctx context.Context, Log logr.Logger) ([]string, error) {
+	nodeList := &corev1.NodeList{}
+	if err := r.Client.List(ctx, nodeList); err != nil {
+		return nil, fmt.Errorf("failed to list nodes: %w", err)
+	}
+
+	var reasons []string
+	for _, node := range nodeList.Items {
+		for _, cond := range node.Status.Conditions {
+			if cond.Type == corev1.NodeReady {
+				if cond.Status != corev1.ConditionTrue {
+					reasons = append(reasons,
+						fmt.Sprintf("node:%s %s", node.Name, cond.Status))
+				}
+				break
+			}
+		}
+	}
+	return reasons, nil
+}
+
+// checkRabbitMQHealth returns suppression reasons for any not-Ready RabbitMQ pods.
+func (r *Reconciler) checkRabbitMQHealth(
+	ctx context.Context,
+	Log logr.Logger,
+	instance *instancehav1.InstanceHa,
+) ([]string, error) {
+	selector := instance.Spec.RabbitMQPodSelector
+	if len(selector) == 0 {
+		selector = map[string]string{"app.kubernetes.io/name": "rabbitmq"}
+	}
+
+	podList := &corev1.PodList{}
+	if err := r.Client.List(ctx, podList,
+		client.InNamespace(instance.Namespace),
+		client.MatchingLabels(selector),
+	); err != nil {
+		return nil, fmt.Errorf("failed to list RabbitMQ pods: %w", err)
+	}
+
+	if len(podList.Items) == 0 {
+		Log.V(1).Info("No RabbitMQ pods found matching selector", "selector", selector)
+		return nil, nil
+	}
+
+	var reasons []string
+	for _, pod := range podList.Items {
+		ready := false
+		for _, cond := range pod.Status.Conditions {
+			if cond.Type == corev1.PodReady {
+				ready = cond.Status == corev1.ConditionTrue
+				break
+			}
+		}
+		if !ready {
+			reasons = append(reasons,
+				fmt.Sprintf("rabbitmq:%s not ready", pod.Name))
+		}
+	}
+	return reasons, nil
+}
+
+// mapNodeToInstanceHa returns reconcile requests for all InstanceHA CRs when a Node changes.
+func (r *Reconciler) mapNodeToInstanceHa(ctx context.Context, _ client.Object) []reconcile.Request {
+	crList := &instancehav1.InstanceHaList{}
+	if err := r.List(ctx, crList); err != nil {
+		return nil
+	}
+	var requests []reconcile.Request
+	for _, item := range crList.Items {
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      item.GetName(),
+				Namespace: item.GetNamespace(),
+			},
+		})
+	}
+	return requests
+}
+
+// mapRabbitMQPodToInstanceHa returns reconcile requests for InstanceHA CRs when
+// a RabbitMQ pod changes. Only triggers if the pod has the expected labels.
+func (r *Reconciler) mapRabbitMQPodToInstanceHa(ctx context.Context, obj client.Object) []reconcile.Request {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return nil
+	}
+
+	crList := &instancehav1.InstanceHaList{}
+	if err := r.List(ctx, crList, client.InNamespace(pod.Namespace)); err != nil {
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for _, item := range crList.Items {
+		selector := item.Spec.RabbitMQPodSelector
+		if len(selector) == 0 {
+			selector = map[string]string{"app.kubernetes.io/name": "rabbitmq"}
+		}
+		if labelsMatchSelector(pod.Labels, selector) {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      item.GetName(),
+					Namespace: item.GetNamespace(),
+				},
+			})
+		}
+	}
+	return requests
+}
+
+// labelsMatchSelector returns true if the object labels contain all key-value
+// pairs from the selector.
+func labelsMatchSelector(objLabels, selector map[string]string) bool {
+	for k, v := range selector {
+		if objLabels[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // fields to index to reconcile when change
@@ -870,6 +1064,16 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&topologyv1.Topology{},
 			handler.EnqueueRequestsFromMapFunc(r.findObjectsForSrc),
 			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Watches(
+			&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(r.mapNodeToInstanceHa),
+			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
+		).
+		Watches(
+			&corev1.Pod{},
+			handler.EnqueueRequestsFromMapFunc(r.mapRabbitMQPodToInstanceHa),
+			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
+		).
 		Complete(r)
 }
 

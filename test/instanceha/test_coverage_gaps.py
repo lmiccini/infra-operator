@@ -770,10 +770,16 @@ class TestMainLoopBackoff(unittest.TestCase):
         svc.config.get_config_value = Mock(side_effect=lambda key: {
             'POLL': 5, 'DELTA': 30, 'LOGLEVEL': 'INFO',
             'DISABLED': False, 'FENCING_TIMEOUT': 30,
+            'K8S_API_RECOVERY_COOLDOWN': 120,
+            'NOVA_FRESHNESS_THRESHOLD': 50,
+            'STALENESS_CORRELATION_WINDOW': 30,
+            'STALENESS_CORRELATION_MIN_PERCENT': 10,
         }.get(key, Mock()))
         svc.update_health_hash = Mock()
         svc.processing_lock = Mock()
         svc.ready = False
+        svc.k8s_api_recovery_time = 0.0
+        svc.k8s_api_reachable = True
         # Use a real Event; tests set it to break the main loop
         svc.shutdown_event = threading.Event()
         return svc
@@ -827,6 +833,8 @@ class TestMainLoopBackoff(unittest.TestCase):
         self.assertGreaterEqual(call_count[0], 2)
 
     @patch('instanceha.signal.signal')
+    @patch('instanceha._check_fencing_suppressed', return_value=(False, ""))
+    @patch('instanceha._validate_nova_data_freshness', return_value=(True, 100.0, 1, 1))
     @patch('instanceha._process_reenabling')
     @patch('instanceha._process_stale_services')
     @patch('instanceha._categorize_services')
@@ -834,7 +842,9 @@ class TestMainLoopBackoff(unittest.TestCase):
     @patch('instanceha._initialize_service')
     @patch('instanceha.ConfigManager')
     def test_successful_poll_resets_consecutive_failures(self, mock_cm, mock_init, mock_conn,
-                                                         mock_cat, mock_proc, mock_reen, mock_signal):
+                                                         mock_cat, mock_proc, mock_reen,
+                                                         mock_freshness, mock_suppressed,
+                                                         mock_signal):
         mock_cm.return_value.get_config_value = Mock(return_value='INFO')
         service = self._make_service_mock()
         mock_init.return_value = service
@@ -906,6 +916,8 @@ class TestProcessStaleServicesSafety(unittest.TestCase):
             'WORKERS': 2, 'POLL': 5, 'FENCING_TIMEOUT': 30,
             'TAGGED_IMAGES': False, 'TAGGED_FLAVORS': False,
             'TAGGED_AGGREGATES': False, 'RESERVED_HOSTS': False,
+            'STALENESS_CORRELATION_WINDOW': 30,
+            'STALENESS_CORRELATION_MIN_PERCENT': 10,
         }.get(key, Mock()))
         svc.processing_lock = threading.Lock()
         svc.hosts_processing = defaultdict(float)
@@ -949,6 +961,8 @@ class TestProcessStaleServicesSafety(unittest.TestCase):
             'WORKERS': 2, 'POLL': 5, 'FENCING_TIMEOUT': 30,
             'TAGGED_IMAGES': False, 'TAGGED_FLAVORS': False,
             'TAGGED_AGGREGATES': False, 'RESERVED_HOSTS': False,
+            'STALENESS_CORRELATION_WINDOW': 30,
+            'STALENESS_CORRELATION_MIN_PERCENT': 10,
         }.get(key, Mock()))
         conn = Mock()
         svc1 = Mock(host='host-1', status='enabled', forced_down=False)

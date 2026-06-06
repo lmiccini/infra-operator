@@ -91,6 +91,9 @@ func (spec *InstanceHaSpec) Default() {
 	if spec.MetricsTLS.CipherSuites == "" {
 		spec.MetricsTLS.CipherSuites = "HIGH:!aNULL:!MD5:!RC4:!3DES:!kRSA"
 	}
+	if spec.RabbitMQPodSelector == nil {
+		spec.RabbitMQPodSelector = map[string]string{"app.kubernetes.io/name": "rabbitmq"}
+	}
 }
 
 // ValidateCreate validates the InstanceHa resource on creation.
