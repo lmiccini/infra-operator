@@ -1,5 +1,7 @@
 # InstanceHA Prometheus Monitoring Guide
 
+> **Related docs**: [instanceha_guide.md — Prometheus Metrics](instanceha_guide.md#prometheus-metrics) (summary and auto-scraping) | [instanceha_architecture.md](instanceha_architecture.md) (internal design)
+
 ## Overview
 
 InstanceHA exposes Prometheus metrics at `:8080/metrics` on the workload pod, covering the full evacuation lifecycle: host failure detection, fencing, evacuation, recovery, and poll loop health. These metrics complement the Kubernetes Events emitted on the InstanceHa CR — events provide human-readable audit records, while metrics provide numeric time-series data suitable for dashboards, alerting, and capacity planning.
@@ -157,6 +159,8 @@ Counters increase monotonically and reset to zero on pod restart.
 | `instanceha_orphaned_host_recovered_total` | — | Orphaned fenced hosts recovered during startup reconciliation |
 | `instanceha_heartbeat_rejected_total` | `reason` | Heartbeat packets rejected. `reason`: `hmac_failed`, `timestamp_invalid` |
 | `instanceha_heartbeat_cliff_total` | — | Fencing skipped due to sudden heartbeat loss (possible network partition) |
+| `instanceha_fencing_rate_limited_total` | — | Times fencing was capped by `MAX_HOSTS_PER_CYCLE` rate limit |
+| `instanceha_all_services_stale_total` | — | Times fencing was skipped because all active services appeared stale |
 | `instanceha_poll_cycles_total` | `result` | Poll cycles executed. `result`: `success`, `error` |
 
 ### Gauges
@@ -174,6 +178,7 @@ Gauges represent current values that can go up or down.
 | Metric | Labels | Buckets (seconds) | Description |
 |--------|--------|-------------------|-------------|
 | `instanceha_instance_evacuation_duration_seconds` | `host` | 10, 30, 60, 120, 180, 300, 600 | Time from evacuation request to completion for individual instances |
+| `instanceha_poll_duration_seconds` | — | 1, 5, 10, 30, 60, 120, 300 | Duration of each poll cycle |
 
 ---
 
@@ -441,10 +446,13 @@ Expected output:
 # TYPE instanceha_orphaned_host_recovered_total counter
 # TYPE instanceha_heartbeat_rejected_total counter
 # TYPE instanceha_heartbeat_cliff_total counter
+# TYPE instanceha_fencing_rate_limited_total counter
+# TYPE instanceha_all_services_stale_total counter
 # TYPE instanceha_poll_consecutive_failures gauge
 # TYPE instanceha_hosts_processing gauge
 # TYPE instanceha_k8s_api_reachable gauge
 # TYPE instanceha_poll_cycles_total counter
+# TYPE instanceha_poll_duration_seconds histogram
 ```
 
 ### Test With Noop Fencing

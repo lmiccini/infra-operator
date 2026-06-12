@@ -363,7 +363,7 @@ class TestInstanceHAService(unittest.TestCase):
         """Test cache refresh functionality."""
         # Set up initial cache
         self.service._evacuable_flavors_cache = ['cached-flavor']
-        self.service._cache_timestamp = time.time() - 400  # Make cache stale
+        self.service._cache_timestamp = time.monotonic() - 400  # Make cache stale
 
         mock_flavor = Mock()
         mock_flavor.id = 'new-flavor'
@@ -1554,8 +1554,8 @@ class TestSecretExposure(unittest.TestCase):
         self._assert_no_secrets_in_logs()
 
     @patch.dict(os.environ, {'OS_CLOUD': 'testcloud'})
-    def test_get_nova_connection_exception_no_secret_exposure(self):
-        """Test that _get_nova_connection exceptions don't expose passwords."""
+    def test_establish_nova_connection_nonfatal_exception_no_secret_exposure(self):
+        """Test that _establish_nova_connection(fatal=False) exceptions don't expose passwords."""
         # Clear log capture
         self.log_capture.seek(0)
         self.log_capture.truncate(0)
@@ -1571,7 +1571,7 @@ class TestSecretExposure(unittest.TestCase):
         with patch('instanceha.nova_login') as mock_login:
             mock_login.side_effect = Exception("Connection error: password=wrong")
 
-            instanceha._get_nova_connection(service)
+            instanceha._establish_nova_connection(service, fatal=False)
 
             self._assert_no_secrets_in_logs()
 
@@ -2440,18 +2440,18 @@ class TestPerformanceAndMemory(unittest.TestCase):
     def test_kdump_timestamp_memory_management(self):
         """Test that kdump timestamps are cleaned up."""
         # Add many old timestamps
-        old_time = time.time() - 400
+        old_time = time.monotonic() - 400
         for i in range(200):
             self.service.kdump_hosts_timestamp[f'old-host-{i}'] = old_time
 
         # Add some recent ones
-        recent_time = time.time()
+        recent_time = time.monotonic()
         for i in range(10):
             self.service.kdump_hosts_timestamp[f'recent-host-{i}'] = recent_time
 
         # Simulate cleanup (threshold is 100 entries)
         if len(self.service.kdump_hosts_timestamp) > 100:
-            cutoff = time.time() - 300
+            cutoff = time.monotonic() - 300
             old_keys = [k for k, v in self.service.kdump_hosts_timestamp.items() if v < cutoff]
             for k in old_keys:
                 del self.service.kdump_hosts_timestamp[k]
@@ -2657,7 +2657,7 @@ class TestFunctionalIntegration(unittest.TestCase):
 
         # Mock fencing, connection retrieval, and filter to succeed
         with patch('instanceha._execute_fence_operation', return_value=True), \
-             patch('instanceha._get_nova_connection', return_value=mock_nova), \
+             patch('instanceha._establish_nova_connection', return_value=mock_nova), \
              patch.object(service, 'filter_hosts_with_servers', side_effect=lambda services, cache: services):
             # Process the service (simulate one host being processed)
             result = instanceha.process_service(failed_service, [], False, service)
@@ -2737,7 +2737,7 @@ class TestFunctionalIntegration(unittest.TestCase):
         # Mock fencing, kdump, connection retrieval, and filter
         with patch('instanceha._execute_fence_operation', return_value=True), \
              patch('instanceha._check_kdump', return_value=(nova_state['services'][:2], [])), \
-             patch('instanceha._get_nova_connection', return_value=mock_nova), \
+             patch('instanceha._establish_nova_connection', return_value=mock_nova), \
              patch.object(service, 'get_hosts_with_servers_cached', return_value=host_servers_cache), \
              patch.object(service, 'filter_hosts_with_servers', side_effect=lambda services, cache: services):
 
@@ -2858,7 +2858,7 @@ class TestFunctionalIntegration(unittest.TestCase):
 
         with patch('instanceha._execute_fence_operation', return_value=True), \
              patch('instanceha._check_kdump', return_value=(down_list, [])), \
-             patch('instanceha._get_nova_connection', return_value=mock_nova), \
+             patch('instanceha._establish_nova_connection', return_value=mock_nova), \
              patch.object(service, 'get_hosts_with_servers_cached', return_value=host_servers_cache), \
              patch.object(service, 'filter_hosts_with_servers', side_effect=lambda services, cache: services):
 
@@ -3032,7 +3032,7 @@ class TestFunctionalIntegration(unittest.TestCase):
                             if magic == 0x1B302A40:
                                 # Valid kdump message - extract hostname
                                 hostname = addr[0]
-                                service.kdump_hosts_timestamp[hostname] = time.time()
+                                service.kdump_hosts_timestamp[hostname] = time.monotonic()
                     except socket.timeout:
                         continue
                 sock.close()
@@ -3069,7 +3069,7 @@ class TestFunctionalIntegration(unittest.TestCase):
 
         # Verify timestamp is recent
         timestamp = service.kdump_hosts_timestamp['127.0.0.1']
-        self.assertGreater(timestamp, time.time() - 3)
+        self.assertGreater(timestamp, time.monotonic() - 3)
 
     def test_cache_lifecycle_integration(self):
         """Test cache lifecycle: initial load, staleness, refresh, usage."""
@@ -3104,7 +3104,7 @@ class TestFunctionalIntegration(unittest.TestCase):
         self.assertEqual(mock_nova.flavors.list.call_count, 1, "Should still be 1 (cached)")
 
         # Make cache stale
-        service._cache_timestamp = time.time() - 400  # Older than 300s
+        service._cache_timestamp = time.monotonic() - 400  # Older than 300s
 
         # Add new flavor to Nova
         new_flavor = Mock()
@@ -3123,7 +3123,7 @@ class TestFunctionalIntegration(unittest.TestCase):
         self.assertIn('flavor-new', evacuable_flavors_new)
 
         # Verify cache is fresh
-        cache_age = time.time() - service._cache_timestamp
+        cache_age = time.monotonic() - service._cache_timestamp
         self.assertLess(cache_age, 5, "Cache should be fresh (< 5 seconds old)")
 
 

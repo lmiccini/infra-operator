@@ -1,5 +1,7 @@
 # InstanceHA Heartbeat Performance at 1000-Node Scale
 
+> **Related docs**: [instanceha_guide.md — Heartbeat Verification](instanceha_guide.md#heartbeat-verification) (operator setup) | [instanceha_architecture.md](instanceha_architecture.md) (internal design)
+
 ## Overview
 
 This document presents performance profiling results for the InstanceHA
@@ -18,7 +20,7 @@ measurements were taken using the benchmark script at
 | HEARTBEAT_TIMEOUT     | 120s            |
 | THRESHOLD             | 5% and 10%      |
 | POLL                  | 45s             |
-| HEARTBEAT_CLEANUP_THRESHOLD | 2000      |
+| UDP_CLEANUP_THRESHOLD | 2000      |
 
 ### HBV2 Packet Format
 

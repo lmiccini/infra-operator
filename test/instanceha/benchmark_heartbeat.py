@@ -105,7 +105,7 @@ def _start_listener(service, port):
             lock=service.heartbeat_lock,
             timestamps=service.heartbeat_hosts_timestamp,
             stop_event=service.heartbeat_listener_stop_event,
-            cleanup_threshold=instanceha.HEARTBEAT_CLEANUP_THRESHOLD,
+            cleanup_threshold=instanceha.UDP_CLEANUP_THRESHOLD,
             cleanup_age_seconds=instanceha.HEARTBEAT_CLEANUP_AGE_SECONDS,
             resolve_hostname=lambda data, addr, label: instanceha._resolve_hostname_packet(data, addr, label, hmac_keys=hmac_keys),
             on_start=on_start,

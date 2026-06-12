@@ -87,7 +87,7 @@ def patch_pipeline(conn=None, fence=True, disable=True,
     """
     if reserved is None:
         reserved = instanceha.ReservedHostResult(success=True, hostname=None)
-    with patch('instanceha._get_nova_connection', return_value=conn) as m_conn, \
+    with patch('instanceha._establish_nova_connection', return_value=conn) as m_conn, \
          patch('instanceha._host_fence', return_value=fence) as m_fence, \
          patch('instanceha._host_disable', return_value=disable) as m_disable, \
          patch('instanceha._manage_reserved_hosts', return_value=reserved) as m_reserved, \

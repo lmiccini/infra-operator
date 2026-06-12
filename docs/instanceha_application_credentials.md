@@ -1,5 +1,7 @@
 # InstanceHA Application Credential Authentication
 
+> **Related docs**: [instanceha_guide.md — Authentication](instanceha_guide.md#authentication) (quick setup) | [instanceha_architecture.md — Authentication](instanceha_architecture.md#authentication) (internal design)
+
 By default InstanceHA authenticates to OpenStack using username/password
 credentials from `clouds.yaml` and `secure.yaml`. As an alternative you can
 use a **Keystone Application Credential**, which provides scoped, time-limited
