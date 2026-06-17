@@ -90,6 +90,14 @@ spec:
                 description: InstanceHaConfigMap is the name of the ConfigMap containing
                   the InstanceHa config file
                 type: string
+              instanceHaGuestMonitorPort:
+                default: 7412
+                description: InstanceHaGuestMonitorPort is the UDP port for guest
+                  monitor notifications
+                format: int32
+                maximum: 65535
+                minimum: 1
+                type: integer
               instanceHaHeartbeatPort:
                 default: 7411
                 description: InstanceHaHeartbeatPort is the UDP port for compute node

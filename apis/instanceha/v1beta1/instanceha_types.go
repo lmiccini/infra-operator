@@ -119,6 +119,13 @@ type InstanceHaSpec struct {
 	InstanceHaHeartbeatPort int32 `json:"instanceHaHeartbeatPort"`
 
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=7412
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// InstanceHaGuestMonitorPort is the UDP port for guest monitor notifications
+	InstanceHaGuestMonitorPort int32 `json:"instanceHaGuestMonitorPort"`
+
+	// +kubebuilder:validation:Optional
 	// NodeSelector to target subset of worker nodes running control plane services
 	NodeSelector *map[string]string `json:"nodeSelector,omitempty"`
 

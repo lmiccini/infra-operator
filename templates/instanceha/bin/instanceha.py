@@ -77,6 +77,10 @@ HEARTBEAT_HMAC_DIGEST_SIZE = 32
 HEARTBEAT_MIN_PACKET_SIZE = 4 + 8 + 1 + 32  # magic + timestamp + min hostname + HMAC
 DEFAULT_HEARTBEAT_PORT = 7411
 HEARTBEAT_CLEANUP_AGE_SECONDS = 600
+GUEST_MONITOR_MAGIC_NUMBER = 0x474D5631
+GUEST_MONITOR_MIN_PACKET_SIZE = 4 + 8 + 1 + 1 + 1 + 36 + 32
+DEFAULT_GUEST_MONITOR_PORT = 7412
+GUEST_MONITOR_CLEANUP_AGE_SECONDS = 600
 _ALLOWED_HTTP_METHODS = frozenset({'get', 'post', 'patch', 'put', 'delete'})
 
 # Disabled reason markers
@@ -174,6 +178,16 @@ K8S_API_REACHABLE = Gauge(
 HEARTBEAT_CLIFF_TOTAL = Counter(
     'instanceha_heartbeat_cliff_total',
     'Times fencing was skipped due to sudden heartbeat loss',
+)
+GUEST_MONITOR_RECEIVED_TOTAL = Counter(
+    'instanceha_guest_monitor_received_total',
+    'GMV1 guest monitor notifications received',
+    ['hostname'],
+)
+GUEST_MONITOR_REJECTED_TOTAL = Counter(
+    'instanceha_guest_monitor_rejected_total',
+    'GMV1 guest monitor notifications rejected',
+    ['reason'],
 )
 FENCING_RATE_LIMITED_TOTAL = Counter(
     'instanceha_fencing_rate_limited_total',
@@ -695,7 +709,9 @@ class ConfigManager:
         'FORCE_ENABLE': ConfigItem('bool', False),
         'CHECK_KDUMP': ConfigItem('bool', False),
         'KDUMP_TIMEOUT': ConfigItem('int', 30, 5, 300),
+        'CHECK_GUEST_MONITOR': ConfigItem('bool', False),
         'CHECK_HEARTBEAT': ConfigItem('bool', False),
+        'GUEST_MONITOR_TIMEOUT': ConfigItem('int', 120, 30, 600),
         'HEARTBEAT_TIMEOUT': ConfigItem('int', 120, 30, 600),
         'DISABLED': ConfigItem('bool', False),
         'SSL_VERIFY': ConfigItem('bool', True),
@@ -754,6 +770,9 @@ class ConfigManager:
 
     def get_heartbeat_port(self) -> int:
         return self._get_env_port('HEARTBEAT_PORT', DEFAULT_HEARTBEAT_PORT)
+
+    def get_guest_monitor_port(self) -> int:
+        return self._get_env_port('GUEST_MONITOR_PORT', DEFAULT_GUEST_MONITOR_PORT)
 
     @property
     def ssl_ca_bundle(self) -> Optional[str]:
@@ -829,6 +848,11 @@ class InstanceHAService:
         self.heartbeat_previous_active_count = 0
         self.heartbeat_consecutive_cliff_cycles = 0
         self.last_poll_time = time.monotonic()
+
+        # Guest monitor state (protected by guest_monitor_lock -- UDP listener writes concurrently)
+        self.guest_monitor_lock = threading.Lock()
+        self.guest_monitor_hosts_timestamp = defaultdict(float)
+        self.guest_monitor_listener_stop_event = threading.Event()
 
         self.heartbeat_hmac_keys = self._load_heartbeat_hmac_keys()
         if self.heartbeat_hmac_keys:
@@ -1567,6 +1591,97 @@ def _heartbeat_udp_listener(service: 'InstanceHAService') -> None:
         resolve_hostname=resolve_with_hmac,
         log_level=logging.DEBUG,
         on_start=on_start,
+    )
+
+
+def _resolve_guest_monitor_packet(data, address, label, hmac_keys=None):
+    """Extract hostname and VM UUID from a GMV1 guest monitor notification.
+
+    Packet layout:
+      Magic (4B) | Timestamp (8B) | EventCode (1B) | HostnameLen (1B) |
+      Hostname (NB) | UUID (36B) | HMAC-SHA256 (32B)
+    """
+    if len(data) < GUEST_MONITOR_MIN_PACKET_SIZE:
+        logging.warning('%s from %s too short (%d bytes)', label, address[0], len(data))
+        return None
+
+    magic_network = struct.unpack('!I', data[:4])[0]
+    if magic_network != GUEST_MONITOR_MAGIC_NUMBER:
+        return None
+
+    if not hmac_keys:
+        logging.warning('%s from %s but no HMAC keys loaded', label, address[0])
+        return None
+
+    received_hmac = data[-HEARTBEAT_HMAC_DIGEST_SIZE:]
+    signed_data = data[:-HEARTBEAT_HMAC_DIGEST_SIZE]
+
+    verified = False
+    for key in hmac_keys:
+        expected = hmac_mod.new(key, signed_data, 'sha256').digest()
+        if hmac_mod.compare_digest(received_hmac, expected):
+            verified = True
+            break
+    if not verified:
+        logging.warning('%s from %s HMAC verification failed', label, address[0])
+        GUEST_MONITOR_REJECTED_TOTAL.labels(reason='hmac_failed').inc()
+        return None
+
+    timestamp = struct.unpack('!Q', data[4:12])[0]
+    delta = time.time() - timestamp
+    if delta < -60 or delta > 120:
+        logging.warning('%s from %s rejected: timestamp out of range (delta=%.0fs)', label, address[0], delta)
+        GUEST_MONITOR_REJECTED_TOTAL.labels(reason='timestamp_invalid').inc()
+        return None
+
+    event_code = data[12]
+    hostname_len = data[13]
+    header_end = 14 + hostname_len
+    if header_end + 36 + HEARTBEAT_HMAC_DIGEST_SIZE != len(data):
+        logging.warning('%s from %s invalid packet structure', label, address[0])
+        GUEST_MONITOR_REJECTED_TOTAL.labels(reason='invalid_structure').inc()
+        return None
+
+    try:
+        raw_hostname = data[14:header_end].decode('utf-8').strip('\x00').strip()
+    except UnicodeDecodeError:
+        logging.warning('%s from %s has invalid hostname encoding', label, address[0])
+        return None
+
+    try:
+        vm_uuid = data[header_end:header_end + 36].decode('ascii')
+    except UnicodeDecodeError:
+        logging.warning('%s from %s has invalid UUID encoding', label, address[0])
+        return None
+
+    hostname = _validate_raw_hostname(raw_hostname, address, label)
+    if not hostname:
+        return None
+
+    event_name = 'QEMU_GA_UNRESPONSIVE' if event_code == 0x01 else f'UNKNOWN(0x{event_code:02x})'
+    logging.warning('Guest monitor: %s from host %s for VM %s', event_name, hostname, vm_uuid)
+    GUEST_MONITOR_RECEIVED_TOTAL.labels(hostname=hostname).inc()
+
+    return hostname
+
+
+def _guest_monitor_udp_listener(service: 'InstanceHAService') -> None:
+    """Background UDP listener for guest monitor GMV1 notifications."""
+    def resolve_with_hmac(data, address, label):
+        return _resolve_guest_monitor_packet(data, address, label, hmac_keys=service.heartbeat_hmac_keys)
+
+    _udp_listener(
+        service,
+        port=service.config.get_guest_monitor_port(),
+        label='GuestMonitor',
+        magic_numbers=GUEST_MONITOR_MAGIC_NUMBER,
+        min_packet_size=GUEST_MONITOR_MIN_PACKET_SIZE,
+        lock=service.guest_monitor_lock,
+        timestamps=service.guest_monitor_hosts_timestamp,
+        stop_event=service.guest_monitor_listener_stop_event,
+        cleanup_threshold=UDP_CLEANUP_THRESHOLD,
+        cleanup_age_seconds=GUEST_MONITOR_CLEANUP_AGE_SECONDS,
+        resolve_hostname=resolve_with_hmac,
     )
 
 
@@ -3017,6 +3132,12 @@ def _initialize_service(config_mgr):
         logging.warning(
             'CHECK_HEARTBEAT is disabled -- fencing decisions rely solely on Nova service '
             'timestamps. Enable heartbeat checking for split-brain protection.')
+
+    # Start guest monitor listener if enabled
+    if service.config.get_config_value('CHECK_GUEST_MONITOR'):
+        gm_thread = threading.Thread(target=_guest_monitor_udp_listener, args=(service,))
+        gm_thread.daemon = True
+        gm_thread.start()
 
     return service
 

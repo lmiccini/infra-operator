@@ -55,6 +55,9 @@ func Deployment(
 	if instance.Spec.InstanceHaHeartbeatPort > 0 {
 		envVars["HEARTBEAT_PORT"] = env.SetValue(fmt.Sprintf("%d", instance.Spec.InstanceHaHeartbeatPort))
 	}
+	if instance.Spec.InstanceHaGuestMonitorPort > 0 {
+		envVars["GUEST_MONITOR_PORT"] = env.SetValue(fmt.Sprintf("%d", instance.Spec.InstanceHaGuestMonitorPort))
+	}
 
 	// create Volume and VolumeMounts
 	volumes := instancehaPodVolumes(instance)
@@ -243,6 +246,13 @@ func instancehaPorts(instance *instancehav1.InstanceHa) []corev1.ContainerPort {
 			ContainerPort: instance.Spec.InstanceHaHeartbeatPort,
 			Protocol:      "UDP",
 			Name:          "heartbeat",
+		})
+	}
+	if instance.Spec.InstanceHaGuestMonitorPort > 0 {
+		ports = append(ports, corev1.ContainerPort{
+			ContainerPort: instance.Spec.InstanceHaGuestMonitorPort,
+			Protocol:      "UDP",
+			Name:          "guestmonitor",
 		})
 	}
 	return ports

@@ -85,6 +85,9 @@ func (spec *InstanceHaSpec) Default() {
 	if spec.InstanceHaHeartbeatPort == 0 {
 		spec.InstanceHaHeartbeatPort = 7411
 	}
+	if spec.InstanceHaGuestMonitorPort == 0 {
+		spec.InstanceHaGuestMonitorPort = 7412
+	}
 	if spec.MetricsTLS.MinTLSVersion == "" {
 		spec.MetricsTLS.MinTLSVersion = "1.2"
 	}
