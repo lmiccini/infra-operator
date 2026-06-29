@@ -625,16 +625,20 @@ class DurabilityProxy:
                     self.forward_client_to_server(client_reader, backend_writer))
                 task_s2c = asyncio.create_task(
                     self.forward_server_to_client(backend_reader, client_writer))
-                done, pending = await asyncio.wait(
-                    [task_c2s, task_s2c],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for t in pending:
-                    t.cancel()
-                # Propagate exceptions from completed tasks
-                for t in done:
-                    if t.exception() is not None:
-                        logger.error(f"Forwarding error: {t.exception()}")
+                try:
+                    done, pending = await asyncio.wait(
+                        [task_c2s, task_s2c],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for t in pending:
+                        t.cancel()
+                    for t in done:
+                        if t.exception() is not None:
+                            logger.error(f"Forwarding error: {t.exception()}")
+                except asyncio.CancelledError:
+                    task_c2s.cancel()
+                    task_s2c.cancel()
+                    raise
 
             await _forward_both()
 
@@ -910,11 +914,18 @@ async def main():
     # Start periodic stats
     stats_task = asyncio.create_task(periodic_stats(proxy, args.stats_interval))
 
-    # Handle SIGTERM (sent by kubelet) the same as SIGINT so the proxy
-    # shuts down gracefully instead of hanging until the
-    # terminationGracePeriodSeconds expires.
+    # Handle SIGTERM (sent by kubelet) by cancelling all tasks so the
+    # proxy shuts down promptly.  server.close() alone only stops new
+    # connections — existing handler tasks stay blocked on read() and
+    # the pod hangs until terminationGracePeriodSeconds expires.
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGTERM, server.close)
+
+    def _handle_sigterm():
+        logger.info("Received SIGTERM, cancelling all tasks...")
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
+
+    loop.add_signal_handler(signal.SIGTERM, _handle_sigterm)
 
     try:
         async with server:
@@ -930,6 +941,6 @@ async def main():
 if __name__ == '__main__':
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         logger.info("Interrupted by user")
         sys.exit(0)
