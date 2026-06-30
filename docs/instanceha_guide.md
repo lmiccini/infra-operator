@@ -95,6 +95,8 @@ The agent tracks state via the Nova service `disabled_reason` field:
 | `instanceha evacuation FAILED: <timestamp>` | Evacuation failed, requires manual intervention |
 | `instanceha evacuation (kdump): <timestamp>` | Kdump-triggered evacuation in progress |
 | `instanceha evacuation complete (kdump): <timestamp>` | Kdump evacuation finished |
+| `instanceha evacuation (watchdog): <timestamp>` | Watchdog-triggered evacuation in progress |
+| `instanceha evacuation complete (watchdog): <timestamp>` | Watchdog evacuation finished, skip power-on |
 
 If the InstanceHA agent is restarted mid-evacuation, it detects services with the `instanceha evacuation:` marker (without `complete` or `FAILED`) and resumes evacuation without re-fencing.
 
@@ -373,8 +375,9 @@ clouds:
       password: <admin-password>
 ```
 
-**fencing.yaml** (Secret): Per-host fencing credentials. Each key is the compute host's short hostname as reported by `nova-compute`.
+**fencing.yaml** (Secret): Per-host fencing credentials. Each key is the compute host's short hostname as reported by `nova-compute`. Two configuration formats are supported:
 
+*Single-agent format (original):*
 ```yaml
 FencingConfig:
   compute-0:
@@ -399,6 +402,24 @@ FencingConfig:
     namespace: openshift-machine-api
     token: <service-account-token>
 ```
+
+*Multi-agent format (fallback chain -- agents tried in order):*
+```yaml
+FencingConfig:
+  compute-3:
+    agents:
+      - agent: redfish
+        ipaddr: 10.0.0.12
+        ipport: "443"
+        login: root
+        passwd: <redfish-password>
+        tls: "true"
+        uuid: System.Embedded.1
+      - agent: watchdog
+        timeout: 90
+```
+
+Both formats can be mixed in the same `fencing.yaml`. The single-agent format is converted internally to a one-element fallback chain.
 
 **config.yaml** (ConfigMap): InstanceHA runtime parameters. All fields are optional; defaults are applied automatically. See the [Configuration Reference](#configuration-reference) section for details.
 
@@ -472,6 +493,7 @@ Fencing (also called STONITH -- Shoot The Other Node In The Head) ensures that a
 | `ipmi` | IPMI over LAN | Standard BMC on most server hardware |
 | `redfish` | Redfish (HTTPS) | Modern BMCs (iDRAC, iLO, OpenBMC) |
 | `bmh` | Kubernetes API | Bare-metal hosts managed by Metal3/Ironic |
+| `watchdog` | Heartbeat silence | Passive agent -- confirms host death via hardware watchdog timeout (requires `CHECK_HEARTBEAT=true`) |
 | `noop` | None | Testing and development only |
 
 ### IPMI Configuration
@@ -511,6 +533,80 @@ compute-2:
 ```
 
 Metal3 fencing patches the `BareMetalHost` custom resource in the Kubernetes API to trigger a power state change, then waits for the power-off to be confirmed.
+
+### Watchdog Configuration
+
+The watchdog agent is a passive fencing mechanism for hosts where the BMC is unreachable. It relies on a hardware watchdog timer on the compute node: if the node crashes, the watchdog fires and resets the hardware. InstanceHA confirms the host is dead by verifying that no heartbeat has been received for longer than `WATCHDOG_TIMEOUT`.
+
+**Requirements**:
+- `CHECK_HEARTBEAT: true` must be enabled (heartbeat data is how the watchdog agent verifies death)
+- The `instanceha-watchdog.service` must be running on compute nodes (deployed via the `edpm_instanceha_monitoring` role with `watchdog_enabled: true`)
+- A hardware watchdog device must be present on the compute node (`/dev/watchdog`)
+
+**Standalone configuration** (watchdog as sole fencing agent):
+```yaml
+compute-3:
+  agent: watchdog
+  timeout: 90    # Optional: override WATCHDOG_TIMEOUT (default: 60s)
+```
+
+**Recovery behavior**: Watchdog-fenced hosts skip the power-on step during recovery (there is no BMC to power on). The host comes back on its own after the hardware watchdog resets it, or requires manual intervention if the hardware failure is permanent.
+
+#### Timeout Relationships
+
+Four timeouts form a chain that must be configured in order. Getting the relationship wrong will either cause false positives (evacuating a live host) or prevent the watchdog agent from ever succeeding:
+
+```
+watchdog_interval  <  HW watchdog timeout  <  WATCHDOG_TIMEOUT  <  HEARTBEAT_TIMEOUT
+    (edpm)               (BIOS/BMC)           (instanceha)         (instanceha)
+    e.g. 15s              e.g. 60s              e.g. 90s             e.g. 120s
+```
+
+| Timeout | Where configured | Must be | Rationale |
+|---------|-----------------|---------|-----------|
+| `watchdog_interval` | edpm-ansible role | < half HW watchdog timeout | Ensures the watchdog is reset often enough during normal operation |
+| Hardware watchdog timeout | Server BIOS/BMC | < `WATCHDOG_TIMEOUT` | The hardware reset fires before InstanceHA declares the host dead |
+| `WATCHDOG_TIMEOUT` | instanceha config.yaml or per-host in fencing.yaml | > HW watchdog timeout, < `HEARTBEAT_TIMEOUT` | Ensures the host has been hardware-reset before declaring it dead |
+| `HEARTBEAT_TIMEOUT` | instanceha config.yaml | > `WATCHDOG_TIMEOUT` | Ensures heartbeat data covers the full watchdog verification window |
+
+**Example for a 60-second hardware watchdog**:
+```yaml
+# edpm-ansible defaults (compute nodes)
+edpm_instanceha_monitoring_watchdog_interval: 15    # Pet every 15s (< 30s = half of 60s)
+
+# instanceha config.yaml (control plane)
+WATCHDOG_TIMEOUT: 90       # Wait 90s of silence (> 60s HW timeout)
+HEARTBEAT_TIMEOUT: 120     # Heartbeat valid for 120s (> 90s watchdog timeout)
+```
+
+If `HEARTBEAT_TIMEOUT` <= `WATCHDOG_TIMEOUT`, a startup warning is emitted.
+
+### Fencing Fallback Chain
+
+Multiple fencing agents can be configured per host. When the primary agent fails with a **connectivity error** (BMC unreachable, connection timeout), InstanceHA tries the next agent in the list:
+
+```yaml
+FencingConfig:
+  compute-4:
+    agents:
+      - agent: redfish
+        ipaddr: 10.0.0.14
+        ipport: "443"
+        login: root
+        passwd: <password>
+        tls: "true"
+        uuid: System.Embedded.1
+      - agent: watchdog
+        timeout: 90
+```
+
+**Important**: The fallback chain only triggers on retriable errors (BMC unreachable, network timeout). If the BMC is reachable but returns an authentication error (wrong credentials, 401/403), the chain **stops immediately** — this is a configuration error that should be fixed, not masked by falling back to watchdog.
+
+**Constraints**:
+- `watchdog` must not be the first agent in a multi-agent chain (startup validation rejects this)
+- `watchdog` as the sole agent is allowed but logs a warning (no BMC power control available)
+
+The old single-agent format (flat dict with `agent` key) is still fully supported and requires no changes.
 
 ---
 
@@ -891,6 +987,7 @@ All values are strings in the ConfigMap. The agent converts and validates them a
 | `HASH_INTERVAL` | int | 60 | 30-300 | Seconds between health-check hash updates |
 | `FENCING_TIMEOUT` | int | 30 | 5-120 | Seconds allowed for fencing operations |
 | `KDUMP_TIMEOUT` | int | 30 | 5-300 | Seconds to wait for kdump messages before normal evacuation |
+| `WATCHDOG_TIMEOUT` | int | 60 | 15-300 | Seconds of heartbeat silence before the watchdog agent declares host dead |
 | `HEARTBEAT_TIMEOUT` | int | 120 | 30-600 | Seconds without a heartbeat before marking host down |
 
 #### Evacuation Behavior
@@ -931,6 +1028,7 @@ All values are strings in the ConfigMap. The agent converts and validates them a
 | `HEARTBEAT_CLIFF_THRESHOLD` | int | 50 (range: 10-100) | Percentage drop in active heartbeat hosts that triggers cliff detection (skips fencing for that cycle) |
 | `HEARTBEAT_CLIFF_MAX_CYCLES` | int | 3 (range: 1-20) | Consecutive cliff detection cycles before accepting the state as genuine and proceeding with fencing |
 | `K8S_API_CHECK_INTERVAL` | int | 15 (range: 5-120) | Seconds between Kubernetes API reachability checks |
+| `WATCHDOG_TIMEOUT` | int | 60 (range: 15-300) | Seconds of heartbeat silence before the watchdog fencing agent declares a host dead. Must be greater than the hardware watchdog timeout configured on compute nodes. Can be overridden per-host in fencing.yaml. |
 
 #### Safety Limits
 

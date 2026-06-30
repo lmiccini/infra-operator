@@ -1073,6 +1073,7 @@ class TestFencingRaceCondition(unittest.TestCase):
 
         # Mock all dependencies to ensure success
         with unittest.mock.patch('instanceha._establish_nova_connection') as mock_conn, \
+             unittest.mock.patch('instanceha._host_fence', return_value='ipmi'), \
              unittest.mock.patch('instanceha._execute_step', return_value=True):
 
             # Call process_service

@@ -85,6 +85,7 @@ DISABLED_REASON_EVACUATION = "instanceha evacuation"
 DISABLED_REASON_EVACUATION_COMPLETE = "instanceha evacuation complete"
 DISABLED_REASON_EVACUATION_FAILED = "instanceha evacuation FAILED"
 DISABLED_REASON_KDUMP_MARKER = "(kdump)"
+DISABLED_REASON_WATCHDOG_MARKER = "(watchdog)"
 
 # Per-aggregate failure threshold metadata key
 AGGREGATE_MAX_FAILURES_KEY = 'instanceha:max_failures'
@@ -620,6 +621,29 @@ class ConfigManager:
                     'HEARTBEAT_TIMEOUT (%ds) is less than DELTA (%ds) -- heartbeats will '
                     'expire before Nova staleness is detected, reducing heartbeat effectiveness',
                     self.get_config_value('HEARTBEAT_TIMEOUT'), self.get_config_value('DELTA'))
+            if self.get_config_value('HEARTBEAT_TIMEOUT') <= self.get_config_value('WATCHDOG_TIMEOUT'):
+                logging.warning(
+                    'HEARTBEAT_TIMEOUT (%ds) should be greater than WATCHDOG_TIMEOUT (%ds) -- '
+                    'otherwise heartbeat filtering may skip hosts before the watchdog agent '
+                    'can verify they are dead. Recommended: HEARTBEAT_TIMEOUT > WATCHDOG_TIMEOUT '
+                    '> hardware watchdog timeout (set in BIOS/BMC)',
+                    self.get_config_value('HEARTBEAT_TIMEOUT'),
+                    self.get_config_value('WATCHDOG_TIMEOUT'))
+
+        for host, cfg in self.fencing.items():
+            agents = _normalize_fencing_config(cfg) if isinstance(cfg, dict) else []
+            agent_names = [a.get('agent', '') for a in agents if isinstance(a, dict)]
+            if not agent_names:
+                continue
+            if agent_names[0] == 'watchdog' and len(agent_names) > 1:
+                raise ConfigurationError(
+                    f"Fencing config for '{host}': 'watchdog' must not be the first agent "
+                    f"in a fallback chain. Move it to the end: {agent_names}")
+            if agent_names == ['watchdog']:
+                raise ConfigurationError(
+                    f"Fencing config for '{host}': 'watchdog' cannot be the sole fencing "
+                    f"agent. It must be used as a fallback after a BMC-based agent "
+                    f"(e.g. redfish, ipmi)")
 
     def get_str(self, key: str, default: str = '') -> str:
         """Get a string configuration value with validation."""
@@ -708,6 +732,7 @@ class ConfigManager:
         'HEARTBEAT_CLIFF_MAX_CYCLES': ConfigItem('int', 3, 1, 20),
         'MAX_HOSTS_PER_CYCLE': ConfigItem('int', 10, 1, 100),
         'K8S_API_CHECK_INTERVAL': ConfigItem('int', 15, 5, 120),
+        'WATCHDOG_TIMEOUT': ConfigItem('int', 60, 15, 300),
     }
 
     def get_config_value(self, key: str) -> Union[str, int, bool, List]:
@@ -820,6 +845,9 @@ class InstanceHAService:
         self.kdump_hosts_checking = defaultdict(float)
         self.kdump_listener_stop_event = threading.Event()
         self.kdump_fenced_hosts = set()
+
+        # Watchdog fencing state (protected by heartbeat_lock)
+        self.watchdog_fenced_hosts = set()
 
         # Heartbeat state (protected by heartbeat_lock -- UDP listener writes concurrently)
         self.heartbeat_lock = threading.Lock()
@@ -2146,9 +2174,17 @@ def _host_disable(connection, service, instanceha_service=None):
         if instanceha_service:
             with instanceha_service.kdump_lock:
                 is_kdump = _extract_hostname(service.host) in instanceha_service.kdump_fenced_hosts
+            with instanceha_service.heartbeat_lock:
+                is_watchdog = _extract_hostname(service.host) in instanceha_service.watchdog_fenced_hosts
         else:
             is_kdump = False
-        suffix = f" {DISABLED_REASON_KDUMP_MARKER}" if is_kdump else ""
+            is_watchdog = False
+        if is_kdump:
+            suffix = f" {DISABLED_REASON_KDUMP_MARKER}"
+        elif is_watchdog:
+            suffix = f" {DISABLED_REASON_WATCHDOG_MARKER}"
+        else:
+            suffix = ""
         disable_reason = _make_disable_reason(DISABLED_REASON_EVACUATION, suffix)
         connection.services.disable_log_reason(service.id, disable_reason)
         logging.info("Successfully disabled %s with reason: %s", service_info, disable_reason)
@@ -2224,6 +2260,10 @@ def _host_enable(connection, nova_service, reenable: bool = False, service=None)
                         service.kdump_hosts_timestamp.pop(hostname, None)
             except (AttributeError, KeyError) as e:
                 logging.warning('Failed to clean up kdump marker for %s: %s', nova_service.host, e)
+        if service:
+            hostname = _extract_hostname(nova_service.host)
+            with service.heartbeat_lock:
+                service.watchdog_fenced_hosts.discard(hostname)
         return True
 
     try:
@@ -2349,9 +2389,9 @@ def _redfish_reset(url, user, passwd, timeout, action, config_mgr, shutdown_even
                     logging.error("Redfish reset failed: %s conflict but not OFF (status: %s) for %s", response.status_code, power_state, safe_url)
                     return False
             elif response.status_code in [401, 403]:
-                # Authentication/authorization errors - don't retry
+                # Authentication/authorization errors - don't retry, don't fall back
                 logging.error("Redfish reset failed: authentication error (status %d) for %s", response.status_code, safe_url)
-                return False
+                return None
             elif response.status_code in [500, 502, 503, 504] and attempt < MAX_FENCING_RETRIES - 1:
                 # Transient server errors - retry
                 logging.warning("Redfish reset failed: server error %d (attempt %d/%d), retrying...",
@@ -2502,6 +2542,13 @@ def _execute_ipmi_fence(host, action, fencing_data, timeout, shutdown_event=None
             f'IPMI {action} for {host}',
             shutdown_event=shutdown_event,
         )
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or '').lower()
+        if 'unauthorized' in stderr or 'authentication' in stderr or 'password' in stderr:
+            logging.error("IPMI %s failed for %s: authentication error (non-retriable)", action, host)
+            return None
+        _safe_log_exception(f"IPMI {action} failed for {host}", e)
+        return False
     except Exception as e:
         _safe_log_exception(f"IPMI {action} failed for {host}", e)
         return False
@@ -2556,12 +2603,91 @@ def _fence_bmh(host, action, fencing_data, service):
                      fencing_data["host"], action, service)
 
 
+def _fence_watchdog(host, action, fencing_data, service):
+    """Watchdog fencing agent — passive, relies on hardware watchdog + heartbeat absence.
+
+    For 'off': verifies the host has been silent (no heartbeats) for longer than
+    WATCHDOG_TIMEOUT, meaning the hardware watchdog has fired and reset the host.
+    For 'on': returns True unconditionally. In a fallback chain (e.g. [redfish, watchdog]),
+    this means if the primary agent's power-on fails (BMC still unreachable), the watchdog
+    agent absorbs the failure — the host will recover on its own after the watchdog reset.
+    """
+    if action == 'on':
+        logging.info("Watchdog agent: skipping power-on for %s (no BMC control)", host)
+        return True
+
+    if not service.config.get_config_value('CHECK_HEARTBEAT'):
+        logging.error("Watchdog fencing requires CHECK_HEARTBEAT=true")
+        return False
+
+    hostname = _extract_hostname(host)
+    timeout = fencing_data.get('timeout',
+                               service.config.get_config_value('WATCHDOG_TIMEOUT'))
+    timeout = max(15, min(300, int(timeout)))
+
+    with service.heartbeat_lock:
+        last_hb = service.heartbeat_hosts_timestamp.get(hostname, 0)
+        listener_start = service.heartbeat_listener_start_time
+
+    if listener_start == 0.0:
+        logging.error("Watchdog fencing: heartbeat listener not started yet")
+        return False
+
+    current = time.monotonic()
+
+    if (current - listener_start) < timeout:
+        logging.warning(
+            "Watchdog fencing: listener uptime (%.0fs) < timeout (%ds), "
+            "cannot confirm %s is dead", current - listener_start, timeout, host)
+        return False
+
+    # If never received a heartbeat, measure silence from listener start
+    silence = current - last_hb if last_hb > 0 else current - listener_start
+
+    if silence >= timeout:
+        logging.info(
+            "Watchdog fencing succeeded for %s: no heartbeat for %.0fs "
+            "(timeout %ds) — host assumed reset by hardware watchdog",
+            host, silence, timeout)
+        with service.heartbeat_lock:
+            service.watchdog_fenced_hosts.add(hostname)
+        return True
+
+    remaining = timeout - silence
+    logging.info(
+        "Watchdog fencing: waiting %.0fs more for %s (silence=%.0fs, timeout=%ds)",
+        remaining, host, silence, timeout)
+    _interruptible_sleep(service.shutdown_event, remaining)
+
+    if service.shutdown_event.is_set():
+        logging.info("Watchdog fencing interrupted by shutdown for %s", host)
+        return False
+
+    with service.heartbeat_lock:
+        last_hb = service.heartbeat_hosts_timestamp.get(hostname, 0)
+    silence = time.monotonic() - last_hb if last_hb > 0 else time.monotonic() - listener_start
+
+    if silence >= timeout:
+        logging.info(
+            "Watchdog fencing succeeded for %s after wait: no heartbeat for %.0fs",
+            host, silence)
+        with service.heartbeat_lock:
+            service.watchdog_fenced_hosts.add(hostname)
+        return True
+
+    logging.warning(
+        "Watchdog fencing failed for %s: heartbeat received during wait "
+        "(host is alive, not a hardware failure)", host)
+    return False
+
+
 # Fencing agent dispatch table
 FENCING_AGENTS = {
     'noop': _fence_noop,
     'ipmi': _fence_ipmi,
     'redfish': _fence_redfish,
     'bmh': _fence_bmh,
+    'watchdog': _fence_watchdog,
 }
 
 
@@ -2583,36 +2709,89 @@ def _execute_fence_operation(host, action, fencing_data, service):
         return False
 
 
+def _normalize_fencing_config(fencing_data):
+    """Normalize fencing config to a list of agent dicts.
+
+    Supports both old format (flat dict with 'agent' key) and new format
+    (dict with 'agents' list).
+    """
+    if 'agents' in fencing_data and isinstance(fencing_data['agents'], list):
+        return fencing_data['agents']
+    if 'agent' in fencing_data:
+        return [fencing_data]
+    return []
+
+
 def _host_fence(host, action, service):
-    """Fence a host using the configured fencing agent."""
+    """Fence a host using configured agents, trying each in order (fallback chain)."""
     if not host:
         logging.error("Invalid fence parameters: missing host")
         return False
-
     if action not in ['on', 'off']:
-        logging.error("Unsupported fence action: %s (only 'on' and 'off' supported)", action)
+        logging.error("Unsupported fence action: %s", action)
         return False
 
     logging.info("Fencing host %s %s", host, action)
 
     try:
-        # Look up fencing configuration by comparing short hostnames
         short_hostname = _extract_hostname(host)
         matching_configs = [v for k, v in service.config.fencing.items()
                            if _extract_hostname(k) == short_hostname]
-
         if not matching_configs:
             logging.error("No fencing data found for %s", host)
             return False
 
         fencing_data = matching_configs[0]
-
-        if not isinstance(fencing_data, dict) or "agent" not in fencing_data:
+        if not isinstance(fencing_data, dict):
             logging.error("Invalid fencing data for %s", host)
             return False
 
-        logging.debug("Using fencing agent '%s' for %s", fencing_data["agent"], host)
-        return _execute_fence_operation(host, action, fencing_data, service)
+        agent_chain = _normalize_fencing_config(fencing_data)
+        if not agent_chain:
+            logging.error("Invalid fencing data for %s: no agents configured", host)
+            return False
+
+        agent_names = [a.get('agent', '') for a in agent_chain if isinstance(a, dict)]
+        if agent_names and agent_names[0] == 'watchdog':
+            logging.error(
+                "Invalid fencing config for %s: 'watchdog' cannot be the first or sole "
+                "fencing agent — it must be used as a fallback after a BMC-based agent "
+                "(e.g. redfish, ipmi). Refusing to fence.", host)
+            return False
+
+        for i, agent_data in enumerate(agent_chain):
+            if not isinstance(agent_data, dict) or 'agent' not in agent_data:
+                logging.warning("Skipping invalid agent entry %d for %s", i, host)
+                continue
+
+            agent_name = agent_data['agent']
+            if len(agent_chain) > 1:
+                logging.info("Trying fencing agent '%s' for %s (%d/%d)",
+                            agent_name, host, i + 1, len(agent_chain))
+            else:
+                logging.debug("Using fencing agent '%s' for %s", agent_name, host)
+
+            result = _execute_fence_operation(host, action, agent_data, service)
+            if result:
+                if len(agent_chain) > 1 and i > 0:
+                    logging.info("Fencing succeeded for %s using fallback agent '%s'",
+                                host, agent_name)
+                return agent_name
+
+            if result is None:
+                logging.error(
+                    "Fencing agent '%s' for %s failed with a non-retriable error "
+                    "(e.g. authentication failure) — not falling back to other agents",
+                    agent_name, host)
+                return False
+
+            if i < len(agent_chain) - 1:
+                logging.warning(
+                    "Fencing agent '%s' failed for %s (retriable), trying next agent",
+                    agent_name, host)
+
+        logging.error("All fencing agents failed for %s", host)
+        return False
 
     except Exception as e:
         logging.error("Fencing failed for %s: %s", host, e)
@@ -2716,16 +2895,22 @@ def _post_evacuation_recovery(conn, failed_service, service, resume=False):
     hostname = _extract_hostname(failed_service.host)
     with service.kdump_lock:
         kdump_fenced = hostname in service.kdump_fenced_hosts
+    with service.heartbeat_lock:
+        watchdog_fenced = hostname in service.watchdog_fenced_hosts
     leave_disabled = service.config.get_config_value('LEAVE_DISABLED')
 
     logging.info("Evacuation successful. Starting recovery for %s", failed_service.host)
 
     try:
-        # Step 1: Power on the host (skip if kdump fenced)
+        # Step 1: Power on the host (skip if kdump fenced or watchdog fenced)
         if kdump_fenced:
             logging.info("Skipping power on for %s (kdump fenced)", failed_service.host)
             with service.kdump_lock:
                 service.kdump_hosts_checking.pop(hostname, None)
+        elif watchdog_fenced:
+            logging.info("Skipping power on for %s (watchdog fenced — no BMC control)", failed_service.host)
+            with service.heartbeat_lock:
+                service.watchdog_fenced_hosts.discard(hostname)
         else:
             logging.debug("Powering on host %s", failed_service.host)
             power_on_result = _host_fence(failed_service.host, 'on', service)
@@ -2735,9 +2920,14 @@ def _post_evacuation_recovery(conn, failed_service, service, resume=False):
 
         # Update disabled reason to indicate evacuation complete (prevents resume loops)
         # Note: Service object may be stale (pre-disable status), so we always try to update
-        # Preserve kdump marker if present to ensure proper re-enable delay
+        # Preserve kdump/watchdog marker if present to ensure proper re-enable delay
         try:
-            suffix = f" {DISABLED_REASON_KDUMP_MARKER}" if kdump_fenced else ""
+            if kdump_fenced:
+                suffix = f" {DISABLED_REASON_KDUMP_MARKER}"
+            elif watchdog_fenced:
+                suffix = f" {DISABLED_REASON_WATCHDOG_MARKER}"
+            else:
+                suffix = ""
             new_reason = _make_disable_reason(DISABLED_REASON_EVACUATION_COMPLETE, suffix)
             conn.services.disable_log_reason(failed_service.id, new_reason)
             logging.debug("Updated disable reason for %s to indicate evacuation complete", failed_service.host)
@@ -2912,13 +3102,14 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
                 _emit_k8s_event(host_name, 'FencingStarted',
                                 'Fencing host (power off)')
                 FENCING_TOTAL.labels(host=host_name, result='started').inc()
-                if not _execute_step("Fencing", _host_fence, host_name, host_name, 'off', service):
+                fence_agent = _host_fence(host_name, 'off', service)
+                if not fence_agent:
                     _emit_k8s_event(host_name, 'FencingFailed',
                                     'Fencing failed', event_type='Warning')
                     FENCING_TOTAL.labels(host=host_name, result='failed').inc()
                     return False
                 _emit_k8s_event(host_name, 'FencingSucceeded',
-                                'Host fenced successfully')
+                                f'Host fenced successfully via {fence_agent}')
                 FENCING_TOTAL.labels(host=host_name, result='succeeded').inc()
 
             # Disable the host (skip if already disabled from previous evacuation attempt)
@@ -3542,7 +3733,9 @@ def _process_reenabling(conn, service, to_reenable) -> None:
                 logging.debug('%d migration(s) incomplete for %s, not re-enabling', len(incomplete), svc.host)
                 continue
 
-            # For kdump hosts, wait until kdump messages stop (60s timeout)
+            # For kdump hosts, wait until kdump messages stop (60s timeout).
+            # Watchdog-fenced hosts need no delay: the hardware watchdog guarantees
+            # a clean reset, and nova-compute must already be up (checked below).
             if 'kdump' in (getattr(svc, 'disabled_reason', '') or ''):
                 hostname = _extract_hostname(svc.host)
                 with service.kdump_lock:
