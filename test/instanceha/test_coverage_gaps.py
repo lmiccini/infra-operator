@@ -2006,5 +2006,477 @@ class TestAllServicesStaleCircuitBreaker(unittest.TestCase):
         self.assertEqual(len(stale_events), 1)
 
 
+# ============================================================================
+# _normalize_fencing_config tests
+# ============================================================================
+
+class TestNormalizeFencingConfig(unittest.TestCase):
+    """Tests for _normalize_fencing_config format normalization."""
+
+    def test_old_format_single_agent(self):
+        """Old format with 'agent' key returns single-element list."""
+        data = {'agent': 'ipmi', 'ipaddr': '10.0.0.1'}
+        result = instanceha._normalize_fencing_config(data)
+        self.assertEqual(result, [data])
+
+    def test_new_format_agents_list(self):
+        """New format with 'agents' list returns the list."""
+        agents = [{'agent': 'ipmi'}, {'agent': 'watchdog'}]
+        data = {'agents': agents}
+        result = instanceha._normalize_fencing_config(data)
+        self.assertEqual(result, agents)
+
+    def test_empty_dict_returns_empty(self):
+        """Dict without 'agent' or 'agents' returns empty list."""
+        result = instanceha._normalize_fencing_config({})
+        self.assertEqual(result, [])
+
+    def test_agents_not_list_returns_empty(self):
+        """If 'agents' is not a list, fall through to 'agent' check."""
+        data = {'agents': 'not-a-list', 'agent': 'ipmi'}
+        result = instanceha._normalize_fencing_config(data)
+        self.assertEqual(result, [data])
+
+    def test_agents_not_list_no_agent_returns_empty(self):
+        """If 'agents' is not a list and no 'agent', returns empty."""
+        data = {'agents': 'not-a-list'}
+        result = instanceha._normalize_fencing_config(data)
+        self.assertEqual(result, [])
+
+    def test_empty_agents_list(self):
+        """Empty 'agents' list returns empty list."""
+        data = {'agents': []}
+        result = instanceha._normalize_fencing_config(data)
+        self.assertEqual(result, [])
+
+    def test_both_agent_and_agents_prefers_agents(self):
+        """When both 'agent' and 'agents' present, 'agents' list wins."""
+        agents = [{'agent': 'redfish'}]
+        data = {'agent': 'ipmi', 'agents': agents}
+        result = instanceha._normalize_fencing_config(data)
+        self.assertEqual(result, agents)
+
+
+# ============================================================================
+# _fence_watchdog tests
+# ============================================================================
+
+class TestFenceWatchdog(unittest.TestCase):
+    """Tests for _fence_watchdog agent."""
+
+    def _make_service(self, check_heartbeat=True, watchdog_timeout=60,
+                      listener_start=100.0, last_hb=0):
+        svc = Mock()
+        svc.config.get_config_value = Mock(side_effect=lambda key: {
+            'CHECK_HEARTBEAT': check_heartbeat,
+            'WATCHDOG_TIMEOUT': watchdog_timeout,
+        }.get(key, Mock()))
+        svc.heartbeat_lock = threading.Lock()
+        svc.heartbeat_hosts_timestamp = {'compute-0': last_hb} if last_hb else {}
+        svc.heartbeat_listener_start_time = listener_start
+        svc.watchdog_fenced_hosts = set()
+        svc.shutdown_event = Mock()
+        svc.shutdown_event.is_set = Mock(return_value=False)
+        svc.shutdown_event.wait = Mock()
+        return svc
+
+    def test_power_on_returns_true(self):
+        """Power-on action is a no-op, returns True."""
+        svc = self._make_service()
+        result = instanceha._fence_watchdog("compute-0.example.com", "on", {}, svc)
+        self.assertTrue(result)
+
+    def test_heartbeat_disabled_returns_false(self):
+        """Returns False when CHECK_HEARTBEAT is disabled."""
+        svc = self._make_service(check_heartbeat=False)
+        result = instanceha._fence_watchdog("compute-0", "off", {}, svc)
+        self.assertFalse(result)
+
+    def test_listener_not_started_returns_false(self):
+        """Returns False when heartbeat listener hasn't started."""
+        svc = self._make_service(listener_start=0.0)
+        result = instanceha._fence_watchdog("compute-0", "off", {}, svc)
+        self.assertFalse(result)
+
+    @patch('instanceha.time.monotonic', return_value=130.0)
+    def test_listener_uptime_too_short_returns_false(self, mock_time):
+        """Returns False when listener uptime < timeout."""
+        svc = self._make_service(listener_start=100.0, watchdog_timeout=60)
+        result = instanceha._fence_watchdog("compute-0", "off", {}, svc)
+        self.assertFalse(result)
+
+    @patch('instanceha.time.monotonic', return_value=200.0)
+    def test_silence_exceeded_returns_true(self, mock_time):
+        """Returns True when heartbeat silence >= timeout."""
+        svc = self._make_service(listener_start=100.0, watchdog_timeout=60, last_hb=120.0)
+        result = instanceha._fence_watchdog("compute-0", "off", {}, svc)
+        self.assertTrue(result)
+        self.assertIn('compute-0', svc.watchdog_fenced_hosts)
+
+    @patch('instanceha.time.monotonic', return_value=200.0)
+    def test_no_heartbeat_ever_uses_listener_start(self, mock_time):
+        """When no heartbeat ever received, uses listener_start as baseline."""
+        svc = self._make_service(listener_start=100.0, watchdog_timeout=60, last_hb=0)
+        result = instanceha._fence_watchdog("compute-0", "off", {}, svc)
+        self.assertTrue(result)
+        self.assertIn('compute-0', svc.watchdog_fenced_hosts)
+
+    @patch('instanceha._interruptible_sleep')
+    @patch('instanceha.time.monotonic')
+    def test_waits_then_succeeds(self, mock_time, mock_sleep):
+        """Waits remaining time and succeeds if heartbeat still absent."""
+        mock_time.side_effect = [200.0, 270.0]
+        svc = self._make_service(listener_start=100.0, watchdog_timeout=60, last_hb=155.0)
+        result = instanceha._fence_watchdog("compute-0", "off", {}, svc)
+        self.assertTrue(result)
+        mock_sleep.assert_called_once()
+
+    @patch('instanceha._interruptible_sleep')
+    @patch('instanceha.time.monotonic')
+    def test_waits_then_fails_heartbeat_received(self, mock_time, mock_sleep):
+        """Fails if heartbeat arrives during the wait period."""
+        mock_time.side_effect = [200.0, 210.0]
+        svc = self._make_service(listener_start=100.0, watchdog_timeout=60, last_hb=155.0)
+        # Simulate heartbeat arriving during the wait
+        def update_hb(*args):
+            svc.heartbeat_hosts_timestamp['compute-0'] = 205.0
+        mock_sleep.side_effect = update_hb
+        result = instanceha._fence_watchdog("compute-0", "off", {}, svc)
+        self.assertFalse(result)
+
+    @patch('instanceha.time.monotonic', return_value=200.0)
+    def test_custom_timeout_from_fencing_data(self, mock_time):
+        """Uses timeout from fencing_data when provided."""
+        svc = self._make_service(listener_start=100.0, watchdog_timeout=60, last_hb=170.0)
+        # With default 60s timeout, silence=30s would not be enough
+        # But with custom 25s timeout, it succeeds
+        result = instanceha._fence_watchdog("compute-0", "off", {'timeout': 25}, svc)
+        self.assertTrue(result)
+
+    @patch('instanceha.time.monotonic', return_value=200.0)
+    def test_timeout_clamped_to_min(self, mock_time):
+        """Timeout is clamped to minimum of 15 seconds."""
+        svc = self._make_service(listener_start=100.0, watchdog_timeout=5, last_hb=190.0)
+        result = instanceha._fence_watchdog("compute-0", "off", {'timeout': 5}, svc)
+        # Silence is 10s, min clamped timeout is 15s. Enters wait path,
+        # but monotonic stays at 200.0, so re-check still shows 10s < 15s.
+        self.assertFalse(result)
+
+    @patch('instanceha.time.monotonic', return_value=200.0)
+    def test_extracts_short_hostname(self, mock_time):
+        """Correctly extracts short hostname from FQDN."""
+        svc = self._make_service(listener_start=100.0, watchdog_timeout=60, last_hb=0)
+        result = instanceha._fence_watchdog("compute-0.example.com", "off", {}, svc)
+        self.assertTrue(result)
+        self.assertIn('compute-0', svc.watchdog_fenced_hosts)
+
+
+# ============================================================================
+# _host_fence fallback chain tests
+# ============================================================================
+
+class TestHostFenceFallbackChain(unittest.TestCase):
+    """Tests for the fallback chain behavior in _host_fence."""
+
+    def _make_service(self, fencing_config):
+        svc = Mock()
+        svc.config.fencing = fencing_config
+        svc.shutdown_event = Mock()
+        return svc
+
+    @patch('instanceha._execute_fence_operation', return_value=True)
+    def test_single_agent_old_format(self, mock_exec):
+        """Old format (flat dict with 'agent') works as before."""
+        svc = self._make_service({'compute-0': {'agent': 'ipmi', 'ipaddr': '10.0.0.1'}})
+        result = instanceha._host_fence('compute-0', 'off', svc)
+        self.assertTrue(result)
+        mock_exec.assert_called_once()
+
+    @patch('instanceha._execute_fence_operation')
+    def test_fallback_chain_first_succeeds(self, mock_exec):
+        """When first agent in chain succeeds, second is not tried."""
+        mock_exec.return_value = True
+        agents = [{'agent': 'ipmi', 'ipaddr': '10.0.0.1'},
+                  {'agent': 'watchdog'}]
+        svc = self._make_service({'compute-0': {'agents': agents}})
+        result = instanceha._host_fence('compute-0', 'off', svc)
+        self.assertTrue(result)
+        self.assertEqual(mock_exec.call_count, 1)
+
+    @patch('instanceha._execute_fence_operation')
+    def test_fallback_chain_first_fails_second_succeeds(self, mock_exec):
+        """When first agent fails, second is tried and succeeds."""
+        mock_exec.side_effect = [False, True]
+        agents = [{'agent': 'ipmi', 'ipaddr': '10.0.0.1'},
+                  {'agent': 'watchdog'}]
+        svc = self._make_service({'compute-0': {'agents': agents}})
+        result = instanceha._host_fence('compute-0', 'off', svc)
+        self.assertTrue(result)
+        self.assertEqual(mock_exec.call_count, 2)
+
+    @patch('instanceha._execute_fence_operation', return_value=False)
+    def test_all_agents_fail(self, mock_exec):
+        """When all agents in chain fail, returns False."""
+        agents = [{'agent': 'ipmi'}, {'agent': 'watchdog'}]
+        svc = self._make_service({'compute-0': {'agents': agents}})
+        result = instanceha._host_fence('compute-0', 'off', svc)
+        self.assertFalse(result)
+        self.assertEqual(mock_exec.call_count, 2)
+
+    @patch('instanceha._execute_fence_operation', return_value=True)
+    def test_skips_invalid_agent_entries(self, mock_exec):
+        """Invalid entries (missing 'agent' key) are skipped."""
+        agents = [{'no_agent_key': True}, {'agent': 'noop'}]
+        svc = self._make_service({'compute-0': {'agents': agents}})
+        result = instanceha._host_fence('compute-0', 'off', svc)
+        self.assertTrue(result)
+        self.assertEqual(mock_exec.call_count, 1)
+
+    def test_empty_host_returns_false(self):
+        """Empty host returns False."""
+        svc = self._make_service({})
+        result = instanceha._host_fence('', 'off', svc)
+        self.assertFalse(result)
+
+    def test_invalid_action_returns_false(self):
+        """Invalid action returns False."""
+        svc = self._make_service({'compute-0': {'agent': 'noop'}})
+        result = instanceha._host_fence('compute-0', 'status', svc)
+        self.assertFalse(result)
+
+    def test_no_fencing_data_returns_false(self):
+        """No matching fencing config returns False."""
+        svc = self._make_service({'other-host': {'agent': 'noop'}})
+        result = instanceha._host_fence('compute-0', 'off', svc)
+        self.assertFalse(result)
+
+    def test_no_agents_configured_returns_false(self):
+        """Dict with neither 'agent' nor 'agents' returns False."""
+        svc = self._make_service({'compute-0': {'something': 'else'}})
+        result = instanceha._host_fence('compute-0', 'off', svc)
+        self.assertFalse(result)
+
+    @patch('instanceha._execute_fence_operation', return_value=True)
+    def test_fqdn_matches_short_hostname(self, mock_exec):
+        """FQDN fencing config matches request by short hostname."""
+        svc = self._make_service({'compute-0.example.com': {'agent': 'noop'}})
+        result = instanceha._host_fence('compute-0', 'off', svc)
+        self.assertTrue(result)
+
+    def test_watchdog_first_in_chain_rejected(self):
+        """Watchdog as first agent in a multi-agent chain is rejected."""
+        agents = [{'agent': 'watchdog'}, {'agent': 'ipmi'}]
+        svc = self._make_service({'compute-0': {'agents': agents}})
+        result = instanceha._host_fence('compute-0', 'off', svc)
+        self.assertFalse(result)
+
+    @patch('instanceha._execute_fence_operation', return_value=True)
+    def test_watchdog_last_in_chain_allowed(self, mock_exec):
+        """Watchdog as last agent in chain is allowed."""
+        agents = [{'agent': 'ipmi'}, {'agent': 'watchdog'}]
+        svc = self._make_service({'compute-0': {'agents': agents}})
+        result = instanceha._host_fence('compute-0', 'off', svc)
+        self.assertTrue(result)
+
+    @patch('instanceha._execute_fence_operation')
+    def test_auth_failure_stops_fallback_chain(self, mock_exec):
+        """Non-retriable error (None) stops the fallback chain."""
+        mock_exec.return_value = None
+        agents = [{'agent': 'redfish'}, {'agent': 'watchdog'}]
+        svc = self._make_service({'compute-0': {'agents': agents}})
+        result = instanceha._host_fence('compute-0', 'off', svc)
+        self.assertFalse(result)
+        self.assertEqual(mock_exec.call_count, 1)
+
+    @patch('instanceha._execute_fence_operation')
+    def test_connection_failure_continues_fallback_chain(self, mock_exec):
+        """Retriable error (False) continues to the next agent."""
+        mock_exec.side_effect = [False, True]
+        agents = [{'agent': 'redfish'}, {'agent': 'watchdog'}]
+        svc = self._make_service({'compute-0': {'agents': agents}})
+        result = instanceha._host_fence('compute-0', 'off', svc)
+        self.assertTrue(result)
+        self.assertEqual(mock_exec.call_count, 2)
+
+    def test_watchdog_sole_agent_rejected(self):
+        """Watchdog as sole agent is rejected."""
+        svc = self._make_service({'compute-0': {'agent': 'watchdog'}})
+        result = instanceha._host_fence('compute-0', 'off', svc)
+        self.assertFalse(result)
+
+
+# ============================================================================
+# Fallback chain integration tests (real agents, no _execute_fence_operation mock)
+# ============================================================================
+
+class TestFallbackChainIntegration(unittest.TestCase):
+    """Integration tests exercising real fencing agents through _host_fence."""
+
+    def _make_service(self, fencing_config, check_heartbeat=True,
+                      watchdog_timeout=60, listener_start=100.0, last_hb=0):
+        svc = Mock()
+        svc.config.fencing = fencing_config
+        svc.config.get_config_value = Mock(side_effect=lambda key: {
+            'CHECK_HEARTBEAT': check_heartbeat,
+            'WATCHDOG_TIMEOUT': watchdog_timeout,
+            'FENCING_TIMEOUT': 30,
+        }.get(key, Mock()))
+        svc.heartbeat_lock = threading.Lock()
+        svc.heartbeat_hosts_timestamp = {'compute-0': last_hb} if last_hb else {}
+        svc.heartbeat_listener_start_time = listener_start
+        svc.watchdog_fenced_hosts = set()
+        svc.shutdown_event = Mock()
+        svc.shutdown_event.is_set = Mock(return_value=False)
+        svc.shutdown_event.wait = Mock()
+        return svc
+
+    @patch('instanceha.time.monotonic', return_value=200.0)
+    def test_noop_primary_never_reaches_watchdog(self, mock_time):
+        """When noop succeeds, watchdog is never tried."""
+        agents = [{'agent': 'noop'}, {'agent': 'watchdog'}]
+        svc = self._make_service({'compute-0': {'agents': agents}})
+        result = instanceha._host_fence('compute-0', 'off', svc)
+        self.assertEqual(result, 'noop')
+        self.assertNotIn('compute-0', svc.watchdog_fenced_hosts)
+
+    @patch('instanceha.time.monotonic', return_value=200.0)
+    @patch('instanceha._execute_ipmi_fence', return_value=False)
+    def test_ipmi_fails_watchdog_succeeds(self, mock_ipmi, mock_time):
+        """IPMI fails, falls back to watchdog which succeeds."""
+        agents = [
+            {'agent': 'ipmi', 'ipaddr': '10.0.0.1', 'ipport': '623',
+             'login': 'admin', 'passwd': 'pass'},
+            {'agent': 'watchdog', 'timeout': 60},
+        ]
+        svc = self._make_service(
+            {'compute-0': {'agents': agents}},
+            listener_start=100.0, last_hb=120.0)
+        result = instanceha._host_fence('compute-0', 'off', svc)
+        self.assertEqual(result, 'watchdog')
+        self.assertIn('compute-0', svc.watchdog_fenced_hosts)
+
+    @patch('instanceha.time.monotonic', return_value=200.0)
+    @patch('instanceha._execute_ipmi_fence', return_value=False)
+    def test_ipmi_fails_watchdog_fails_heartbeat_recent(self, mock_ipmi, mock_time):
+        """IPMI fails, watchdog also fails because heartbeat is recent."""
+        agents = [
+            {'agent': 'ipmi', 'ipaddr': '10.0.0.1', 'ipport': '623',
+             'login': 'admin', 'passwd': 'pass'},
+            {'agent': 'watchdog', 'timeout': 60},
+        ]
+        svc = self._make_service(
+            {'compute-0': {'agents': agents}},
+            listener_start=100.0, last_hb=195.0)
+        result = instanceha._host_fence('compute-0', 'off', svc)
+        self.assertFalse(result)
+        self.assertNotIn('compute-0', svc.watchdog_fenced_hosts)
+
+    @patch('instanceha.time.monotonic', return_value=200.0)
+    def test_watchdog_power_on_in_chain(self, mock_time):
+        """In a chain, watchdog absorbs power-on for action='on'."""
+        agents = [
+            {'agent': 'redfish', 'ipaddr': '10.0.0.1', 'login': 'a', 'passwd': 'p'},
+            {'agent': 'watchdog'},
+        ]
+        svc = self._make_service({'compute-0': {'agents': agents}})
+        with patch('instanceha._redfish_reset', return_value=False):
+            result = instanceha._host_fence('compute-0', 'on', svc)
+        self.assertEqual(result, 'watchdog')
+
+    @patch('instanceha.time.monotonic', return_value=200.0)
+    def test_old_format_returns_agent_name(self, mock_time):
+        """Old single-agent format returns the agent name, not True."""
+        svc = self._make_service({'compute-0': {'agent': 'noop'}})
+        result = instanceha._host_fence('compute-0', 'off', svc)
+        self.assertEqual(result, 'noop')
+
+
+# ============================================================================
+# Post-evacuation recovery watchdog tests
+# ============================================================================
+
+class TestPostEvacuationRecoveryWatchdog(unittest.TestCase):
+    """Tests for watchdog-fenced recovery in _post_evacuation_recovery."""
+
+    def _make_service(self, kdump_fenced=False, watchdog_fenced=False, leave_disabled=False):
+        svc = Mock()
+        svc.kdump_lock = threading.Lock()
+        svc.heartbeat_lock = threading.Lock()
+        svc.kdump_fenced_hosts = {'compute-0'} if kdump_fenced else set()
+        svc.kdump_hosts_checking = {}
+        svc.watchdog_fenced_hosts = {'compute-0'} if watchdog_fenced else set()
+        svc.config.get_config_value = Mock(side_effect=lambda key: {
+            'LEAVE_DISABLED': leave_disabled,
+        }.get(key, Mock()))
+        return svc
+
+    def _make_failed_service(self, host='compute-0.example.com'):
+        svc = Mock()
+        svc.host = host
+        svc.id = 'svc-1'
+        return svc
+
+    @patch('instanceha._host_fence', return_value=True)
+    def test_watchdog_fenced_skips_power_on(self, mock_fence):
+        """Watchdog-fenced host skips power-on."""
+        svc = self._make_service(watchdog_fenced=True)
+        conn = MagicMock()
+        failed_svc = self._make_failed_service()
+        result = instanceha._post_evacuation_recovery(conn, failed_svc, svc)
+        self.assertTrue(result)
+        mock_fence.assert_not_called()
+
+    @patch('instanceha._host_fence', return_value=True)
+    def test_watchdog_fenced_clears_from_set(self, mock_fence):
+        """Watchdog-fenced host is removed from watchdog_fenced_hosts after recovery."""
+        svc = self._make_service(watchdog_fenced=True)
+        conn = MagicMock()
+        failed_svc = self._make_failed_service()
+        instanceha._post_evacuation_recovery(conn, failed_svc, svc)
+        self.assertNotIn('compute-0', svc.watchdog_fenced_hosts)
+
+    @patch('instanceha._host_fence', return_value=True)
+    def test_watchdog_marker_in_disable_reason(self, mock_fence):
+        """Watchdog marker appears in the disable reason suffix."""
+        svc = self._make_service(watchdog_fenced=True)
+        conn = MagicMock()
+        failed_svc = self._make_failed_service()
+        instanceha._post_evacuation_recovery(conn, failed_svc, svc)
+        disable_reason_call = conn.services.disable_log_reason.call_args[0][1]
+        self.assertIn(instanceha.DISABLED_REASON_WATCHDOG_MARKER, disable_reason_call)
+
+    @patch('instanceha._host_fence', return_value=True)
+    def test_kdump_takes_priority_over_watchdog(self, mock_fence):
+        """When both kdump and watchdog fenced, kdump marker takes priority."""
+        svc = self._make_service(kdump_fenced=True, watchdog_fenced=True)
+        conn = MagicMock()
+        failed_svc = self._make_failed_service()
+        instanceha._post_evacuation_recovery(conn, failed_svc, svc)
+        disable_reason_call = conn.services.disable_log_reason.call_args[0][1]
+        self.assertIn(instanceha.DISABLED_REASON_KDUMP_MARKER, disable_reason_call)
+        self.assertNotIn(instanceha.DISABLED_REASON_WATCHDOG_MARKER, disable_reason_call)
+        mock_fence.assert_not_called()
+
+    @patch('instanceha._host_fence', return_value=True)
+    def test_normal_host_powers_on(self, mock_fence):
+        """Non-fenced host gets normal power-on."""
+        svc = self._make_service()
+        conn = MagicMock()
+        failed_svc = self._make_failed_service()
+        instanceha._post_evacuation_recovery(conn, failed_svc, svc)
+        mock_fence.assert_called_once_with(failed_svc.host, 'on', svc)
+
+    @patch('instanceha._host_fence', return_value=True)
+    def test_normal_host_no_marker_suffix(self, mock_fence):
+        """Non-fenced host has no marker suffix in disable reason."""
+        svc = self._make_service()
+        conn = MagicMock()
+        failed_svc = self._make_failed_service()
+        instanceha._post_evacuation_recovery(conn, failed_svc, svc)
+        disable_reason_call = conn.services.disable_log_reason.call_args[0][1]
+        self.assertNotIn(instanceha.DISABLED_REASON_KDUMP_MARKER, disable_reason_call)
+        self.assertNotIn(instanceha.DISABLED_REASON_WATCHDOG_MARKER, disable_reason_call)
+
+
 if __name__ == '__main__':
     unittest.main()
