@@ -3114,7 +3114,7 @@ def process_service(failed_service, reserved_hosts, resume, service) -> bool:
 
             # Disable the host (skip if already disabled from previous evacuation attempt)
             # Note: kdump-fenced hosts use resume=True but are NOT yet disabled, so we still disable them
-            if not (resume and failed_service.forced_down and 'disabled' in failed_service.status):
+            if not (resume and getattr(failed_service, 'forced_down', False) and 'disabled' in failed_service.status):
                 if not _execute_step("Host disable", _host_disable, host_name, conn, failed_service, service):
                     return False
 
@@ -3228,7 +3228,7 @@ def _establish_nova_connection(service, fatal=True):
 
 def _is_service_resume_candidate(svc) -> bool:
     """Check if a service is a candidate for resuming evacuation."""
-    if not (svc.forced_down and svc.state == 'down' and 'disabled' in svc.status):
+    if not (getattr(svc, 'forced_down', False) and svc.state == 'down' and 'disabled' in svc.status):
         return False
 
     reason = getattr(svc, 'disabled_reason', '') or ''
@@ -3253,7 +3253,7 @@ def _categorize_services(services: List[Any], target_date: datetime) -> tuple:
     """Categorize services into compute nodes, resume candidates, and re-enable candidates."""
     # Compute nodes needing evacuation (not disabled/forced-down, and either down or stale)
     compute_nodes = (svc for svc in services
-                     if not ('disabled' in svc.status or svc.forced_down)
+                     if not ('disabled' in svc.status or getattr(svc, 'forced_down', False))
                      and (svc.state == 'down' or _is_service_stale(svc, target_date)))
 
     # Resume candidates (forced down, disabled with instanceha marker, not failed, not complete)
@@ -3262,8 +3262,8 @@ def _categorize_services(services: List[Any], target_date: datetime) -> tuple:
     # Re-enable candidates (forced down OR disabled with instanceha complete marker, but NOT resume candidates)
     # Note: We unset force_down first to allow service to report up, then enable once up
     reenable = (svc for svc in services
-                if (('enabled' in svc.status and svc.forced_down)
-                   or ('disabled' in svc.status and DISABLED_REASON_EVACUATION_COMPLETE in (svc.disabled_reason or '')))
+                if (('enabled' in svc.status and getattr(svc, 'forced_down', False))
+                   or ('disabled' in svc.status and DISABLED_REASON_EVACUATION_COMPLETE in (getattr(svc, 'disabled_reason', '') or '')))
                 and not _is_service_resume_candidate(svc))
 
     return compute_nodes, resume, reenable
@@ -3499,7 +3499,7 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
         # filtering, the data source is likely wrong. Only trigger when there are
         # enough active services for this to be meaningful (>=3), since small
         # clusters (2 nodes) can legitimately have all hosts down.
-        active_services = [s for s in services if 'disabled' not in s.status and not s.forced_down]
+        active_services = [s for s in services if 'disabled' not in s.status and not getattr(s, 'forced_down', False)]
         if compute_nodes and len(active_services) >= MIN_ACTIVE_SERVICES_FOR_STALE_CHECK and len(compute_nodes) >= len(active_services):
             logging.critical(
                 'ALL %d active compute services appear stale -- this is almost certainly '
@@ -3635,7 +3635,7 @@ def _get_evacuable_hosts_from_aggregates(conn, service, aggregates=None):
 def _count_evacuable_hosts(conn, service, services, aggregates=None):
     """Count total number of compute services in evacuable aggregates."""
     evacuable_hosts = _get_evacuable_hosts_from_aggregates(conn, service, aggregates)
-    active_services = [s for s in services if 'disabled' not in s.status and not s.forced_down]
+    active_services = [s for s in services if 'disabled' not in s.status and not getattr(s, 'forced_down', False)]
     if evacuable_hosts is None:
         return len(active_services)
     return sum(1 for svc in active_services if svc.host in evacuable_hosts)
@@ -3748,7 +3748,7 @@ def _process_reenabling(conn, service, to_reenable) -> None:
                     logging.info('%s kdump messages stopped (%.0fs since last message), proceeding with re-enable', svc.host, time_since_kdump)
 
             # Unset force_down if needed (allows service to report up)
-            if svc.forced_down:
+            if getattr(svc, 'forced_down', False):
                 _host_enable(conn, svc, reenable=True, service=service)
 
             # Enable disabled services only if they're now up
@@ -3780,7 +3780,7 @@ def _reconcile_orphaned_hosts(conn):
     recovered = 0
     unlocked = 0
     for svc in services:
-        if not (svc.forced_down and svc.state == 'down'):
+        if not (getattr(svc, 'forced_down', False) and svc.state == 'down'):
             continue
 
         # Mark orphaned fenced hosts for evacuation resume
