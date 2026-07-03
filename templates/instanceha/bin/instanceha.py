@@ -3451,7 +3451,7 @@ def _filter_reachable_hosts(service, compute_nodes):
             skipped.append(svc)
             logging.warning(
                 'Host %s reported down by Nova but heartbeat received %.1fs ago -- '
-                'skipping fencing (likely nova-compute crash)',
+                'skipping fencing, please check nova-compute service health',
                 svc.host, current_time - last_heartbeat)
         else:
             unreachable.append(svc)
@@ -3487,7 +3487,7 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
                 for svc in heartbeat_skipped:
                     _emit_k8s_event(svc.host, 'HostReachable',
                                     'Host reported down by Nova but still sending heartbeats -- '
-                                    'skipping fencing (likely nova-compute crash)',
+                                    'skipping fencing, please check nova-compute service health',
                                     event_type='Warning')
                     HOST_REACHABLE_TOTAL.labels(host=svc.host).inc()
 
@@ -3496,19 +3496,18 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
             stale_count, len(heartbeat_skipped), len(compute_nodes), cliff_detected)
 
         # Sanity check: if every active service still appears stale after heartbeat
-        # filtering, the data source is likely wrong. Only trigger when there are
+        # filtering, the data source is suspect. Only trigger when there are
         # enough active services for this to be meaningful (>=3), since small
         # clusters (2 nodes) can legitimately have all hosts down.
         active_services = [s for s in services if 'disabled' not in s.status and not getattr(s, 'forced_down', False)]
         if compute_nodes and len(active_services) >= MIN_ACTIVE_SERVICES_FOR_STALE_CHECK and len(compute_nodes) >= len(active_services):
             logging.critical(
-                'ALL %d active compute services appear stale -- this is almost certainly '
-                'a Nova API or infrastructure issue, not a genuine failure of every host. '
-                'Skipping fencing this cycle.',
+                'ALL %d active compute services appear stale -- '
+                'skipping fencing this cycle, please check Nova API and infrastructure health.',
                 len(active_services))
             _emit_k8s_event('cluster', 'AllServicesStale',
                             f'All {len(active_services)} active compute services appear stale -- '
-                            'skipping fencing (likely Nova API issue)',
+                            'skipping fencing, please check Nova API and infrastructure health',
                             event_type='Warning')
             ALL_SERVICES_STALE_TOTAL.inc()
             return
