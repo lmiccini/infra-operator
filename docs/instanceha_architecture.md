@@ -694,6 +694,17 @@ Poll cycle starts
   │   Rationale: if InstanceHA's worker node is network-isolated,
   │   Nova's service list may be stale -- fencing would hit healthy hosts
   │
+  ├─ Gate 1b: Cluster maintenance?
+  │   Question: "Is the OCP cluster undergoing planned maintenance?"
+  │   If any node is both cordoned (spec.unschedulable=true) AND NotReady -> skip entire cycle
+  │   Detection: the Go controller watches Node objects and sets the annotation
+  │   instanceha.openstack.org/cluster-maintenance=true on the CR; the Python pod
+  │   reads this annotation at the start of each poll cycle
+  │   Rationale: during rolling OCP upgrades/restarts, control plane disruption may cause
+  │   Nova to report stale or incorrect compute service state, leading to false fencing of
+  │   healthy compute nodes. A single uncordoned NotReady node (hardware failure) does
+  │   NOT trigger this gate -- it is not indicative of cluster-wide maintenance
+  │
   │   ─── enters _process_stale_services ───
   │
   ├─ Pre-gate: _filter_processing_hosts

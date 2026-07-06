@@ -732,6 +732,104 @@ var _ = Describe("InstanceHa Controller", func() {
 		})
 	})
 
+	When("cluster maintenance annotation is managed based on node state", func() {
+		BeforeEach(func() {
+			ih := CreateInstanceHaConfig(namespace, GetDefaultInstanceHaSpec())
+			instanceHaName.Name = ih.GetName()
+			instanceHaName.Namespace = ih.GetNamespace()
+			DeferCleanup(th.DeleteInstance, ih)
+
+			DeferCleanup(k8sClient.Delete, ctx, th.CreateConfigMap(types.NamespacedName{
+				Name:      "openstack-config",
+				Namespace: namespace,
+			}, map[string]any{
+				"clouds.yaml": "test-data",
+			}))
+
+			DeferCleanup(k8sClient.Delete, ctx, th.CreateSecret(types.NamespacedName{
+				Name:      "openstack-config-secret",
+				Namespace: namespace,
+			}, map[string][]byte{
+				"secure.yaml": []byte("test-data"),
+			}))
+
+			DeferCleanup(k8sClient.Delete, ctx, th.CreateSecret(types.NamespacedName{
+				Name:      "fencing-secret",
+				Namespace: namespace,
+			}, map[string][]byte{
+				"fencing.yaml": []byte("test-data"),
+			}))
+		})
+
+		It("should set the annotation when a node is cordoned and NotReady", func() {
+			node := CreateNode("test-node-maint-1", true, false)
+			DeferCleanup(DeleteNode, node.Name)
+
+			// Initially no annotation
+			Eventually(func(g Gomega) {
+				instance := GetInstanceHa(instanceHaName)
+				_, exists := instance.Annotations["instanceha.openstack.org/cluster-maintenance"]
+				g.Expect(exists).To(BeFalse())
+			}, timeout, interval).Should(Succeed())
+
+			// Cordon and mark NotReady
+			SetNodeState("test-node-maint-1", false, true)
+
+			// Annotation should appear
+			Eventually(func(g Gomega) {
+				instance := GetInstanceHa(instanceHaName)
+				g.Expect(instance.Annotations).To(HaveKeyWithValue(
+					"instanceha.openstack.org/cluster-maintenance", "true"))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should remove the annotation when the node recovers", func() {
+			node := CreateNode("test-node-maint-2", false, true)
+			DeferCleanup(DeleteNode, node.Name)
+
+			// Wait for annotation to be set
+			Eventually(func(g Gomega) {
+				instance := GetInstanceHa(instanceHaName)
+				g.Expect(instance.Annotations).To(HaveKeyWithValue(
+					"instanceha.openstack.org/cluster-maintenance", "true"))
+			}, timeout, interval).Should(Succeed())
+
+			// Recover the node
+			SetNodeState("test-node-maint-2", true, false)
+
+			// Annotation should be removed
+			Eventually(func(g Gomega) {
+				instance := GetInstanceHa(instanceHaName)
+				_, exists := instance.Annotations["instanceha.openstack.org/cluster-maintenance"]
+				g.Expect(exists).To(BeFalse())
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should NOT set the annotation for an uncordoned NotReady node (hardware failure)", func() {
+			node := CreateNode("test-node-maint-3", false, false)
+			DeferCleanup(DeleteNode, node.Name)
+
+			// The annotation should NOT appear — uncordoned NotReady means hardware failure
+			Consistently(func(g Gomega) {
+				instance := GetInstanceHa(instanceHaName)
+				_, exists := instance.Annotations["instanceha.openstack.org/cluster-maintenance"]
+				g.Expect(exists).To(BeFalse())
+			}, timeout/3, interval).Should(Succeed())
+		})
+
+		It("should NOT set the annotation for a cordoned but Ready node (draining)", func() {
+			node := CreateNode("test-node-maint-4", true, true)
+			DeferCleanup(DeleteNode, node.Name)
+
+			// Cordoned but still Ready — drain in progress, not yet down
+			Consistently(func(g Gomega) {
+				instance := GetInstanceHa(instanceHaName)
+				_, exists := instance.Annotations["instanceha.openstack.org/cluster-maintenance"]
+				g.Expect(exists).To(BeFalse())
+			}, timeout/3, interval).Should(Succeed())
+		})
+	})
+
 	When("the fencing-secret is missing", func() {
 		BeforeEach(func() {
 			ih := CreateInstanceHaConfig(namespace, GetDefaultInstanceHaSpec())

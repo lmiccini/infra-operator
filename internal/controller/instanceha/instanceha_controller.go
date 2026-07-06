@@ -42,6 +42,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -100,6 +101,9 @@ func (r *Reconciler) GetLogger(ctx context.Context) logr.Logger {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=topology.openstack.org,resources=topologies,verbs=get;list;watch;update
 // +kubebuilder:rbac:groups=dataplane.openstack.org,resources=openstackdataplanenodesets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+
+const clusterMaintenanceAnnotation = "instanceha.openstack.org/cluster-maintenance"
 
 // Reconcile -
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, _err error) {
@@ -219,12 +223,44 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			Resources: []string{"events"},
 			Verbs:     []string{"create", "patch"},
 		},
+		{
+			APIGroups: []string{"instanceha.openstack.org"},
+			Resources: []string{"instancehas"},
+			Verbs:     []string{"get"},
+		},
 	}
 	rbacResult, err := common_rbac.ReconcileRbac(ctx, helper, instance, rbacRules)
 	if err != nil {
 		return rbacResult, err
 	} else if (rbacResult != ctrl.Result{}) {
 		return rbacResult, nil
+	}
+
+	// Check cluster maintenance state and update annotation on the CR
+	// so the InstanceHA pod can detect it and suppress fencing.
+	inMaintenance, err := r.isClusterInMaintenance(ctx)
+	if err != nil {
+		Log.Error(err, "Failed to check cluster maintenance state")
+	} else {
+		currentVal := instance.Annotations[clusterMaintenanceAnnotation]
+		if inMaintenance && currentVal != "true" {
+			Log.Info("Cluster maintenance detected -- setting annotation to suppress fencing")
+			patch := client.MergeFrom(instance.DeepCopy())
+			if instance.Annotations == nil {
+				instance.Annotations = map[string]string{}
+			}
+			instance.Annotations[clusterMaintenanceAnnotation] = "true"
+			if patchErr := r.Patch(ctx, instance, patch); patchErr != nil {
+				Log.Error(patchErr, "Failed to set cluster maintenance annotation")
+			}
+		} else if !inMaintenance && currentVal != "" {
+			Log.Info("Cluster maintenance ended -- removing annotation to allow fencing")
+			patch := client.MergeFrom(instance.DeepCopy())
+			delete(instance.Annotations, clusterMaintenanceAnnotation)
+			if patchErr := r.Patch(ctx, instance, patch); patchErr != nil {
+				Log.Error(patchErr, "Failed to remove cluster maintenance annotation")
+			}
+		}
 	}
 
 	deploymentLabels := map[string]string{
@@ -877,7 +913,12 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		).
 		Watches(&topologyv1.Topology{},
 			handler.EnqueueRequestsFromMapFunc(r.findObjectsForSrc),
-			builder.WithPredicates(predicate.GenerationChangedPredicate{}))
+			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Watches(
+			&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(r.findAllInstanceHa),
+			builder.WithPredicates(nodeMaintenancePredicate()),
+		)
 
 	gk := schema.GroupKind{Group: edpm.NodeSetGVK.Group, Kind: edpm.NodeSetGVK.Kind}
 	if _, err := mgr.GetRESTMapper().RESTMapping(gk, edpm.NodeSetGVK.Version); err == nil {
@@ -1001,6 +1042,71 @@ func (r *Reconciler) findInstanceHaWithPendingRotation(ctx context.Context, _ cl
 				},
 			})
 		}
+	}
+	return requests
+}
+
+// nodeMaintenancePredicate filters Node events to only those where
+// spec.unschedulable or the Ready condition status changed.
+func nodeMaintenancePredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(_ event.CreateEvent) bool { return true },
+		DeleteFunc: func(_ event.DeleteEvent) bool { return true },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldNode, ok1 := e.ObjectOld.(*corev1.Node)
+			newNode, ok2 := e.ObjectNew.(*corev1.Node)
+			if !ok1 || !ok2 {
+				return true
+			}
+			if oldNode.Spec.Unschedulable != newNode.Spec.Unschedulable {
+				return true
+			}
+			return nodeReadyStatus(oldNode) != nodeReadyStatus(newNode)
+		},
+		GenericFunc: func(_ event.GenericEvent) bool { return true },
+	}
+}
+
+func nodeReadyStatus(node *corev1.Node) corev1.ConditionStatus {
+	for _, c := range node.Status.Conditions {
+		if c.Type == corev1.NodeReady {
+			return c.Status
+		}
+	}
+	return corev1.ConditionUnknown
+}
+
+func (r *Reconciler) isClusterInMaintenance(ctx context.Context) (bool, error) {
+	nodeList := &corev1.NodeList{}
+	if err := r.List(ctx, nodeList); err != nil {
+		return false, fmt.Errorf("failed to list nodes: %w", err)
+	}
+	for _, node := range nodeList.Items {
+		if !node.Spec.Unschedulable {
+			continue
+		}
+		for _, cond := range node.Status.Conditions {
+			if cond.Type == corev1.NodeReady && cond.Status != corev1.ConditionTrue {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func (r *Reconciler) findAllInstanceHa(ctx context.Context, _ client.Object) []reconcile.Request {
+	crList := &instancehav1.InstanceHaList{}
+	if err := r.List(ctx, crList); err != nil {
+		return nil
+	}
+	var requests []reconcile.Request
+	for _, cr := range crList.Items {
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      cr.Name,
+				Namespace: cr.Namespace,
+			},
+		})
 	}
 	return requests
 }

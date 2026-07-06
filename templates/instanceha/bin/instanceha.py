@@ -88,7 +88,6 @@ def _migration_query_minutes_for_timeout(evacuation_timeout_seconds):
     """
     return max(MIGRATION_QUERY_MINUTES, (evacuation_timeout_seconds + 120) // 60)
 
-
 # Disabled reason markers
 LOCK_REASON_EVACUATION = "instanceha-evacuation"
 DISABLED_REASON_EVACUATION = "instanceha evacuation"
@@ -181,6 +180,10 @@ HEARTBEAT_REJECTED_TOTAL = Counter(
 K8S_API_REACHABLE = Gauge(
     'instanceha_k8s_api_reachable',
     'Whether the Kubernetes API is reachable (1=yes, 0=no)',
+)
+CLUSTER_MAINTENANCE = Gauge(
+    'instanceha_cluster_maintenance',
+    'Whether cluster maintenance is detected (1=maintenance, 0=normal)',
 )
 HEARTBEAT_CLIFF_TOTAL = Counter(
     'instanceha_heartbeat_cliff_total',
@@ -836,6 +839,8 @@ class InstanceHAService:
         self.ready = False
         self.k8s_api_reachable = True
         K8S_API_REACHABLE.set(1)
+        self.cluster_maintenance = False
+        CLUSTER_MAINTENANCE.set(0)
 
         # Caching
         self._evacuable_flavors_cache = None
@@ -1309,6 +1314,30 @@ class InstanceHAService:
                 logging.error("K8s health check error: %s", e, exc_info=True)
                 consecutive_failures += 1
             self.shutdown_event.wait(interval)
+
+    def update_cluster_maintenance(self):
+        """Check the CR annotation and update state, metrics, and logging on transitions."""
+        try:
+            in_maintenance = _check_cluster_maintenance()
+        except Exception as e:
+            logging.error("Cluster maintenance check error: %s", e, exc_info=True)
+            return self.cluster_maintenance
+        if in_maintenance and not self.cluster_maintenance:
+            logging.warning(
+                "Cluster maintenance detected -- suppressing all fencing "
+                "until maintenance annotation is removed")
+            _emit_k8s_event('cluster', 'ClusterMaintenanceDetected',
+                            'Cluster maintenance detected -- fencing suppressed',
+                            event_type='Warning')
+            self.cluster_maintenance = True
+            CLUSTER_MAINTENANCE.set(1)
+        elif not in_maintenance and self.cluster_maintenance:
+            logging.info("Cluster maintenance ended -- resuming normal fencing")
+            _emit_k8s_event('cluster', 'ClusterMaintenanceEnded',
+                            'Cluster maintenance ended -- fencing resumed')
+            self.cluster_maintenance = False
+            CLUSTER_MAINTENANCE.set(0)
+        return self.cluster_maintenance
 
     def _run_health_check_server(self):
         """Simple health check server implementation."""
@@ -3022,6 +3051,32 @@ def _check_k8s_api_reachable():
         return False
 
 
+def _check_cluster_maintenance():
+    """Check if the InstanceHA CR has the cluster-maintenance annotation set by the controller."""
+    token, namespace = _get_k8s_credentials()
+    if not token:
+        return False
+    cr_name = os.environ.get('INSTANCEHA_CR_NAME', '')
+    if not cr_name:
+        return False
+    headers = {'Authorization': f'Bearer {token}'}
+    try:
+        response = requests.get(
+            f"{_K8S_API_BASE}/apis/instanceha.openstack.org/v1beta1"
+            f"/namespaces/{namespace}/instancehas/{cr_name}",
+            headers=headers,
+            verify=_K8S_CA_PATH,
+            timeout=5,
+        )
+        if response.status_code != 200:
+            return False
+        cr = response.json()
+        annotations = cr.get('metadata', {}).get('annotations', {})
+        return annotations.get('instanceha.openstack.org/cluster-maintenance') == 'true'
+    except Exception:
+        return False
+
+
 def _emit_k8s_event(host, reason, message, event_type='Normal'):
     """Emit a Kubernetes Event on the InstanceHA CR. Message is auto-sanitized."""
     message = _sanitize_message(message)
@@ -3896,6 +3951,12 @@ def main():
         try:
             if not service.k8s_api_reachable:
                 logging.warning("Skipping fencing -- K8s API unreachable (possible network partition)")
+                service.shutdown_event.wait(poll_interval)
+                continue
+
+            if service.update_cluster_maintenance():
+                logging.warning("Skipping fencing -- cluster maintenance detected "
+                                "(cordoned+NotReady nodes present)")
                 service.shutdown_event.wait(poll_interval)
                 continue
 

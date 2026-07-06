@@ -1534,3 +1534,59 @@ func InstanceHaConditionGetter(name types.NamespacedName) condition.Conditions {
 	instance := GetInstanceHa(name)
 	return instance.Status.Conditions
 }
+
+func CreateNode(name string, ready bool, cordoned bool) *corev1.Node {
+	readyStatus := corev1.ConditionTrue
+	if !ready {
+		readyStatus = corev1.ConditionFalse
+	}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+		Spec: corev1.NodeSpec{
+			Unschedulable: cordoned,
+		},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{
+				{
+					Type:   corev1.NodeReady,
+					Status: readyStatus,
+				},
+			},
+		},
+	}
+	Expect(k8sClient.Create(ctx, node)).Should(Succeed())
+	Expect(k8sClient.Status().Update(ctx, node)).Should(Succeed())
+	return node
+}
+
+func SetNodeState(name string, ready bool, cordoned bool) {
+	Eventually(func(g Gomega) {
+		node := &corev1.Node{}
+		g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name}, node)).Should(Succeed())
+
+		node.Spec.Unschedulable = cordoned
+		g.Expect(k8sClient.Update(ctx, node)).Should(Succeed())
+
+		readyStatus := corev1.ConditionTrue
+		if !ready {
+			readyStatus = corev1.ConditionFalse
+		}
+		node.Status.Conditions = []corev1.NodeCondition{
+			{
+				Type:   corev1.NodeReady,
+				Status: readyStatus,
+			},
+		}
+		g.Expect(k8sClient.Status().Update(ctx, node)).Should(Succeed())
+	}, timeout, interval).Should(Succeed())
+}
+
+func DeleteNode(name string) {
+	node := &corev1.Node{}
+	err := k8sClient.Get(ctx, types.NamespacedName{Name: name}, node)
+	if err == nil {
+		Expect(k8sClient.Delete(ctx, node)).Should(Succeed())
+	}
+}
