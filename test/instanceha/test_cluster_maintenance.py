@@ -11,7 +11,7 @@ import os
 import unittest
 from unittest.mock import patch, MagicMock
 
-import conftest  # noqa: F401
+from conftest import make_mock_config  # noqa: F401
 import instanceha
 
 
@@ -111,8 +111,7 @@ class TestUpdateClusterMaintenance(unittest.TestCase):
     """Tests for update_cluster_maintenance() state transitions."""
 
     def setUp(self):
-        self.config = instanceha.ConfigManager()
-        self.service = instanceha.InstanceHAService(self.config)
+        self.service = instanceha.InstanceHAService(make_mock_config())
 
     def test_initial_state(self):
         self.assertFalse(self.service.cluster_maintenance)
@@ -177,8 +176,7 @@ class TestClusterMaintenanceFencingGate(unittest.TestCase):
     """Tests for the fencing gate using update_cluster_maintenance return value."""
 
     def setUp(self):
-        self.config = instanceha.ConfigManager()
-        self.service = instanceha.InstanceHAService(self.config)
+        self.service = instanceha.InstanceHAService(make_mock_config())
 
     @patch('instanceha._emit_k8s_event')
     @patch('instanceha._check_cluster_maintenance', return_value=True)
