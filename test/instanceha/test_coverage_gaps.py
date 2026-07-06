@@ -760,6 +760,36 @@ class TestMonitorEvacuation(unittest.TestCase):
         monotonic_values = [100, 100 + timeout + 1]
         self.assertFalse(self._run_monitor([in_progress], monotonic_values=monotonic_values))
 
+    def test_custom_timeout(self):
+        """Custom evacuation_timeout is honored over the default."""
+        in_progress = Mock(completed=False, error=False)
+        custom_timeout = 600
+        # Should NOT timeout at default 300s
+        monotonic_values = [100, 100 + 400, 100 + custom_timeout + 1]
+        with patch('instanceha.time.sleep'):
+            with patch('instanceha.time.monotonic', side_effect=monotonic_values):
+                with patch('instanceha._server_evacuation_status',
+                           side_effect=[in_progress, in_progress]):
+                    result = instanceha._monitor_evacuation(
+                        Mock(), 'srv-1', 'resp-1', 100,
+                        evacuation_timeout=custom_timeout)
+        self.assertFalse(result)
+
+    def test_custom_timeout_completes_before_default_would_expire(self):
+        """Evacuation completing at 400s succeeds with custom timeout of 600s."""
+        in_progress = Mock(completed=False, error=False)
+        done = Mock(completed=True, error=False)
+        custom_timeout = 600
+        monotonic_values = [100, 100 + 400, 100 + 450]
+        with patch('instanceha.time.sleep'):
+            with patch('instanceha.time.monotonic', side_effect=monotonic_values):
+                with patch('instanceha._server_evacuation_status',
+                           side_effect=[in_progress, done]):
+                    result = instanceha._monitor_evacuation(
+                        Mock(), 'srv-1', 'resp-1', 100,
+                        evacuation_timeout=custom_timeout)
+        self.assertTrue(result)
+
 
 # ============================================================================
 # Main loop backoff tests

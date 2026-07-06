@@ -79,6 +79,16 @@ DEFAULT_HEARTBEAT_PORT = 7411
 HEARTBEAT_CLEANUP_AGE_SECONDS = 600
 _ALLOWED_HTTP_METHODS = frozenset({'get', 'post', 'patch', 'put', 'delete'})
 
+
+def _migration_query_minutes_for_timeout(evacuation_timeout_seconds):
+    """Derive migration query window from evacuation timeout.
+
+    Always at least MIGRATION_QUERY_MINUTES, with 2 minutes of padding
+    beyond the evacuation timeout so in-progress migrations remain visible.
+    """
+    return max(MIGRATION_QUERY_MINUTES, (evacuation_timeout_seconds + 120) // 60)
+
+
 # Disabled reason markers
 LOCK_REASON_EVACUATION = "instanceha-evacuation"
 DISABLED_REASON_EVACUATION = "instanceha evacuation"
@@ -728,6 +738,7 @@ class ConfigManager:
         'ORCHESTRATED_RESTART': ConfigItem('bool', False),
         'SKIP_SERVERS_WITH_NAME': ConfigItem('list', []),
         'EVACUATION_RETRIES': ConfigItem('int', DEFAULT_EVACUATION_RETRIES, 1, 20),
+        'EVACUATION_TIMEOUT': ConfigItem('int', MAX_EVACUATION_TIMEOUT_SECONDS, 60, 3600),
         'HEARTBEAT_CLIFF_THRESHOLD': ConfigItem('int', 50, 10, 100),
         'HEARTBEAT_CLIFF_MAX_CYCLES': ConfigItem('int', 3, 1, 20),
         'MAX_HOSTS_PER_CYCLE': ConfigItem('int', 10, 1, 100),
@@ -1722,8 +1733,9 @@ def _build_evacuation_groups(evacuables) -> List[List]:
     return [servers for _, _, servers in phases]
 
 
-def _run_concurrent(func, items, max_workers, item_id_func, log_prefix=""):
+def _run_concurrent(func, items, max_workers, item_id_func, log_prefix="", timeout=None):
     """Run func for each item concurrently, return True if all succeeded."""
+    effective_timeout = timeout if timeout is not None else MAX_EVACUATION_TIMEOUT_SECONDS + 60
     all_succeeded = True
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_item = {executor.submit(func, item): item for item in items}
@@ -1731,7 +1743,7 @@ def _run_concurrent(func, items, max_workers, item_id_func, log_prefix=""):
             item = future_to_item[future]
             item_id = item_id_func(item)
             try:
-                if not future.result(timeout=MAX_EVACUATION_TIMEOUT_SECONDS + 60):
+                if not future.result(timeout=effective_timeout):
                     logging.warning('%s%s failed', log_prefix, item_id)
                     all_succeeded = False
                 else:
@@ -1752,10 +1764,11 @@ def _concurrent_evacuate(connection, evacuables, service, host, service_id, targ
     phases = _build_evacuation_groups(evacuables) if orchestrated else [evacuables]
     total_phases = len(phases)
     max_retries = service.config.get_config_value('EVACUATION_RETRIES')
+    evacuation_timeout = service.config.get_config_value('EVACUATION_TIMEOUT')
     inner_workers = max(1, MAX_TOTAL_EVACUATION_THREADS // service.config.get_config_value('WORKERS'))
 
-    logging.info("Concurrent evacuation: %d phase(s), %d total servers from %s (orchestrated=%s)",
-                total_phases, sum(len(p) for p in phases), host, orchestrated)
+    logging.info("Concurrent evacuation: %d phase(s), %d total servers from %s (orchestrated=%s, timeout=%ds)",
+                total_phases, sum(len(p) for p in phases), host, orchestrated, evacuation_timeout)
 
     all_succeeded = True
     for phase_num, phase_servers in enumerate(phases, 1):
@@ -1766,11 +1779,13 @@ def _concurrent_evacuate(connection, evacuables, service, host, service_id, targ
         phase_ok = _run_concurrent(
             lambda s: _server_evacuate_future(connection, s, target_host,
                                               max_retries=max_retries,
-                                              shutdown_event=service.shutdown_event),
+                                              shutdown_event=service.shutdown_event,
+                                              evacuation_timeout=evacuation_timeout),
             phase_servers,
             inner_workers,
             lambda s: s.id,
             log_prefix=f"Phase {phase_num}: " if total_phases > 1 else "",
+            timeout=evacuation_timeout + 60,
         )
         if not phase_ok:
             all_succeeded = False
@@ -1904,13 +1919,13 @@ def _server_evacuate(connection, server, target_host=None, server_obj=None) -> E
     )
 
 
-def _server_evacuation_status(connection, server) -> EvacuationStatus:
+def _server_evacuation_status(connection, server, query_minutes=MIGRATION_QUERY_MINUTES) -> EvacuationStatus:
     """Check the status of a server evacuation by querying recent migrations."""
     if not connection or not server:
         return EvacuationStatus(completed=False, error=True)
 
     try:
-        query_time = (datetime.now(timezone.utc) - timedelta(minutes=MIGRATION_QUERY_MINUTES)).isoformat()
+        query_time = (datetime.now(timezone.utc) - timedelta(minutes=query_minutes)).isoformat()
         migrations = connection.migrations.list(
             instance_uuid=str(server),
             migration_type='evacuation',
@@ -1941,23 +1956,26 @@ def _server_evacuation_status(connection, server) -> EvacuationStatus:
 
 def _monitor_evacuation(connection, server_id, response_uuid, start_time,
                         max_retries=DEFAULT_EVACUATION_RETRIES,
-                        shutdown_event=None) -> bool:
+                        shutdown_event=None,
+                        evacuation_timeout=MAX_EVACUATION_TIMEOUT_SECONDS) -> bool:
     """Poll Nova migrations API until evacuation completes, errors out, or times out."""
     migration_error_count = 0
     api_error_count = 0
+    query_minutes = _migration_query_minutes_for_timeout(evacuation_timeout)
 
     while True:
         if shutdown_event and shutdown_event.is_set():
             logging.warning("Shutdown requested, aborting evacuation monitoring for %s", response_uuid)
             return False
 
-        if time.monotonic() - start_time > MAX_EVACUATION_TIMEOUT_SECONDS:
+        if time.monotonic() - start_time > evacuation_timeout:
             logging.error("Evacuation of %s timed out after %d seconds. Giving up.",
-                         response_uuid, MAX_EVACUATION_TIMEOUT_SECONDS)
+                         response_uuid, evacuation_timeout)
             return False
 
         try:
-            status = _server_evacuation_status(connection, server_id)
+            status = _server_evacuation_status(connection, server_id,
+                                               query_minutes=query_minutes)
             api_error_count = 0
 
             if status.completed:
@@ -2003,7 +2021,8 @@ def _monitor_evacuation(connection, server_id, response_uuid, start_time,
 
 def _server_evacuate_future(connection, server, target_host=None,
                             max_retries=DEFAULT_EVACUATION_RETRIES,
-                            shutdown_event=None) -> bool:
+                            shutdown_event=None,
+                            evacuation_timeout=MAX_EVACUATION_TIMEOUT_SECONDS) -> bool:
     """Evacuate a server and monitor until completion."""
     if not hasattr(server, 'id'):
         logging.warning("Could not evacuate instance - missing server ID: %s",
@@ -2051,7 +2070,8 @@ def _server_evacuate_future(connection, server, target_host=None,
 
         result = _monitor_evacuation(connection, server.id, response.uuid, start_time,
                                      max_retries=max_retries,
-                                     shutdown_event=shutdown_event)
+                                     shutdown_event=shutdown_event,
+                                     evacuation_timeout=evacuation_timeout)
 
         if result:
             _emit_k8s_event(source_host, 'InstanceEvacuationSucceeded',
@@ -3295,7 +3315,8 @@ def _cleanup_filtered_hosts(service, marked_hostnames, final_hostnames, current_
 def _filter_processing_hosts(service, compute_nodes, to_resume):
     """Filter out hosts already being processed and mark new ones."""
     current_time = time.monotonic()
-    max_processing_time = max(service.config.get_config_value('FENCING_TIMEOUT'), MAX_EVACUATION_TIMEOUT_SECONDS)
+    max_processing_time = max(service.config.get_config_value('FENCING_TIMEOUT'),
+                              service.config.get_config_value('EVACUATION_TIMEOUT'))
     marked_hostnames = set()
 
     with service.processing_lock:
@@ -3596,6 +3617,8 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
 
             workers = service.config.get_config_value('WORKERS')
             poll_interval = service.config.get_config_value('POLL')
+            outer_timeout = (service.config.get_config_value('FENCING_TIMEOUT')
+                             + service.config.get_config_value('EVACUATION_TIMEOUT') + 60)
             for batch_name, batch, resume in [
                 ('new evacuations', to_evacuate, False),
                 ('kdump-fenced', kdump_fenced, True),
@@ -3608,6 +3631,7 @@ def _process_stale_services(conn, service, services, compute_nodes, to_resume):
                     batch,
                     workers,
                     lambda svc: f"{svc.host} ({batch_name})",
+                    timeout=outer_timeout,
                 )
 
             final_hostnames = {_extract_hostname(svc.host) for svc in to_evacuate + kdump_fenced + to_resume}
@@ -3715,6 +3739,8 @@ def _process_reenabling(conn, service, to_reenable) -> None:
 
     logging.debug('Checking %d computes for re-enabling', len(to_reenable))
     force_enable = service.config.get_config_value('FORCE_ENABLE')
+    query_minutes = _migration_query_minutes_for_timeout(
+        service.config.get_config_value('EVACUATION_TIMEOUT'))
 
     for svc in to_reenable:
         try:
@@ -3722,7 +3748,7 @@ def _process_reenabling(conn, service, to_reenable) -> None:
             if force_enable:
                 migrations_complete = True
             else:
-                query_time = (datetime.now(timezone.utc) - timedelta(minutes=MIGRATION_QUERY_MINUTES)).isoformat()
+                query_time = (datetime.now(timezone.utc) - timedelta(minutes=query_minutes)).isoformat()
                 migrations = conn.migrations.list(source_compute=svc.host, migration_type='evacuation',
                                                  changes_since=query_time, limit=str(MIGRATION_QUERY_LIMIT))
                 incomplete = [m for m in migrations if m.status not in MIGRATION_STATUS_COMPLETED and m.status not in MIGRATION_STATUS_ERROR]

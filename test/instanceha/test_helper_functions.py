@@ -440,5 +440,25 @@ class TestCountEvacuableHosts(unittest.TestCase):
         self.assertEqual(count, 3)
 
 
+class TestMigrationQueryMinutesForTimeout(unittest.TestCase):
+    """Tests for _migration_query_minutes_for_timeout derivation."""
+
+    def test_default_timeout(self):
+        result = instanceha._migration_query_minutes_for_timeout(300)
+        self.assertEqual(result, 7)
+
+    def test_small_timeout_uses_floor(self):
+        result = instanceha._migration_query_minutes_for_timeout(60)
+        self.assertEqual(result, 5)
+
+    def test_large_timeout(self):
+        result = instanceha._migration_query_minutes_for_timeout(3600)
+        self.assertEqual(result, 62)
+
+    def test_zero_timeout_uses_floor(self):
+        result = instanceha._migration_query_minutes_for_timeout(0)
+        self.assertEqual(result, 5)
+
+
 if __name__ == '__main__':
     unittest.main()

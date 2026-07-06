@@ -1045,7 +1045,7 @@ def _server_evacuate_future(connection, server, target_host=None) -> bool:
 - Separate counters for migration errors (`EVACUATION_RETRIES`, default 5, configurable 1-20) and API errors (`MAX_API_RETRIES=10`)
 - API error counter resets on successful API call
 - On migration failure: resets server state to `error` and re-issues `_server_evacuate` (scheduler picks new target)
-- Hard timeout: `MAX_EVACUATION_TIMEOUT_SECONDS` (300s) via `time.monotonic()`
+- Hard timeout: `EVACUATION_TIMEOUT` (default 300s, configurable 60-3600) via `time.monotonic()`
 - Per-instance K8s events emitted: `InstanceEvacuationStarted`, `InstanceEvacuationSucceeded`, `InstanceEvacuationFailed`
 
 **Behavior**:
@@ -1055,7 +1055,7 @@ def _server_evacuate_future(connection, server, target_host=None) -> bool:
 - Target host retry: if evacuation to a specific host fails with 409/500, retries without target (scheduler picks)
 - Migration failures trigger automatic re-issue (reset state + new evacuate call)
 - API errors retried independently (budget of 10, not shared with migration errors)
-- Times out after 300 seconds
+- Times out after `EVACUATION_TIMEOUT` seconds (default 300, configurable)
 - Skips redundant state restore when Nova already preserved the original state after evacuation
 - Restores original VM state after successful evacuation only when needed (`SHUTOFF` -> stop, `ERROR` -> reset_state)
 - Unlocks the server in `finally` block (even on failure)
@@ -2803,12 +2803,32 @@ This would skip servers named `test-vm-1`, `dev-instance-02`, etc.
 **Usage**:
 - Used in `_monitor_evacuation()` to cap migration-error retries
 - On each failure the server state is reset to `error` and evacuation is re-issued
-- Does not affect API-error retries (`MAX_API_RETRIES`) or the overall evacuation timeout (`MAX_EVACUATION_TIMEOUT_SECONDS`)
+- Does not affect API-error retries (`MAX_API_RETRIES`) or the overall evacuation timeout (`EVACUATION_TIMEOUT`)
 
 **Example**:
 ```yaml
 config:
   EVACUATION_RETRIES: 10
+```
+
+---
+
+#### EVACUATION_TIMEOUT
+**Type**: Integer (seconds)
+**Default**: `300`
+**Range**: 60-3600
+
+**Description**: Maximum wall-clock time (in seconds) to monitor a single instance evacuation before giving up. Increase this for environments with large VMs or slow storage backends where evacuations routinely exceed 5 minutes.
+
+**Usage**:
+- Used in `_monitor_evacuation()` as the hard per-instance timeout
+- The Nova migrations query window is automatically derived from this value to ensure in-progress migrations remain visible
+- Also governs the thread-pool future timeout (adds 60s padding) and host-processing staleness tracking
+
+**Example**:
+```yaml
+config:
+  EVACUATION_TIMEOUT: 900
 ```
 
 ---
