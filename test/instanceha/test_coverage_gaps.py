@@ -804,10 +804,13 @@ class TestMainLoopBackoff(unittest.TestCase):
         svc.config.get_config_value = Mock(side_effect=lambda key: {
             'POLL': 5, 'DELTA': 30, 'LOGLEVEL': 'INFO',
             'DISABLED': False, 'FENCING_TIMEOUT': 30,
+            'EVACUATION_TIMEOUT': 300,
         }.get(key, Mock()))
         svc.update_health_hash = Mock()
         svc.processing_lock = Mock()
         svc.ready = False
+        svc.k8s_api_reachable = True
+        svc.update_cluster_maintenance = Mock(return_value=False)
         # Use a real Event; tests set it to break the main loop
         svc.shutdown_event = threading.Event()
         return svc
@@ -937,7 +940,7 @@ class TestProcessStaleServicesSafety(unittest.TestCase):
         svc.config.get_config_value = Mock(side_effect=lambda key: {
             'DISABLED': False, 'THRESHOLD': 50, 'CHECK_KDUMP': False,
             'CHECK_HEARTBEAT': False,
-            'WORKERS': 2, 'POLL': 5, 'FENCING_TIMEOUT': 30,
+            'WORKERS': 2, 'POLL': 5, 'FENCING_TIMEOUT': 30, 'EVACUATION_TIMEOUT': 300,
             'TAGGED_IMAGES': False, 'TAGGED_FLAVORS': False,
             'TAGGED_AGGREGATES': False, 'RESERVED_HOSTS': False,
         }.get(key, Mock()))
@@ -980,7 +983,7 @@ class TestProcessStaleServicesSafety(unittest.TestCase):
         service.config.get_config_value = Mock(side_effect=lambda key: {
             'DISABLED': True, 'THRESHOLD': 50, 'CHECK_KDUMP': False,
             'CHECK_HEARTBEAT': False,
-            'WORKERS': 2, 'POLL': 5, 'FENCING_TIMEOUT': 30,
+            'WORKERS': 2, 'POLL': 5, 'FENCING_TIMEOUT': 30, 'EVACUATION_TIMEOUT': 300,
             'TAGGED_IMAGES': False, 'TAGGED_FLAVORS': False,
             'TAGGED_AGGREGATES': False, 'RESERVED_HOSTS': False,
         }.get(key, Mock()))
@@ -1790,7 +1793,7 @@ class TestFencingRateLimiter(unittest.TestCase):
         svc.config.get_config_value = Mock(side_effect=lambda key: {
             'DISABLED': False, 'THRESHOLD': 50, 'CHECK_KDUMP': False,
             'CHECK_HEARTBEAT': False,
-            'WORKERS': 2, 'POLL': 5, 'FENCING_TIMEOUT': 30,
+            'WORKERS': 2, 'POLL': 5, 'FENCING_TIMEOUT': 30, 'EVACUATION_TIMEOUT': 300,
             'TAGGED_IMAGES': False, 'TAGGED_FLAVORS': False,
             'TAGGED_AGGREGATES': False, 'RESERVED_HOSTS': False,
             'MAX_HOSTS_PER_CYCLE': 3,
@@ -1913,7 +1916,7 @@ class TestAllServicesStaleCircuitBreaker(unittest.TestCase):
         svc.config.get_config_value = Mock(side_effect=lambda key: {
             'DISABLED': False, 'THRESHOLD': 50, 'CHECK_KDUMP': False,
             'CHECK_HEARTBEAT': False,
-            'WORKERS': 2, 'POLL': 5, 'FENCING_TIMEOUT': 30,
+            'WORKERS': 2, 'POLL': 5, 'FENCING_TIMEOUT': 30, 'EVACUATION_TIMEOUT': 300,
             'TAGGED_IMAGES': False, 'TAGGED_FLAVORS': False,
             'TAGGED_AGGREGATES': False, 'RESERVED_HOSTS': False,
             'MAX_HOSTS_PER_CYCLE': 10,
@@ -2349,7 +2352,7 @@ class TestFallbackChainIntegration(unittest.TestCase):
         svc.config.get_config_value = Mock(side_effect=lambda key: {
             'CHECK_HEARTBEAT': check_heartbeat,
             'WATCHDOG_TIMEOUT': watchdog_timeout,
-            'FENCING_TIMEOUT': 30,
+            'FENCING_TIMEOUT': 30, 'EVACUATION_TIMEOUT': 300,
         }.get(key, Mock()))
         svc.heartbeat_lock = threading.Lock()
         svc.heartbeat_hosts_timestamp = {'compute-0': last_hb} if last_hb else {}

@@ -207,6 +207,7 @@ class TestOrchestratedEvacuate(unittest.TestCase):
         config.get_config_value.side_effect = lambda key: {
             'WORKERS': workers,
             'EVACUATION_RETRIES': evacuation_retries,
+            'EVACUATION_TIMEOUT': 300,
             'ORCHESTRATED_RESTART': orchestrated,
         }.get(key, None)
         return config
@@ -329,7 +330,8 @@ class TestOrchestratedEvacuate(unittest.TestCase):
                                           target_host='reserved-01')
         mock_future.assert_called_once_with(conn, server, 'reserved-01',
                                                    max_retries=5,
-                                                   shutdown_event=service.shutdown_event)
+                                                   shutdown_event=service.shutdown_event,
+                                                   evacuation_timeout=300)
 
     @patch('instanceha._update_service_disable_reason')
     @patch('instanceha._server_evacuate_future')
