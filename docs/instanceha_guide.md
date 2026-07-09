@@ -684,6 +684,17 @@ config:
 
 The agent tracks each migration to completion using a thread pool. It polls Nova for migration status every 5 seconds, retries on transient errors (including target-host retry on 409/500 conflicts), and times out after 300 seconds. Failed evacuations are recorded individually but do not abort remaining ones. This is the recommended mode for production.
 
+When evacuating many VMs with Cinder volumes from a single host, volume driver lock contention can cause API timeouts and failed evacuations. Use `EVACUATION_STAGGER` to spread the submissions:
+
+```yaml
+config:
+  SMART_EVACUATION: "true"
+  WORKERS: "8"
+  EVACUATION_STAGGER: "2"   # 2-second delay between each VM's evacuation start
+```
+
+With `EVACUATION_STAGGER: 2` and 30 VMs, the submissions spread over 60 seconds, keeping the Cinder volume driver lock queue shallow and avoiding thundering-herd timeouts.
+
 ### Orchestrated Evacuation
 
 ```yaml
@@ -1004,6 +1015,7 @@ All values are strings in the ConfigMap. The agent converts and validates them a
 | `TAGGED_AGGREGATES` | bool | true | Filter by aggregate tag (also affects threshold calculation and reserved host matching) |
 | `SKIP_SERVERS_WITH_NAME` | list | `[]` (empty) | Server name glob patterns (comma-separated) to exclude from evacuation |
 | `EVACUATION_RETRIES` | int | 5 (range: 1-20) | Max per-instance evacuation retry attempts before giving up |
+| `EVACUATION_STAGGER` | int | 0 (range: 0-10) | Seconds between each VM's evacuation start (0 = all start immediately). Reduces Cinder volume driver lock contention when evacuating many VMs with volumes from a single host |
 
 #### Host Recovery
 
@@ -1286,6 +1298,7 @@ These gates are evaluated in sequence -- a host must pass all of them before fen
 | `K8S_API_CHECK_INTERVAL` | 15s | How often the K8s API reachability probe runs. 3 consecutive failures (3 x interval) block all fencing. On networks with intermittent K8s API latency, raising to 30-60s avoids flapping between reachable/unreachable states. |
 | `FENCING_TIMEOUT` | 30s | Per-request timeout for IPMI/Redfish fencing calls (Redfish retries up to 3 times). If the BMC management network is slow or lossy, fencing may time out even though the host is reachable -- raise toward 60-90s. Also raise `terminationGracePeriodSeconds` accordingly. |
 | `EVACUATION_RETRIES` | 5 | Max per-instance evacuation retry attempts. Each retry re-issues the evacuate API call. On a flaky Nova API, retries cover transient 500s; at large scale, lower to 3 to avoid piling up retry traffic. |
+| `EVACUATION_STAGGER` | 0 | Seconds between each VM's evacuation start within a phase. Set to 2-3 when using storage backends with per-host serialization (e.g., Hitachi HBSD FC) to avoid lock contention and Cinder API timeouts during mass evacuation. |
 
 #### Tuning by cluster size
 
@@ -1411,6 +1424,7 @@ spec:
     SMART_EVACUATION: "True"         # Track migrations to completion -- essential for visibility at scale
     WORKERS: "8"                     # 8 parallel fencing workers (up from default 4)
     EVACUATION_RETRIES: "3"          # 3 retries per VM (lower than default 5 -- avoid piling up at scale)
+    EVACUATION_STAGGER: "2"          # 2s between each VM -- reduces Cinder lock contention at scale
 
     # Security
     FENCING_TIMEOUT: "30"            # 30s timeout per fencing command

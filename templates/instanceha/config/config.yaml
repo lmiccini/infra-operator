@@ -5,6 +5,7 @@ config:
   DELTA: "30"
   DISABLED: "false"
   EVACUATION_RETRIES: "5"
+  EVACUATION_STAGGER: "0"
   EVACUABLE_TAG: "evacuable"
   FENCING_TIMEOUT: "30"
   FORCE_ENABLE: "false"

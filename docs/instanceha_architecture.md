@@ -132,6 +132,7 @@ _config_map: Dict[str, ConfigItem] = {
     'ORCHESTRATED_RESTART': ConfigItem('bool', False),
     'SKIP_SERVERS_WITH_NAME': ConfigItem('list', []),
     'EVACUATION_RETRIES': ConfigItem('int', DEFAULT_EVACUATION_RETRIES, 1, 20),  # DEFAULT_EVACUATION_RETRIES = 5
+    'EVACUATION_STAGGER': ConfigItem('int', 0, 0, 10),
     'HEARTBEAT_CLIFF_THRESHOLD': ConfigItem('int', 50, 10, 100),
     'HEARTBEAT_CLIFF_MAX_CYCLES': ConfigItem('int', 3, 1, 20),
     'MAX_HOSTS_PER_CYCLE': ConfigItem('int', 10, 1, 100),
@@ -2723,6 +2724,7 @@ config:
 **Notes**:
 - Smart mode increases API load (polling) and memory usage (thread pool)
 - Traditional mode does not track completion or verify success after submission
+- When `EVACUATION_STAGGER` > 0, each VM's evacuation start is delayed by `index * stagger` seconds within a phase, reducing Cinder volume driver lock contention during mass evacuation
 
 ---
 
@@ -2840,6 +2842,31 @@ config:
 ```yaml
 config:
   EVACUATION_TIMEOUT: 900
+```
+
+---
+
+#### EVACUATION_STAGGER
+**Type**: Integer (seconds)
+**Default**: `0`
+**Range**: 0-10
+
+**Description**: Seconds of delay between each VM's evacuation start within a concurrent evacuation phase. VM 0 starts immediately, VM 1 waits `1 * stagger` seconds, VM 2 waits `2 * stagger` seconds, and so on. Default 0 starts all VMs immediately (existing behavior).
+
+**Usage**:
+- Applied in `_concurrent_evacuate()`: each server in a phase is assigned `_stagger_delay = index * stagger`
+- `_server_evacuate_future()` sleeps for `stagger_delay` seconds (via `_interruptible_sleep`) before starting the evacuation, respecting shutdown signals
+- Applies per-phase: in orchestrated mode, each phase's VMs are staggered independently starting from 0
+- Does not affect the overall `EVACUATION_TIMEOUT` — the timeout starts after the stagger sleep
+
+**Motivation**: Some Cinder volume drivers (e.g., Hitachi HBSD FC) use a per-host coordination lock that serializes all volume attach/detach operations for a given compute host. When many VMs with Cinder volumes are evacuated concurrently from a single failed host, all `terminate_connection` and `initialize_connection` calls queue behind this lock, causing escalating wait times (observed up to 44 seconds) and Cinder API timeouts that make Nova's `attachment_create` call fail with `ConnectFailure`. Staggering the evacuation submissions keeps the lock queue shallow.
+
+**Example**:
+```yaml
+config:
+  SMART_EVACUATION: true
+  WORKERS: 8
+  EVACUATION_STAGGER: 2   # 2s between each VM -- 30 VMs spread over 60s
 ```
 
 ---

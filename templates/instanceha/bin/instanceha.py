@@ -741,6 +741,7 @@ class ConfigManager:
         'ORCHESTRATED_RESTART': ConfigItem('bool', False),
         'SKIP_SERVERS_WITH_NAME': ConfigItem('list', []),
         'EVACUATION_RETRIES': ConfigItem('int', DEFAULT_EVACUATION_RETRIES, 1, 20),
+        'EVACUATION_STAGGER': ConfigItem('int', 0, 0, 10),
         'EVACUATION_TIMEOUT': ConfigItem('int', MAX_EVACUATION_TIMEOUT_SECONDS, 60, 3600),
         'HEARTBEAT_CLIFF_THRESHOLD': ConfigItem('int', 50, 10, 100),
         'HEARTBEAT_CLIFF_MAX_CYCLES': ConfigItem('int', 3, 1, 20),
@@ -1794,10 +1795,12 @@ def _concurrent_evacuate(connection, evacuables, service, host, service_id, targ
     total_phases = len(phases)
     max_retries = service.config.get_config_value('EVACUATION_RETRIES')
     evacuation_timeout = service.config.get_config_value('EVACUATION_TIMEOUT')
+    stagger = service.config.get_config_value('EVACUATION_STAGGER')
     inner_workers = max(1, MAX_TOTAL_EVACUATION_THREADS // service.config.get_config_value('WORKERS'))
 
-    logging.info("Concurrent evacuation: %d phase(s), %d total servers from %s (orchestrated=%s, timeout=%ds)",
-                total_phases, sum(len(p) for p in phases), host, orchestrated, evacuation_timeout)
+    logging.info("Concurrent evacuation: %d phase(s), %d total servers from %s (orchestrated=%s, timeout=%ds%s)",
+                total_phases, sum(len(p) for p in phases), host, orchestrated, evacuation_timeout,
+                f", stagger={stagger}s" if stagger else "")
 
     all_succeeded = True
     for phase_num, phase_servers in enumerate(phases, 1):
@@ -1805,11 +1808,15 @@ def _concurrent_evacuate(connection, evacuables, service, host, service_id, targ
             logging.info("Starting evacuation phase %d/%d (%d servers)",
                         phase_num, total_phases, len(phase_servers))
 
+        for idx, s in enumerate(phase_servers):
+            s._stagger_delay = idx * stagger
+
         phase_ok = _run_concurrent(
             lambda s: _server_evacuate_future(connection, s, target_host,
                                               max_retries=max_retries,
                                               shutdown_event=service.shutdown_event,
-                                              evacuation_timeout=evacuation_timeout),
+                                              evacuation_timeout=evacuation_timeout,
+                                              stagger_delay=s._stagger_delay),
             phase_servers,
             inner_workers,
             lambda s: s.id,
@@ -2051,12 +2058,19 @@ def _monitor_evacuation(connection, server_id, response_uuid, start_time,
 def _server_evacuate_future(connection, server, target_host=None,
                             max_retries=DEFAULT_EVACUATION_RETRIES,
                             shutdown_event=None,
-                            evacuation_timeout=MAX_EVACUATION_TIMEOUT_SECONDS) -> bool:
+                            evacuation_timeout=MAX_EVACUATION_TIMEOUT_SECONDS,
+                            stagger_delay=0) -> bool:
     """Evacuate a server and monitor until completion."""
     if not hasattr(server, 'id'):
         logging.warning("Could not evacuate instance - missing server ID: %s",
                        getattr(server, 'to_dict', lambda: str(server))())
         return False
+
+    if stagger_delay > 0:
+        logging.debug("Staggering evacuation of %s by %ds", server.id, stagger_delay)
+        _interruptible_sleep(shutdown_event, stagger_delay)
+        if shutdown_event and shutdown_event.is_set():
+            return False
 
     start_time = time.monotonic()
 
