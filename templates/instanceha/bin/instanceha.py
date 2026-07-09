@@ -3821,7 +3821,12 @@ def _process_reenabling(conn, service, to_reenable) -> None:
                 query_time = (datetime.now(timezone.utc) - timedelta(minutes=query_minutes)).isoformat()
                 migrations = conn.migrations.list(source_compute=svc.host, migration_type='evacuation',
                                                  changes_since=query_time, limit=str(MIGRATION_QUERY_LIMIT))
-                incomplete = [m for m in migrations if m.status not in MIGRATION_STATUS_COMPLETED and m.status not in MIGRATION_STATUS_ERROR]
+                if migrations is None:
+                    logging.warning('Nova returned no migration data for %s (API may be unavailable), skipping re-enable check', svc.host)
+                    continue
+                incomplete = [m for m in migrations
+                              if getattr(m, 'status', None) not in MIGRATION_STATUS_COMPLETED
+                              and getattr(m, 'status', None) not in MIGRATION_STATUS_ERROR]
                 migrations_complete = len(incomplete) == 0
 
             if not migrations_complete:
@@ -3857,7 +3862,7 @@ def _process_reenabling(conn, service, to_reenable) -> None:
                 else:
                     logging.debug('%s still down, will enable once up', svc.host)
         except Exception as e:
-            logging.error('Failed to enable %s: %s', svc.host, e)
+            logging.error('Failed to enable %s: %s', svc.host, e, exc_info=True)
 
 def _reconcile_orphaned_hosts(conn):
     """Reconcile hosts left in an inconsistent state after a crash.
