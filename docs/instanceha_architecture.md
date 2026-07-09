@@ -2909,7 +2909,7 @@ config:
 **Description**: Enable automatic management of reserved compute hosts.
 
 **Usage**:
-- Controls whether `_manage_reserved_hosts()` is called during evacuation
+- Controls whether `_manage_reserved_hosts()` is called during recovery (before evacuation)
 - Works with `FORCE_RESERVED_HOST_EVACUATION` to determine evacuation target
 
 **Behavior**:
@@ -3052,7 +3052,7 @@ openstack flavor set --property ha-enabled=true m1.small
 **Default**: `true`
 **Range**: N/A
 
-**Description**: Enable aggregate-based evacuability filtering. When enabled, only servers on hosts in aggregates with the evacuable tag are evacuated.
+**Description**: Enable aggregate-based host filtering. When enabled, only hosts in aggregates with the evacuable tag are processed for fencing and evacuation.
 
 **Usage**:
 - Controls whether aggregate tags are checked in `is_aggregate_evacuable()`
@@ -3060,7 +3060,7 @@ openstack flavor set --property ha-enabled=true m1.small
 
 **Behavior**:
 - When `true`:
-  - Only evacuate servers if host is in an aggregate with `{EVACUABLE_TAG}: true` metadata
+  - Only process hosts in aggregates with `{EVACUABLE_TAG}: true` metadata
   - Reserved hosts matched by shared aggregate
   - `THRESHOLD` percentage calculated against active evacuable hosts only
 - When `false`:
@@ -3466,18 +3466,18 @@ config:
 **Default**: `false`
 **Range**: N/A
 
-**Description**: Disable evacuation processing.
+**Description**: Disable fencing and evacuation processing.
 
 **Usage**:
 - Checked at the beginning of evacuation processing
-- When `true`: Log "Service disabled" and skip all evacuation logic
+- When `true`: Log "Service disabled" and skip fencing and evacuation
 - When `false`: Normal operation
 
 **Behavior**:
 - Service runs and polls Nova API
 - Service categorization occurs
 - No fencing, disabling, or evacuation actions executed
-- Health checks continue to update
+- Health checks and host re-enabling continue to run
 
 **Testing**:
 - Configuration feature tests verify evacuation skipping
@@ -3505,11 +3505,11 @@ config:
 **Default**: `true`
 **Range**: N/A
 
-**Description**: Enable SSL/TLS certificate verification for HTTPS requests.
+**Description**: Enable SSL/TLS certificate verification for Redfish fencing HTTPS requests.
 
 **Usage**:
-- Controls `verify` parameter in `requests` library calls
-- Affects Redfish fencing and Kubernetes API (BMH) connections
+- Controls `verify` parameter in `requests` library calls via `get_requests_ssl_config()`
+- Affects Redfish fencing connections only (K8s API uses the service account CA cert independently)
 **Behavior**:
 - **Enabled** (`true`):
   - Use `get_requests_ssl_config()` to determine SSL configuration

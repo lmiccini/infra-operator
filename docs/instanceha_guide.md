@@ -1012,7 +1012,7 @@ All values are strings in the ConfigMap. The agent converts and validates them a
 | `EVACUABLE_TAG` | string | `"evacuable"` | Metadata tag name used to identify evacuable resources |
 | `TAGGED_IMAGES` | bool | true | Filter by image tag |
 | `TAGGED_FLAVORS` | bool | true | Filter by flavor tag |
-| `TAGGED_AGGREGATES` | bool | true | Filter by aggregate tag (also affects threshold calculation and reserved host matching) |
+| `TAGGED_AGGREGATES` | bool | true | Only process hosts in aggregates with the evacuable tag (also affects threshold calculation and reserved host matching) |
 | `SKIP_SERVERS_WITH_NAME` | list | `[]` (empty) | Server name glob patterns (comma-separated) to exclude from evacuation |
 | `EVACUATION_MAX_THREADS` | int | 32 (range: 1-256) | Total evacuation thread budget shared across all hosts. Per-host concurrency is `EVACUATION_MAX_THREADS / WORKERS`. Increase for faster single-host evacuation; decrease to reduce control plane pressure |
 | `EVACUATION_RETRIES` | int | 5 (range: 1-20) | Max per-instance evacuation retry attempts before giving up |
@@ -1055,13 +1055,13 @@ All values are strings in the ConfigMap. The agent converts and validates them a
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `SSL_VERIFY` | bool | true | Verify TLS certificates for Redfish and Kubernetes API connections |
+| `SSL_VERIFY` | bool | true | Verify TLS certificates for Redfish fencing connections |
 
 #### Service Control
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `DISABLED` | bool | false | Skip all evacuation logic (health checks continue). Overridden by CR `spec.disabled` |
+| `DISABLED` | bool | false | Skip fencing and evacuation (monitoring and host re-enabling continue). Overridden by CR `spec.disabled` |
 | `LOGLEVEL` | string | `"INFO"` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 
 ---
