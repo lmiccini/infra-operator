@@ -131,6 +131,7 @@ _config_map: Dict[str, ConfigItem] = {
     'HASH_INTERVAL': ConfigItem('int', 60, 30, 300),
     'ORCHESTRATED_RESTART': ConfigItem('bool', False),
     'SKIP_SERVERS_WITH_NAME': ConfigItem('list', []),
+    'EVACUATION_MAX_THREADS': ConfigItem('int', MAX_TOTAL_EVACUATION_THREADS, 1, 256),  # MAX_TOTAL_EVACUATION_THREADS = 32
     'EVACUATION_RETRIES': ConfigItem('int', DEFAULT_EVACUATION_RETRIES, 1, 20),  # DEFAULT_EVACUATION_RETRIES = 5
     'EVACUATION_STAGGER': ConfigItem('int', 0, 0, 10),
     'HEARTBEAT_CLIFF_THRESHOLD': ConfigItem('int', 50, 10, 100),
@@ -2724,7 +2725,7 @@ config:
 **Notes**:
 - Smart mode increases API load (polling) and memory usage (thread pool)
 - Traditional mode does not track completion or verify success after submission
-- When `EVACUATION_STAGGER` > 0, each VM's evacuation start is delayed by `index * stagger` seconds within a phase, reducing Cinder volume driver lock contention during mass evacuation
+- When `EVACUATION_STAGGER` > 0, each VM's evacuation start is delayed by `index * stagger` seconds within a phase, reducing control plane pressure during mass evacuation
 
 ---
 
@@ -2806,6 +2807,35 @@ This would skip servers named `test-vm-1`, `dev-instance-02`, etc.
 
 ---
 
+#### EVACUATION_MAX_THREADS
+**Type**: Integer
+**Default**: `32`
+**Range**: 1-256
+
+**Description**: Total evacuation thread budget shared across all concurrent host evacuations. The per-host evacuation concurrency is derived as `inner_workers = EVACUATION_MAX_THREADS / WORKERS`. Increase this to allow more concurrent per-host evacuations (faster recovery when a single host with many VMs fails); decrease to reduce control plane pressure.
+
+**Usage**:
+- Used in `_concurrent_evacuate()` to compute `inner_workers`: `max(1, EVACUATION_MAX_THREADS // WORKERS)`
+- Only affects smart evacuation (`SMART_EVACUATION=true`) and orchestrated evacuation (`ORCHESTRATED_RESTART=true`)
+- Traditional (fire-and-forget) evacuation is single-threaded and not affected
+
+**Per-host concurrency examples**:
+
+| WORKERS | EVACUATION_MAX_THREADS | inner_workers (per host) |
+|---------|----------------------|--------------------------|
+| 4       | 32 (default)          | 8                        |
+| 10      | 32 (default)          | 3                        |
+| 10      | 100                   | 10                       |
+| 4       | 64                    | 16                       |
+
+**Example**:
+```yaml
+config:
+  EVACUATION_MAX_THREADS: 100  # With WORKERS=10, gives 10 concurrent evacuations per host
+```
+
+---
+
 #### EVACUATION_RETRIES
 **Type**: Integer
 **Default**: `5`
@@ -2859,7 +2889,7 @@ config:
 - Applies per-phase: in orchestrated mode, each phase's VMs are staggered independently starting from 0
 - Does not affect the overall `EVACUATION_TIMEOUT` — the timeout starts after the stagger sleep
 
-**Motivation**: Some Cinder volume drivers (e.g., Hitachi HBSD FC) use a per-host coordination lock that serializes all volume attach/detach operations for a given compute host. When many VMs with Cinder volumes are evacuated concurrently from a single failed host, all `terminate_connection` and `initialize_connection` calls queue behind this lock, causing escalating wait times (observed up to 44 seconds) and Cinder API timeouts that make Nova's `attachment_create` call fail with `ConnectFailure`. Staggering the evacuation submissions keeps the lock queue shallow.
+**Motivation**: When many VMs are evacuated concurrently from a single failed host, the burst of parallel API calls (Nova evacuate, Cinder volume attach/detach, Neutron port binding) can saturate the control plane, causing timeouts and failed evacuations. Staggering the submissions spreads the load over time.
 
 **Example**:
 ```yaml

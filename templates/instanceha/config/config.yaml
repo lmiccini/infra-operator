@@ -4,6 +4,7 @@ config:
   DELAY: "0"
   DELTA: "30"
   DISABLED: "false"
+  EVACUATION_MAX_THREADS: "32"
   EVACUATION_RETRIES: "5"
   EVACUATION_STAGGER: "0"
   EVACUABLE_TAG: "evacuable"

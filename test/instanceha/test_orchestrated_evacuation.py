@@ -206,6 +206,7 @@ class TestOrchestratedEvacuate(unittest.TestCase):
         config = MagicMock()
         config.get_config_value.side_effect = lambda key: {
             'WORKERS': workers,
+            'EVACUATION_MAX_THREADS': 32,
             'EVACUATION_RETRIES': evacuation_retries,
             'EVACUATION_STAGGER': 0,
             'EVACUATION_TIMEOUT': 300,

@@ -740,6 +740,7 @@ class ConfigManager:
         'HASH_INTERVAL': ConfigItem('int', 60, 30, 300),
         'ORCHESTRATED_RESTART': ConfigItem('bool', False),
         'SKIP_SERVERS_WITH_NAME': ConfigItem('list', []),
+        'EVACUATION_MAX_THREADS': ConfigItem('int', MAX_TOTAL_EVACUATION_THREADS, 1, 256),
         'EVACUATION_RETRIES': ConfigItem('int', DEFAULT_EVACUATION_RETRIES, 1, 20),
         'EVACUATION_STAGGER': ConfigItem('int', 0, 0, 10),
         'EVACUATION_TIMEOUT': ConfigItem('int', MAX_EVACUATION_TIMEOUT_SECONDS, 60, 3600),
@@ -1796,7 +1797,7 @@ def _concurrent_evacuate(connection, evacuables, service, host, service_id, targ
     max_retries = service.config.get_config_value('EVACUATION_RETRIES')
     evacuation_timeout = service.config.get_config_value('EVACUATION_TIMEOUT')
     stagger = service.config.get_config_value('EVACUATION_STAGGER')
-    inner_workers = max(1, MAX_TOTAL_EVACUATION_THREADS // service.config.get_config_value('WORKERS'))
+    inner_workers = max(1, service.config.get_config_value('EVACUATION_MAX_THREADS') // service.config.get_config_value('WORKERS'))
 
     logging.info("Concurrent evacuation: %d phase(s), %d total servers from %s (orchestrated=%s, timeout=%ds%s)",
                 total_phases, sum(len(p) for p in phases), host, orchestrated, evacuation_timeout,
