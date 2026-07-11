@@ -1060,6 +1060,9 @@ class TestFencingRaceCondition(unittest.TestCase):
         self.config_manager = instanceha.ConfigManager()
         self.service = instanceha.InstanceHAService(self.config_manager)
 
+    def tearDown(self):
+        self.service.processing_executor.shutdown(wait=True)
+
     def test_hosts_processing_initialization(self):
         """Test that hosts_processing dict is properly initialized."""
         self.assertIsInstance(self.service.hosts_processing, dict)
@@ -1073,6 +1076,7 @@ class TestFencingRaceCondition(unittest.TestCase):
 
         # Mock all dependencies to ensure success
         with unittest.mock.patch('instanceha._establish_nova_connection') as mock_conn, \
+             unittest.mock.patch('instanceha._host_fence', return_value='ipmi'), \
              unittest.mock.patch('instanceha._execute_step', return_value=True):
 
             # Call process_service
@@ -1183,6 +1187,7 @@ class TestFencingRaceCondition(unittest.TestCase):
         # Simulate: host is marked, but then filtered out (e.g., no servers)
         # The cleanup should happen when compute_nodes becomes empty
         with unittest.mock.patch.object(self.service, 'get_hosts_with_servers_cached', return_value={}), \
+             unittest.mock.patch.object(self.service, 'filter_hosts_with_servers', return_value=[]), \
              unittest.mock.patch.object(self.service, 'get_evacuable_images', return_value=[]), \
              unittest.mock.patch.object(self.service, 'get_evacuable_flavors', return_value=[]), \
              unittest.mock.patch.object(self.service, 'refresh_evacuable_cache'):

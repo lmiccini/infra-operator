@@ -128,7 +128,7 @@ def make_mock_config(**overrides):
 
 
 @contextmanager
-def patch_pipeline(conn=None, fence=True, disable=True,
+def patch_pipeline(conn=None, fence='ipmi', disable=True,
                    reserved=None, evacuate=True, recovery=True):
     """Patch all process_service pipeline steps with configurable return values.
 

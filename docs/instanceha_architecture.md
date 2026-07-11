@@ -138,6 +138,7 @@ _config_map: Dict[str, ConfigItem] = {
     'HEARTBEAT_CLIFF_MAX_CYCLES': ConfigItem('int', 3, 1, 20),
     'MAX_HOSTS_PER_CYCLE': ConfigItem('int', 10, 1, 200),
     'K8S_API_CHECK_INTERVAL': ConfigItem('int', 15, 5, 120),
+    'WATCHDOG_TIMEOUT': ConfigItem('int', 60, 15, 300),
 }
 ```
 
@@ -189,6 +190,9 @@ def __init__(self, config_manager: ConfigManager, cloud_client: Optional[OpenSta
     self.kdump_listener_stop_event = threading.Event()
     self.kdump_fenced_hosts = set()
 
+    # Watchdog state (protected by heartbeat_lock - shared with heartbeat state)
+    self.watchdog_fenced_hosts = set()
+
     # Heartbeat state (protected by heartbeat_lock - UDP listener writes concurrently)
     self.heartbeat_lock = threading.Lock()
     self.heartbeat_hosts_timestamp = defaultdict(float)
@@ -223,7 +227,8 @@ def __init__(self, config_manager: ConfigManager, cloud_client: Optional[OpenSta
 - `processing_executor` is a persistent `ThreadPoolExecutor` for background host processing (fencing + evacuation). Safety gates run synchronously in the main loop, then accepted hosts are submitted to the executor non-blocking. The main loop polls every `POLL` seconds regardless of in-flight work.
 - `shutdown_event` is set by the SIGTERM handler to signal the main loop and all `wait()` calls to exit gracefully.
 - `kdump_lock` protects all kdump-related state since the UDP listener thread writes concurrently with the main poll loop.
-- `heartbeat_lock` similarly protects heartbeat state from concurrent UDP listener writes.
+- `heartbeat_lock` similarly protects heartbeat state from concurrent UDP listener writes. Also protects `watchdog_fenced_hosts`.
+- `watchdog_fenced_hosts` tracks hosts that were fenced via the watchdog agent. Cleaned up when the host is re-enabled.
 
 **Key Methods**:
 - `get_connection()` - Get Nova client with dependency injection support
@@ -528,11 +533,21 @@ process_service(failed_service, reserved_hosts, resume, service)
     │   └─ 1. Fence Host (Power Off)
     │       └─ _host_fence(host, 'off')
     │           ├─ Look up fencing config
+    │           ├─ _normalize_fencing_config() resolves config format:
+    │           │   ├─ New format (agents list): try each agent in order
+    │           │   └─ Old format (flat dict with agent key): single agent
     │           ├─ Validate inputs (SSRF prevention)
-    │           └─ Execute fencing operation
+    │           └─ Fencing fallback chain: try agents in order
+    │               ├─ First agent succeeds -> return True
+    │               ├─ First agent fails -> try next agent
+    │               └─ All agents fail -> return False
+    │               Agent types:
     │               ├─ IPMI: ipmitool with retries
     │               ├─ Redfish: HTTP POST with retries
-    │               └─ BMH: Kubernetes PATCH with wait
+    │               ├─ BMH: Kubernetes PATCH with wait
+    │               └─ Watchdog: passive, checks heartbeat silence
+    │                   ├─ action='off': verify host silent > WATCHDOG_TIMEOUT
+    │                   └─ action='on': no-op (host recovers on its own)
     │
     ├─ 2. Disable Host in Nova
     │   └─ (if not (resume AND forced_down AND 'disabled' in status))
@@ -540,6 +555,7 @@ process_service(failed_service, reserved_hosts, resume, service)
     │           ├─ Force service down (forced_down=True)
     │           └─ Set disabled_reason:
     │               ├─ 'instanceha evacuation (kdump): {timestamp}' (if kdump-fenced)
+    │               ├─ 'instanceha evacuation (watchdog): {timestamp}' (if watchdog-fenced)
     │               └─ 'instanceha evacuation: {timestamp}' (otherwise)
     │       Note: Skipped for resume evacuations (already disabled)
     │             Called for kdump-fenced (not yet disabled)
@@ -566,12 +582,14 @@ process_service(failed_service, reserved_hosts, resume, service)
     └─ 5. Post-Evacuation Recovery
         └─ _post_evacuation_recovery(conn, failed_service, service, resume)
             ├─ Power on host (_host_fence(host, 'on'))
-            │   └─ Skip if kdump-fenced (host is still dumping memory)
+            │   ├─ Skip if kdump-fenced (host is still dumping memory)
+            │   └─ Skip if watchdog-fenced (host recovers on its own or manually)
             ├─ Update disabled_reason (always, even if service object is stale):
             │   ├─ 'instanceha evacuation complete (kdump): {timestamp}' (if kdump-fenced)
+            │   ├─ 'instanceha evacuation complete (watchdog): {timestamp}' (if watchdog-fenced)
             │   └─ 'instanceha evacuation complete: {timestamp}' (otherwise)
             │   └─ Excludes service from resume criteria
-            │       Preserves kdump marker for re-enable delay
+            │       Preserves kdump/watchdog marker for re-enable handling
             └─ Service remains disabled until it comes back up
 ```
 
@@ -654,8 +672,10 @@ The `disabled_reason` field tracks evacuation state:
 |-------|--------|----------------|---------|
 | `instanceha evacuation: {timestamp}` | `_host_disable()` during initial evacuation | `resume` | Evacuation in progress or interrupted |
 | `instanceha evacuation (kdump): {timestamp}` | `_host_disable()` when host is kdump-fenced | `resume` | Kdump evacuation in progress, host rebooting |
+| `instanceha evacuation (watchdog): {timestamp}` | `_host_disable()` when host is watchdog-fenced | `resume` | Watchdog evacuation in progress, host confirmed dead by heartbeat silence |
 | `instanceha evacuation complete: {timestamp}` | `_post_evacuation_recovery()` after successful evacuation | `reenable` | Evacuation complete, waiting for re-enable |
 | `instanceha evacuation complete (kdump): {timestamp}` | `_post_evacuation_recovery()` after kdump-fenced evacuation | `reenable` | Kdump evacuation complete, waiting 60s for kdump messages to stop before re-enable |
+| `instanceha evacuation complete (watchdog): {timestamp}` | `_post_evacuation_recovery()` after watchdog-fenced evacuation | `reenable` | Watchdog evacuation complete, skip power-on, host recovers on its own |
 | `instanceha evacuation FAILED: {timestamp}` | `_update_service_disable_reason()` on evacuation failure | (none) | Evacuation failed, requires manual intervention |
 
 **Key Design Points**:
@@ -891,6 +911,8 @@ clouds:
 ```
 
 **4. Fencing Configuration** (`fencing.yaml`):
+
+*Single-agent format (original, still supported):*
 ```yaml
 FencingConfig:
   compute-01.example.com:
@@ -915,6 +937,24 @@ FencingConfig:
     namespace: openshift-machine-api
     token: eyJhbGciOi...
 ```
+
+*Multi-agent format (fallback chain -- agents tried in order):*
+```yaml
+FencingConfig:
+  compute-04.example.com:
+    agents:
+      - agent: redfish
+        ipaddr: 192.168.1.12
+        ipport: '443'
+        login: root
+        passwd: redfish_password
+        tls: 'true'
+        uuid: System.Embedded.1
+      - agent: watchdog
+        timeout: 90
+```
+
+The `_normalize_fencing_config()` function handles both formats transparently. The single-agent format is converted internally to a one-element agents list.
 
 ### Configuration Validation
 
@@ -1134,6 +1174,7 @@ FENCING_AGENTS = {
     'ipmi': _fence_ipmi,
     'redfish': _fence_redfish,
     'bmh': _fence_bmh,
+    'watchdog': _fence_watchdog,
 }
 
 def _execute_fence_operation(host, action, fencing_data, service):
@@ -1208,6 +1249,97 @@ compute-03:
 - Uses bearer token authentication
 - Waits for power-off confirmation
 - Validates input parameters
+
+---
+
+### 4. Watchdog
+
+**Agent**: `watchdog`
+
+**Purpose**: Passive fencing agent that confirms host death by verifying the host has been silent (no heartbeats) for longer than `WATCHDOG_TIMEOUT` seconds. This relies on a hardware watchdog timer on the compute node: if the OS hangs or crashes, the watchdog timer fires and resets or powers off the host.
+
+**Prerequisite**: Requires `CHECK_HEARTBEAT=true`. The watchdog agent uses heartbeat timestamps to determine whether the host has been silent long enough.
+
+**Configuration**:
+```yaml
+compute-04:
+  agents:
+    - agent: redfish
+      ipaddr: 192.168.1.12
+      ipport: '443'
+      login: root
+      passwd: redfish_password
+      tls: 'true'
+      uuid: System.Embedded.1
+    - agent: watchdog
+      timeout: 90
+```
+
+The per-host `timeout` overrides the global `WATCHDOG_TIMEOUT` (default 60s, range 15-300).
+
+**Behavior**:
+- **`action='off'`**: Checks if the host has been silent (no heartbeat received) for longer than `WATCHDOG_TIMEOUT` seconds. If yes, the hardware watchdog has fired and the host is confirmed dead -- returns `True`. If not enough time has elapsed, returns `False`.
+- **`action='on'`**: No-op -- returns `True` immediately. Watchdog-fenced hosts recover on their own (hardware watchdog resets the host) or require manual intervention.
+
+**Recovery**:
+- Watchdog-fenced hosts are recorded in `watchdog_fenced_hosts` (protected by `heartbeat_lock`)
+- Power-on is skipped during post-evacuation recovery (like kdump-fenced hosts)
+- No re-enable delay is needed (unlike kdump's 60s wait)
+- The `watchdog_fenced_hosts` set is cleaned up when the host is re-enabled
+
+**Compute-Side Requirements**:
+- Hardware watchdog enabled (e.g., `ipmi_watchdog`, `iTCO_wdt`)
+- `instanceha-watchdog.service` running on compute nodes (deployed via edpm-ansible `edpm_instanceha_monitoring` role) -- this service resets the hardware watchdog timer at regular intervals, independent of the heartbeat sender
+
+---
+
+### 5. Fencing Fallback Chain
+
+**Purpose**: Allow multiple fencing agents to be configured per host, tried in order. If the primary agent fails, the next agent in the list is attempted.
+
+**Implementation**:
+```python
+def _normalize_fencing_config(fencing_data: dict) -> list:
+    """Convert fencing config to a list of agent configs.
+    Supports both old format (flat dict with 'agent' key) and
+    new format (dict with 'agents' list)."""
+    if 'agents' in fencing_data:
+        return fencing_data['agents']
+    return [fencing_data]
+
+def _host_fence(host, action, fencing_config, service):
+    agents = _normalize_fencing_config(fencing_config.get(host, {}))
+    for agent_config in agents:
+        if _execute_fence_operation(host, action, agent_config, service):
+            return True
+    return False
+```
+
+**Behavior**:
+- `_normalize_fencing_config()` converts both config formats to a uniform list
+- `_host_fence()` iterates through the agent list, calling `_execute_fence_operation()` for each
+- On first success, returns the agent name (truthy) immediately
+- If all agents fail with retriable errors, returns `False`
+- Backward compatible: old single-agent format works unchanged
+
+**Retriable vs Non-Retriable Failures**:
+
+Agents return three possible values:
+
+| Return | Meaning | Chain behavior |
+|--------|---------|----------------|
+| `True` | Success | Stop, return agent name |
+| `False` | Retriable failure (BMC unreachable, connection timeout) | Try next agent |
+| `None` | Non-retriable failure (auth error, wrong credentials) | Stop chain, return `False` |
+
+This prevents the watchdog agent from masking configuration errors. If the BMC is reachable but credentials are wrong (Redfish 401/403), the chain stops immediately — the operator needs to fix the fencing secret, not fall back to watchdog. Only connectivity failures (timeouts, network errors) trigger fallback.
+
+**Validation**:
+- Startup: `_validate_config()` raises `ConfigurationError` if `watchdog` is the first agent in a multi-agent chain
+- Startup: `_validate_config()` raises `ConfigurationError` if `watchdog` is the sole fencing agent
+- Runtime: `_host_fence()` rejects chains with `watchdog` first or sole
+
+**Use Case**: Primary BMC fencing (Redfish/IPMI) with watchdog as fallback. If BMC is unreachable (network issue, BMC crash), the watchdog agent can confirm host death via heartbeat silence instead.
 
 ---
 
@@ -2099,6 +2231,10 @@ Core unit tests covering:
 - Evacuation monitoring: `_monitor_evacuation` (completion, retry, timeout)
 - Main loop backoff: exponential backoff on Unauthorized/DiscoveryFailure/generic errors
 - Process stale services safety: empty nodes, threshold exceeded, disabled mode
+- Fencing config normalization: `TestNormalizeFencingConfig` (old format, new format, edge cases)
+- Watchdog fencing agent: `TestFenceWatchdog` (timeout evaluation, action handling)
+- Fencing fallback chain: `TestHostFenceFallbackChain` (multi-agent iteration, partial failures)
+- Watchdog recovery: `TestPostEvacuationRecoveryWatchdog` (skip power-on, marker handling)
 
 **13. K8s Events Tests** (`test_k8s_events.py`):
 - K8s credential reading and event emission
@@ -3032,7 +3168,7 @@ config:
   FORCE_ENABLE: true  # Re-enable hosts immediately, don't wait for migrations
 ```
 
-**Notes**: Kdump-fenced hosts still wait 60s after last kdump message before re-enable attempt.
+**Notes**: Kdump-fenced hosts still wait 60s after last kdump message before re-enable attempt. Watchdog-fenced hosts do not require a re-enable delay.
 
 ---
 
@@ -3138,6 +3274,67 @@ POLL=45, KDUMP_TIMEOUT=300
 ```
 
 **Notes**: Multiple poll cycles can occur during timeout period.
+
+---
+
+#### WATCHDOG_TIMEOUT
+**Type**: Integer
+**Default**: `60`
+**Range**: `15-300` seconds
+
+**Description**: How long a host must be silent (no heartbeats received) before the watchdog fencing agent declares it dead. Only used when a host's fencing configuration includes the `watchdog` agent and `CHECK_HEARTBEAT=true`.
+
+**Usage**:
+- Used by `_fence_watchdog()` to determine if enough time has passed since the last heartbeat
+- Can be overridden per-host via the `timeout` field in the fencing YAML
+
+**Behavior**:
+- When the watchdog agent runs with `action='off'`, it checks whether the host has been silent for at least `WATCHDOG_TIMEOUT` seconds
+- If the silence duration exceeds the timeout, the agent declares the host dead (hardware watchdog has fired) and returns `True`
+- If not enough time has elapsed, the agent sleeps for the remaining time (blocking the worker thread), then re-checks
+- **Thread pool impact**: While waiting, the agent holds one of the `WORKERS` threads. If multiple hosts simultaneously fall back to watchdog fencing, the thread pool may be temporarily saturated. This is by design — the wait is bounded by `WATCHDOG_TIMEOUT` and interruptible via `shutdown_event`.
+
+**Per-Host Override**:
+```yaml
+FencingConfig:
+  compute-04:
+    agents:
+      - agent: redfish
+        ipaddr: 192.168.1.12
+        ipport: '443'
+        login: root
+        passwd: redfish_password
+      - agent: watchdog
+        timeout: 90  # Override global WATCHDOG_TIMEOUT for this host
+```
+
+**Testing**:
+- `TestFenceWatchdog` tests verify timeout evaluation and action handling
+- `TestHostFenceFallbackChain` tests verify integration with the fallback chain
+- `TestPostEvacuationRecoveryWatchdog` tests verify recovery behavior
+
+**Timeout Chain**:
+
+Four timeouts form a dependency chain. Each must be greater than the previous:
+
+```
+watchdog_interval (edpm) < HW watchdog timeout (BIOS) < WATCHDOG_TIMEOUT (config) < HEARTBEAT_TIMEOUT (config)
+```
+
+- `watchdog_interval` (edpm-ansible, default 15s): must be < half the hardware watchdog timeout
+- Hardware watchdog timeout (BIOS/BMC, e.g. 60s): must be < `WATCHDOG_TIMEOUT`
+- `WATCHDOG_TIMEOUT` (config, default 60s): must be < `HEARTBEAT_TIMEOUT`
+- `HEARTBEAT_TIMEOUT` (config, default 120s): must be > `WATCHDOG_TIMEOUT`
+
+If `HEARTBEAT_TIMEOUT <= WATCHDOG_TIMEOUT`, a startup warning is emitted by `_validate_config()`.
+
+**Example**:
+```yaml
+config:
+  CHECK_HEARTBEAT: true
+  WATCHDOG_TIMEOUT: 90       # > 60s HW watchdog timeout
+  HEARTBEAT_TIMEOUT: 120     # > 90s WATCHDOG_TIMEOUT
+```
 
 ---
 

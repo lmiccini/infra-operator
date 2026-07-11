@@ -86,6 +86,8 @@ class TestPostEvacuationRecoveryErrors(unittest.TestCase):
         self.mock_service.kdump_fenced_hosts = set()
         self.mock_service.kdump_hosts_checking = {}
         self.mock_service.kdump_lock = threading.Lock()
+        self.mock_service.heartbeat_lock = threading.Lock()
+        self.mock_service.watchdog_fenced_hosts = set()
 
         self.mock_failed_service = Mock()
         self.mock_failed_service.host = 'test-host.example.com'
