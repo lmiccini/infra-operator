@@ -6,4 +6,4 @@ tls-cert-file /var/lib/config-data/tls/certs/redis.crt
 tls-key-file /var/lib/config-data/tls/private/redis.key
 tls-ca-cert-file /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
 tls-replication yes
-tls-auth-clients optional
+tls-auth-clients { TLS_AUTH_CLIENTS }

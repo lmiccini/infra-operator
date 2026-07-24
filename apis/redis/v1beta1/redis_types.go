@@ -29,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -59,6 +60,31 @@ type RedisSpec struct {
 	ContainerImage string `json:"containerImage"`
 }
 
+// RedisTLSSection contains TLS and mTLS configuration for Redis
+type RedisTLSSection struct {
+	tls.SimpleService `json:",inline"`
+
+	// +kubebuilder:validation:Optional
+	MTLS RedisMTLSSection `json:"mtls,omitempty"`
+}
+
+// RedisMTLSSection contains mutual TLS configuration for Redis
+type RedisMTLSSection struct {
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum="None";"Request";"Require"
+	// SslVerifyMode controls whether Redis requires client certificates.
+	// "None" (default): clients are not required to present a certificate.
+	// "Request": clients may present a certificate; if they do, it is validated.
+	// "Require": clients must present a valid certificate to connect.
+	SslVerifyMode string `json:"sslVerifyMode,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +operator-sdk:csv:customresourcedefinitions:type=spec
+	// AuthCertSecret is the secret containing the client cert/key/CA
+	// for mTLS authentication. Consumers mount this to authenticate to Redis.
+	AuthCertSecret tls.GenericService `json:"authCertSecret,omitempty"`
+}
+
 // RedisSpecCore - this version is used by the OpenStackControlplane CR (no container images)
 type RedisSpecCore struct {
 	// +kubebuilder:validation:Optional
@@ -68,7 +94,7 @@ type RedisSpecCore struct {
 	// +kubebuilder:validation:Optional
 	// +operator-sdk:csv:customresourcedefinitions:type=spec
 	// TLS settings for Redis service and internal Redis replication
-	TLS tls.SimpleService `json:"tls,omitempty"`
+	TLS RedisTLSSection `json:"tls,omitempty"`
 	// +kubebuilder:validation:Optional
 	// NodeSelector to target subset of worker nodes running this service
 	NodeSelector *map[string]string `json:"nodeSelector,omitempty"`
@@ -94,6 +120,9 @@ type RedisStatus struct {
 	// +kubebuilder:validation:Enum=True;False;""
 	// Whether TLS is supported by the Redis instance
 	TLSSupport string `json:"tlsSupport,omitempty"`
+
+	// MTLSCert is the name of the secret containing the mTLS client certificate
+	MTLSCert string `json:"mtlsCert,omitempty"`
 
 	// SentinelHosts - List of sentinel endpoints in host:port format
 	// +listType=atomic
@@ -184,6 +213,47 @@ func (instance *Redis) GetRedisSentinelURL() string {
 		url += "&ssl=true&sentinel_ssl=true&ssl_ca_certs=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
 	}
 	return url
+}
+
+// GetRedisMTLSSecret returns the name of the mTLS client cert secret if mTLS
+// is enabled (SslVerifyMode is Request or Require), empty string otherwise.
+func (instance *Redis) GetRedisMTLSSecret() string {
+	mode := instance.Spec.TLS.MTLS.SslVerifyMode
+	if (mode == "Request" || mode == "Require") && instance.Spec.TLS.MTLS.AuthCertSecret.SecretName != nil {
+		return *instance.Spec.TLS.MTLS.AuthCertSecret.SecretName
+	}
+	return ""
+}
+
+// CreateMTLSVolume returns a Volume sourced from the mTLS AuthCertSecret for
+// consumer pods to mount.
+func (instance *Redis) CreateMTLSVolume() corev1.Volume {
+	if instance.Spec.TLS.MTLS.AuthCertSecret.SecretName == nil {
+		return corev1.Volume{}
+	}
+	return corev1.Volume{
+		Name: *instance.Spec.TLS.MTLS.AuthCertSecret.SecretName,
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName:  *instance.Spec.TLS.MTLS.AuthCertSecret.SecretName,
+				DefaultMode: ptr.To[int32](0o400),
+			},
+		},
+	}
+}
+
+// CreateMTLSVolumeMounts returns VolumeMounts for the mTLS client cert, key,
+// and CA certificate for consumer pods.
+func (instance *Redis) CreateMTLSVolumeMounts() []corev1.VolumeMount {
+	if instance.Spec.TLS.MTLS.AuthCertSecret.SecretName == nil {
+		return nil
+	}
+	name := *instance.Spec.TLS.MTLS.AuthCertSecret.SecretName
+	return []corev1.VolumeMount{
+		{Name: name, MountPath: "/var/lib/config-data/mtls/certs/mtls.crt", SubPath: tls.CertKey, ReadOnly: true},
+		{Name: name, MountPath: "/var/lib/config-data/mtls/private/mtls.key", SubPath: tls.PrivateKey, ReadOnly: true},
+		{Name: name, MountPath: "/var/lib/config-data/mtls/certs/mtls-ca.crt", SubPath: tls.CAKey, ReadOnly: true},
+	}
 }
 
 // GetRedisByName - gets the Redis instance by name

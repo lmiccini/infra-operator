@@ -6,6 +6,7 @@ import (
 	redisv1 "github.com/openstack-k8s-operators/infra-operator/apis/redis/v1beta1"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -104,6 +105,17 @@ func getVolumes(r *redisv1.Redis) []corev1.Volume {
 			caVolume := r.Spec.TLS.CreateVolume()
 			vols = append(vols, caVolume)
 		}
+		if r.Spec.TLS.MTLS.AuthCertSecret.SecretName != nil {
+			vols = append(vols, corev1.Volume{
+				Name: "redis-mtls",
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName:  *r.Spec.TLS.MTLS.AuthCertSecret.SecretName,
+						DefaultMode: ptr.To[int32](0o440),
+					},
+				},
+			})
+		}
 	}
 
 	return vols
@@ -123,6 +135,13 @@ func getTLSVolumeMounts(r *redisv1.Redis) []corev1.VolumeMount {
 		if r.Spec.TLS.CaBundleSecretName != "" {
 			caVolumeMounts := r.Spec.TLS.CreateVolumeMounts(nil)
 			vols = append(vols, caVolumeMounts...)
+		}
+		if r.Spec.TLS.MTLS.AuthCertSecret.SecretName != nil {
+			vols = append(vols, corev1.VolumeMount{
+				Name:      "redis-mtls",
+				MountPath: "/secrets/redis-mtls",
+				ReadOnly:  true,
+			})
 		}
 	}
 	return vols

@@ -188,6 +188,32 @@ spec:
                     description: CaBundleSecretName - holding the CA certs in a pre-created
                       bundle file
                     type: string
+                  mtls:
+                    description: RedisMTLSSection contains mutual TLS configuration
+                      for Redis
+                    properties:
+                      authCertSecret:
+                        description: |-
+                          AuthCertSecret is the secret containing the client cert/key/CA
+                          for mTLS authentication. Consumers mount this to authenticate to Redis.
+                        properties:
+                          secretName:
+                            description: SecretName - holding the cert, key for the
+                              service
+                            type: string
+                        type: object
+                      sslVerifyMode:
+                        description: |-
+                          SslVerifyMode controls whether Redis requires client certificates.
+                          "None" (default): clients are not required to present a certificate.
+                          "Request": clients may present a certificate; if they do, it is validated.
+                          "Require": clients must present a valid certificate to connect.
+                        enum:
+                        - None
+                        - Request
+                        - Require
+                        type: string
+                    type: object
                   secretName:
                     description: SecretName - holding the cert, key for the service
                     type: string
@@ -277,6 +303,10 @@ spec:
                       current project
                     type: string
                 type: object
+              mtlsCert:
+                description: MTLSCert is the name of the secret containing the mTLS
+                  client certificate
+                type: string
               observedGeneration:
                 description: |-
                   ObservedGeneration - the most recent generation observed for this

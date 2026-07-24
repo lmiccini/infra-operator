@@ -17,10 +17,18 @@ if test -d /var/lib/config-data/tls; then
     REDIS_CLI_CMD="redis-cli --tls"
     REDIS_CONFIG=/var/lib/config-data/generated/var/lib/redis/redis-tls.conf
     SENTINEL_CONFIG=/var/lib/config-data/generated/var/lib/redis/sentinel-tls.conf
+    # mTLS: if client cert is mounted, add cert/key/cacert to redis-cli
+    if test -f /secrets/redis-mtls/tls.crt; then
+        REDIS_CLI_CMD="$REDIS_CLI_CMD --cert /secrets/redis-mtls/tls.crt --key /secrets/redis-mtls/tls.key --cacert /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+        TLS_AUTH_CLIENTS=yes
+    else
+        TLS_AUTH_CLIENTS=optional
+    fi
 else
     REDIS_CLI_CMD=redis-cli
     REDIS_CONFIG=/var/lib/config-data/generated/var/lib/redis/redis.conf
     SENTINEL_CONFIG=/var/lib/config-data/generated/var/lib/redis/sentinel.conf
+    TLS_AUTH_CLIENTS=optional
 fi
 
 function log() {
@@ -38,7 +46,7 @@ function generate_configs() {
     cd /var/lib/config-data/default
     for cfg in $(find -L * -name '*.conf.in'); do
         log "Generating config file from template $PWD/${cfg}"
-        sed -e "s/{ POD_FQDN }/${POD_FQDN}/g" -e "s/{ POD_IP }/${POD_IP}/g" "${cfg}" > "/var/lib/config-data/generated/${cfg%.in}"
+        sed -e "s/{ POD_FQDN }/${POD_FQDN}/g" -e "s/{ POD_IP }/${POD_IP}/g" -e "s/{ TLS_AUTH_CLIENTS }/${TLS_AUTH_CLIENTS}/g" "${cfg}" > "/var/lib/config-data/generated/${cfg%.in}"
     done
 }
 

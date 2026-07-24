@@ -200,6 +200,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		cl.Set(c)
 	}
 
+	// Init MTLS condition if mTLS is configured
+	if instance.Spec.TLS.MTLS.SslVerifyMode == "Request" || instance.Spec.TLS.MTLS.SslVerifyMode == "Require" {
+		c := condition.UnknownCondition(redisv1.MTLSInputReadyCondition, condition.InitReason, condition.InputReadyInitMessage)
+		cl.Set(c)
+	}
+
 	// Handle service delete
 	if !instance.DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, instance, helper)
@@ -292,6 +298,41 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		}
 		inputHashEnv["Cert"] = env.SetValue(hash)
 	}
+
+	// Validate mTLS client cert secret
+	if instance.Spec.TLS.MTLS.SslVerifyMode == "Request" || instance.Spec.TLS.MTLS.SslVerifyMode == "Require" {
+		if instance.Spec.TLS.MTLS.AuthCertSecret.SecretName != nil {
+			hash, err := instance.Spec.TLS.MTLS.AuthCertSecret.ValidateCertSecret(ctx, helper, instance.Namespace)
+			if err != nil {
+				if k8s_errors.IsNotFound(err) {
+					instance.Status.Conditions.Set(condition.FalseCondition(
+						redisv1.MTLSInputReadyCondition,
+						condition.RequestedReason,
+						condition.SeverityInfo,
+						condition.TLSInputReadyWaitingMessage, err.Error()))
+					return ctrl.Result{}, nil
+				}
+				instance.Status.Conditions.Set(condition.FalseCondition(
+					redisv1.MTLSInputReadyCondition,
+					condition.ErrorReason,
+					condition.SeverityWarning,
+					condition.TLSInputErrorMessage,
+					err.Error()))
+				return ctrl.Result{}, err
+			}
+			inputHashEnv["ClientCert"] = env.SetValue(hash)
+			instance.Status.MTLSCert = *instance.Spec.TLS.MTLS.AuthCertSecret.SecretName
+			instance.Status.Conditions.MarkTrue(redisv1.MTLSInputReadyCondition, condition.InputReadyMessage)
+		} else {
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				redisv1.MTLSInputReadyCondition,
+				condition.RequestedReason,
+				condition.SeverityInfo,
+				"%s", redisv1.MTLSInputReadyWaitingMessage))
+			return ctrl.Result{}, nil
+		}
+	}
+
 	// all cert input checks out so report InputReady
 	instance.Status.Conditions.MarkTrue(condition.TLSInputReadyCondition, condition.InputReadyMessage)
 	if instance.Spec.TLS.Enabled() {
