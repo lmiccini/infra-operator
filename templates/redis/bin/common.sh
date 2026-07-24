@@ -23,6 +23,10 @@ else
     SENTINEL_CONFIG=/var/lib/config-data/generated/var/lib/redis/sentinel.conf
 fi
 
+REDIS_PASSWORD=$(cat /secrets/redis-password/password)
+REDIS_PASSWORD_PREVIOUS=$(cat /secrets/redis-password/password-previous 2>/dev/null)
+export REDISCLI_AUTH="$REDIS_PASSWORD"
+
 function log() {
     echo "$(date +%F_%H_%M_%S) $*"
 }
@@ -40,6 +44,19 @@ function generate_configs() {
         log "Generating config file from template $PWD/${cfg}"
         sed -e "s/{ POD_FQDN }/${POD_FQDN}/g" -e "s/{ POD_IP }/${POD_IP}/g" "${cfg}" > "/var/lib/config-data/generated/${cfg%.in}"
     done
+}
+
+function apply_auth_config() {
+    if [ -n "$REDIS_PASSWORD" ]; then
+        local acl_entry=">$REDIS_PASSWORD"
+        if [ -n "$REDIS_PASSWORD_PREVIOUS" ]; then
+            acl_entry="$acl_entry >$REDIS_PASSWORD_PREVIOUS"
+        fi
+        echo "masterauth $REDIS_PASSWORD" >> $REDIS_CONFIG
+        echo "user default on $acl_entry ~* &* +@all" >> $REDIS_CONFIG
+        echo "sentinel auth-pass redis $REDIS_PASSWORD" >> $SENTINEL_CONFIG
+        echo "user default on $acl_entry ~* &* +@all" >> $SENTINEL_CONFIG
+    fi
 }
 
 function is_bootstrap_pod() {

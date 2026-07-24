@@ -48,6 +48,9 @@ const (
 	// SentinelMasterName is the name of the Redis master as known to Sentinel.
 	// This is hardcoded in the sentinel configuration templates.
 	SentinelMasterName = "redis"
+
+	// RedisRotatePasswordAnnotation triggers password rotation when set to "true"
+	RedisRotatePasswordAnnotation = "redis.openstack.org/rotate-password"
 )
 
 // RedisSpec defines the desired state of Redis
@@ -98,6 +101,10 @@ type RedisStatus struct {
 	// SentinelHosts - List of sentinel endpoints in host:port format
 	// +listType=atomic
 	SentinelHosts []string `json:"sentinelHosts,omitempty" optional:"true"`
+
+	// RedisPasswordSecret is the name of the auto-generated Secret containing
+	// the password for Redis authentication
+	RedisPasswordSecret string `json:"redisPasswordSecret,omitempty"`
 
 	// ObservedGeneration - the most recent generation observed for this
 	// service. If the observed generation is less than the spec generation,
@@ -184,6 +191,11 @@ func (instance *Redis) GetRedisSentinelURL() string {
 		url += "&ssl=true&sentinel_ssl=true&ssl_ca_certs=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
 	}
 	return url
+}
+
+// GetRedisPasswordSecretName returns the name of the Secret containing the Redis password
+func (instance *Redis) GetRedisPasswordSecretName() string {
+	return instance.Status.RedisPasswordSecret
 }
 
 // GetRedisByName - gets the Redis instance by name

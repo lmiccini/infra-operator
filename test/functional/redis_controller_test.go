@@ -26,6 +26,7 @@ import (
 	redisv1 "github.com/openstack-k8s-operators/infra-operator/apis/redis/v1beta1"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	. "github.com/openstack-k8s-operators/lib-common/modules/common/test/helpers"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -161,6 +162,107 @@ var _ = Describe("Redis Controller", func() {
 			Eventually(func(g Gomega) {
 				instance := GetRedis(redisName)
 				g.Expect(instance.Status.TLSSupport).To(Equal("False"))
+			}, timeout, interval).Should(Succeed())
+		})
+	})
+
+	When("Redis password authentication", func() {
+		BeforeEach(func() {
+			redis := CreateRedisConfig(namespace, GetDefaultRedisSpec())
+			redisName.Name = redis.GetName()
+			redisName.Namespace = redis.GetNamespace()
+			DeferCleanup(th.DeleteInstance, redis)
+		})
+
+		It("should auto-generate the Redis password secret", func() {
+			Eventually(func(g Gomega) {
+				passwordSecretName := types.NamespacedName{
+					Name:      redisName.Name + "-redis-password",
+					Namespace: redisName.Namespace,
+				}
+				passwordSecret := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, passwordSecretName, passwordSecret)).Should(Succeed())
+				g.Expect(passwordSecret.Data).To(HaveKey("password"))
+				g.Expect(passwordSecret.Data).To(HaveKey("password-previous"))
+				g.Expect(passwordSecret.Data["password"]).To(HaveLen(64))
+				g.Expect(passwordSecret.Data["password-previous"]).To(BeEmpty())
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should publish RedisPasswordSecret in status", func() {
+			Eventually(func(g Gomega) {
+				instance := GetRedis(redisName)
+				g.Expect(instance.Status.RedisPasswordSecret).To(Equal(redisName.Name + "-redis-password"))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should mount the password secret in the StatefulSet", func() {
+			Eventually(func(g Gomega) {
+				stsName := types.NamespacedName{
+					Name:      redisName.Name + "-redis",
+					Namespace: redisName.Namespace,
+				}
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, stsName, sts)).Should(Succeed())
+
+				var passwordVolumeFound bool
+				for _, v := range sts.Spec.Template.Spec.Volumes {
+					if v.Name == "redis-password" {
+						passwordVolumeFound = true
+						g.Expect(v.VolumeSource.Secret).ToNot(BeNil())
+						g.Expect(v.VolumeSource.Secret.SecretName).To(Equal(redisName.Name + "-redis-password"))
+					}
+				}
+				g.Expect(passwordVolumeFound).To(BeTrue(), "redis-password volume not found")
+
+				for _, container := range sts.Spec.Template.Spec.Containers {
+					var mountFound bool
+					for _, vm := range container.VolumeMounts {
+						if vm.Name == "redis-password" {
+							mountFound = true
+							g.Expect(vm.MountPath).To(Equal("/secrets/redis-password"))
+							g.Expect(vm.ReadOnly).To(BeTrue())
+						}
+					}
+					g.Expect(mountFound).To(BeTrue(), "redis-password volume mount not found in container %s", container.Name)
+				}
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should rotate the password when the rotate annotation is set", func() {
+			passwordSecretName := types.NamespacedName{
+				Name:      redisName.Name + "-redis-password",
+				Namespace: redisName.Namespace,
+			}
+			var originalPassword []byte
+			Eventually(func(g Gomega) {
+				passwordSecret := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, passwordSecretName, passwordSecret)).Should(Succeed())
+				g.Expect(passwordSecret.Data["password"]).ToNot(BeEmpty())
+				originalPassword = make([]byte, len(passwordSecret.Data["password"]))
+				copy(originalPassword, passwordSecret.Data["password"])
+			}, timeout, interval).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				instance := GetRedis(redisName)
+				if instance.Annotations == nil {
+					instance.Annotations = map[string]string{}
+				}
+				instance.Annotations[redisv1.RedisRotatePasswordAnnotation] = "true"
+				g.Expect(k8sClient.Update(ctx, instance)).Should(Succeed())
+			}, timeout, interval).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				passwordSecret := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, passwordSecretName, passwordSecret)).Should(Succeed())
+				g.Expect(passwordSecret.Data["password"]).ToNot(Equal(originalPassword), "password should have changed")
+				g.Expect(passwordSecret.Data["password-previous"]).To(Equal(originalPassword), "previous password should contain old password")
+			}, timeout, interval).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				instance := GetRedis(redisName)
+				_, exists := instance.Annotations[redisv1.RedisRotatePasswordAnnotation]
+				g.Expect(exists).To(BeFalse(), "rotate annotation should have been removed")
 			}, timeout, interval).Should(Succeed())
 		})
 	})

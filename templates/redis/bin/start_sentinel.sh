@@ -3,6 +3,7 @@
 . /var/lib/operator-scripts/common.sh
 
 generate_configs
+apply_auth_config
 
 # 1. check if a redis cluster is already running by contacting sentinel
 output=$(timeout ${TIMEOUT} $REDIS_CLI_CMD -h ${SVC_FQDN} -p 26379 sentinel master redis)

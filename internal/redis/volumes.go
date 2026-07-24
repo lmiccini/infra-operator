@@ -6,6 +6,7 @@ import (
 	redisv1 "github.com/openstack-k8s-operators/infra-operator/apis/redis/v1beta1"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -91,6 +92,16 @@ func getVolumes(r *redisv1.Redis) []corev1.Volume {
 		},
 	}
 
+	vols = append(vols, corev1.Volume{
+		Name: "redis-password",
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName:  fmt.Sprintf("%s-redis-password", r.Name),
+				DefaultMode: ptr.To[int32](0o440),
+			},
+		},
+	})
+
 	if r.Spec.TLS.Enabled() {
 		svc := tls.Service{
 			SecretName: *r.Spec.TLS.SecretName,
@@ -140,6 +151,10 @@ func getRedisVolumeMounts(r *redisv1.Redis) []corev1.VolumeMount {
 		MountPath: "/var/lib/operator-scripts",
 		ReadOnly:  true,
 		Name:      "operator-scripts",
+	}, {
+		MountPath: "/secrets/redis-password",
+		ReadOnly:  true,
+		Name:      "redis-password",
 	}}
 	vm = append(vm, getTLSVolumeMounts(r)...)
 	return vm
@@ -157,6 +172,10 @@ func getSentinelVolumeMounts(r *redisv1.Redis) []corev1.VolumeMount {
 		MountPath: "/var/lib/operator-scripts",
 		ReadOnly:  true,
 		Name:      "operator-scripts",
+	}, {
+		MountPath: "/secrets/redis-password",
+		ReadOnly:  true,
+		Name:      "redis-password",
 	}}
 	vm = append(vm, getTLSVolumeMounts(r)...)
 	return vm

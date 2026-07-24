@@ -19,6 +19,8 @@ package redis
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"strconv"
@@ -45,6 +47,7 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/env"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
 
@@ -52,6 +55,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	redis "github.com/openstack-k8s-operators/infra-operator/internal/redis"
@@ -108,6 +112,7 @@ type Reconciler struct {
 // service account permissions that are needed to grant permission to the above
 // +kubebuilder:rbac:groups="security.openshift.io",resourceNames=nonroot-v2,resources=securitycontextconstraints,verbs=use
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;patch;watch
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=topology.openstack.org,resources=topologies,verbs=get;list;watch;update
 
 // Reconcile - Redis
@@ -229,8 +234,90 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return rbacResult, nil
 	}
 
+	//
+	// Ensure Redis password secret exists
+	//
+	redisPasswordSecretName := instance.Name + "-redis-password"
+	passwordSecret := &corev1.Secret{}
+	err = r.Get(ctx, types.NamespacedName{Name: redisPasswordSecretName, Namespace: instance.Namespace}, passwordSecret)
+	if err != nil {
+		if !k8s_errors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("failed to get Redis password secret: %w", err)
+		}
+		password := make([]byte, 32)
+		if _, err = rand.Read(password); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to generate Redis password: %w", err)
+		}
+		passwordSecret = &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      redisPasswordSecretName,
+				Namespace: instance.Namespace,
+				Labels:    labels.GetLabels(instance, "redis", map[string]string{}),
+			},
+			Data: map[string][]byte{
+				"password":          []byte(hex.EncodeToString(password)),
+				"password-previous": {},
+			},
+		}
+		if err = controllerutil.SetControllerReference(instance, passwordSecret, r.Scheme); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to set owner reference on Redis password secret: %w", err)
+		}
+		if err = r.Create(ctx, passwordSecret); err != nil {
+			if !k8s_errors.IsAlreadyExists(err) {
+				return ctrl.Result{}, fmt.Errorf("failed to create Redis password secret: %w", err)
+			}
+			if err = r.Get(ctx, types.NamespacedName{Name: redisPasswordSecretName, Namespace: instance.Namespace}, passwordSecret); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to get existing Redis password secret: %w", err)
+			}
+		} else {
+			Log.Info("Created Redis password secret", "secret", redisPasswordSecretName)
+		}
+	}
+	instance.Status.RedisPasswordSecret = redisPasswordSecretName
+
+	//
+	// Handle password rotation via annotation
+	//
+	if instance.Annotations[redisv1.RedisRotatePasswordAnnotation] != "" {
+		alreadyRotated := instance.Annotations[redisv1.RedisRotatePasswordAnnotation] == passwordSecret.ResourceVersion
+
+		if !alreadyRotated {
+			newPassword := make([]byte, 32)
+			if _, err = rand.Read(newPassword); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to generate new Redis password: %w", err)
+			}
+			passwordSecret.Data["password-previous"] = passwordSecret.Data["password"]
+			passwordSecret.Data["password"] = []byte(hex.EncodeToString(newPassword))
+			if err = r.Update(ctx, passwordSecret); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to rotate Redis password: %w", err)
+			}
+			Log.Info("Rotated Redis password", "secret", redisPasswordSecretName)
+
+			stampBase := client.MergeFrom(instance.DeepCopy())
+			instance.Annotations[redisv1.RedisRotatePasswordAnnotation] = passwordSecret.ResourceVersion
+			if err = r.Patch(ctx, instance, stampBase); err != nil {
+				Log.Info("Failed to stamp rotation version, will retry", "error", err)
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
+		}
+
+		metaBase := client.MergeFrom(instance.DeepCopy())
+		delete(instance.Annotations, redisv1.RedisRotatePasswordAnnotation)
+		if err = r.Patch(ctx, instance, metaBase); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to remove rotate annotation: %w", err)
+		}
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+
 	// Hash of all resources that may cause a service restart
 	inputHashEnv := make(map[string]env.Setter)
+
+	// Include Redis password secret hash so pods restart on password change
+	_, passwordSecretHash, err := secret.GetSecret(ctx, helper, redisPasswordSecretName, instance.Namespace)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to hash Redis password secret: %w", err)
+	}
+	inputHashEnv[redisPasswordSecretName] = env.SetValue(passwordSecretHash)
 
 	//
 	// TLS input validation
@@ -557,6 +644,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&redisv1.Redis{}).
 		Owns(&appsv1.StatefulSet{}).
+		Owns(&corev1.Secret{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&rbacv1.Role{}).

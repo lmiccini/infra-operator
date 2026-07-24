@@ -81,6 +81,7 @@ func (tc *TestHelper) SimulateRedisReady(name types.NamespacedName) {
 				))
 		}
 		r.Status.SentinelHosts = sentinelHosts
+		r.Status.RedisPasswordSecret = r.Name + "-redis-password"
 
 		// This can return conflict so we have the t.Eventually block to retry
 		g.Expect(tc.K8sClient.Status().Update(tc.Ctx, r)).To(t.Succeed())
