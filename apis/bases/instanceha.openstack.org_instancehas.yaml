@@ -158,6 +158,16 @@ spec:
                 description: OpenStackConfigSecret is the name of the Secret containing
                   the secure.yaml
                 type: string
+              terminationGracePeriodSeconds:
+                default: 300
+                description: |-
+                  TerminationGracePeriodSeconds is the timeout for graceful pod termination.
+                  During an evacuation, this determines how long the pod has to finish
+                  in-flight work before being killed. Set this based on expected VM count
+                  and evacuation time per VM.
+                format: int64
+                minimum: 0
+                type: integer
               topologyRef:
                 description: |-
                   TopologyRef to apply the Topology defined by the associated CR referenced

@@ -6,7 +6,9 @@ import (
 	. "github.com/onsi/gomega" //revive:disable:dot-imports
 
 	instancehav1 "github.com/openstack-k8s-operators/infra-operator/apis/instanceha/v1beta1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 )
 
 func TestDeploymentDisabledEnvVar(t *testing.T) {
@@ -121,4 +123,42 @@ func TestDeploymentSecurityContext(t *testing.T) {
 		}
 	}
 	g.Expect(tmpMountFound).To(BeTrue(), "/tmp volume mount should exist")
+}
+
+func TestDeploymentTerminationGracePeriod(t *testing.T) {
+	g := NewWithT(t)
+
+	instance := &instancehav1.InstanceHa{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-instanceha",
+			Namespace: "test-namespace",
+		},
+		Spec: instancehav1.InstanceHaSpec{
+			ContainerImage:                "test-image:latest",
+			OpenStackCloud:                "default",
+			OpenStackConfigMap:            "openstack-config",
+			OpenStackConfigSecret:         "openstack-config-secret",
+			FencingSecret:                 "fencing-secret",
+			InstanceHaConfigMap:           "instanceha-config",
+			InstanceHaKdumpPort:           7410,
+			Disabled:                      "False",
+			TerminationGracePeriodSeconds: ptr.To[int64](600),
+		},
+	}
+
+	labels := map[string]string{"app": "instanceha"}
+	annotations := map[string]string{}
+
+	dep := Deployment(instance, labels, annotations, "default", "hash123", "test-image:latest", nil, "", "", nil)
+
+	g.Expect(dep.Spec.Template.Spec.TerminationGracePeriodSeconds).NotTo(BeNil())
+	g.Expect(*dep.Spec.Template.Spec.TerminationGracePeriodSeconds).To(Equal(int64(600)))
+
+	// Verify RunAsNonRoot is set
+	container := dep.Spec.Template.Spec.Containers[0]
+	g.Expect(container.SecurityContext.RunAsNonRoot).NotTo(BeNil())
+	g.Expect(*container.SecurityContext.RunAsNonRoot).To(BeTrue())
+
+	g.Expect(container.SecurityContext.SeccompProfile).NotTo(BeNil())
+	g.Expect(container.SecurityContext.SeccompProfile.Type).To(Equal(corev1.SeccompProfileTypeRuntimeDefault))
 }

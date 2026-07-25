@@ -21,6 +21,7 @@ import (
 	. "github.com/onsi/gomega"    //revive:disable:dot-imports
 	instancehav1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/instanceha/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 )
 
 var _ = Describe("InstanceHa webhook", func() {
@@ -45,6 +46,8 @@ var _ = Describe("InstanceHa webhook", func() {
 			Expect(instanceha.Spec.InstanceHaHeartbeatPort).To(Equal(int32(7411)))
 			Expect(instanceha.Spec.MetricsTLS.MinTLSVersion).To(Equal("1.2"))
 			Expect(instanceha.Spec.MetricsTLS.CipherSuites).To(Equal("HIGH:!aNULL:!MD5:!RC4:!3DES:!kRSA"))
+			Expect(instanceha.Spec.TerminationGracePeriodSeconds).NotTo(BeNil())
+			Expect(*instanceha.Spec.TerminationGracePeriodSeconds).To(Equal(int64(300)))
 		})
 
 		It("should not override explicitly set values", func() {
@@ -54,13 +57,14 @@ var _ = Describe("InstanceHa webhook", func() {
 					Namespace: "default",
 				},
 				Spec: instancehav1beta1.InstanceHaSpec{
-					OpenStackCloud:          "my-cloud",
-					OpenStackConfigMap:      "my-config",
-					OpenStackConfigSecret:   "my-secret",
-					FencingSecret:           "my-fencing",
-					InstanceHaConfigMap:     "my-instanceha-config",
-					InstanceHaKdumpPort:     8000,
-					InstanceHaHeartbeatPort: 9000,
+					OpenStackCloud:                "my-cloud",
+					OpenStackConfigMap:            "my-config",
+					OpenStackConfigSecret:         "my-secret",
+					FencingSecret:                 "my-fencing",
+					InstanceHaConfigMap:           "my-instanceha-config",
+					InstanceHaKdumpPort:           8000,
+					InstanceHaHeartbeatPort:       9000,
+					TerminationGracePeriodSeconds: ptr.To[int64](600),
 					MetricsTLS: instancehav1beta1.InstanceHaMetricsTLS{
 						MinTLSVersion: "1.3",
 						CipherSuites:  "HIGH",
@@ -77,6 +81,8 @@ var _ = Describe("InstanceHa webhook", func() {
 			Expect(instanceha.Spec.InstanceHaConfigMap).To(Equal("my-instanceha-config"))
 			Expect(instanceha.Spec.InstanceHaKdumpPort).To(Equal(int32(8000)))
 			Expect(instanceha.Spec.InstanceHaHeartbeatPort).To(Equal(int32(9000)))
+			Expect(instanceha.Spec.TerminationGracePeriodSeconds).NotTo(BeNil())
+			Expect(*instanceha.Spec.TerminationGracePeriodSeconds).To(Equal(int64(600)))
 			Expect(instanceha.Spec.MetricsTLS.MinTLSVersion).To(Equal("1.3"))
 			Expect(instanceha.Spec.MetricsTLS.CipherSuites).To(Equal("HIGH"))
 		})

@@ -152,6 +152,16 @@ type InstanceHaSpec struct {
 	//+operator-sdk:csv:customresourcedefinitions:type=spec
 	// MetricsTLS - Parameters related to TLS for the metrics endpoint
 	MetricsTLS InstanceHaMetricsTLS `json:"metricsTLS,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum:=0
+	// +kubebuilder:default:=300
+	//+operator-sdk:csv:customresourcedefinitions:type=spec
+	// TerminationGracePeriodSeconds is the timeout for graceful pod termination.
+	// During an evacuation, this determines how long the pod has to finish
+	// in-flight work before being killed. Set this based on expected VM count
+	// and evacuation time per VM.
+	TerminationGracePeriodSeconds *int64 `json:"terminationGracePeriodSeconds"`
 }
 
 // InstanceHaStatus defines the observed state of InstanceHa

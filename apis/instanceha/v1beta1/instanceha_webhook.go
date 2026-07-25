@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -87,6 +88,9 @@ func (spec *InstanceHaSpec) Default() {
 	}
 	if spec.MetricsTLS.CipherSuites == "" {
 		spec.MetricsTLS.CipherSuites = "HIGH:!aNULL:!MD5:!RC4:!3DES:!kRSA"
+	}
+	if spec.TerminationGracePeriodSeconds == nil {
+		spec.TerminationGracePeriodSeconds = ptr.To[int64](300)
 	}
 }
 
