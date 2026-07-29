@@ -3684,6 +3684,44 @@ def _filter_by_aggregate_threshold(compute_nodes, aggregates, service):
     return allowed, blocked
 
 
+def _check_fencing_coverage(conn, service):
+    """Check that every host in evacuable aggregates has a fencing resource.
+
+    Returns True if all evacuable hosts have fencing, False otherwise.
+    On failure the readiness probe stays down so the pod is not marked ready.
+    """
+    try:
+        aggregates = conn.aggregates.list()
+    except Exception as e:
+        logging.error("Failed to fetch aggregates for fencing coverage check: %s", e)
+        return False
+
+    evacuable_hosts = set()
+    for agg in aggregates:
+        if service._is_resource_evacuable(agg, service.evacuable_tag, ['metadata']):
+            evacuable_hosts.update(agg.hosts)
+
+    if not evacuable_hosts:
+        logging.info("No hosts found in evacuable aggregates, skipping fencing coverage check")
+        return True
+
+    fencing_shortnames = {_extract_hostname(k) for k in service.config.fencing}
+
+    missing = sorted(h for h in evacuable_hosts
+                     if _extract_hostname(h) not in fencing_shortnames)
+    if missing:
+        logging.error(
+            "Fencing coverage gap: %d host(s) in evacuable aggregates have no "
+            "fencing resource configured: %s. "
+            "Readiness probe will not pass until fencing is configured for all evacuable hosts.",
+            len(missing), missing)
+        return False
+
+    logging.info("Fencing coverage check passed: all %d evacuable host(s) have fencing resources",
+                 len(evacuable_hosts))
+    return True
+
+
 def _process_reenabling(conn, service, to_reenable) -> None:
     """Process services that can be re-enabled."""
     # Convert generator to list for processing
@@ -3839,6 +3877,11 @@ def main():
     conn = _establish_nova_connection(service)
 
     _reconcile_orphaned_hosts(conn)
+
+    if config_manager.get_config_value('TAGGED_AGGREGATES'):
+        if not _check_fencing_coverage(conn, service):
+            logging.error("Fencing coverage check failed, pod will not become ready")
+            sys.exit(1)
 
     def _sigterm_handler(signum, frame):
         logging.info("SIGTERM received, finishing in-flight work before shutdown")
