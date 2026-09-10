@@ -39,6 +39,18 @@ config:
   # Seconds to wait for the first kdump message before proceeding with normal evacuation
   KDUMP_TIMEOUT: "30"
 
+  # -- Auto-Disabled Host Evacuation --
+
+  # Evacuate hosts that Nova auto-disabled due to libvirt connection loss.
+  # Such hosts keep reporting state=up so they are never detected as down/stale,
+  # but their instances are unmanageable. NOTE: with CHECK_HEARTBEAT enabled a
+  # host that is still sending heartbeats is skipped (deliberately not fenced),
+  # so this is most effective when the node OS itself is unresponsive.
+  EVACUATE_AUTO_DISABLED: "false"
+  # Seconds a host must stay auto-disabled before it is evacuated (grace period
+  # that avoids acting on transient libvirt blips Nova auto-recovers from)
+  AUTO_DISABLE_TIMEOUT: "60"
+
   # -- Fencing --
 
   # Seconds allowed for each fencing operation (IPMI/Redfish/BMH)

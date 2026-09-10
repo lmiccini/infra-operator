@@ -119,7 +119,7 @@ class TestFilterProcessingHosts(unittest.TestCase):
         service.hosts_processing['host1'] = time.monotonic()
 
         result = instanceha._filter_processing_hosts(service, compute_nodes, to_resume)
-        compute_filtered, resume_filtered, marked, current_time = result
+        compute_filtered, resume_filtered, auto_disabled_filtered, marked, current_time = result
 
         # host1 should be filtered out
         self.assertEqual(len(compute_filtered), 2)
@@ -163,7 +163,7 @@ class TestFilterProcessingHosts(unittest.TestCase):
         to_resume = [svc2]
 
         result = instanceha._filter_processing_hosts(service, compute_nodes, to_resume)
-        compute_filtered, resume_filtered, marked, current_time = result
+        compute_filtered, resume_filtered, auto_disabled_filtered, marked, current_time = result
 
         # Both hosts should be marked
         self.assertIn('host1', marked)
@@ -178,7 +178,7 @@ class TestFilterProcessingHosts(unittest.TestCase):
         service = instanceha.InstanceHAService(make_mock_config())
 
         result = instanceha._filter_processing_hosts(service, [], [])
-        compute_filtered, resume_filtered, marked, current_time = result
+        compute_filtered, resume_filtered, auto_disabled_filtered, marked, current_time = result
 
         self.assertEqual(len(compute_filtered), 0)
         self.assertEqual(len(resume_filtered), 0)
@@ -197,7 +197,7 @@ class TestFilterProcessingHosts(unittest.TestCase):
         to_resume = [svc_resume]
 
         result = instanceha._filter_processing_hosts(service, [], to_resume)
-        compute_filtered, resume_filtered, marked, current_time = result
+        compute_filtered, resume_filtered, auto_disabled_filtered, marked, current_time = result
 
         # resume-host should be filtered out
         self.assertEqual(len(resume_filtered), 0)

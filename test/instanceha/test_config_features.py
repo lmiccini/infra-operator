@@ -80,7 +80,7 @@ class TestDisabledConfig(unittest.TestCase):
         services = [mock_failed_service, Mock(status='enabled', forced_down=False), Mock(status='enabled', forced_down=False)]
         compute_nodes = [mock_failed_service]
 
-        with patch('instanceha._filter_processing_hosts', return_value=(compute_nodes, [], set(['test-host']), 0)):
+        with patch('instanceha._filter_processing_hosts', return_value=(compute_nodes, [], [], set(['test-host']), 0)):
             with patch('instanceha._prepare_evacuation_resources', return_value=(compute_nodes, [], [], [])):
                 with patch('instanceha._cleanup_filtered_hosts'):
                     with patch('instanceha.process_service') as mock_process:
@@ -120,7 +120,7 @@ class TestDisabledConfig(unittest.TestCase):
         compute_nodes = [mock_failed_service]
         mock_conn.services.list.return_value = []
 
-        with patch('instanceha._filter_processing_hosts', return_value=(compute_nodes, [], set(['test-host']), 0)):
+        with patch('instanceha._filter_processing_hosts', return_value=(compute_nodes, [], [], set(['test-host']), 0)):
             with patch('instanceha._prepare_evacuation_resources', return_value=(compute_nodes, [], [], [])):
                 with patch('instanceha._cleanup_filtered_hosts'):
                     instanceha._admit_stale_services(
@@ -427,7 +427,7 @@ class TestTaggedAggregatesConfig(unittest.TestCase):
         services = [svc1, svc2] + healthy
         compute_nodes = [svc1, svc2]
 
-        with patch('instanceha._filter_processing_hosts', return_value=(compute_nodes, [], set(['host1', 'host2']), 0)):
+        with patch('instanceha._filter_processing_hosts', return_value=(compute_nodes, [], [], set(['host1', 'host2']), 0)):
             with patch('instanceha._prepare_evacuation_resources', return_value=(compute_nodes, [], [], [])):
                 with patch('instanceha._cleanup_filtered_hosts'):
                     with patch('instanceha._check_critical_services', return_value=(True, '')):

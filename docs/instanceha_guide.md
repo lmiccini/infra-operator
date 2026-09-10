@@ -116,6 +116,7 @@ InstanceHA emits Kubernetes events on the InstanceHa CR to provide observability
 | `InstanceEvacuationFailed` | Warning | Individual VM evacuation failed |
 | `HostReenabled` | Normal | Host re-enabled after recovery |
 | `HostReachable` | Warning | Host reported down by Nova but still reachable via heartbeat |
+| `HostAutoDisabled` | Warning | Host auto-disabled by Nova (e.g. libvirt connection lost) and scheduled for evacuation (`EVACUATE_AUTO_DISABLED`) |
 | `RecoveryCompleted` | Normal | Full recovery cycle complete |
 | `ProcessingFailed` | Warning | Unhandled exception during service processing |
 | `ThresholdExceeded` | Warning | Too many hosts down simultaneously |
@@ -743,6 +744,40 @@ If a host goes down and no kdump packet arrives within `KDUMP_TIMEOUT` seconds, 
 
 ---
 
+## Evacuating Auto-Disabled Hosts
+
+Nova can disable a `nova-compute` service by itself, prefixing the `disabled_reason` with `AUTO: `. One such case is **libvirt connection loss**: when nova-compute loses its connection to libvirtd (daemon crash/restart, keepalive timeout, socket unavailable), the libvirt driver auto-disables the service with a reason of the form:
+
+```
+AUTO: Connection to libvirt lost: connection closed due to keepalive timeout
+```
+
+The important subtlety is that such a host **keeps reporting `state=up`** -- the nova-compute process is alive and still heartbeating to the conductor, it has merely disabled itself. Because the standard failure detection looks for hosts that are `down` or stale (and explicitly *excludes* disabled hosts), these hosts are never evacuated by default even though their instances are unmanageable (Nova cannot reach libvirt to act on them).
+
+When `EVACUATE_AUTO_DISABLED: "true"`, InstanceHA additionally treats these hosts as evacuation candidates.
+
+### How It Works
+
+1. Each poll cycle, services disabled with the libvirt-lost `AUTO:` reason are collected. InstanceHA's own markers (`instanceha evacuation ...`), operator-set reasons, reserved hosts, and consecutive-build-failure auto-disables are all ignored.
+2. A **grace period** (`AUTO_DISABLE_TIMEOUT`, default 60s) is applied: a host must remain auto-disabled for at least this long before it is evacuated. Libvirt connection loss auto-recovers when the connection is restored, so this avoids fencing a host over a transient blip. A host that recovers before the timeout is dropped, and a later re-occurrence restarts the clock.
+3. Once past the grace period, the host is fenced (powered off) and its instances evacuated, exactly like any other failed host. It is still subject to the global `THRESHOLD`, per-aggregate limits, and `MAX_HOSTS_PER_CYCLE` rate limiting. A `HostAutoDisabled` K8s event is emitted.
+
+### Interaction with Heartbeat Verification
+
+Auto-disabled hosts bypass the heartbeat "still reachable" skip. That skip exists to avoid fencing a host whose OS is healthy and whose VMs are running fine when only nova-compute flapped. For an auto-disabled host the VMs are *not* healthy (libvirt is unreachable), so evacuation proceeds even if the node is still sending heartbeats. The grace period is what guards against transient conditions here, not the heartbeat channel.
+
+### Configuration
+
+```yaml
+config:
+  EVACUATE_AUTO_DISABLED: "true"
+  AUTO_DISABLE_TIMEOUT: "60"   # Seconds a host must stay auto-disabled before evacuating
+```
+
+> **Note:** This feature is opt-in (`false` by default). Fencing an auto-disabled host is destructive (power-off + evacuate), so enable it only where a sustained libvirt outage on a compute node should trigger HA recovery.
+
+---
+
 ## Reserved Hosts
 
 Reserved hosts act as standby capacity. They are compute nodes that are pre-disabled in Nova with a `disabled_reason` containing "reserved". When a compute host fails, InstanceHA can automatically enable a matching reserved host to replace the lost capacity.
@@ -953,6 +988,8 @@ All values are strings in the ConfigMap. The agent converts and validates them a
 |-----------|------|---------|-------------|
 | `CHECK_KDUMP` | bool | false | Enable kdump detection via UDP listener |
 | `CHECK_HEARTBEAT` | bool | false | Enable heartbeat verification via UDP listener |
+| `EVACUATE_AUTO_DISABLED` | bool | false | Evacuate hosts Nova auto-disabled due to libvirt connection loss (reason `AUTO: Connection to libvirt lost: ...`). Such hosts keep reporting `state=up`, so they are never caught by the normal down/stale detection, but their instances are unmanageable. See [Evacuating Auto-Disabled Hosts](#evacuating-auto-disabled-hosts) |
+| `AUTO_DISABLE_TIMEOUT` | int | 60 (range: 10-600) | Seconds a host must stay auto-disabled before it is evacuated. A grace period that avoids acting on transient libvirt blips Nova auto-recovers from |
 | `HEARTBEAT_CLIFF_THRESHOLD` | int | 50 (range: 10-100) | Percentage drop in active heartbeat hosts that triggers cliff detection (skips fencing for that cycle) |
 | `HEARTBEAT_CLIFF_MAX_CYCLES` | int | 3 (range: 1-20) | Consecutive cliff detection cycles before accepting the state as genuine and proceeding with fencing |
 | `K8S_API_CHECK_INTERVAL` | int | 15 (range: 5-120) | Seconds between Kubernetes API reachability checks |

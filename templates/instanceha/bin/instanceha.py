@@ -97,6 +97,16 @@ DISABLED_REASON_EVACUATION_COMPLETE = "instanceha evacuation complete"
 DISABLED_REASON_EVACUATION_FAILED = "instanceha evacuation FAILED"
 DISABLED_REASON_KDUMP_MARKER = "(kdump)"
 
+# Nova auto-disable reason markers. Nova disables a compute service itself (as
+# opposed to instanceha or an operator) prefixing the reason with "AUTO: ". When
+# nova-compute loses its connection to libvirt it auto-disables with a reason of
+# the form "AUTO: Connection to libvirt lost: <reason>". Such a host keeps
+# reporting state=up (the nova-compute process is alive) so it is never detected
+# as stale/down, yet its instances are unmanageable. When EVACUATE_AUTO_DISABLED
+# is enabled instanceha treats these hosts as evacuation candidates.
+NOVA_AUTO_DISABLE_PREFIX = "AUTO:"
+NOVA_LIBVIRT_LOST_MARKER = "connection to libvirt lost"
+
 # Per-aggregate failure threshold metadata key
 AGGREGATE_MAX_FAILURES_KEY = 'instanceha:max_failures'
 
@@ -723,6 +733,8 @@ class ConfigManager:
         'HEARTBEAT_CLIFF_MAX_CYCLES': ConfigItem('int', 3, 1, 20),
         'MAX_HOSTS_PER_CYCLE': ConfigItem('int', 10, 1, 200),
         'K8S_API_CHECK_INTERVAL': ConfigItem('int', 15, 5, 120),
+        'EVACUATE_AUTO_DISABLED': ConfigItem('bool', False),
+        'AUTO_DISABLE_TIMEOUT': ConfigItem('int', 60, 10, 600),
     }
 
     def get_config_value(self, key: str) -> Union[str, int, bool, List]:
@@ -835,6 +847,12 @@ class InstanceHAService:
         self.kdump_hosts_checking = defaultdict(float)
         self.kdump_listener_stop_event = threading.Event()
         self.kdump_fenced_hosts = set()
+
+        # Auto-disabled host tracking (grace period before evacuating hosts that
+        # Nova auto-disabled, e.g. due to libvirt connection loss). Maps short
+        # hostname -> monotonic time the host was first seen auto-disabled.
+        self.auto_disable_lock = threading.Lock()
+        self.auto_disable_first_seen = defaultdict(float)
 
         # Heartbeat state (protected by heartbeat_lock -- UDP listener writes concurrently)
         self.heartbeat_lock = threading.Lock()
@@ -3211,6 +3229,73 @@ def _categorize_services(services: List[Any], target_date: datetime) -> tuple:
 
     return compute_nodes, resume, reenable
 
+
+def _is_auto_disabled_libvirt(svc) -> bool:
+    """Check if Nova auto-disabled a compute service due to libvirt connection loss.
+
+    Such a host is disabled (status contains 'disabled') with a reason Nova sets
+    itself ("AUTO: Connection to libvirt lost: ..."), but keeps reporting
+    state=up, so it is never caught by the normal down/stale detection. It is not
+    forced_down, and its reason must not already be an instanceha marker.
+    """
+    if 'disabled' not in svc.status or getattr(svc, 'forced_down', False):
+        return False
+
+    reason = (getattr(svc, 'disabled_reason', '') or '')
+    reason_lower = reason.lower()
+    if DISABLED_REASON_EVACUATION in reason:
+        return False
+    return (NOVA_AUTO_DISABLE_PREFIX.lower() in reason_lower
+            and NOVA_LIBVIRT_LOST_MARKER in reason_lower)
+
+
+def _detect_auto_disabled_services(services: List[Any]) -> List[Any]:
+    """Return services Nova auto-disabled due to libvirt connection loss."""
+    return [svc for svc in services if _is_auto_disabled_libvirt(svc)]
+
+
+def _filter_auto_disabled_grace(service, auto_disabled_services: List[Any]) -> List[Any]:
+    """Apply a grace period to auto-disabled hosts before evacuating them.
+
+    Nova auto-recovers a libvirt connection loss when the connection is restored,
+    so a brief blip (e.g. a libvirtd restart or keepalive timeout) should not
+    trigger a destructive fence + evacuate. Only hosts that stay auto-disabled for
+    at least AUTO_DISABLE_TIMEOUT seconds are returned as evacuation candidates.
+    Hosts that recovered are pruned so a later re-occurrence restarts the clock.
+    """
+    if not auto_disabled_services:
+        return []
+
+    timeout = service.config.get_config_value('AUTO_DISABLE_TIMEOUT')
+    now = time.monotonic()
+    current = {_extract_hostname(svc.host) for svc in auto_disabled_services}
+    ready = []
+
+    with service.auto_disable_lock:
+        # Prune hosts that are no longer auto-disabled (recovered or now handled).
+        for hostname in list(service.auto_disable_first_seen):
+            if hostname not in current:
+                del service.auto_disable_first_seen[hostname]
+
+        for svc in auto_disabled_services:
+            hostname = _extract_hostname(svc.host)
+            first_seen = service.auto_disable_first_seen.get(hostname)
+            if not first_seen:
+                service.auto_disable_first_seen[hostname] = now
+                logging.warning(
+                    'Host %s auto-disabled by Nova (%s) -- waiting %ds before '
+                    'evacuating in case the connection recovers',
+                    svc.host, (getattr(svc, 'disabled_reason', '') or 'unknown reason'), timeout)
+            elif (now - first_seen) >= timeout:
+                ready.append(svc)
+            else:
+                logging.info(
+                    'Host %s still auto-disabled (%.0fs/%ds) -- waiting before evacuating',
+                    svc.host, now - first_seen, timeout)
+
+    return ready
+
+
 def _check_critical_services(conn):
     """Check if critical Nova services are operational for evacuation."""
     try:
@@ -3235,8 +3320,9 @@ def _cleanup_filtered_hosts(service, marked_hostnames, final_hostnames, current_
         if to_cleanup:
             logging.debug('Cleaned up %d filtered hosts from processing tracking', len(to_cleanup))
 
-def _filter_processing_hosts(service, compute_nodes, to_resume):
+def _filter_processing_hosts(service, compute_nodes, to_resume, auto_disabled=None):
     """Filter out hosts already being processed and mark new ones."""
+    auto_disabled = auto_disabled or []
     current_time = time.monotonic()
     stagger = service.config.get_config_value('EVACUATION_STAGGER')
     max_threads = service.config.get_config_value('EVACUATION_MAX_THREADS')
@@ -3261,6 +3347,7 @@ def _filter_processing_hosts(service, compute_nodes, to_resume):
         original_count = len(compute_nodes)
         compute_nodes_filtered = []
         to_resume_filtered = []
+        auto_disabled_filtered = []
 
         for svc in compute_nodes:
             hostname = _extract_hostname(svc.host)
@@ -3272,17 +3359,22 @@ def _filter_processing_hosts(service, compute_nodes, to_resume):
             if hostname not in service.hosts_processing:
                 to_resume_filtered.append(svc)
 
+        for svc in auto_disabled:
+            hostname = _extract_hostname(svc.host)
+            if hostname not in service.hosts_processing:
+                auto_disabled_filtered.append(svc)
+
         if original_count > len(compute_nodes_filtered):
             skipped_hosts = original_count - len(compute_nodes_filtered)
             logging.info('Skipped %d hosts already being processed by another poll cycle', skipped_hosts)
 
         # Mark hosts as being processed
-        for svc in compute_nodes_filtered + to_resume_filtered:
+        for svc in compute_nodes_filtered + to_resume_filtered + auto_disabled_filtered:
             hostname = _extract_hostname(svc.host)
             service.hosts_processing[hostname] = current_time
             marked_hostnames.add(hostname)
 
-    return compute_nodes_filtered, to_resume_filtered, marked_hostnames, current_time
+    return compute_nodes_filtered, to_resume_filtered, auto_disabled_filtered, marked_hostnames, current_time
 
 
 def _prepare_evacuation_resources(conn, service, services, compute_nodes, aggregates=None):
@@ -3412,22 +3504,29 @@ def _filter_reachable_hosts(service, compute_nodes):
     return unreachable, skipped, False
 
 
-def _admit_stale_services(conn, service, services, compute_nodes, to_resume):
+def _admit_stale_services(conn, service, services, compute_nodes, to_resume, auto_disabled=None):
     """Evaluate safety gates and submit accepted hosts for background processing."""
     # Convert generators to lists - needed for multiple iterations and length checks
     compute_nodes = list(compute_nodes)
     to_resume = list(to_resume)
 
-    if not (compute_nodes or to_resume):
+    # Hosts Nova auto-disabled (e.g. libvirt connection loss) that have stayed
+    # auto-disabled past the grace period. They report state=up so they bypass the
+    # heartbeat / all-stale gates (which target stale detection), but still go
+    # through processing dedup and the threshold / aggregate / rate-limit gates.
+    auto_disabled = _filter_auto_disabled_grace(service, list(auto_disabled or []))
+
+    if not (compute_nodes or to_resume or auto_disabled):
         return
 
 
     # Filter out hosts already being processed
-    compute_nodes, to_resume, marked_hostnames, current_time = _filter_processing_hosts(service, compute_nodes, to_resume)
+    compute_nodes, to_resume, auto_disabled, marked_hostnames, current_time = _filter_processing_hosts(
+        service, compute_nodes, to_resume, auto_disabled)
 
     final_hostnames = set()
     try:
-        if not (compute_nodes or to_resume):
+        if not (compute_nodes or to_resume or auto_disabled):
             return
 
         # Filter out hosts still reachable via heartbeat (before the all-stale check,
@@ -3466,7 +3565,7 @@ def _admit_stale_services(conn, service, services, compute_nodes, to_resume):
             ALL_SERVICES_STALE_TOTAL.inc()
             return
 
-        if not (compute_nodes or to_resume):
+        if not (compute_nodes or to_resume or auto_disabled):
             return
 
         if compute_nodes:
@@ -3475,6 +3574,19 @@ def _admit_stale_services(conn, service, services, compute_nodes, to_resume):
                 _emit_k8s_event(svc.host, 'HostDown',
                                 'Compute host detected as down', event_type='Warning')
                 HOST_DOWN_TOTAL.labels(host=svc.host).inc()
+
+        # Merge auto-disabled hosts in now that the stale-detection gates (heartbeat,
+        # all-stale) have run. From here on they are treated like any other host
+        # needing evacuation (resource prep, threshold, aggregate, rate limit, fence).
+        if auto_disabled:
+            logging.warning('The following computes are auto-disabled by Nova and will be evacuated: %s',
+                            [svc.host for svc in auto_disabled])
+            for svc in auto_disabled:
+                _emit_k8s_event(svc.host, 'HostAutoDisabled',
+                                'Compute host auto-disabled by Nova (e.g. libvirt connection lost) -- evacuating',
+                                event_type='Warning')
+                HOST_DOWN_TOTAL.labels(host=svc.host).inc()
+            compute_nodes = compute_nodes + auto_disabled
 
         # Fetch aggregates once per poll cycle to avoid redundant API calls
         aggregates = None
@@ -3876,7 +3988,10 @@ def main():
 
             compute_nodes_list = list(compute_nodes)
 
-            _admit_stale_services(conn, service, services, compute_nodes_list, to_resume)
+            auto_disabled = (_detect_auto_disabled_services(services)
+                             if service.config.get_config_value('EVACUATE_AUTO_DISABLED') else [])
+
+            _admit_stale_services(conn, service, services, compute_nodes_list, to_resume, auto_disabled)
             _process_reenabling(conn, service, to_reenable)
 
             stale_count = len(compute_nodes_list)
