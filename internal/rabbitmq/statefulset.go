@@ -1,6 +1,8 @@
 package rabbitmq
 
 import (
+	_ "embed"
+	"encoding/base64"
 	"fmt"
 	"strings"
 
@@ -17,6 +19,19 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 )
+
+// nodeRejoinScript is the PostStart hook that rejoins a blank-booted seed node
+// (server-0) to the surviving cluster. See data/node-rejoin.sh.
+//
+//go:embed data/node-rejoin.sh
+var nodeRejoinScript string
+
+// nodeRejoinEnabled reports whether the seed-node rejoin hook should be wired in:
+// only for 4.1+ multi-replica clusters, where the lowest ordinal is the peer
+// discovery seed and a blank PVC can cause a split.
+func nodeRejoinEnabled(r *rabbitmqv1.RabbitMq, configVersion string) bool {
+	return isRabbitMQ41OrLater(configVersion) && getReplicaCount(r) > 1
+}
 
 // ProxyConfig holds configuration for the AMQP proxy sidecar
 type ProxyConfig struct {
@@ -69,7 +84,7 @@ func StatefulSet(
 		Ports:          buildContainerPorts(r),
 		VolumeMounts:   append(getVolumeMounts(r, proxy.IPv6Enabled), serviceaccount.KubeAPIAccessVolumeMount()),
 		ReadinessProbe: readinessProbe,
-		Lifecycle:      buildLifecycle(r),
+		Lifecycle:      buildLifecycle(r, targetVersion),
 		SecurityContext: func() *corev1.SecurityContext {
 			sc := pod.RestrictiveSecurityContext(users.RabbitmqUID, users.RabbitmqGID)
 			sc.ReadOnlyRootFilesystem = ptr.To(false)
@@ -115,7 +130,7 @@ func StatefulSet(
 		initContainers = append(initContainers, buildWipeDataInitContainer(r, targetVersion))
 	}
 
-	initContainers = append(initContainers, buildInitContainer(r))
+	initContainers = append(initContainers, buildInitContainer(r, targetVersion))
 
 	// Build containers list
 	containers := []corev1.Container{rabbitmqContainer}
@@ -267,6 +282,14 @@ func buildContainerEnv(r *rabbitmqv1.RabbitMq, additionalEnv []corev1.EnvVar, ra
 	// Append additional environment variables (ERL_ARGS, TLS config from cluster.go)
 	env = append(env, additionalEnv...)
 
+	// The node-rejoin PostStart hook needs the cluster size to compute quorum.
+	if nodeRejoinEnabled(r, rabbitmqVersion) {
+		env = append(env, corev1.EnvVar{
+			Name:  "RABBITMQ_REPLICAS",
+			Value: fmt.Sprintf("%d", getReplicaCount(r)),
+		})
+	}
+
 	env = append(env,
 		corev1.EnvVar{
 			// Tell RabbitMQ to scan our conf.d directory for .conf files.
@@ -415,12 +438,12 @@ func buildReadinessProbe(r *rabbitmqv1.RabbitMq) *corev1.Probe {
 // For multi-replica clusters, the PreStop hook waits for quorum safety
 // before draining. For single-replica clusters, quorum checks are
 // skipped since there are no other nodes to maintain quorum.
-func buildLifecycle(r *rabbitmqv1.RabbitMq) *corev1.Lifecycle {
+func buildLifecycle(r *rabbitmqv1.RabbitMq, configVersion string) *corev1.Lifecycle {
 	preStopCmd := `if [ ! -z "$(cat /etc/pod-info/skipPreStopChecks)" ]; then exit 0; fi; rabbitmq-upgrade await_online_quorum_plus_one -t 600 && rabbitmq-upgrade await_online_synchronized_mirror -t 600 || true && rabbitmq-upgrade drain -t 600`
 	if r.Spec.Replicas != nil && *r.Spec.Replicas <= 1 {
 		preStopCmd = `if [ ! -z "$(cat /etc/pod-info/skipPreStopChecks)" ]; then exit 0; fi; rabbitmq-upgrade drain -t 600`
 	}
-	return &corev1.Lifecycle{
+	lifecycle := &corev1.Lifecycle{
 		PreStop: &corev1.LifecycleHandler{
 			Exec: &corev1.ExecAction{
 				Command: []string{
@@ -431,17 +454,27 @@ func buildLifecycle(r *rabbitmqv1.RabbitMq) *corev1.Lifecycle {
 			},
 		},
 	}
+
+	// Rejoin a server-0 that came up with a blank data directory (its PVC was
+	// replaced) rather than letting it form a standalone cluster. The script is
+	// staged into /operator by the setup init container; it only acts when the
+	// init container left the fresh-node marker. Running it as a PostStart hook
+	// keeps server-0 out of the Service (NotReady) until it has rejoined.
+	if nodeRejoinEnabled(r, configVersion) {
+		lifecycle.PostStart = &corev1.LifecycleHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{"/bin/sh", "/operator/node-rejoin.sh"},
+			},
+		}
+	}
+
+	return lifecycle
 }
 
 // buildInitContainer builds the init container for RabbitMQ setup
 // matching the old rabbitmq-cluster-operator's init container
-func buildInitContainer(r *rabbitmqv1.RabbitMq) corev1.Container {
-	return corev1.Container{
-		Name:    "setup-container",
-		Image:   r.Spec.ContainerImage,
-		Command: []string{"sh", "-c"},
-		Args: []string{
-			fmt.Sprintf(`set -e
+func buildInitContainer(r *rabbitmqv1.RabbitMq, configVersion string) corev1.Container {
+	args := fmt.Sprintf(`set -e
 cp /tmp/erlang-cookie-secret/.erlang.cookie /var/lib/rabbitmq/.erlang.cookie
 chmod 600 /var/lib/rabbitmq/.erlang.cookie
 cp /tmp/rabbitmq-plugins/enabled_plugins /operator/enabled_plugins
@@ -449,8 +482,40 @@ echo '[default]' > /var/lib/rabbitmq/.rabbitmqadmin.conf
 sed -e 's/^default_user = /username = /' -e 's/^default_pass = /password = /' /tmp/default_user.conf >> /var/lib/rabbitmq/.rabbitmqadmin.conf
 chmod 600 /var/lib/rabbitmq/.rabbitmqadmin.conf
 # Allow time for multi-pod clusters to complete peer discovery
-sleep %d`, ptr.Deref(r.Spec.DelayStartSeconds, 30)),
-		},
+sleep %d`, ptr.Deref(r.Spec.DelayStartSeconds, 30))
+
+	env := []corev1.EnvVar{}
+
+	// Stage the PostStart node-rejoin hook into the shared /operator volume and,
+	// for server-0 only, drop a marker when the data directory is absent so the
+	// hook can tell a replaced (blank) PVC from a normal restart with real data.
+	// base64 avoids any shell-quoting issues embedding the script.
+	if nodeRejoinEnabled(r, configVersion) {
+		args += fmt.Sprintf(`
+echo '%s' | base64 -d > /operator/node-rejoin.sh
+case "$MY_POD_NAME" in
+  *-server-0)
+    if [ ! -d "/var/lib/rabbitmq/mnesia/rabbit@${MY_POD_NAME}.${K8S_SERVICE_NAME}.${MY_POD_NAMESPACE}" ]; then
+      touch /var/lib/rabbitmq/mnesia/.operator-fresh-node
+    fi
+    ;;
+esac`, base64.StdEncoding.EncodeToString([]byte(nodeRejoinScript)))
+
+		env = append(env,
+			corev1.EnvVar{Name: "MY_POD_NAME", ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "metadata.name"}}},
+			corev1.EnvVar{Name: "MY_POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "metadata.namespace"}}},
+			corev1.EnvVar{Name: "K8S_SERVICE_NAME", Value: fmt.Sprintf("%s-nodes", r.Name)},
+		)
+	}
+
+	return corev1.Container{
+		Name:    "setup-container",
+		Image:   r.Spec.ContainerImage,
+		Command: []string{"sh", "-c"},
+		Args:    []string{args},
+		Env:     env,
 		Resources: corev1.ResourceRequirements{
 			Limits: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("20m"),
