@@ -10,8 +10,14 @@
 # queues it was removed from.
 #
 # It is survivor-safe: it only ever acts on server-0's own node, never touches
-# the surviving quorum, and always exits 0 so a failed attempt simply retries on
-# the next restart instead of crash-looping the container.
+# the surviving quorum.
+#
+# Exposure safety: once we know this is a blank server-0 that must rejoin, every
+# path that does NOT achieve membership exits non-zero. A failing PostStart hook
+# makes the kubelet kill the container before it reaches Running, so the TCP
+# readiness probe never passes and a still-standalone node is never added to the
+# Service. The container then restarts and the hook retries. Only a confirmed
+# cluster member exits 0 and is allowed to become Ready.
 #
 # Delivered to /operator (a shared emptyDir) by the setup init container. Runs
 # only for 4.1+ multi-replica clusters. Required env: MY_POD_NAME,
@@ -27,7 +33,8 @@ QUORUM=$(( RABBITMQ_REPLICAS / 2 + 1 ))
 peer() { echo "rabbit@${BASE}-server-$1.${K8S_SERVICE_NAME}.${MY_POD_NAMESPACE}"; }
 
 # Wait for the local node to finish booting so rabbitmqctl can talk to it.
-rabbitmqctl await_startup -t 300 || exit 0
+# If it never boots we have not rejoined, so fail (restart) rather than expose.
+rabbitmqctl await_startup -t 300 || exit 1
 
 attempt=1
 while [ "$attempt" -le 60 ]; do
@@ -70,5 +77,5 @@ while [ "$attempt" -le 60 ]; do
   attempt=$(( attempt + 1 ))
 done
 
-echo "node-rejoin: no surviving peer with quorum yet; keeping marker for next restart"
-exit 0
+echo "node-rejoin: could not rejoin a surviving cluster; failing so the container restarts and retries (never exposing a standalone node)"
+exit 1

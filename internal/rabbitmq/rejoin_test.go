@@ -69,6 +69,11 @@ func TestNodeRejoinScriptEmbedded(t *testing.T) {
 			t.Errorf("embedded node-rejoin.sh missing %q", tok)
 		}
 	}
+	// The give-up path must fail (non-zero) so the container restarts instead of
+	// becoming Ready while still standalone.
+	if !strings.Contains(nodeRejoinScript, "exit 1") {
+		t.Error("embedded node-rejoin.sh must exit non-zero when it cannot rejoin")
+	}
 }
 
 func TestStatefulSet_RejoinWiredWhenEnabled(t *testing.T) {
