@@ -6,7 +6,8 @@
 # PVC was replaced during node remediation) it forms its own standalone cluster
 # instead of rejoining server-1/server-2. This PostStart hook detects that case
 # (via a marker written by the init container only when the data dir was absent)
-# and joins the node back to a surviving peer.
+# and joins the node back to a surviving peer, then re-adds it to the quorum
+# queues it was removed from.
 #
 # It is survivor-safe: it only ever acts on server-0's own node, never touches
 # the surviving quorum, and always exits 0 so a failed attempt simply retries on
@@ -46,8 +47,19 @@ while [ "$attempt" -le 60 ]; do
     if rabbitmqctl -n "$P" await_online_nodes "$QUORUM" -t 5 >/dev/null 2>&1; then
       echo "node-rejoin: joining server-0 to surviving cluster via $P"
       if rabbitmqctl join_cluster "$P"; then
-        rm -f "$MARKER"
         echo "node-rejoin: server-0 rejoined via $P"
+        # Rejoining the cluster does NOT restore quorum-queue replicas:
+        # forget_cluster_node dropped server-0 from every quorum queue's member
+        # list, and a rejoined node only hosts a queue's replica once it is added
+        # back. `grow <self> all` re-adds this node to all quorum queues now,
+        # instead of waiting for continuous membership reconciliation (CMR) to do
+        # it on its own interval. Best-effort: CMR (enabled in the operator
+        # config) is the backstop, and strict replica-count verification belongs
+        # in an e2e test, not this hook.
+        SELF="rabbit@${MY_POD_NAME}.${K8S_SERVICE_NAME}.${MY_POD_NAMESPACE}"
+        rabbitmq-queues grow "$SELF" all ||
+          echo "node-rejoin: quorum-queue grow failed; leaving replica regrowth to CMR"
+        rm -f "$MARKER"
         exit 0
       fi
     fi

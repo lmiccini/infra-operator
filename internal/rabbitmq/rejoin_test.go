@@ -64,7 +64,7 @@ func TestNodeRejoinEnabled(t *testing.T) {
 }
 
 func TestNodeRejoinScriptEmbedded(t *testing.T) {
-	for _, tok := range []string{"await_online_nodes", "join_cluster", ".operator-fresh-node", "server-0"} {
+	for _, tok := range []string{"await_online_nodes", "join_cluster", "rabbitmq-queues grow", ".operator-fresh-node", "server-0"} {
 		if !strings.Contains(nodeRejoinScript, tok) {
 			t.Errorf("embedded node-rejoin.sh missing %q", tok)
 		}
