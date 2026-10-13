@@ -202,6 +202,69 @@ oc logs deployment/instanceha | grep "Heartbeat listener"
 oc exec deployment/instanceha -- curl -s http://localhost:8080/metrics | grep heartbeat
 ```
 
+### Set Up Kdump Detection
+
+Kdump detection lets InstanceHA respond to kernel panics while the compute host is collecting a crash dump. Enable it when kdump is configured on the compute nodes and their source IP addresses resolve by reverse DNS to their Nova compute service hostnames.
+
+**Step 1:** Expose the InstanceHA kdump listener on a stable MetalLB IP. The listener uses UDP port `7410` by default:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: instanceha-kdump
+  namespace: openstack
+  annotations:
+    metallb.universe.tf/address-pool: <pool-name>
+    metallb.universe.tf/loadBalancerIPs: <unused-ip>
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    service: instanceha
+  ports:
+  - name: kdump
+    port: 7410
+    targetPort: 7410
+    protocol: UDP
+```
+
+Replace `<pool-name>` and `<unused-ip>` with a MetalLB pool reachable from the compute nodes and an available address. `externalTrafficPolicy: Local` preserves the packet's source IP, which InstanceHA needs for reverse DNS host identification. If other Services sharing an IP use `externalTrafficPolicy: Cluster`, assign this Service a different IP.
+
+**Step 2:** Set the listener port in the `InstanceHa` resource and enable detection in the InstanceHA ConfigMap:
+
+```yaml
+# In the InstanceHa CR
+spec:
+  instanceHaKdumpPort: 7410
+
+# In config.yaml
+config:
+  CHECK_KDUMP: "true"
+  KDUMP_TIMEOUT: "300"   # Wait up to 5 minutes for a kdump packet before normal fencing
+```
+
+Keep the CR port, Service port, and compute-node port in sync. `KDUMP_TIMEOUT` accepts 5-300 seconds; if no packet arrives before it expires, InstanceHA follows the normal fencing and evacuation workflow.
+
+**Step 3:** Configure each compute node's `/etc/kdump.conf` to send panic notifications to the Service IP:
+
+```text
+fence_kdump_nodes <instanceha-service-ip>
+fence_kdump_args -p 7410
+```
+
+Use the MetalLB Service IP for `<instanceha-service-ip>`, and ensure reverse DNS for each compute node's source IP returns the matching Nova compute service hostname.
+
+**Verification:**
+
+```bash
+# Confirm the stable Service IP and UDP port
+oc get service instanceha-kdump -n openstack
+
+# Check InstanceHA logs for kdump listener or packet activity
+oc logs -n openstack deployment/instanceha | grep -i kdump
+```
+
 ### Tune Detection for Your Environment
 
 | Scenario | Recommended Settings | Rationale |
@@ -320,6 +383,8 @@ Patterns use glob syntax (`*` = any characters, `?` = single character, `[abc]` 
 ### Why Fencing Is Required
 
 Fencing prevents split-brain scenarios where the same instance runs on two hosts simultaneously. Without confirmed power-off, a host that appears down but is actually network-partitioned could continue running instances, causing data corruption when those instances are rebuilt elsewhere.
+
+When kdump detection is enabled (`CHECK_KDUMP: "true"`), a `fence_kdump` packet reporting a kernel panic is handled specially: InstanceHA starts evacuation without the normal BMC power-off fencing step, then waits 60 seconds after the last kdump packet before re-enabling the host so the kernel dump can finish. If no packet arrives within `KDUMP_TIMEOUT`, InstanceHA follows the standard fencing and evacuation workflow. See [Set Up Kdump Detection](#set-up-kdump-detection) for deployment steps.
 
 ### Supported Fencing Mechanisms
 
