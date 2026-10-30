@@ -2,19 +2,26 @@
 
 ## What is PodRemediator?
 
-PodRemediator is an infra-operator controller configured through namespaced
-`PodRemediator` custom resources (CRs). A CR watches PVCs in the namespaces listed
-in `spec.namespaces`. If the list is empty, it watches PVCs only in the CR's own
-namespace.
+**The problem it solves:** when a worker node dies, a pod that used *local* disk on
+that node can't simply restart elsewhere — its storage (the PVC) is still tied to
+the dead node. Recovery stays blocked until that PVC is deleted so a new one can be
+created on a healthy node. But deleting storage is risky, so it has to wait for the
+workload's owner to confirm the data is safe to discard.
 
-When a worker fails, a local PVC may remain bound to that node and prevent the
-workload from starting elsewhere. PodRemediator coordinates PVC cleanup after
-SNR fencing confirmation and consent from the application operator that owns the
-workload. It unblocks recovery work; it does not guarantee that the application
-will recover.
+PodRemediator does exactly that coordination. It waits until Self Node Remediation
+(SNR) confirms the node was fenced, asks the operator that owns the workload for
+permission, and only then cleans up the stuck PVC so recovery can proceed. It
+unblocks recovery; it does **not** guarantee the application itself recovers.
 
-PodRemediator bridges the gap between the existing OpenShift remediation stack
-(NHC + SNR) and the application operators that own the workloads.
+In other words, it bridges the existing OpenShift remediation stack (NHC + SNR) and
+the application operators that own the workloads.
+
+You turn it on by creating one or more namespaced `PodRemediator` custom resources
+(CRs). Each CR manages the PVCs in the namespaces listed in `spec.namespaces`; if
+that list is empty, it manages PVCs only in its own namespace.
+
+> New to the terms (PVC, PV, NHC, SNR, fencing, consent)? See the
+> [glossary in the architecture reference](podremediator_architecture.md#terms-used-here).
 
 ---
 
@@ -107,9 +114,9 @@ can be attached on another node and do not need this node-local PVC deletion flo
 ### Workload-specific integration
 
 PodRemediator does not implement Galera or RabbitMQ safety policy. Each workload
-operator decides whether its own recovery policy permits deletion. See the
-[Galera integration notes](podremediator_galera.md); RabbitMQ-specific behavior
-belongs with its workload operator.
+operator decides whether its own recovery policy permits deletion — the Galera
+participant lives in mariadb-operator, and the RabbitMQ participant in
+infra-operator's own RabbitMQ controller.
 
 ---
 
@@ -368,6 +375,8 @@ recovers or the CR is deleted.
 
 ## Testing
 
-The test guide describes the in-repository unit, functional, and KUTTL tests,
-and the separate requirements for real-cluster validation:
-[PodRemediator testing](podremediator_testing.md).
+The controller is tested in-repository at three levels: unit tests in
+`test/unit/remediation/`, envtest functional tests in `test/functional/`, and a
+KUTTL integration test in `test/kuttl/tests/podremediator-deletion-commit/`.
+Behavior under a real node failure must be validated on a cluster with NHC and SNR
+installed — the in-repository tests do not exercise that path.

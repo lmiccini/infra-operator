@@ -1,11 +1,36 @@
 # PodRemediator – Architecture Reference
 
-This document describes the PodRemediator API, controller flow, and workload-independent
-behavior. Application-specific recovery policies are outside the controller's scope.
+## In short
 
-For operator/user documentation see [podremediator_guide.md](podremediator_guide.md).
-For integration and test details, see the [Galera notes](podremediator_galera.md),
-[RabbitMQ notes](podremediator_rabbitmq.md), and [testing guide](podremediator_testing.md).
+When a worker node dies, a pod that used local disk on that node gets stuck:
+Kubernetes wants to restart the pod somewhere healthy, but its storage (the PVC)
+is still tied to the dead node and cannot move. Something has to delete that PVC
+so a fresh one can be created elsewhere — but deleting storage is dangerous, so it
+must happen only when the application confirms its data is safe to discard.
+
+PodRemediator automates that cleanup *safely*. It waits for proof that the node
+was really fenced, asks the operator that owns the workload for permission, and
+only then deletes the stuck PVC (and the pods still holding it) so recovery can
+continue. It never decides on its own that data can be thrown away.
+
+This document explains the API, the controller's flow, and the behavior that is
+the same for every workload. How a specific application (Galera, RabbitMQ, …)
+decides whether deletion is safe lives with that application's operator, not here.
+
+For install and day-to-day use, see the [operator guide](podremediator_guide.md).
+
+## Terms used here
+
+| Term | Meaning |
+|------|---------|
+| **PVC** / **PV** | PersistentVolumeClaim / PersistentVolume — a pod's request for storage, and the actual volume bound to it. |
+| **Node-local storage** | A volume that physically lives on one node (e.g. LVMS/TopoLVM). It cannot be reattached on a different node. |
+| **NHC** | [NodeHealthCheck](https://github.com/medik8s/node-healthcheck-operator) — spots unhealthy nodes and asks SNR to remediate them. |
+| **SNR** | [SelfNodeRemediation](https://github.com/medik8s/self-node-remediation) — fences (reboots/isolates) an unhealthy node and reports its progress as a *phase*. |
+| **Fencing** | Making a failed node safe. Confirmed here only when SNR reports the `Reboot-Completed` or `Fencing-Completed` phase. |
+| **Handshake** | The annotation-based exchange between PodRemediator and a workload operator that leads to consent. |
+| **Consent** | The workload operator's explicit "yes, this PVC is safe to delete", granted for one specific fault. |
+| **CR** | Custom Resource — here, a `PodRemediator` object you create to turn the feature on. |
 
 ## 1. Design context
 
@@ -18,13 +43,16 @@ PVC deletion until a dedicated mechanism exists.
 
 ### 1.2 Design principles
 
-1. **Workload-owner authorization** — only the operator that owns the workload
-   decides whether its recovery policy permits PVC deletion.
-2. **Externalized action** — deletion is performed by a separate generic controller;
-   application operators stay focused.
-3. **Signal-based integration** — PodRemediator publishes a PVC request after SNR
-   fencing confirmation; the workload operator grants request-scoped consent.
-4. **NHC/SNR coordination** — a NotReady node alone does not authorize a PVC request.
+1. **The workload owner decides.** Only the operator that owns the workload can
+   say whether deleting a PVC is safe for its data. PodRemediator never makes that
+   call itself.
+2. **Cleanup lives in one shared controller.** Deletion is handled here, once, so
+   individual application operators don't each reimplement it.
+3. **Operators talk through annotations.** PodRemediator marks a stuck PVC; the
+   workload operator answers with consent scoped to that exact fault. No new APIs
+   and no direct calls between operators.
+4. **A sick node is not enough.** A node going NotReady never authorizes deletion
+   on its own — PodRemediator first waits for NHC/SNR to actually fence it.
 
 ### 1.3 Workload-specific policy
 
@@ -35,11 +63,12 @@ evaluate, not an instruction to approve deletion.
 
 ### 1.4 Workload integrations
 
-Integration details can change independently of the generic controller. The
-[Galera notes](podremediator_galera.md) describe the current Galera adapter; the
-[RabbitMQ notes](podremediator_rabbitmq.md) describe the RabbitMQ integration
-contract. Neither application's safety checks are requirements imposed on other
-workload operators.
+A workload operator joins in simply by implementing the annotation contract in
+[§2.3](#23-pvc-annotations-shared-contract) — nothing in this controller needs to
+change. For example, the Galera participant lives in mariadb-operator and the
+RabbitMQ participant in infra-operator's own RabbitMQ controller. One
+application's safety checks are never forced on another's: each operator only
+reads and writes the two consent annotations.
 
 ## 2. API and Custom Resource
 
@@ -147,18 +176,21 @@ become unavailable. Cleanup failures are retried. Re-enabling starts fresh
 handshakes and requires new workload consent.
 
 The controller lists Nodes and active (non-deleting) `SelfNodeRemediation`
-objects. Only `status.phase: Reboot-Completed` or `Fencing-Completed` passes the
-fencing gate. SNR performs the node-remediation action configured by the cluster;
-PodRemediator does not issue a power-off or reboot request itself. It publishes
-the PVC request annotation only after seeing one of those accepted phases. In the SNR
-lifecycle, `Reboot-Completed` follows its safe reboot deadline and precedes
-workload removal; `Fencing-Completed` follows that removal. These phases let
-PodRemediator wait for SNR's declared safety barrier before publishing the PVC
-request or deleting it. They do not move the local PV: its affinity can remain
-pinned to the original node after a reboot, so workload recovery may still
-require PVC cleanup. A missing phase, unknown phase, deleting SNR, or missing SNR
-does not authorize deletion. Merely observing an elapsed `timeAssumedRebooted`
-is insufficient. See the
+objects. Only an SNR in phase `Reboot-Completed` or `Fencing-Completed` passes the
+fencing gate, and PodRemediator publishes the PVC request annotation only after it
+sees one of those phases. (SNR itself carries out whatever reboot or fencing the
+cluster configured — PodRemediator never powers off or reboots a node.)
+
+Why those two phases? They are SNR's own "the node is now safe" milestones:
+`Reboot-Completed` comes after SNR's safe-reboot deadline and before it removes
+workloads; `Fencing-Completed` comes after that removal. Waiting for them means
+PodRemediator acts only once SNR has crossed its declared safety barrier. Anything
+weaker — a missing or unknown phase, a deleting or absent SNR, or merely an elapsed
+`timeAssumedRebooted` timestamp — does **not** authorize deletion.
+
+Note that fencing does not move the PV: a node-local PV stays pinned to its
+original node even after a reboot, which is exactly why workload recovery may still
+need the PVC deleted. See the
 [SNR controller](https://github.com/medik8s/self-node-remediation/blob/main/internal/controller/selfnoderemediation_controller.go).
 
 Every reconcile scans existing handshakes, including when all remaining Nodes are
@@ -257,14 +289,15 @@ effectiveInterval(spec.X, r.X, DefaultX):
 
 ### 3.6 Local PV Detection
 
-**`isLocalPV(pv)`** accepts local, CSI, and HostPath volumes only when their
-required node affinity exclusively identifies one node. Every OR selector term
-must pin the same node using a known topology key with `operator: In` and exactly
-one non-empty value. `NotIn`, multiple values, conflicting keys, and unpinned or
-other-node alternatives are rejected. Additional AND constraints may narrow the
-selection but cannot broaden it.
+PodRemediator only ever touches a PVC whose PV is pinned to exactly one node.
+`resolveLocalPVNodeName(pv, nodes)` figures this out: it accepts local, CSI, and
+HostPath volumes only when their required node affinity unambiguously points to a
+single node. Every OR branch of the affinity must pin the *same* node using a known
+topology key with `operator: In` and exactly one non-empty value. `NotIn`, multiple
+values, conflicting keys, and unpinned or other-node alternatives are all rejected.
+Extra AND constraints may narrow the match but can never broaden it.
 
-**`getLocalPVNodeName(pv)`** applies those checks using these known keys:
+It recognizes these topology keys:
 
 | Key | Driver |
 |-----|--------|
@@ -279,9 +312,9 @@ may be attachable on another node; deleting its PVC is therefore not the generic
 recovery mechanism. CSI volumes are treated as local only when their affinity
 proves an exclusive node pin.
 
-If exclusive node pinning cannot be established, `getLocalPVNodeName` returns `""`
-and remediation is skipped. Add supported keys to `localPVNodeTopologyKeys` when
-integrating another local CSI driver.
+If a single node cannot be established, `resolveLocalPVNodeName` returns `""` and
+remediation is skipped. To support another local CSI driver, add its key to
+`localPVNodeTopologyKeys`.
 
 ### 3.7 Watches
 
@@ -340,5 +373,8 @@ these dependency checks are not watch sources.
   does not provide a structured per-PVC remediation list and the controller does
   not emit Kubernetes Events for each handshake step.
 
-For test responsibilities and what each test layer validates, see the
-[PodRemediator testing guide](podremediator_testing.md).
+The in-repository tests cover this controller at three levels: unit tests in
+`test/unit/remediation/`, envtest functional tests in `test/functional/`, and a
+KUTTL integration test in `test/kuttl/tests/podremediator-deletion-commit/`.
+A real node-failure scenario must be validated on a cluster with NHC and SNR
+installed.
