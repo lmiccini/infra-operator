@@ -29,6 +29,19 @@ import (
 	remediationv1 "github.com/openstack-k8s-operators/infra-operator/apis/remediation/v1beta1"
 )
 
+// snrNodeNameKey is the medik8s annotation/label carrying the fenced node's name.
+const snrNodeNameKey = "remediation.medik8s.io/node-name"
+
+// remediationAnnotationKeys are the handshake annotations owned by PodRemediator.
+var remediationAnnotationKeys = []string{
+	remediationv1.PVCStuckOnNodeAnnotation,
+	remediationv1.SafeToDeleteAnnotation,
+	remediationv1.RequestIDAnnotation,
+	remediationv1.ConsentIDAnnotation,
+	remediationv1.RemediatorUIDAnnotation,
+	remediationv1.FencingNodeUIDAnnotation,
+}
+
 // safetyReader returns the uncached reader used for destructive decisions.
 func (r *PodRemediatorReconciler) safetyReader() client.Reader {
 	if r.APIReader != nil {
@@ -37,26 +50,48 @@ func (r *PodRemediatorReconciler) safetyReader() client.Reader {
 	return r.Client
 }
 
+// readPVC fetches the current PVC from the uncached reader.
+func (r *PodRemediatorReconciler) readPVC(ctx context.Context, key client.ObjectKey) (*corev1.PersistentVolumeClaim, error) {
+	pvc := &corev1.PersistentVolumeClaim{}
+	err := r.safetyReader().Get(ctx, key, pvc)
+	return pvc, err
+}
+
+// patchPVC applies mutate to pvc and writes it under an optimistic lock,
+// tolerating a concurrent deletion (NotFound).
+func (r *PodRemediatorReconciler) patchPVC(ctx context.Context, pvc *corev1.PersistentVolumeClaim, mutate func()) error {
+	old := pvc.DeepCopy()
+	mutate()
+	if err := r.Patch(ctx, pvc, client.MergeFromWithOptions(old, client.MergeFromWithOptimisticLock{})); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	return nil
+}
+
 // observedDeleteOptions binds deletion to the object's observed UID and version.
 func observedDeleteOptions(obj client.Object) *client.DeleteOptions {
 	uid, rv := obj.GetUID(), obj.GetResourceVersion()
 	return &client.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid, ResourceVersion: &rv}}
 }
 
+// hasRemediationAnnotations reports whether any handshake annotation is set.
+func hasRemediationAnnotations(obj client.Object) bool {
+	annotations := obj.GetAnnotations()
+	for _, key := range remediationAnnotationKeys {
+		if annotations[key] != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // clearRemediationAnnotations removes every annotation owned by the handshake.
 func clearRemediationAnnotations(obj client.Object) {
-	if obj.GetAnnotations() == nil {
+	annotations := obj.GetAnnotations()
+	if annotations == nil {
 		return
 	}
-	annotations := obj.GetAnnotations()
-	for _, key := range []string{
-		remediationv1.PVCStuckOnNodeAnnotation,
-		remediationv1.SafeToDeleteAnnotation,
-		remediationv1.RequestIDAnnotation,
-		remediationv1.ConsentIDAnnotation,
-		remediationv1.RemediatorUIDAnnotation,
-		remediationv1.FencingNodeUIDAnnotation,
-	} {
+	for _, key := range remediationAnnotationKeys {
 		delete(annotations, key)
 	}
 	obj.SetAnnotations(annotations)
@@ -76,10 +111,10 @@ func snrNodeName(snr *unstructured.Unstructured) string {
 	if snr == nil {
 		return ""
 	}
-	if name := snr.GetAnnotations()["remediation.medik8s.io/node-name"]; name != "" {
+	if name := snr.GetAnnotations()[snrNodeNameKey]; name != "" {
 		return name
 	}
-	if name := snr.GetLabels()["remediation.medik8s.io/node-name"]; name != "" {
+	if name := snr.GetLabels()[snrNodeNameKey]; name != "" {
 		return name
 	}
 	return snr.GetName()

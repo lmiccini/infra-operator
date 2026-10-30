@@ -53,12 +53,12 @@ func (r *PodRemediatorReconciler) clearAbortedPVC(ctx context.Context, pvc *core
 	if pvc.DeletionTimestamp != nil {
 		return nil // API deletion cannot be undone; never remove its commit here.
 	}
-	old := pvc.DeepCopy()
-	clearRemediationAnnotations(pvc)
-	delete(pvc.Annotations, remediationv1.PVCDeletionCommittedAnnotation)
-	delete(pvc.Annotations, deletionCommitTokenAnnotation)
-	delete(pvc.Annotations, deletionCommitFinalizedAnnotation)
-	if err := r.Patch(ctx, pvc, client.MergeFromWithOptions(old, client.MergeFromWithOptimisticLock{})); err != nil && !k8s_errors.IsNotFound(err) {
+	if err := r.patchPVC(ctx, pvc, func() {
+		clearRemediationAnnotations(pvc)
+		delete(pvc.Annotations, remediationv1.PVCDeletionCommittedAnnotation)
+		delete(pvc.Annotations, deletionCommitTokenAnnotation)
+		delete(pvc.Annotations, deletionCommitFinalizedAnnotation)
+	}); err != nil {
 		return fmt.Errorf("clear aborted PVC %s remediation: %w", pvc.Name, err)
 	}
 	return nil
@@ -114,7 +114,7 @@ func (r *PodRemediatorReconciler) resumeCommittedPVCDeletions(ctx context.Contex
 					result.BlockedByInvalidCommit = fmt.Sprintf("PVC %s/%s has an invalid deletion commit record; preserve the PVC and repair or remove the record before cleanup can continue", pvc.Namespace, pvc.Name)
 					continue
 				}
-				if err := r.Delete(ctx, commit, observedDeleteOptions(commit)); err != nil && !k8s_errors.IsNotFound(err) {
+				if err := r.deleteCommit(ctx, commit); err != nil {
 					return committedPVCDeletionResumeResult{}, fmt.Errorf("remove invalid PVC deletion commit %s: %w", commit.Name, err)
 				}
 				if err := r.clearAbortedPVC(ctx, pvc); err != nil {
@@ -128,18 +128,18 @@ func (r *PodRemediatorReconciler) resumeCommittedPVCDeletions(ctx context.Contex
 				active[state.PVCUID] = true
 				continue
 			}
-			pvc := &corev1.PersistentVolumeClaim{}
-			if err := r.safetyReader().Get(ctx, client.ObjectKey{Namespace: namespace, Name: state.PVCName}, pvc); err != nil {
+			pvc, err := r.readPVC(ctx, client.ObjectKey{Namespace: namespace, Name: state.PVCName})
+			if err != nil {
 				if !k8s_errors.IsNotFound(err) {
 					return committedPVCDeletionResumeResult{}, err
 				}
-				if err := r.Delete(ctx, commit, observedDeleteOptions(commit)); err != nil && !k8s_errors.IsNotFound(err) {
+				if err := r.deleteCommit(ctx, commit); err != nil {
 					return committedPVCDeletionResumeResult{}, err
 				}
 				continue
 			}
 			if string(pvc.UID) != state.PVCUID {
-				if err := r.Delete(ctx, commit, observedDeleteOptions(commit)); err != nil && !k8s_errors.IsNotFound(err) {
+				if err := r.deleteCommit(ctx, commit); err != nil {
 					return committedPVCDeletionResumeResult{}, err
 				}
 				continue
@@ -242,7 +242,7 @@ func (r *PodRemediatorReconciler) resumeCommittedPVCDeletion(ctx context.Context
 				return true, false, blocked, nil
 			}
 			Log.Info("Aborting committed PVC deletion because claim users changed", "pvc", pvc.Name, "pod", pod.Name)
-			if err := r.Delete(ctx, commit, observedDeleteOptions(commit)); err != nil && !k8s_errors.IsNotFound(err) {
+			if err := r.deleteCommit(ctx, commit); err != nil {
 				return false, false, "", err
 			}
 			return false, true, "", r.clearAbortedPVC(ctx, pvc)
@@ -275,12 +275,12 @@ func (r *PodRemediatorReconciler) resumeCommittedPVCDeletion(ctx context.Context
 			return false, false, "", fmt.Errorf("conditionally delete committed PVC %s: %w", pvc.Name, err)
 		}
 	}
-	current := &corev1.PersistentVolumeClaim{}
-	if err := r.safetyReader().Get(ctx, client.ObjectKeyFromObject(pvc), current); err != nil {
+	current, err := r.readPVC(ctx, client.ObjectKeyFromObject(pvc))
+	if err != nil {
 		if !k8s_errors.IsNotFound(err) {
 			return false, false, "", err
 		}
-		if err := r.Delete(ctx, commit, observedDeleteOptions(commit)); err != nil && !k8s_errors.IsNotFound(err) {
+		if err := r.deleteCommit(ctx, commit); err != nil {
 			return false, false, "", err
 		}
 		return false, false, "", nil

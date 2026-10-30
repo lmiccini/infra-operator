@@ -161,7 +161,7 @@ func (r *PodRemediatorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	)
 	instance.Status.Conditions.Init(&cl)
 
-	if instance.DeletionTimestamp.IsZero() && controllerutil.AddFinalizer(instance, helper.GetFinalizer()) || isNewInstance {
+	if (instance.DeletionTimestamp.IsZero() && controllerutil.AddFinalizer(instance, helper.GetFinalizer())) || isNewInstance {
 		return ctrl.Result{}, nil
 	}
 
@@ -293,6 +293,24 @@ func podRemediatorWatchesNamespace(instance *remediationv1.PodRemediator, namesp
 	return false
 }
 
+// setPendingDeletionCondition sets Ready to reflect an in-flight committed PVC
+// deletion: blocked by an invalid commit record, blocked by a replacement Pod,
+// or simply still completing. Pass "" for a reason that does not apply.
+func setPendingDeletionCondition(instance *remediationv1.PodRemediator, invalidMsg, replacementMsg string) {
+	switch {
+	case invalidMsg != "":
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.ReadyCondition, InvalidPVCDeletionCommitReason, condition.SeverityWarning,
+			"%s", invalidMsg))
+	case replacementMsg != "":
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.ReadyCondition, ReplacementPodBlocksPVCDeletionReason, condition.SeverityWarning,
+			"%s", replacementMsg))
+	default:
+		instance.Status.Conditions.MarkTrue(condition.ReadyCondition, "Completing a previously committed PVC deletion")
+	}
+}
+
 // reconcileDelete cleans up both pvc-stuck-on-node AND safe-to-delete annotations from PVCs
 // in configured namespaces before removing the CR finalizer. If any annotation patch fails the finalizer
 // is NOT removed and the reconcile requeues, preserving atomicity. Removing safe-to-delete
@@ -309,17 +327,7 @@ func (r *PodRemediatorReconciler) reconcileDelete(ctx context.Context, instance 
 	}
 	if resumeResult.Pending || len(resumeResult.BlockedPVCUIDs) != 0 {
 		// Keep the CR finalizer until every committed PVC deletion has finished.
-		if resumeResult.BlockedByInvalidCommit != "" {
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				condition.ReadyCondition, InvalidPVCDeletionCommitReason, condition.SeverityWarning,
-				"%s", resumeResult.BlockedByInvalidCommit))
-		} else if resumeResult.BlockedByReplacementPod != "" {
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				condition.ReadyCondition, ReplacementPodBlocksPVCDeletionReason, condition.SeverityWarning,
-				"%s", resumeResult.BlockedByReplacementPod))
-		} else {
-			instance.Status.Conditions.MarkTrue(condition.ReadyCondition, "Completing a previously committed PVC deletion")
-		}
+		setPendingDeletionCondition(instance, resumeResult.BlockedByInvalidCommit, resumeResult.BlockedByReplacementPod)
 		return ctrl.Result{RequeueAfter: DefaultConsentPollInterval}, nil
 	}
 	if err := r.cleanupAnnotations(ctx, namespaces, string(instance.UID), true); err != nil {
@@ -350,19 +358,13 @@ func (r *PodRemediatorReconciler) cleanupAnnotations(ctx context.Context, namesp
 			if pvcOwner != owner && (pvcOwner != "" || !includeLegacy) {
 				continue
 			}
-			// Clean up both keys, including an orphaned safe-to-delete with no
-			// pvc-stuck-on-node, so no stale consent is left behind after CR removal.
-			if pvc.Annotations[remediationv1.PVCStuckOnNodeAnnotation] == "" &&
-				pvc.Annotations[remediationv1.SafeToDeleteAnnotation] == "" &&
-				pvc.Annotations[remediationv1.RequestIDAnnotation] == "" &&
-				pvc.Annotations[remediationv1.ConsentIDAnnotation] == "" &&
-				pvc.Annotations[remediationv1.RemediatorUIDAnnotation] == "" &&
-				pvc.Annotations[remediationv1.FencingNodeUIDAnnotation] == "" {
+			// Clean up every handshake annotation, including an orphaned
+			// safe-to-delete with no pvc-stuck-on-node, so no stale consent is
+			// left behind after CR removal.
+			if !hasRemediationAnnotations(pvc) {
 				continue
 			}
-			oldPVC := pvc.DeepCopy()
-			clearRemediationAnnotations(pvc)
-			if err := r.Patch(ctx, pvc, client.MergeFromWithOptions(oldPVC, client.MergeFromWithOptimisticLock{})); err != nil && !k8s_errors.IsNotFound(err) {
+			if err := r.patchPVC(ctx, pvc, func() { clearRemediationAnnotations(pvc) }); err != nil {
 				Log.Error(err, "remove remediation annotations", "pvc", client.ObjectKeyFromObject(pvc))
 				cleanupFailed = true
 			}
@@ -374,32 +376,38 @@ func (r *PodRemediatorReconciler) cleanupAnnotations(ctx context.Context, namesp
 	return nil
 }
 
+// listDynamicOptional lists gvr, treating a missing CRD (NoMatch/NotFound) as an
+// empty result so optional medik8s dependencies never surface as hard errors.
+func (r *PodRemediatorReconciler) listDynamicOptional(ctx context.Context, gvr schema.GroupVersionResource) ([]unstructured.Unstructured, error) {
+	list, err := r.DynamicClient.Resource(gvr).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		if meta.IsNoMatchError(err) || k8s_errors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if list == nil {
+		return nil, nil
+	}
+	return list.Items, nil
+}
+
 // checkNHCAndSNR reports whether at least one NodeHealthCheck and one
 // SelfNodeRemediationTemplate exist. reconcileNormal calls it before scanning
 // PVCs to gate new remediation work on these required dependencies.
 func (r *PodRemediatorReconciler) checkNHCAndSNR(ctx context.Context) (bool, error) {
-	nhcList, err := r.DynamicClient.Resource(gvrNodeHealthCheck).List(ctx, metav1.ListOptions{})
+	nhc, err := r.listDynamicOptional(ctx, gvrNodeHealthCheck)
 	if err != nil {
-		if meta.IsNoMatchError(err) || k8s_errors.IsNotFound(err) {
-			return false, nil
-		}
 		return false, err
 	}
-	if nhcList == nil || len(nhcList.Items) == 0 {
+	if len(nhc) == 0 {
 		return false, nil
 	}
-
-	snrList, err := r.DynamicClient.Resource(gvrSelfNodeRemediationTemplate).List(ctx, metav1.ListOptions{})
+	snr, err := r.listDynamicOptional(ctx, gvrSelfNodeRemediationTemplate)
 	if err != nil {
-		if meta.IsNoMatchError(err) || k8s_errors.IsNotFound(err) {
-			return false, nil
-		}
 		return false, err
 	}
-	if snrList == nil || len(snrList.Items) == 0 {
-		return false, nil
-	}
-	return true, nil
+	return len(snr) > 0, nil
 }
 
 // getNodesWithFencedSNR returns only nodes whose active SNR has crossed the reboot
@@ -407,17 +415,14 @@ func (r *PodRemediatorReconciler) checkNHCAndSNR(ctx context.Context) (bool, err
 // In medik8s/self-node-remediation, waitForNodeRebooted advances to Reboot-Completed
 // before SNR removes workloads; Fencing-Completed follows that cleanup.
 func (r *PodRemediatorReconciler) getNodesWithFencedSNR(ctx context.Context, Log logr.Logger) (map[string]*unstructured.Unstructured, error) {
-	snrList, err := r.DynamicClient.Resource(gvrSelfNodeRemediation).List(ctx, metav1.ListOptions{})
+	snrs, err := r.listDynamicOptional(ctx, gvrSelfNodeRemediation)
 	if err != nil {
-		if meta.IsNoMatchError(err) || k8s_errors.IsNotFound(err) {
-			return map[string]*unstructured.Unstructured{}, nil
-		}
 		return nil, err
 	}
 	active := make(map[string]int)
 	fenced := make(map[string]*unstructured.Unstructured)
-	for i := range snrList.Items {
-		snr := &snrList.Items[i]
+	for i := range snrs {
+		snr := &snrs[i]
 		if snr.GetDeletionTimestamp() != nil {
 			continue
 		}
@@ -493,13 +498,9 @@ func (r *PodRemediatorReconciler) reconcileNormal(ctx context.Context, instance 
 		}
 	}
 	if instance.Spec.Disabled && resumeResult.Pending {
-		if resumeResult.BlockedByReplacementPod != "" {
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				condition.ReadyCondition, ReplacementPodBlocksPVCDeletionReason, condition.SeverityWarning,
-				"%s", resumeResult.BlockedByReplacementPod))
-		} else {
-			instance.Status.Conditions.MarkTrue(condition.ReadyCondition, "Completing a previously committed PVC deletion")
-		}
+		// An invalid commit on the disabled path is reported above; here only a
+		// replacement Pod can still block an otherwise-completing deletion.
+		setPendingDeletionCondition(instance, "", resumeResult.BlockedByReplacementPod)
 		return ctrl.Result{RequeueAfter: DefaultConsentPollInterval}, nil
 	}
 
@@ -634,6 +635,18 @@ func (r *PodRemediatorReconciler) reconcileNormal(ctx context.Context, instance 
 		}
 	}
 
+	return buildScanResult(instance, scan, resumeResult, consentPoll, periodicPoll)
+}
+
+// buildScanResult maps the outcome of one PVC scan to a Ready condition and a
+// requeue interval. It is the single place that turns scan state into a reconcile
+// result, so the requeue policy can be reviewed independently of the scan itself.
+func buildScanResult(
+	instance *remediationv1.PodRemediator,
+	scan *pvcRemediationScan,
+	resumeResult committedPVCDeletionResumeResult,
+	consentPoll, periodicPoll time.Duration,
+) (ctrl.Result, error) {
 	if scan.hadError {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ReadyCondition, condition.ErrorReason, condition.SeverityWarning,
@@ -642,13 +655,7 @@ func (r *PodRemediatorReconciler) reconcileNormal(ctx context.Context, instance 
 	}
 
 	if scan.pendingCommittedDeletion {
-		if scan.blockedByReplacementPod != "" {
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				condition.ReadyCondition, ReplacementPodBlocksPVCDeletionReason, condition.SeverityWarning,
-				"%s", scan.blockedByReplacementPod))
-		} else {
-			instance.Status.Conditions.MarkTrue(condition.ReadyCondition, "Completing a previously committed PVC deletion")
-		}
+		setPendingDeletionCondition(instance, "", scan.blockedByReplacementPod)
 		requeueAfter := DefaultConsentPollInterval
 		if scan.waitingForConsent > 0 || scan.waitingForFencing > 0 {
 			requeueAfter = min(requeueAfter, consentPoll)
@@ -712,14 +719,20 @@ var localPVNodeTopologyKeys = []string{
 	"topology.lvms.io/node",    // LVMS variant
 }
 
+// pvHasLocalNodeAffinity reports whether pv is a node-local volume carrying the
+// required node affinity the resolvers inspect.
+func pvHasLocalNodeAffinity(pv *corev1.PersistentVolume) bool {
+	if pv.Spec.Local == nil && pv.Spec.CSI == nil && pv.Spec.HostPath == nil {
+		return false
+	}
+	return pv.Spec.NodeAffinity != nil && pv.Spec.NodeAffinity.Required != nil
+}
+
 // resolveLocalPVNodeName maps every exclusive topology requirement to an
 // actual Node and returns its Kubernetes object name. Topology label values are
 // not assumed to be Node.Name; hostname labels in particular commonly differ.
 func resolveLocalPVNodeName(pv *corev1.PersistentVolume, nodes []corev1.Node, Log logr.Logger) string {
-	if pv.Spec.Local == nil && pv.Spec.CSI == nil && pv.Spec.HostPath == nil {
-		return ""
-	}
-	if pv.Spec.NodeAffinity == nil || pv.Spec.NodeAffinity.Required == nil {
+	if !pvHasLocalNodeAffinity(pv) {
 		return ""
 	}
 
@@ -760,10 +773,7 @@ func resolveLocalPVNodeName(pv *corev1.PersistentVolume, nodes []corev1.Node, Lo
 // convention when the Node object has disappeared. Hostname is never a direct
 // Node identity, and mixed topology expressions cannot prove exclusivity here.
 func getDirectLocalPVNodeName(pv *corev1.PersistentVolume) string {
-	if pv.Spec.Local == nil && pv.Spec.CSI == nil && pv.Spec.HostPath == nil {
-		return ""
-	}
-	if pv.Spec.NodeAffinity == nil || pv.Spec.NodeAffinity.Required == nil {
+	if !pvHasLocalNodeAffinity(pv) {
 		return ""
 	}
 	name := ""

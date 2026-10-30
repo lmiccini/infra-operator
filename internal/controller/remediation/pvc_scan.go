@@ -61,9 +61,7 @@ func (r *PodRemediatorReconciler) processExistingPVCHandshake(
 	// Path A: clear the request only when the Node still exists and is not
 	// marked unhealthy.
 	if !scan.rawUnhealthyNodes[stuckOnNode] && scan.allNodeNames[stuckOnNode] {
-		oldPVC := pvc.DeepCopy()
-		clearRemediationAnnotations(pvc)
-		if err := r.Patch(ctx, pvc, client.MergeFromWithOptions(oldPVC, client.MergeFromWithOptimisticLock{})); err != nil && !k8s_errors.IsNotFound(err) {
+		if err := r.patchPVC(ctx, pvc, func() { clearRemediationAnnotations(pvc) }); err != nil {
 			scan.log.Error(err, "remove remediation annotations (node recovered)", "pvc", client.ObjectKeyFromObject(pvc), "node", stuckOnNode)
 			scan.hadError = true
 		} else {
@@ -179,10 +177,10 @@ func (r *PodRemediatorReconciler) processNewPVCHandshake(
 ) {
 	// Drop orphaned consent when there is no active unhealthy-node request.
 	if len(scan.rawUnhealthyNodes) == 0 && pvc.Annotations[remediationv1.SafeToDeleteAnnotation] != "" {
-		oldPVC := pvc.DeepCopy()
-		delete(pvc.Annotations, remediationv1.SafeToDeleteAnnotation)
-		delete(pvc.Annotations, remediationv1.ConsentIDAnnotation)
-		if err := r.Patch(ctx, pvc, client.MergeFromWithOptions(oldPVC, client.MergeFromWithOptimisticLock{})); err != nil && !k8s_errors.IsNotFound(err) {
+		if err := r.patchPVC(ctx, pvc, func() {
+			delete(pvc.Annotations, remediationv1.SafeToDeleteAnnotation)
+			delete(pvc.Annotations, remediationv1.ConsentIDAnnotation)
+		}); err != nil {
 			scan.hadError = true
 			scan.log.Error(err, "remove orphaned consent", "pvc", client.ObjectKeyFromObject(pvc))
 		}

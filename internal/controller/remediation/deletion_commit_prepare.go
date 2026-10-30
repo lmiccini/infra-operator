@@ -110,28 +110,22 @@ func (r *PodRemediatorReconciler) deletePVCAndPods(ctx context.Context, instance
 		state = stored
 	}
 	if committedDeletion(state) {
-		current := &corev1.PersistentVolumeClaim{}
-		if err := r.safetyReader().Get(ctx, client.ObjectKeyFromObject(pvc), current); err != nil {
+		current, err := r.readPVC(ctx, client.ObjectKeyFromObject(pvc))
+		if err != nil {
 			if k8s_errors.IsNotFound(err) {
-				if deleteErr := r.Delete(ctx, commit, observedDeleteOptions(commit)); deleteErr != nil && !k8s_errors.IsNotFound(deleteErr) {
-					return false, "", deleteErr
-				}
-				return false, "", nil
+				return false, "", r.deleteCommit(ctx, commit)
 			}
 			return false, "", err
 		}
 		if current.UID != pvc.UID {
-			if err := r.Delete(ctx, commit, observedDeleteOptions(commit)); err != nil && !k8s_errors.IsNotFound(err) {
-				return false, "", err
-			}
-			return false, "", nil
+			return false, "", r.deleteCommit(ctx, commit)
 		}
 		pending, _, blocked, err := r.resumeCommittedPVCDeletion(ctx, current, commit, state, Log)
 		return pending, blocked, err
 	}
 
-	current := &corev1.PersistentVolumeClaim{}
-	if err := r.safetyReader().Get(ctx, client.ObjectKeyFromObject(pvc), current); err != nil {
+	current, err := r.readPVC(ctx, client.ObjectKeyFromObject(pvc))
+	if err != nil {
 		if k8s_errors.IsNotFound(err) {
 			if deleteErr := r.discardPreparedDeletionCommit(ctx, commit); deleteErr != nil {
 				return false, "", deleteErr
@@ -163,8 +157,7 @@ func (r *PodRemediatorReconciler) deletePVCAndPods(ctx context.Context, instance
 		// This marker is provisional. A second resource-version-locked PVC write
 		// below is the consent boundary; revocation between the two must win.
 		if err := r.Patch(ctx, marked, client.MergeFromWithOptions(old, client.MergeFromWithOptimisticLock{})); err != nil {
-			latest := &corev1.PersistentVolumeClaim{}
-			getErr := r.safetyReader().Get(ctx, client.ObjectKeyFromObject(pvc), latest)
+			latest, getErr := r.readPVC(ctx, client.ObjectKeyFromObject(pvc))
 			if getErr != nil || !preparedCommitMatchesPVC(latest, state) {
 				if !k8s_errors.IsNotFound(getErr) && getErr != nil {
 					return false, "", fmt.Errorf("conditionally mark PVC %s deletion and verify commit: %w (read current PVC: %w)", pvc.Name, err, getErr)
@@ -176,8 +169,8 @@ func (r *PodRemediatorReconciler) deletePVCAndPods(ctx context.Context, instance
 			}
 			current = latest
 		} else {
-			current = &corev1.PersistentVolumeClaim{}
-			if err := r.safetyReader().Get(ctx, client.ObjectKeyFromObject(pvc), current); err != nil {
+			current, err = r.readPVC(ctx, client.ObjectKeyFromObject(pvc))
+			if err != nil {
 				return false, "", fmt.Errorf("read committed PVC %s: %w", pvc.Name, err)
 			}
 			if !preparedCommitMatchesPVC(current, state) {
@@ -202,13 +195,10 @@ func (r *PodRemediatorReconciler) deletePVCAndPods(ctx context.Context, instance
 	if err != nil {
 		return false, "", err
 	}
-	current = &corev1.PersistentVolumeClaim{}
-	if err := r.safetyReader().Get(ctx, client.ObjectKeyFromObject(pvc), current); err != nil {
+	current, err = r.readPVC(ctx, client.ObjectKeyFromObject(pvc))
+	if err != nil {
 		if k8s_errors.IsNotFound(err) {
-			if deleteErr := r.Delete(ctx, commit, observedDeleteOptions(commit)); deleteErr != nil && !k8s_errors.IsNotFound(deleteErr) {
-				return false, "", deleteErr
-			}
-			return false, "", nil
+			return false, "", r.deleteCommit(ctx, commit)
 		}
 		return false, "", err
 	}
@@ -216,8 +206,17 @@ func (r *PodRemediatorReconciler) deletePVCAndPods(ctx context.Context, instance
 	return pending, blocked, err
 }
 
-func (r *PodRemediatorReconciler) discardPreparedDeletionCommit(ctx context.Context, commit *corev1.ConfigMap) error {
+// deleteCommit removes a deletion-commit ConfigMap under UID/version
+// preconditions, tolerating a concurrent deletion (NotFound).
+func (r *PodRemediatorReconciler) deleteCommit(ctx context.Context, commit *corev1.ConfigMap) error {
 	if err := r.Delete(ctx, commit, observedDeleteOptions(commit)); err != nil && !k8s_errors.IsNotFound(err) {
+		return err
+	}
+	return nil
+}
+
+func (r *PodRemediatorReconciler) discardPreparedDeletionCommit(ctx context.Context, commit *corev1.ConfigMap) error {
+	if err := r.deleteCommit(ctx, commit); err != nil {
 		return fmt.Errorf("remove rejected provisional PVC deletion commit %s: %w", commit.Name, err)
 	}
 	return nil
@@ -261,8 +260,8 @@ func (r *PodRemediatorReconciler) finalizePreparedDeletionCommit(ctx context.Con
 	finalized := pvc.DeepCopy()
 	finalized.Annotations[deletionCommitFinalizedAnnotation] = state.Token
 	if err := r.Patch(ctx, finalized, client.MergeFromWithOptions(old, client.MergeFromWithOptimisticLock{})); err != nil {
-		latest := &corev1.PersistentVolumeClaim{}
-		if getErr := r.safetyReader().Get(ctx, client.ObjectKeyFromObject(pvc), latest); getErr != nil {
+		latest, getErr := r.readPVC(ctx, client.ObjectKeyFromObject(pvc))
+		if getErr != nil {
 			return nil, fmt.Errorf("finalize PVC %s deletion and read current PVC: %w (read: %w)", pvc.Name, err, getErr)
 		}
 		if finalizedCommitMatchesPVC(latest, state) {
@@ -276,8 +275,8 @@ func (r *PodRemediatorReconciler) finalizePreparedDeletionCommit(ctx context.Con
 		}
 		return nil, fmt.Errorf("conditionally finalize PVC %s deletion: %w", pvc.Name, err)
 	}
-	current := &corev1.PersistentVolumeClaim{}
-	if err := r.safetyReader().Get(ctx, client.ObjectKeyFromObject(pvc), current); err != nil {
+	current, err := r.readPVC(ctx, client.ObjectKeyFromObject(pvc))
+	if err != nil {
 		return nil, fmt.Errorf("read finalized PVC %s: %w", pvc.Name, err)
 	}
 	if !finalizedCommitMatchesPVC(current, state) {

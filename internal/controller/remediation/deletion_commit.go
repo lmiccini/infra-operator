@@ -147,10 +147,9 @@ func decodeDeletionCommit(commit *corev1.ConfigMap) (deletionCommit, error) {
 	if state.Phase != deletionCommitPhasePrepared && state.Phase != deletionCommitPhaseCommitted {
 		return state, fmt.Errorf("invalid PVC deletion commit phase in ConfigMap %s", commit.Name)
 	}
-	if state.Phase == deletionCommitPhasePrepared || state.Phase == deletionCommitPhaseCommitted {
-		if state.PVCResourceVersion == "" || state.RequestID == "" || state.Token == "" {
-			return state, fmt.Errorf("incomplete PVC deletion commit state in ConfigMap %s", commit.Name)
-		}
+	// Both prepared and committed records must carry the full locking context.
+	if state.PVCResourceVersion == "" || state.RequestID == "" || state.Token == "" {
+		return state, fmt.Errorf("incomplete PVC deletion commit state in ConfigMap %s", commit.Name)
 	}
 	for _, pod := range state.Pods {
 		if pod.Name == "" || pod.UID == "" {

@@ -95,9 +95,8 @@ func snrRemediationChanged(old, current interface{}) bool {
 	}
 	oldPhase, _, _ := unstructured.NestedString(oldSNR.Object, "status", "phase")
 	newPhase, _, _ := unstructured.NestedString(newSNR.Object, "status", "phase")
-	const nodeKey = "remediation.medik8s.io/node-name"
 	return oldPhase != newPhase ||
 		!oldSNR.GetDeletionTimestamp().Equal(newSNR.GetDeletionTimestamp()) ||
-		oldSNR.GetAnnotations()[nodeKey] != newSNR.GetAnnotations()[nodeKey] ||
-		oldSNR.GetLabels()[nodeKey] != newSNR.GetLabels()[nodeKey]
+		oldSNR.GetAnnotations()[snrNodeNameKey] != newSNR.GetAnnotations()[snrNodeNameKey] ||
+		oldSNR.GetLabels()[snrNodeNameKey] != newSNR.GetLabels()[snrNodeNameKey]
 }
