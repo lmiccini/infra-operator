@@ -55,8 +55,7 @@ func (r *PodRemediatorReconciler) deletePVCAndPods(ctx context.Context, instance
 	if paused {
 		return false, "", errPVCRemediationPaused
 	}
-	if pvc.Annotations[remediationv1.PVCDeletionCommittedAnnotation] != "" ||
-		pvc.Annotations[deletionCommitTokenAnnotation] != "" || pvc.Annotations[deletionCommitFinalizedAnnotation] != "" {
+	if hasDeletionCommitAnnotations(pvc) {
 		// A concurrent reconcile may be completing the PVC commit boundary.
 		// Let the resume path validate the annotations against its ConfigMap.
 		return true, "", nil
@@ -91,23 +90,9 @@ func (r *PodRemediatorReconciler) deletePVCAndPods(ctx context.Context, instance
 	}
 	commit := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: deletionCommitName(state.PVCUID), Namespace: pvc.Namespace,
 		Annotations: map[string]string{deletionCommitAnnotation: string(encoded)}}}
-	if err := r.Create(ctx, commit); err != nil {
-		if !k8s_errors.IsAlreadyExists(err) {
-			return false, "", fmt.Errorf("prepare PVC %s deletion commit: %w", pvc.Name, err)
-		}
-		storedCommit := &corev1.ConfigMap{}
-		if err := r.safetyReader().Get(ctx, client.ObjectKeyFromObject(commit), storedCommit); err != nil {
-			return false, "", err
-		}
-		stored, err := decodeDeletionCommit(storedCommit)
-		if err != nil || stored.PVCUID != state.PVCUID || stored.RemediatorUID != state.RemediatorUID || stored.PVCName != state.PVCName || stored.Node != state.Node {
-			return false, "", fmt.Errorf("PVC %s has a conflicting deletion commit", pvc.Name)
-		}
-		if !committedDeletion(stored) && (stored.PVCResourceVersion != pvc.ResourceVersion || stored.RequestID != requestID) {
-			return false, "", fmt.Errorf("PVC %s has a conflicting provisional deletion commit", pvc.Name)
-		}
-		commit = storedCommit
-		state = stored
+	commit, state, err = r.createOrAdoptDeletionCommit(ctx, commit, state, pvc, requestID)
+	if err != nil {
+		return false, "", err
 	}
 	if committedDeletion(state) {
 		current, err := r.readPVC(ctx, client.ObjectKeyFromObject(pvc))
@@ -139,47 +124,9 @@ func (r *PodRemediatorReconciler) deletePVCAndPods(ctx context.Context, instance
 		}
 		return false, "", fmt.Errorf("PVC %s changed identity before committed cleanup", pvc.Name)
 	}
-	if !preparedCommitMatchesPVC(current, state) {
-		if current.ResourceVersion != state.PVCResourceVersion || !pvcDeletionConsentMatches(current, state.RemediatorUID, state.Node, state.RequestID) {
-			if err := r.discardPreparedDeletionCommit(ctx, commit); err != nil {
-				return false, "", err
-			}
-			return false, "", fmt.Errorf("PVC %s changed after deletion consent was validated", pvc.Name)
-		}
-
-		old := pvc.DeepCopy()
-		marked := pvc.DeepCopy()
-		if marked.Annotations == nil {
-			marked.Annotations = map[string]string{}
-		}
-		marked.Annotations[remediationv1.PVCDeletionCommittedAnnotation] = committedPVCDeletionValue(state.PVCUID, state.RemediatorUID, state.Node)
-		marked.Annotations[deletionCommitTokenAnnotation] = state.Token
-		// This marker is provisional. A second resource-version-locked PVC write
-		// below is the consent boundary; revocation between the two must win.
-		if err := r.Patch(ctx, marked, client.MergeFromWithOptions(old, client.MergeFromWithOptimisticLock{})); err != nil {
-			latest, getErr := r.readPVC(ctx, client.ObjectKeyFromObject(pvc))
-			if getErr != nil || !preparedCommitMatchesPVC(latest, state) {
-				if !k8s_errors.IsNotFound(getErr) && getErr != nil {
-					return false, "", fmt.Errorf("conditionally mark PVC %s deletion and verify commit: %w (read current PVC: %w)", pvc.Name, err, getErr)
-				}
-				if discardErr := r.discardPreparedDeletionCommit(ctx, commit); discardErr != nil {
-					return false, "", discardErr
-				}
-				return false, "", fmt.Errorf("conditionally mark PVC %s deletion: %w", pvc.Name, err)
-			}
-			current = latest
-		} else {
-			current, err = r.readPVC(ctx, client.ObjectKeyFromObject(pvc))
-			if err != nil {
-				return false, "", fmt.Errorf("read committed PVC %s: %w", pvc.Name, err)
-			}
-			if !preparedCommitMatchesPVC(current, state) {
-				if err := r.discardPreparedDeletionCommit(ctx, commit); err != nil {
-					return false, "", err
-				}
-				return false, "", fmt.Errorf("PVC %s lost its provisional deletion marker before commit", pvc.Name)
-			}
-		}
+	current, err = r.ensureProvisionalMarker(ctx, pvc, current, commit, state)
+	if err != nil {
+		return false, "", err
 	}
 
 	_, err = r.finalizePreparedDeletionCommit(ctx, instance, current, commit, state)
@@ -204,6 +151,79 @@ func (r *PodRemediatorReconciler) deletePVCAndPods(ctx context.Context, instance
 	}
 	pending, _, blocked, err := r.resumeCommittedPVCDeletion(ctx, current, commit, state, Log)
 	return pending, blocked, err
+}
+
+// createOrAdoptDeletionCommit creates the deletion-commit ConfigMap, or adopts an
+// existing one after verifying it describes the same PVC, owner, node, and (for a
+// still-provisional record) the same resource version and request. It returns the
+// authoritative ConfigMap and decoded state to continue with.
+func (r *PodRemediatorReconciler) createOrAdoptDeletionCommit(ctx context.Context, commit *corev1.ConfigMap, state deletionCommit, pvc *corev1.PersistentVolumeClaim, requestID string) (*corev1.ConfigMap, deletionCommit, error) {
+	if err := r.Create(ctx, commit); err == nil {
+		return commit, state, nil
+	} else if !k8s_errors.IsAlreadyExists(err) {
+		return nil, state, fmt.Errorf("prepare PVC %s deletion commit: %w", pvc.Name, err)
+	}
+	stored := &corev1.ConfigMap{}
+	if err := r.safetyReader().Get(ctx, client.ObjectKeyFromObject(commit), stored); err != nil {
+		return nil, state, err
+	}
+	storedState, err := decodeDeletionCommit(stored)
+	if err != nil || storedState.PVCUID != state.PVCUID || storedState.RemediatorUID != state.RemediatorUID || storedState.PVCName != state.PVCName || storedState.Node != state.Node {
+		return nil, state, fmt.Errorf("PVC %s has a conflicting deletion commit", pvc.Name)
+	}
+	if !committedDeletion(storedState) && (storedState.PVCResourceVersion != pvc.ResourceVersion || storedState.RequestID != requestID) {
+		return nil, state, fmt.Errorf("PVC %s has a conflicting provisional deletion commit", pvc.Name)
+	}
+	return stored, storedState, nil
+}
+
+// ensureProvisionalMarker makes sure the PVC carries the provisional deletion
+// marker described by state, writing it under an optimistic lock when absent and
+// re-reading to confirm. It returns the PVC as observed with the marker present.
+// The marker is provisional: the finalized-token write that follows is the real
+// consent boundary, so a consent change racing this write must still win.
+func (r *PodRemediatorReconciler) ensureProvisionalMarker(ctx context.Context, pvc, current *corev1.PersistentVolumeClaim, commit *corev1.ConfigMap, state deletionCommit) (*corev1.PersistentVolumeClaim, error) {
+	if preparedCommitMatchesPVC(current, state) {
+		return current, nil
+	}
+	if current.ResourceVersion != state.PVCResourceVersion || !pvcDeletionConsentMatches(current, state.RemediatorUID, state.Node, state.RequestID) {
+		if err := r.discardPreparedDeletionCommit(ctx, commit); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("PVC %s changed after deletion consent was validated", pvc.Name)
+	}
+
+	old := pvc.DeepCopy()
+	marked := pvc.DeepCopy()
+	if marked.Annotations == nil {
+		marked.Annotations = map[string]string{}
+	}
+	marked.Annotations[remediationv1.PVCDeletionCommittedAnnotation] = committedPVCDeletionValue(state.PVCUID, state.RemediatorUID, state.Node)
+	marked.Annotations[deletionCommitTokenAnnotation] = state.Token
+	if err := r.Patch(ctx, marked, client.MergeFromWithOptions(old, client.MergeFromWithOptimisticLock{})); err != nil {
+		latest, getErr := r.readPVC(ctx, client.ObjectKeyFromObject(pvc))
+		if getErr != nil || !preparedCommitMatchesPVC(latest, state) {
+			if !k8s_errors.IsNotFound(getErr) && getErr != nil {
+				return nil, fmt.Errorf("conditionally mark PVC %s deletion and verify commit: %w (read current PVC: %w)", pvc.Name, err, getErr)
+			}
+			if discardErr := r.discardPreparedDeletionCommit(ctx, commit); discardErr != nil {
+				return nil, discardErr
+			}
+			return nil, fmt.Errorf("conditionally mark PVC %s deletion: %w", pvc.Name, err)
+		}
+		return latest, nil
+	}
+	refreshed, err := r.readPVC(ctx, client.ObjectKeyFromObject(pvc))
+	if err != nil {
+		return nil, fmt.Errorf("read committed PVC %s: %w", pvc.Name, err)
+	}
+	if !preparedCommitMatchesPVC(refreshed, state) {
+		if err := r.discardPreparedDeletionCommit(ctx, commit); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("PVC %s lost its provisional deletion marker before commit", pvc.Name)
+	}
+	return refreshed, nil
 }
 
 // deleteCommit removes a deletion-commit ConfigMap under UID/version

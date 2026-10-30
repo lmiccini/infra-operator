@@ -55,9 +55,9 @@ func (r *PodRemediatorReconciler) clearAbortedPVC(ctx context.Context, pvc *core
 	}
 	if err := r.patchPVC(ctx, pvc, func() {
 		clearRemediationAnnotations(pvc)
-		delete(pvc.Annotations, remediationv1.PVCDeletionCommittedAnnotation)
-		delete(pvc.Annotations, deletionCommitTokenAnnotation)
-		delete(pvc.Annotations, deletionCommitFinalizedAnnotation)
+		for _, key := range deletionCommitAnnotationKeys {
+			delete(pvc.Annotations, key)
+		}
 	}); err != nil {
 		return fmt.Errorf("clear aborted PVC %s remediation: %w", pvc.Name, err)
 	}
@@ -151,9 +151,7 @@ func (r *PodRemediatorReconciler) resumeCommittedPVCDeletions(ctx context.Contex
 					if err := r.rejectPreparedDeletionCommit(ctx, pvc, commit, state); err != nil {
 						return committedPVCDeletionResumeResult{}, err
 					}
-					if pvc.Annotations[remediationv1.PVCDeletionCommittedAnnotation] != "" ||
-						pvc.Annotations[deletionCommitTokenAnnotation] != "" ||
-						pvc.Annotations[deletionCommitFinalizedAnnotation] != "" {
+					if hasDeletionCommitAnnotations(pvc) {
 						if err := r.clearAbortedPVC(ctx, pvc); err != nil {
 							return committedPVCDeletionResumeResult{}, err
 						}
@@ -206,9 +204,7 @@ func (r *PodRemediatorReconciler) resumeCommittedPVCDeletions(ctx context.Contex
 		}
 		for i := range pvcs.Items {
 			pvc := &pvcs.Items[i]
-			if (pvc.Annotations[remediationv1.PVCDeletionCommittedAnnotation] != "" ||
-				pvc.Annotations[deletionCommitTokenAnnotation] != "" ||
-				pvc.Annotations[deletionCommitFinalizedAnnotation] != "") && !active[string(pvc.UID)] {
+			if hasDeletionCommitAnnotations(pvc) && !active[string(pvc.UID)] {
 				if err := r.clearAbortedPVC(ctx, pvc); err != nil {
 					return committedPVCDeletionResumeResult{}, err
 				}

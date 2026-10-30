@@ -46,6 +46,25 @@ const deletionCommitFinalizedAnnotation = "remediation.openstack.org/pvc-deletio
 var errPreparedCommitRejected = errors.New("prepared PVC deletion commit rejected")
 var errPVCRemediationPaused = errors.New("PVC remediation is paused")
 
+// deletionCommitAnnotationKeys are the PVC annotations that mark an in-progress
+// deletion transaction (provisional marker, commit token, finalized token).
+var deletionCommitAnnotationKeys = []string{
+	remediationv1.PVCDeletionCommittedAnnotation,
+	deletionCommitTokenAnnotation,
+	deletionCommitFinalizedAnnotation,
+}
+
+// hasDeletionCommitAnnotations reports whether a PVC still carries any
+// deletion-transaction marker.
+func hasDeletionCommitAnnotations(pvc *corev1.PersistentVolumeClaim) bool {
+	for _, key := range deletionCommitAnnotationKeys {
+		if pvc.Annotations[key] != "" {
+			return true
+		}
+	}
+	return false
+}
+
 const (
 	deletionCommitPhasePrepared  = "prepared"
 	deletionCommitPhaseCommitted = "committed"
