@@ -1,271 +1,184 @@
-# PR #684 Refactor — RabbitMQ PVC remediation / quorum protection
+# RabbitMQ PVC remediation — refactor design notes
 
-Working design + progress doc so this effort can be paused and resumed. Not
-upstream architecture documentation — decide separately whether to commit it.
+Design rationale and outcomes for the refactor applied on top of PR #684
+("Protect RabbitMQ quorum during local PVC remediation"). It records the review
+findings, the decisions and *why* they were made, and the resulting behaviour, so
+reviewers and future maintainers can follow the reasoning without re-deriving it.
 
 - **Upstream PR:** https://github.com/openstack-k8s-operators/infra-operator/pull/684
-  ("Protect RabbitMQ quorum during local PVC remediation")
-- **Branch under refactor:** `podremediator-rabbitmq` (checked out from PR #684 head)
 - **Jira:** OSPRH-36533
 - **Builds on:** PR #677 (PodRemediator foundation, merged)
 
-## How to resume
-
-1. `git checkout podremediator-rabbitmq`
-2. Re-read this doc's "Refactor plan" and tick off completed items.
-3. After any Go change: `make generate manifests fmt vet`.
-4. Tests: unit tests in `test/unit/rabbitmq/`, functional via `make test`.
-5. Local lib-common fork is wired via `go.work` (dev only); the PR's `go.mod`
-   pins the official lib-common. Do not rely on fork-only symbols.
-
-## What the PR does (one paragraph)
+## What the feature does
 
 When a worker hosting a RabbitMQ broker goes unhealthy, PodRemediator wants to
-replace the node-local PVC. Before that is safe, the RabbitMQ controller must
-confirm the broker cluster and every quorum/stream/durable-classic queue can
-survive losing that replica. The controller grants request-scoped
-`safe-to-delete` consent (annotation handshake), then — for 4.1+ multi-replica
-clusters — repairs the blank replacement: forget the stale member, `join_cluster`,
-grow quorum-queue membership, and verify the replacement is online in every
-quorum queue before returning it to client traffic.
+replace the node-local PVC. Before that is safe, the RabbitMQ controller confirms
+the broker cluster and every quorum / stream / durable-classic queue can survive
+losing that replica, then grants request-scoped `safe-to-delete` consent (an
+annotation handshake). For 4.1+ multi-replica clusters it repairs the blank
+replacement: forget the stale member, `join_cluster`, grow quorum-queue
+membership, and verify the replacement is online in every quorum queue before
+returning it to client traffic.
 
-## Combined review findings (staff-level)
+## Findings addressed
 
-Severity-ranked. Source: automated `/code-review high` pass + manual analysis.
+Source: a `/code-review high` pass plus manual analysis.
 
-1. **[design] Readiness-gate blast radius.** The PR adds a template-wide
-   readiness gate (`rabbitmq.openstack.org/rejoin-ready`) to every pod of
-   4.1+ multi-replica clusters. The condition is absent on pod creation, so a
-   pod is `NotReady` until the operator sets it. If infra-operator is down when
-   any broker pod restarts (drain/OOM/rollout), that pod is dropped from the
-   client Service though RabbitMQ is healthy → operator downtime becomes a
-   data-plane outage. **DECISION: fix via option 1 (see Decisions).**
-2. **[liveness] Remediation slot trap.** The single remediation slot is released
-   only when `ReadyCount >= Replicas && runningNodes >= Replicas`. If an
-   unrelated broker is intentionally down (maintenance) or a second node fails,
-   the slot stays occupied forever and no future PVC on any node can get
-   consent. **FIX: release the slot per-PVC when that replacement has rejoined
-   (its pod Ready + node running in mgmt API), not on full cluster count.**
-3. **[security] `InsecureSkipVerify` on a destructive gate.** `rmqManagementGet`
-   skips TLS verification when `creds.caPEM` is empty, and that probe authorizes
-   PVC deletion. Reachability analysis below. **FIX: fail closed on misconfig,
-   log visibly on the legitimate no-CA fallback, fix the misleading comment.**
-4. **[duplication] `HasRemediationConsent` reimplemented inline.** The consent
-   check in `CheckForStuckPVCRequiringRemediation` open-codes exactly
-   `apis/remediation/v1beta1/annotations.go:HasRemediationConsent` (already used
-   by `deletion_commit.go`, `pvc_scan.go`). **FIX: call the shared helper.**
-5. **[duplication] Paginated queue scanner duplicated.** `rmqQueuesSafeAfterDeletion`
-   and `verifyQuorumQueueReplicasOnline` share ~60 lines of pagination envelope
-   validation + per-queue parsing, differing only in error strings and the
-   per-queue decision. **FIX: one `scanQueues(...)` iterator + per-queue closure.**
-6. **[perf] Reconcile storm.** The Pod watch uses
-   `ResourceVersionChangedPredicate`, firing a full reconcile on every pod status
-   heartbeat. **FIX: predicate keyed on readiness/condition changes.**
-7. **[perf] New HTTP client/transport per call.** `rmqManagementGet` builds a
-   fresh `http.Client`+`http.Transport` each call → new TCP+TLS handshake per
-   page (up to 100). **FIX: build once per scan, pass the client in.**
-8. **[quality] Open-coded quorum + overlapping pod-ready helpers.** `n/2+1`
-   repeated 5+ places; `podIsReady`/`podRejoinReady`/`podRabbitMQContainerReady`/
-   `rmqReadyPods` overlap. **FIX: `quorumOf()` + consolidate readiness helpers.**
-9. **[minor] Loose watch predicates.** `IsRabbitmqPVC`/`IsRabbitmqPod` match any
-   object carrying `app.kubernetes.io/name`. Tighten to the real selector.
+1. **[design] Availability coupled to the operator.** The original PR held a
+   replacement out of client traffic with a template-wide readiness gate
+   (`rabbitmq.openstack.org/rejoin-ready`). Because the gate condition is absent
+   on pod creation, any pod that (re)starts while the operator is down is dropped
+   from the client Service even though RabbitMQ is healthy — operator downtime
+   became a data-plane outage. **Fixed** by replacing the gate with a `serving`
+   label (see "Key decision").
+2. **[liveness] Remediation-slot trap.** The single slot was released only when
+   the whole cluster was back at the full configured replica count, so an
+   unrelated broker being down (maintenance or a second failure) pinned the slot
+   forever and blocked all future remediations. **Fixed**: the slot is released
+   per-PVC once *that* replacement rejoins (its pod Ready and its node running in
+   the live view).
+3. **[security] `InsecureSkipVerify` on a destructive gate.** The management
+   probe that authorizes PVC deletion skipped TLS verification whenever no CA
+   bytes were available. **Fixed**: fail closed when a *separate* CA secret is
+   configured but has no `ca.crt`; log visibly on the legitimate no-CA fallback;
+   corrected the misleading comment.
+4. **[duplication] `HasRemediationConsent` reimplemented inline.** **Fixed**: the
+   consent check now calls `remediationv1.HasRemediationConsent`, as the sibling
+   remediation controllers already do.
+5. **[duplication] Paginated queue scanner duplicated** (~60 lines across the
+   consent and rejoin scans). **Fixed**: one `scanQueues(...)` iterator +
+   per-queue closure, plus a shared `quorumQueueMembers()` helper.
+6. **[perf] Reconcile storm.** The Pod watch used
+   `ResourceVersionChangedPredicate`, reconciling on every status heartbeat.
+   **Fixed**: `rmqPodUpdatePredicate` enqueues only on readiness, serving-label,
+   rejoin-annotation, phase, or deletion-timestamp changes.
+7. **[perf] New HTTP client/transport per management call.** **Fixed**:
+   `rmqManagementClient` builds one client/transport per scan.
+8. **[quality] Open-coded quorum + overlapping pod-ready helpers.** **Fixed**:
+   `quorumOf()` and a single `podReady()` predicate.
+9. **[minor] Loose watch predicates.** `IsRabbitmqPod`/`IsRabbitmqPVC` matched any
+   object carrying `app.kubernetes.io/name`. **Fixed**: pods must carry
+   `app.kubernetes.io/component=rabbitmq`; PVCs must match the
+   `persistence-…-server-<ordinal>` shape (PVCs only inherit the StatefulSet
+   selector label, so component/part-of are unavailable there).
 
-### Not bugs (verified, excluded)
+### Verified not-bugs
 
 Label propagation to PVCs; headless service `PublishNotReadyAddresses:true`
-(lets probes reach not-ready replacements); version-resolution symmetry between
-readiness gate and `rejoinEnabled`; empty-cluster pagination formula; `join_cluster`
-self-preparing on 4.1+. No new helper duplicates a **lib-common** primitive
-(lib-common has no RabbitMQ mgmt client and no pod-readiness predicate; the exec
-path correctly reuses `rsh.ExecInPod`). The duplication is in-repo only.
+(lets probes reach not-ready replacements); empty-cluster pagination formula;
+`join_cluster` self-preparing on 4.1+. No new helper duplicates a **lib-common**
+primitive — lib-common has no RabbitMQ management client and no pod-readiness
+predicate; the exec path correctly reuses `rsh.ExecInPod`. The duplication was
+in-repo only.
 
-## Point 3 reachability analysis (resolved)
+## Key decision: a `serving` label instead of the readiness gate
+
+**Principle: do not couple RabbitMQ availability to operator liveness.**
+
+A readiness gate must be template-wide (there are no per-pod gates, and
+`readinessGates` is immutable after pod creation), so its availability coupling
+is inherent and hits *all* scenarios — unrelated restarts, rollouts, manual
+operations — while the protection it buys applies only to the automated
+remediation path. Notably, a manual `kubectl delete pod`+`pvc` is **not**
+protected by the feature at all: replacement detection is built solely from
+`Status.PVCRemediation` entries (only created for PodRemediator-annotated PVCs),
+so a manually recreated pod is returned to service without cluster verification —
+exactly as on `main` today.
+
+The chosen mechanism (a `serving` label on the client Service selector) therefore
+makes the exclusion **fail-open**: pods are created `serving=true`, so a pod that
+restarts while the operator is down keeps serving; the controller only flips a
+pending replacement to `serving=false` until it has rejoined, then restores it.
+
+### Why not keep the gate
+
+A readiness gate is fail-closed for data but fail-closed-to-outage for
+availability. The brief fail-open exposure of the label approach (a blank
+replacement could appear in the client Service in the window before the operator
+holds it) is the *status quo on `main`*, not a new regression — whereas the
+gate's availability coupling *is* a new regression. Given the stated principle,
+the label is the consistent choice. See "Accepted limitations" for the window.
+
+### Service-selector hazards and how they are handled
+
+A Service `spec.selector` is equality-only and inclusive, so holding a pod out
+requires adding `serving=true` to the client Service selector. That introduces
+two outage risks the gate never had, both mitigated:
+
+- **Upgrade migration:** applying the new selector would drop already-running
+  pods that lack the label. Mitigated by making the label **unconditional** on
+  the pod template and by `ensurePodsServingLabeled`, which backfills existing
+  pods with `serving=true` *before* the client Service is applied.
+- **Scale/upgrade transition divergence:** avoided because the label is
+  unconditional (all versions / replica counts), so selector and labels never
+  disagree.
+
+Cost accepted: a one-time, fleet-wide StatefulSet rolling restart on operator
+upgrade (the pod template changes for all clusters, including 3.x/single-replica).
+
+## Point 3 (TLS) reachability analysis
 
 - The literal state "`spec.tls.secretName` set, `caSecretName` empty" is **not**
-  reachable via normal admission: the mutating webhook
-  (`apis/rabbitmq/v1beta1/rabbitmq_webhook.go:127-128`) defaults
-  `CaSecretName = SecretName`. Only reachable if webhooks are bypassed.
-- But the `InsecureSkipVerify` branch keys on `creds.caPEM` being empty (the
-  referenced secret lacks a `ca.crt` key), **not** on `CaSecretName == ""`. That
-  IS reachable and common: a plain `kubectl create secret tls` secret (or the
-  webhook-defaulted `CaSecretName == SecretName` case the controller already
-  models with a `/dev/null` CA mount at `rabbitmq_controller.go:374-376`) has no
-  `ca.crt`. So the branch fires in real TLS-without-separate-CA deployments. The
-  PR's comment describing the trigger is wrong; the risk is real.
+  reachable through normal admission: the mutating webhook
+  (`apis/rabbitmq/v1beta1/rabbitmq_webhook.go`) defaults
+  `CaSecretName = SecretName`.
+- But the fallback keys on `caPEM` being empty (the referenced secret has no
+  `ca.crt`), which *is* reachable and common: a plain `kubectl create secret tls`
+  secret, or the webhook-defaulted `CaSecretName == SecretName` case the
+  controller already models with a `/dev/null` CA mount. So the branch fired in
+  real TLS-without-separate-CA deployments. The hardening (finding #3) fails
+  closed only on a genuine misconfiguration (an explicitly separate CA secret
+  with no `ca.crt`) and logs the legitimate no-CA fallback.
 
-## Decisions
+## What changed (by area)
 
-- **#1 → Option 1 (label-based, fail-open). Principle: do NOT couple RabbitMQ
-  availability to operator liveness.** Rationale captured below.
-- Keep the *verified rejoin repair* (forget/join/grow/verify) for the
-  PodRemediator-consented path — it is valuable and independent of the gate.
+- **apis/rabbitmq/v1beta1:** added `RabbitMQServingLabel` +
+  `RabbitMQServingTrue`/`False`; removed `RabbitMQRejoinReadyCondition`.
+- **internal/rabbitmq/statefulset.go:** pod template carries `serving=true`
+  unconditionally; readiness gate and `rejoinReadinessGates` removed.
+- **internal/rabbitmq/service.go:** client Service selector requires
+  `serving=true`; headless Service unchanged (replacement stays reachable for
+  clustering and the operator probe).
+- **internal/controller/rabbitmq/rabbitmq_controller.go:** per-pod PodOverride
+  Services also require `serving=true` (they feed transport URLs, so a held
+  replacement must be excluded there too); `ensurePodsServingLabeled` migration
+  backfill; `scanQueues`/`quorumQueueMembers`/`quorumOf`/`rmqManagementClient`;
+  per-PVC slot release; `rmqPodUpdatePredicate`; tightened `IsRabbitmqPod/PVC`;
+  `pods/status` RBAC removed (we patch labels, not status).
+- **internal/controller/rabbitmq/rejoin.go:** `setPodServing`/`podServing`
+  replace the gate helpers; verified rejoin repair unchanged.
 
-### Why option 1 (the analysis that drove the decision)
+## Accepted limitations
 
-- A readiness gate must be template-wide (no per-pod gates; `readinessGates` is
-  immutable post-creation). So its availability coupling is inherent and hits
-  ALL scenarios (unrelated restarts, rollouts, manual ops), while the protection
-  it buys only applies to the automated remediation path.
-- **Manual `kubectl delete pod`+`pvc` is NOT protected by the PR.** Rejoin
-  replacement-detection is built solely from `Status.PVCRemediation` entries,
-  which only exist for PVCs annotated by PodRemediator. A manual delete falls
-  through to the "ordinary pods pass the gate" branch and is marked
-  `rejoin-ready=true` WITHOUT cluster verification. So:
-  - On `main` today: manual delete → blank pod serves when ready (fully
-    fail-open; on 4.1+ server-0 can form a standalone/split-brain cluster).
-    Unmitigated today.
-  - With the PR: manual delete → gated briefly, then marked ready unverified
-    (still fail-open for data), AND if the operator is down the pod is stuck
-    NotReady (pure availability coupling, no benefit).
-- Therefore option 1's only "cost" (a blank replacement briefly serving) is the
-  STATUS QUO on `main`, not a new regression — whereas the gate's availability
-  coupling IS a new regression. Option 1 is the consistent choice given the
-  stated principle. The brief exposure window is minimized by stripping the
-  `serving` label on the pod-ADD watch event.
+- **Fresh-replacement exposure window.** A replacement is born `serving=true`
+  and the controller flips it to `serving=false` only after observing it. With a
+  healthy operator the pod-ADD watch fires during pod startup, so the label is
+  set before the pod is Ready and the window is effectively closed; the residual
+  risk is only "operator down *and* a replacement becomes Ready", which equals
+  `main`'s current behaviour. This is the deliberate fail-open trade for not
+  coupling availability to the operator. Closing it entirely would require
+  reintroducing operator-coupling (default `serving=false`), which is the
+  availability bug this refactor removes.
+- **Manual pod+PVC deletion** remains unverified by design (outside PodRemediator
+  scope). A generic blank-seed rejoin detection could be a future follow-up.
 
-## Refactor plan (tick as completed)
+## Testing
 
-### A. Safe cleanups (no behavior change)  — DONE (build + unit tests green)
-- [x] A1. `scanQueues(...)` iterator owning pagination+validation+dedup; both
-      callers supply a closure. Added `quorumQueueMembers()` helper too.
-- [x] A2. Use `remediationv1.HasRemediationConsent(pvc.Annotations)` for consent.
-- [x] A3. `quorumOf(n int32) int`; used in queue-member majority +
-      `canRetainQuorumAfterLosingOneReplica`.
-- [x] A4. One `podReady(pod)` predicate; `rmqReadyPods` + rejoin reuse it
-      (renamed `podIsReady`→`podReady`).
-- [x] A5. `rmqManagementClient(...)` builds `*http.Client`/transport once per
-      scan; `rmqManagementGet` now takes the client.
+- `go vet ./...` clean; `go test ./test/unit/...` green, including:
+  - `TestPVCRemediationSlotReleasedPerReplacement` (per-PVC slot release;
+    unrelated-broker-down case fails under the old full-count logic),
+  - `TestRejoinHoldsFreshReplacementOutOfService` (fresh replacement actively
+    flipped `serving=true`→`false`; restore-after-verify is covered by the
+    existing completion test),
+  - `TestIsRabbitmqPod` / `TestIsRabbitmqPVC` (tightened predicates).
+- Full functional suite green: 280/280. Run it with an **absolute**
+  `KUBEBUILDER_ASSETS=$PWD/bin/k8s/<ver>` via ginkgo in parallel; a serial
+  `go test ./test/functional/` hits the default 10-minute timeout.
 
-### B. Point 3 hardening (TLS) — DONE
-- [x] B1. Fixed misleading comment (empty caPEM, not empty CaSecretName).
-- [x] B2. Separate CA configured (`CaSecretName != SecretName`) but `ca.crt`
-      missing → fail closed via `creds.caConfiguredSeparately`.
-- [x] B3. Legitimate no-CA fallback logs at Info level in `rmqManagementClient`.
+## PR description call-outs
 
-### C. #1 — label-based serving exclusion (replaces readiness gate) — BLOCKED on a mechanism decision
-
-**Hazard discovered during implementation (was not visible when option 1 was chosen).**
-A Kubernetes Service `spec.selector` is equality-only and *inclusive*: a pod is in
-the Service iff it matches ALL selector labels. So the only native way to hold a
-pod out via a label is to ADD `serving=true` to the client-Service selector and
-give serving pods that exact label. That creates two new ways to cause an outage:
-
-1. **Upgrade migration:** the moment the operator applies the new client-Service
-   selector (`serving=true`), every already-running pod that lacks the label is
-   dropped from the Service — a full outage until the StatefulSet template roll
-   re-creates pods with the label (minutes for a 3-node cluster).
-2. **Transition divergence (if the label is applied conditionally, i.e. only for
-   4.1+ multi-replica like the original gate):** during a scale 1→3 or a 4.0→4.1
-   upgrade, the selector and the pods' labels can briefly disagree → zero pods
-   selected → outage.
-
-Neither hazard exists with the readiness-gate mechanism (a missing gate just makes
-a pod Ready sooner; it never removes a pod from a Service selector).
-
-**Candidate mechanisms (need a decision):**
-
-- **C-opt-A — Always-on label + pre-label before selector.** Add `serving=true`
-  to the pod template UNCONDITIONALLY (all versions/replica counts) so selector and
-  labels never diverge; and, before applying the client Service, have the operator
-  label any existing unlabeled pod `serving=true` so the upgrade migration causes no
-  outage. Cost: a one-time fleet-wide StatefulSet roll (template changed for 3.x and
-  single-replica too), and the exclusion is still fail-open (brief blank-replacement
-  exposure, = today's `main`).
-- **C-opt-B — Keep the readiness gate, make it fail-open via fast default
-  (the earlier "hybrid").** No Service-selector change, so neither hazard applies.
-  Operator sets `rejoin-ready=true` for every non-replacement pod as early as
-  possible (pod-ADD watch). Residual: still couples to operator liveness during the
-  (now small) window a restarted pod waits for the operator; full-operator-down +
-  restart still drops a pod. This is what the user explicitly did NOT want.
-- **C-opt-C — Negative label on the headless path only / EndpointSlice surgery.**
-  Operator-managed EndpointSlice exclusion. More moving parts; rejected as
-  over-engineered for now.
-
-**DECISION: C-opt-A chosen and IMPLEMENTED** (build + unit + RabbitMq functional
-tests green). The only new cost is a one-time fleet roll and the brief exposure
-that already exists on `main`.
-
-C-opt-A edits (DONE):
-- [x] C1. Const `RabbitMQServingLabel = "rabbitmq.openstack.org/serving"` +
-      `RabbitMQServingTrue`/`RabbitMQServingFalse` in apis; removed
-      `RabbitMQRejoinReadyCondition`.
-- [x] C2. StatefulSet pod template: `serving=true` on all pods (unconditional, via
-      `podLabels`). Removed `ReadinessGates`/`rejoinReadinessGates` + the
-      `sts...ReadinessGates =` update sync line.
-- [x] C3. ClientService selector requires `serving=true`; HeadlessService unchanged.
-      `ensurePodsServingLabeled` backfills existing pods BEFORE the client Service is
-      applied (migration-safe upgrade).
-- [x] C4. Removed `setRejoinReady`/`podRejoinReady`; added `setPodServing(pod,bool)`
-      (patches metadata label) + `podServing(pod)bool`. Dropped `pods/status` RBAC;
-      regenerated role.yaml.
-- [x] C5. Rejoin controller holds a replacement via `serving=false`, restores to
-      `true` after verify; non-pending pods default to `serving=true`. The existing
-      Pod watch drives prompt reaction. (Watch predicate still ResourceVersion-based;
-      see E1.)
-- [x] C6. Verified rejoin repair (forget/join/grow/verify) unchanged.
-
-### D. #2 — slot-trap fix — DONE (build + existing unit tests green)
-- [x] D1. Release each pending-recovery entry when THAT replacement pod is Ready
-      and its node is `running` in the mgmt API (per-PVC `stillRecovering` loop),
-      not `ReadyCount>=Replicas`. Removes unrelated-broker coupling while keeping
-      one-at-a-time. Removed now-unused `rmqRunningNodeCount`.
-      TODO(F): add a unit test for the unrelated-broker-down release path.
-
-### E. Lower priority — DONE
-- [x] E1. Pod watch now uses `rmqPodUpdatePredicate` (finding #6): update events
-      enqueue a reconcile only on PodReady transition, serving-label change, rejoin
-      annotation change, phase change, or deletion-timestamp (dis)appearance.
-      Create/Delete/Generic still pass. Replaces `ResourceVersionChangedPredicate`.
-- [x] E2. Tightened predicates (#9): `IsRabbitmqPod` requires
-      `app.kubernetes.io/component=rabbitmq` (+ name label + `-server-`);
-      `IsRabbitmqPVC` requires the name label + `persistence-…-server-<ordinal>`
-      shape (valid ordinal via `rmqPVCOrdinal`). Note PVCs only inherit the STS
-      selector label, so component/part-of are unavailable there. New unit tests in
-      `test/unit/rabbitmq/predicate_test.go`.
-
-### F. Verify
-- [x] `make generate manifests fmt vet` clean.
-- [x] Unit tests migrated to the serving model (`rejoin_test.go`,
-      `remediation_quorum_test.go`); `go test ./test/unit/...` green.
-- [x] RabbitMq functional suite green (envtest, abs `KUBEBUILDER_ASSETS`).
-- [x] RBAC regenerated; `pods/status` removed from role.yaml.
-- [x] Added unit tests for the two NEW behaviors:
-      - D: `TestPVCRemediationSlotReleasedPerReplacement` — slot released when an
-        unrelated broker is down but the replacement rejoined; retained (error)
-        when the replacement is still rejoining. (First case fails under old code.)
-      - C: `TestRejoinHoldsFreshReplacementOutOfService` — a fresh replacement
-        (serving=true) is actively flipped to serving=false. Restore-after-verify
-        is covered by the existing completion test (asserts serving=true at end).
-- [x] Full functional suite green: `ginkgo --procs 5 --timeout 25m
-      ./test/functional/` → 280/280 passed (2m17s). NOTE: run with an ABSOLUTE
-      `KUBEBUILDER_ASSETS=$PWD/bin/k8s/1.33.0-linux-amd64`; a serial `go test`
-      hits the default 10-min timeout (use ginkgo parallel or `-timeout 25m`).
-
-## Residual risks / open questions
-
-- Option 1 exposure window: blank replacement may briefly join client Service
-  before the operator strips `serving`. Minimized via pod-ADD watch; accepted as
-  equal to current `main` behavior. Revisit if a stronger guarantee is required.
-- Manual pod+PVC deletion remains unverified by design (out of PodRemediator
-  scope). Consider a follow-up to detect blank-seed rejoin generically.
-- `pods/status` RBAC (`verbs=get;update;patch`) added by the PR may become
-  unnecessary after C4 (we patch metadata labels, not status). Re-check during F.
-
-## Progress log
-
-- 2026-11-06: Doc created. Review complete, decisions locked (option 1 + hybrid
-  discarded). Starting refactor at phase A.
-- 2026-11-06: Phases A, B, D implemented; build + unit tests green.
-- 2026-11-06: C mechanism hazard found (Service-selector migration/transition
-  outage). Decision: C-opt-A (always-on label + pre-label migration).
-- 2026-11-06: C implemented (serving label replaces readiness gate). All unit
-  tests migrated + green; `go vet ./...` clean; RabbitMq functional suite green;
-  RBAC regenerated (pods/status dropped).
-- 2026-11-06: Phase F complete. Added D test
-  (TestPVCRemediationSlotReleasedPerReplacement) and C test
-  (TestRejoinHoldsFreshReplacementOutOfService). Full functional suite 280/280
-  passed.
-- 2026-11-06: E1 + E2 done (findings #6, #9). Pod watch uses
-  `rmqPodUpdatePredicate`; `IsRabbitmqPod`/`IsRabbitmqPVC` tightened; new
-  `predicate_test.go`. `go vet ./...` clean, unit green, functional 280/280 green.
-  ALL planned work (A–F + E) complete; refactor ready for review/PR.
+- The upgrade triggers a **one-time, fleet-wide StatefulSet rolling restart**
+  (pod template changed for all RabbitMQ clusters).
+- The fail-open exposure window above is an explicit, documented trade equal to
+  current `main` behaviour — the price of decoupling RabbitMQ availability from
+  operator liveness.
