@@ -46,6 +46,43 @@ func rabbitMQClaimOrdinal(clusterName, claimName string) (int, bool) {
 	return ordinal, err == nil && ordinal >= 0 && strconv.Itoa(ordinal) == suffix
 }
 
+// rmqDataClaims lists this cluster's canonical data PVCs through reader. The
+// app label alone is not proof of identity, so claims that do not match the
+// StatefulSet's volumeClaimTemplate naming are dropped.
+func (r *Reconciler) rmqDataClaims(
+	ctx context.Context,
+	instance *rabbitmqv1.RabbitMq,
+	reader client.Reader,
+) ([]corev1.PersistentVolumeClaim, error) {
+	claimList := &corev1.PersistentVolumeClaimList{}
+	if err := reader.List(ctx, claimList,
+		client.InNamespace(instance.Namespace),
+		client.MatchingLabels(rabbitmq.SelectorLabels(instance.Name)),
+	); err != nil {
+		return nil, fmt.Errorf("listing RabbitMq data claims: %w", err)
+	}
+	claims := make([]corev1.PersistentVolumeClaim, 0, len(claimList.Items))
+	for _, claim := range claimList.Items {
+		if _, ok := rabbitMQClaimOrdinal(instance.Name, claim.Name); ok {
+			claims = append(claims, claim)
+		}
+	}
+	return claims, nil
+}
+
+// rmqStuckNodes returns the Kubernetes nodes PodRemediator has marked as stuck
+// for any of this cluster's claims. Pods on those nodes never count as healthy
+// survivors.
+func rmqStuckNodes(claims []corev1.PersistentVolumeClaim) map[string]bool {
+	stuck := make(map[string]bool)
+	for _, claim := range claims {
+		if node := claim.Annotations[remediationv1.PVCStuckOnNodeAnnotation]; node != "" {
+			stuck[node] = true
+		}
+	}
+	return stuck
+}
+
 // ValidatePVCDeletion refreshes broker and queue safety immediately before
 // PodRemediator writes its finalized token. It uses uncached Kubernetes reads,
 // and never grants consent itself. Consent changes during these checks conflict
@@ -72,65 +109,31 @@ func (r *Reconciler) ValidatePVCDeletion(ctx context.Context, pvc *corev1.Persis
 		return fmt.Errorf("RabbitMq %s cannot authorize PVC deletion in its current state", clusterName)
 	}
 	recovery, exists := instance.Status.PVCRemediation[pvc.Name]
-	if !exists || recovery.PVCUID != string(pvc.UID) || recovery.RequestID != pvc.Annotations[remediationv1.RequestIDAnnotation] ||
-		recovery.ConsentState != rabbitmqv1.PVCRemediationConsentGranted {
+	if !exists || recovery.PVCUID != string(pvc.UID) ||
+		recovery.RequestID != pvc.Annotations[remediationv1.RequestIDAnnotation] || !recovery.Consented() {
 		return fmt.Errorf("PVC %s has no matching RabbitMQ recovery record", pvc.Name)
 	}
-	claims := &corev1.PersistentVolumeClaimList{}
-	if err := reader.List(ctx, claims, client.InNamespace(pvc.Namespace), client.MatchingLabels{"app.kubernetes.io/name": clusterName}); err != nil {
+	claims, err := r.rmqDataClaims(ctx, instance, reader)
+	if err != nil {
 		return err
 	}
-	stuckNodes := map[string]bool{}
-	for i := range claims.Items {
-		claim := &claims.Items[i]
-		if _, ok := rabbitMQClaimOrdinal(clusterName, claim.Name); ok {
-			if node := claim.Annotations[remediationv1.PVCStuckOnNodeAnnotation]; node != "" {
-				stuckNodes[node] = true
-			}
-		}
-	}
+	stuckNodes := rmqStuckNodes(claims)
 	// Include the authoritative commit snapshot even if a concurrent label
 	// update made the candidate disappear from the selector-based list.
 	stuckNodes[pvc.Annotations[remediationv1.PVCStuckOnNodeAnnotation]] = true
-	pods := &corev1.PodList{}
-	if err := reader.List(ctx, pods, client.InNamespace(pvc.Namespace), client.MatchingLabels(rabbitmq.SelectorLabels(clusterName))); err != nil {
+
+	pods, err := r.rmqListPods(ctx, instance, reader)
+	if err != nil {
 		return err
 	}
-	candidatePod := fmt.Sprintf("%s-server-%d", clusterName, ordinal)
-	survivors := rmqReadyPods(pods.Items, stuckNodes, map[string]bool{candidatePod: true})
-	quorum := quorumOf(*instance.Spec.Replicas)
-	if len(survivors) < quorum {
+	candidatePod := rmqPodName(instance, ordinal)
+	survivors := rmqReadyPods(pods, stuckNodes, map[string]bool{candidatePod: true})
+	if quorum := quorumOf(*instance.Spec.Replicas); len(survivors) < quorum {
 		return fmt.Errorf("RabbitMq has %d ready survivors below quorum %d", len(survivors), quorum)
 	}
-	creds, err := r.rmqLoadMgmtCreds(ctx, instance)
+	view, err := r.rmqClusterView(ctx, instance, survivors)
 	if err != nil {
 		return err
 	}
-	anchor := &survivors[0]
-	nodes, err := r.rmqClusterNodes(ctx, instance, anchor, creds)
-	if err != nil {
-		return err
-	}
-	running, err := rmqRunningSurvivorCount(instance, survivors, nodes)
-	if err != nil {
-		return err
-	}
-	if running < quorum {
-		return fmt.Errorf("RabbitMq has %d running survivors below quorum %d", running, quorum)
-	}
-	runningNodes := map[string]bool{}
-	for _, n := range nodes {
-		if n.Running {
-			runningNodes[n.Name] = true
-		}
-	}
-	safeNodes := map[string]bool{}
-	for _, pod := range survivors {
-		name := "rabbit@" + rabbitmq.ManagementPodServerName(pod.Name, instance.Name, instance.Namespace)
-		if runningNodes[name] {
-			safeNodes[name] = true
-		}
-	}
-	candidateNode := "rabbit@" + rabbitmq.ManagementPodServerName(candidatePod, instance.Name, instance.Namespace)
-	return r.rmqQueuesSafeAfterDeletion(ctx, instance, anchor, creds, candidateNode, safeNodes)
+	return r.verifyCandidateRemovable(ctx, instance, view, candidatePod)
 }

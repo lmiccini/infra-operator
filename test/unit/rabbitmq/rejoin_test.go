@@ -514,10 +514,10 @@ func instanceWithRecovery(replicas int32) *rabbitmqv1beta1.RabbitMq {
 	instance := instanceWith(replicas)
 	instance.Status.PVCRemediation = map[string]rabbitmqv1beta1.PVCRemediationStatus{
 		testPVCName: {
-			PVCUID:       oldPVCUID,
-			RequestID:    testRequestID,
-			StuckNode:    "worker-0",
-			ConsentState: rabbitmqv1beta1.PVCRemediationConsentGranted,
+			PVCUID:    oldPVCUID,
+			RequestID: testRequestID,
+			StuckNode: "worker-0",
+			Phase:     rabbitmqv1beta1.PVCRemediationConsented,
 		},
 	}
 	return instance
@@ -528,7 +528,7 @@ func instanceWithRecovery(replicas int32) *rabbitmqv1beta1.RabbitMq {
 func instanceAfterMemberRemoval(replicas int32) *rabbitmqv1beta1.RabbitMq {
 	instance := instanceWithRecovery(replicas)
 	entry := instance.Status.PVCRemediation[testPVCName]
-	entry.MemberRemovalState = rabbitmqv1beta1.PVCRemediationMemberRemoved
+	entry.Phase = rabbitmqv1beta1.PVCRemediationMemberRemoved
 	entry.ReplacementPVCUID = newPVCUID
 	instance.Status.PVCRemediation[testPVCName] = entry
 	return instance
@@ -789,8 +789,8 @@ func TestRejoinAfterPersistedMemberRemoval(t *testing.T) {
 	if fx.lastOrderOf("rabbitmqctl --formatter json cluster_status") >= fx.orderOf(queueGrowth) {
 		t.Errorf("queue growth must follow cluster membership verification, calls=%v", fx.calls)
 	}
-	if instance.Status.PVCRemediation[testPVCName].QueueReplicaState != rabbitmqv1beta1.PVCRemediationQueueReplicasGrown {
-		t.Error("expected successful queue growth to be recorded in PVC remediation status")
+	if instance.Status.PVCRemediation[testPVCName].Phase != rabbitmqv1beta1.PVCRemediationRecovered {
+		t.Error("expected completed queue recovery to be recorded in PVC remediation status")
 	}
 
 	// Annotation cleared after successful verify.
@@ -904,8 +904,8 @@ func TestReconcilePersistsQuorumQueueGrowthStatus(t *testing.T) {
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: testName}, persisted); err != nil {
 		t.Fatal(err)
 	}
-	if persisted.Status.PVCRemediation[testPVCName].QueueReplicaState != rabbitmqv1beta1.PVCRemediationQueueReplicasGrown {
-		t.Fatal("deferred reconcile status patch did not persist queueReplicaState=Grown")
+	if persisted.Status.PVCRemediation[testPVCName].Phase != rabbitmqv1beta1.PVCRemediationRecovered {
+		t.Fatal("deferred reconcile status patch did not persist phase=Recovered")
 	}
 	if persisted.Status.ObservedGeneration != persisted.Generation {
 		t.Fatalf("rejoin deferral left observedGeneration=%d behind generation=%d", persisted.Status.ObservedGeneration, persisted.Generation)
@@ -932,8 +932,11 @@ func TestRejoinKeepsReadinessClosedUntilQuorumReplicasAreOnline(t *testing.T) {
 	if _, err := r.ReconcileNodeRejoin(context.Background(), instance); err == nil || !strings.Contains(err.Error(), "not online yet") {
 		t.Fatalf("expected rejoin to wait for online queue replicas, got %v", err)
 	}
-	if instance.Status.PVCRemediation[testPVCName].QueueReplicaState != rabbitmqv1beta1.PVCRemediationQueueReplicasGrown {
-		t.Fatal("successful growth command should be recorded while replicas synchronize")
+	if fx.orderOf("rabbitmq-queues grow") < 0 {
+		t.Fatal("missing replicas should have been grown before waiting for sync")
+	}
+	if instance.Status.PVCRemediation[testPVCName].Phase == rabbitmqv1beta1.PVCRemediationRecovered {
+		t.Fatal("recovery must not be recorded while replicas are still synchronizing")
 	}
 	got := &corev1.Pod{}
 	if err := r.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: target.Name}, got); err != nil {
@@ -979,8 +982,11 @@ func TestRejoinGrowsQuorumQueuesCreatedDuringRecovery(t *testing.T) {
 	if _, err := r.ReconcileNodeRejoin(context.Background(), instance); err == nil || !strings.Contains(err.Error(), "not online yet") {
 		t.Fatalf("expected rejoin to wait for initial replicas to sync, got %v", err)
 	}
-	if instance.Status.PVCRemediation[testPVCName].QueueReplicaState != rabbitmqv1beta1.PVCRemediationQueueReplicasGrown {
-		t.Fatal("successful initial growth command should be recorded while replicas synchronize")
+	if fx.orderOf("rabbitmq-queues grow") < 0 {
+		t.Fatal("missing replicas should have been grown before waiting for sync")
+	}
+	if instance.Status.PVCRemediation[testPVCName].Phase == rabbitmqv1beta1.PVCRemediationRecovered {
+		t.Fatal("recovery must not be recorded while replicas are still synchronizing")
 	}
 
 	// A queue declared while the replacement pod is held unready has no member
@@ -1053,7 +1059,7 @@ func TestRejoinRetriesFailedQuorumQueueGrowth(t *testing.T) {
 	if got.Annotations[rabbitmqv1beta1.AnnotationRejoinCluster] != testRequestID {
 		t.Fatal("request annotation must remain until queue growth succeeds")
 	}
-	if instance.Status.PVCRemediation[testPVCName].QueueReplicaState == rabbitmqv1beta1.PVCRemediationQueueReplicasGrown {
+	if instance.Status.PVCRemediation[testPVCName].Phase == rabbitmqv1beta1.PVCRemediationRecovered {
 		t.Fatal("failed queue growth must not be recorded as complete")
 	}
 	if fx.orderOf("rabbitmq-queues grow") < 0 {
@@ -1075,8 +1081,8 @@ func TestRejoinRetriesFailedQuorumQueueGrowth(t *testing.T) {
 	if strings.Count(strings.Join(fx.calls, "\n"), "rabbitmqctl join_cluster") != 1 {
 		t.Fatalf("retry should continue the existing cluster membership without joining again, calls=%v", fx.calls)
 	}
-	if instance.Status.PVCRemediation[testPVCName].QueueReplicaState != rabbitmqv1beta1.PVCRemediationQueueReplicasGrown {
-		t.Fatal("expected successful queue growth to be recorded")
+	if instance.Status.PVCRemediation[testPVCName].Phase != rabbitmqv1beta1.PVCRemediationRecovered {
+		t.Fatal("expected completed queue recovery to be recorded")
 	}
 	assertQuorumQueueMembership(t, fx, node(testName+"-server-0"), true)
 }
@@ -1118,8 +1124,8 @@ func TestRejoinKeepsGateClosedOnPerQueueGrowErrors(t *testing.T) {
 				t.Fatalf("expected errors-only silent queue growth command, calls=%v", fx.calls)
 			}
 			assertQuorumQueueMembership(t, fx, node(testName+"-server-0"), false)
-			if instance.Status.PVCRemediation[testPVCName].QueueReplicaState == rabbitmqv1beta1.PVCRemediationQueueReplicasGrown {
-				t.Fatal("per-queue errors must not be recorded as successful growth")
+			if instance.Status.PVCRemediation[testPVCName].Phase == rabbitmqv1beta1.PVCRemediationRecovered {
+				t.Fatal("per-queue errors must not be recorded as successful recovery")
 			}
 			got := &corev1.Pod{}
 			if err := r.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: target.Name}, got); err != nil {

@@ -28,6 +28,7 @@ import (
 
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -308,20 +309,22 @@ func (r *Reconciler) ensurePodStartup(ctx context.Context, instance *rabbitmqv1.
 	if claim.UID == "" || claim.DeletionTimestamp != nil {
 		return false, false, nil
 	}
+	// The cached instance already knew this was a replacement: refuse to start
+	// it unless the durable record still agrees on who authorized the deletion.
 	if expected, pending := instance.Status.PVCRemediation[pvcName]; pending &&
-		expected.ConsentState == rabbitmqv1.PVCRemediationConsentGranted &&
-		string(claim.UID) != expected.PVCUID {
+		expected.Consented() && string(claim.UID) != expected.PVCUID {
 		record, exists := current.Status.PVCRemediation[pvcName]
-		if !exists || record.ConsentState != expected.ConsentState ||
+		if !exists || !record.Consented() ||
 			record.RequestID != expected.RequestID || record.PVCUID != expected.PVCUID {
 			return false, false, nil
 		}
 	}
+	// A replacement may only start once the old member has been removed from
+	// the surviving cluster, and only for the exact claim that removal targeted.
 	if recovery, exists := current.Status.PVCRemediation[pvcName]; exists &&
-		recovery.ConsentState == rabbitmqv1.PVCRemediationConsentGranted &&
-		string(claim.UID) != recovery.PVCUID {
+		recovery.Consented() && string(claim.UID) != recovery.PVCUID {
 		if recovery.RequestID == "" || recovery.PVCUID == "" ||
-			recovery.MemberRemovalState != rabbitmqv1.PVCRemediationMemberRemoved ||
+			!recovery.Phase.AtLeast(rabbitmqv1.PVCRemediationMemberRemoved) ||
 			recovery.ReplacementPVCUID != string(claim.UID) ||
 			live.Annotations[rabbitmqv1.AnnotationRejoinCluster] != recovery.RequestID {
 			return false, false, nil
@@ -332,8 +335,14 @@ func (r *Reconciler) ensurePodStartup(ctx context.Context, instance *rabbitmqv1.
 		live.Annotations = map[string]string{}
 	}
 	live.Annotations[rabbitmqv1.AnnotationStartupApproved] = string(live.UID)
-	if err := r.Patch(ctx, live, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
-		return false, false, fmt.Errorf("approving startup of %s: %w", live.Name, err)
+	patchErr := r.Patch(ctx, live, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	if apierrors.IsConflict(patchErr) {
+		// The pod moved under us; report a change so the caller comes back with
+		// a fresh read instead of failing the reconcile.
+		return false, true, nil
+	}
+	if patchErr != nil {
+		return false, false, fmt.Errorf("approving startup of %s: %w", live.Name, patchErr)
 	}
 	*pod = *live
 	return true, true, nil
@@ -362,7 +371,7 @@ func (r *Reconciler) consistentMembers(ctx context.Context, instance *rabbitmqv1
 			}
 			members[name] = true
 		}
-		if !members[rejoinNodeName(instance, peer.Name)] {
+		if !members[rmqNodeName(instance, peer.Name)] {
 			return nil, fmt.Errorf("authoritative membership excludes its queried peer")
 		}
 		return members, nil
@@ -412,7 +421,7 @@ func (r *Reconciler) removeOldMember(ctx context.Context, instance *rabbitmqv1.R
 		return fmt.Errorf("RabbitMQ resource changed before member removal")
 	}
 	record, exists := current.Status.PVCRemediation[pvcName]
-	if !exists || record.ConsentState != rabbitmqv1.PVCRemediationConsentGranted ||
+	if !exists || !record.Consented() ||
 		record.RequestID != recovery.RequestID || record.PVCUID != recovery.PVCUID {
 		return fmt.Errorf("PVC recovery authorization changed before member removal")
 	}
@@ -420,7 +429,7 @@ func (r *Reconciler) removeOldMember(ctx context.Context, instance *rabbitmqv1.R
 		string(claim.UID) == recovery.PVCUID || recovery.RequestID == "" {
 		return fmt.Errorf("replacement claim changed before old-member removal")
 	}
-	oldNode := rejoinNodeName(instance, target.Name)
+	oldNode := rmqNodeName(instance, target.Name)
 	if membership.Running[oldNode] {
 		return fmt.Errorf("old RabbitMQ member is still running; keeping replacement blocked")
 	}
@@ -433,12 +442,12 @@ func (r *Reconciler) removeOldMember(ctx context.Context, instance *rabbitmqv1.R
 	}
 	for i := range pods {
 		p := &pods[i]
-		n := rejoinNodeName(instance, p.Name)
+		n := rmqNodeName(instance, p.Name)
 		if p.Name != target.Name && podReady(p) && !stuck[p.Spec.NodeName] && membership.Running[n] {
 			safe[n] = true
 		}
 	}
-	quorum := int(*instance.Spec.Replicas/2 + 1)
+	quorum := quorumOf(*instance.Spec.Replicas)
 	if len(safe) < quorum {
 		return fmt.Errorf("not enough healthy survivors for member removal")
 	}
@@ -483,7 +492,7 @@ func (r *Reconciler) removeOldMember(ctx context.Context, instance *rabbitmqv1.R
 		return err
 	}
 	recovery.ReplacementPVCUID = string(claim.UID)
-	recovery.MemberRemovalState = rabbitmqv1.PVCRemediationMemberRemoved
+	recovery.Phase = rabbitmqv1.PVCRemediationMemberRemoved
 	instance.Status.PVCRemediation[pvcName] = recovery
 	// Return before approving startup. The outer reconcile must first persist
 	// this progress, and ensurePodStartup subsequently reads it from the API.

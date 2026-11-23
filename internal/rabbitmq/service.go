@@ -151,15 +151,19 @@ func HeadlessService(r *rabbitmqv1.RabbitMq) (*corev1.Service, error) {
 }
 
 // ClientService creates the client-facing service for RabbitMQ
-// matching the old rabbitmq-cluster-operator layout
-func ClientService(r *rabbitmqv1.RabbitMq) (*corev1.Service, error) {
+// matching the old rabbitmq-cluster-operator layout.
+// When remediation is true the selector also requires the controller's serving
+// label, so a replacement held back for recovery receives no client traffic.
+func ClientService(r *rabbitmqv1.RabbitMq, remediation bool) (*corev1.Service, error) {
 	ls := CommonLabels(r.Name)
 	// Select only pods admitted by the controller. New pods start serving=false;
 	// recorded replacements remain held until rejoin and queue verification.
 	// The headless service deliberately does NOT filter on this label so the
 	// replacement remains reachable for clustering and the operator's probe.
 	selector := SelectorLabels(r.Name)
-	selector[rabbitmqv1.RabbitMQServingLabel] = rabbitmqv1.RabbitMQServingTrue
+	if remediation {
+		selector[rabbitmqv1.RabbitMQServingLabel] = rabbitmqv1.RabbitMQServingTrue
+	}
 
 	ports := buildClientServicePorts(r)
 

@@ -210,7 +210,7 @@ func TestPVCRemediationConsentChecksQueueMembership(t *testing.T) {
 							t.Errorf("get RabbitMq status before PVC consent: %v", err)
 						} else {
 							entry := persisted.Status.PVCRemediation[pvc.Name]
-							if entry.ConsentState != rabbitmqv1beta1.PVCRemediationConsentGranted || entry.PVCUID != string(pvc.UID) || entry.RequestID != requestID {
+							if !entry.Consented() || entry.PVCUID != string(pvc.UID) || entry.RequestID != requestID {
 								t.Errorf("recovery record was not durable before PVC consent: %+v", entry)
 							}
 						}
@@ -293,7 +293,7 @@ func TestPVCRemediationConsentChecksQueueMembership(t *testing.T) {
 					t.Fatal(err)
 				}
 				entry := persisted.Status.PVCRemediation[pvc.Name]
-				if entry.ConsentState != rabbitmqv1beta1.PVCRemediationConsentGranted || entry.PVCUID != string(pvc.UID) || entry.RequestID != requestID {
+				if !entry.Consented() || entry.PVCUID != string(pvc.UID) || entry.RequestID != requestID {
 					t.Fatalf("persisted recovery status = %+v, want consent, PVC UID and request ID", entry)
 				}
 			}
@@ -492,10 +492,10 @@ func TestPVCRemediationSlotReleasedPerReplacement(t *testing.T) {
 					ReadyCount: 2,
 					PVCRemediation: map[string]rabbitmqv1beta1.PVCRemediationStatus{
 						"persistence-rabbitmq-server-0": {
-							PVCUID:       "old-pvc-uid",
-							RequestID:    requestID,
-							StuckNode:    "worker-0",
-							ConsentState: rabbitmqv1beta1.PVCRemediationConsentGranted,
+							PVCUID:    "old-pvc-uid",
+							RequestID: requestID,
+							StuckNode: "worker-0",
+							Phase:     rabbitmqv1beta1.PVCRemediationConsented,
 						},
 					},
 				},

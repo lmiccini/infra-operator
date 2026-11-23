@@ -230,11 +230,11 @@ func TestRecoverySlotRequiresReplacementClaim(t *testing.T) {
 
 func TestNewPodStartsOutsideClientServices(t *testing.T) {
 	instance := instanceWith(3)
-	sts := rabbitmqresources.StatefulSet(instance, "config", nil, nil, "4.2", false, rabbitmqresources.ProxyConfig{})
+	sts := rabbitmqresources.StatefulSet(instance, "config", nil, nil, "4.2", false, rabbitmqresources.ProxyConfig{}, true)
 	if got := sts.Spec.Template.Labels[rabbitmqv1.RabbitMQServingLabel]; got != rabbitmqv1.RabbitMQServingFalse {
 		t.Fatalf("new pod serving=%q", got)
 	}
-	service, err := rabbitmqresources.ClientService(instance)
+	service, err := rabbitmqresources.ClientService(instance, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,32 +243,56 @@ func TestNewPodStartsOutsideClientServices(t *testing.T) {
 	}
 }
 
-func TestObservedGenerationOnEarlyReturns(t *testing.T) {
-	for _, tlsWait := range []bool{false, true} {
-		t.Run(fmt.Sprintf("tlsWait=%t", tlsWait), func(t *testing.T) {
-			ctx := context.Background()
-			r, instance, _ := newConsentFixture(t, testPVCName)
-			if err := r.Get(ctx, client.ObjectKeyFromObject(instance), instance); err != nil {
-				t.Fatal(err)
-			}
-			instance.Generation = 7
-			if tlsWait {
-				instance.Finalizers = []string{"openstack.org/rabbitmq"}
-				instance.Spec.TLS.SecretName = "missing-tls-secret"
-			}
-			if err := r.Update(ctx, instance); err != nil {
-				t.Fatal(err)
-			}
-			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(instance)})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := r.Get(ctx, client.ObjectKeyFromObject(instance), instance); err != nil {
-				t.Fatal(err)
-			}
-			if instance.Status.ObservedGeneration != instance.Generation {
-				t.Fatalf("observedGeneration=%d, generation=%d", instance.Status.ObservedGeneration, instance.Generation)
-			}
-		})
+// Without PodRemediator nothing can ever remediate a PVC, so none of the
+// machinery that makes a broker depend on a running operator may be deployed:
+// an unavailable operator must not be able to stop RabbitMQ from starting or
+// from serving clients.
+func TestWithoutRemediationNothingWaitsForTheOperator(t *testing.T) {
+	instance := instanceWith(3)
+	sts := rabbitmqresources.StatefulSet(instance, "config", nil, nil, "4.2", false, rabbitmqresources.ProxyConfig{}, false)
+	for _, init := range sts.Spec.Template.Spec.InitContainers {
+		if init.Name == "startup-gate" {
+			t.Fatal("startup gate must not be deployed without PodRemediator")
+		}
+	}
+	if _, ok := sts.Spec.Template.Labels[rabbitmqv1.RabbitMQServingLabel]; ok {
+		t.Fatal("pods must not require admission without PodRemediator")
+	}
+	service, err := rabbitmqresources.ClientService(instance, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := service.Spec.Selector[rabbitmqv1.RabbitMQServingLabel]; ok {
+		t.Fatal("client Service must not require admission without PodRemediator")
+	}
+}
+
+// ObservedGeneration means "this spec has been fully applied", which the
+// openstack-operator relies on to tell whether a change it injected (e.g. a new
+// ContainerImage) has been processed. A reconcile that defers on a missing
+// input has not applied anything, so it must not claim the generation.
+// TestReconcilePersistsQuorumQueueGrowthStatus covers the opposite case: the
+// PVC remediation steps run after the spec is applied, so deferring there does
+// advance it.
+func TestObservedGenerationNotClaimedWhileInputsAreMissing(t *testing.T) {
+	ctx := context.Background()
+	r, instance, _ := newConsentFixture(t, testPVCName)
+	if err := r.Get(ctx, client.ObjectKeyFromObject(instance), instance); err != nil {
+		t.Fatal(err)
+	}
+	instance.Generation = 7
+	instance.Finalizers = []string{"openstack.org/rabbitmq"}
+	instance.Spec.TLS.SecretName = "missing-tls-secret"
+	if err := r.Update(ctx, instance); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(instance)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(instance), instance); err != nil {
+		t.Fatal(err)
+	}
+	if instance.Status.ObservedGeneration == instance.Generation {
+		t.Fatalf("generation %d must not be reported as observed while TLS input is missing", instance.Generation)
 	}
 }

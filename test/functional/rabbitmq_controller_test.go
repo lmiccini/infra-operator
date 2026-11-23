@@ -173,7 +173,11 @@ var _ = Describe("RabbitMQ Controller", func() {
 			}
 			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 			DeferCleanup(th.DeleteInstance, pod)
-			rabbitmq := CreateRabbitMQ(rabbitmqName, GetDefaultRabbitMQSpec())
+			// Multi-replica: a single broker has no quorum to protect, so it is
+			// deliberately left out of the admission machinery entirely.
+			spec := GetDefaultRabbitMQSpec()
+			spec["replicas"] = int32(3)
+			rabbitmq := CreateRabbitMQ(rabbitmqName, spec)
 			DeferCleanup(th.DeleteInstance, rabbitmq)
 			Eventually(func(g Gomega) {
 				current := &corev1.Pod{}
@@ -200,7 +204,7 @@ var _ = Describe("RabbitMQ Controller", func() {
 			Eventually(func(g Gomega) {
 				current := GetRabbitMQ(rabbitmqName)
 				current.Status.PVCRemediation = map[string]rabbitmqv1.PVCRemediationStatus{
-					claimName: {PVCUID: "deleted-original-uid", RequestID: "recovery-request", StuckNode: "worker-0", ConsentState: rabbitmqv1.PVCRemediationConsentGranted, MemberRemovalState: rabbitmqv1.PVCRemediationMemberRemovalPending},
+					claimName: {PVCUID: "deleted-original-uid", RequestID: "recovery-request", StuckNode: "worker-0", Phase: rabbitmqv1.PVCRemediationConsented},
 				}
 				g.Expect(k8sClient.Status().Update(ctx, current)).To(Succeed())
 			}, timeout, interval).Should(Succeed())
@@ -225,7 +229,7 @@ var _ = Describe("RabbitMQ Controller", func() {
 				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), current)).To(Succeed())
 				g.Expect(current.Annotations).To(HaveKeyWithValue(rabbitmqv1.AnnotationRejoinCluster, "recovery-request"))
 				g.Expect(current.Annotations).NotTo(HaveKey(rabbitmqv1.AnnotationStartupApproved))
-				g.Expect(GetRabbitMQ(rabbitmqName).Status.PVCRemediation[claimName].MemberRemovalState).To(Equal(rabbitmqv1.PVCRemediationMemberRemovalPending))
+				g.Expect(GetRabbitMQ(rabbitmqName).Status.PVCRemediation[claimName].Phase).To(Equal(rabbitmqv1.PVCRemediationConsented))
 				g.Expect(current.Labels).To(HaveKeyWithValue(rabbitmqv1.RabbitMQServingLabel, rabbitmqv1.RabbitMQServingFalse))
 				service := &corev1.Service{}
 				g.Expect(k8sClient.Get(ctx, rabbitmqName, service)).To(Succeed())
@@ -440,7 +444,9 @@ var _ = Describe("RabbitMQ Controller", func() {
 
 			Eventually(func(g Gomega) {
 				instance := GetRabbitMQ(rabbitmqName)
-				g.Expect(instance.Status.ObservedGeneration).To(Equal(instance.Generation))
+				// ObservedGeneration means the spec was fully applied, so it must
+				// not advance while a required input is missing.
+				g.Expect(instance.Status.ObservedGeneration).NotTo(Equal(instance.Generation))
 				g.Expect(instance.Status.Conditions.Has(condition.TLSInputReadyCondition)).To(BeTrue())
 				tlsCondition := instance.Status.Conditions.Get(condition.TLSInputReadyCondition)
 				g.Expect(tlsCondition.Status).To(Equal(corev1.ConditionFalse))

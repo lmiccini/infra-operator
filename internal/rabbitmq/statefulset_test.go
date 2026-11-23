@@ -41,7 +41,7 @@ func newTestRabbitMq(name string) *rabbitmqv1.RabbitMq {
 
 func TestStatefulSet_WithoutDataWipe(t *testing.T) {
 	r := newTestRabbitMq("test-mq")
-	sts := StatefulSet(r, "hash123", nil, nil, "4.2", false, ProxyConfig{})
+	sts := StatefulSet(r, "hash123", nil, nil, "4.2", false, ProxyConfig{}, true)
 
 	if sts.Name != "test-mq-server" {
 		t.Errorf("StatefulSet name = %q, want %q", sts.Name, "test-mq-server")
@@ -74,7 +74,7 @@ func hasEnvVar(container corev1.Container, name string) bool {
 
 func TestStatefulSet_PluginsDirSetForVersion4(t *testing.T) {
 	r := newTestRabbitMq("test-mq")
-	sts := StatefulSet(r, "hash123", nil, nil, "4.2", false, ProxyConfig{})
+	sts := StatefulSet(r, "hash123", nil, nil, "4.2", false, ProxyConfig{}, true)
 
 	rabbitContainer := sts.Spec.Template.Spec.Containers[0]
 	if !hasEnvVar(rabbitContainer, "RABBITMQ_PLUGINS_DIR") {
@@ -86,7 +86,7 @@ func TestStatefulSet_PluginsDirNotSetForVersion3(t *testing.T) {
 	r := newTestRabbitMq("test-mq")
 	// 3.x images do not ship the /usr/lib/rabbitmq/plugins symlink, so the
 	// env var must not be set or the node cannot find its plugins.
-	sts := StatefulSet(r, "hash123", nil, nil, "3.9", false, ProxyConfig{})
+	sts := StatefulSet(r, "hash123", nil, nil, "3.9", false, ProxyConfig{}, true)
 
 	rabbitContainer := sts.Spec.Template.Spec.Containers[0]
 	if hasEnvVar(rabbitContainer, "RABBITMQ_PLUGINS_DIR") {
@@ -96,7 +96,7 @@ func TestStatefulSet_PluginsDirNotSetForVersion3(t *testing.T) {
 
 func TestStatefulSet_WithDataWipe(t *testing.T) {
 	r := newTestRabbitMq("test-mq")
-	sts := StatefulSet(r, "hash123", nil, nil, "4.2", true, ProxyConfig{})
+	sts := StatefulSet(r, "hash123", nil, nil, "4.2", true, ProxyConfig{}, true)
 
 	initContainers := sts.Spec.Template.Spec.InitContainers
 	if len(initContainers) != 3 {
@@ -115,7 +115,7 @@ func TestStatefulSet_WithDataWipe(t *testing.T) {
 func TestStatefulSet_WipeDataNotAddedForInvalidVersion(t *testing.T) {
 	r := newTestRabbitMq("test-mq")
 	// Invalid version pattern should prevent wipe-data init container
-	sts := StatefulSet(r, "hash123", nil, nil, "bad-version", true, ProxyConfig{})
+	sts := StatefulSet(r, "hash123", nil, nil, "bad-version", true, ProxyConfig{}, false)
 
 	initContainers := sts.Spec.Template.Spec.InitContainers
 	if len(initContainers) != 1 {
@@ -191,7 +191,7 @@ func TestStatefulSet_ReplicaCount(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			r := newTestRabbitMq("test-mq")
 			r.Spec.Replicas = tt.replicas
-			sts := StatefulSet(r, "hash", nil, nil, "4.2", false, ProxyConfig{})
+			sts := StatefulSet(r, "hash", nil, nil, "4.2", false, ProxyConfig{}, true)
 			if *sts.Spec.Replicas != tt.want {
 				t.Errorf("replicas = %d, want %d", *sts.Spec.Replicas, tt.want)
 			}

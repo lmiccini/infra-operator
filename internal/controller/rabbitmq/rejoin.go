@@ -92,24 +92,49 @@ func (s clusterStatus) membership() (clusterMembership, error) {
 	return membership, nil
 }
 
-// rejoinNodeName returns the RabbitMQ Erlang node name for a pod, e.g.
-// rabbit@<name>-server-0.<name>-nodes.<namespace>.
-func rejoinNodeName(instance *rabbitmqv1beta1.RabbitMq, podName string) string {
-	return fmt.Sprintf("rabbit@%s.%s-nodes.%s", podName, instance.Name, instance.Namespace)
+// rmqNodeName returns the RabbitMQ Erlang node name for a pod, e.g.
+// rabbit@<name>-server-0.<name>-nodes.<namespace>. This is the same hostname
+// the pod certificate's SAN uses, so it is built from one helper to keep the
+// management API, the CLI and the certificate in agreement.
+func rmqNodeName(instance *rabbitmqv1beta1.RabbitMq, podName string) string {
+	return "rabbit@" + rabbitmq.ManagementPodServerName(podName, instance.Name, instance.Namespace)
 }
 
+// rmqPodName returns the StatefulSet pod name for an ordinal.
+func rmqPodName(instance *rabbitmqv1beta1.RabbitMq, ordinal int) string {
+	return fmt.Sprintf("%s-server-%d", instance.Name, ordinal)
+}
+
+// rmqConfigVersion is the RabbitMQ version this reconcile configures: the
+// target version while an upgrade is in flight, otherwise the running one.
+func rmqConfigVersion(instance *rabbitmqv1beta1.RabbitMq) string {
+	if instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" {
+		return *instance.Spec.TargetVersion
+	}
+	if instance.Status.CurrentVersion != "" {
+		return instance.Status.CurrentVersion
+	}
+	return DefaultRabbitMQVersion
+}
+
+// rejoinEnabled reports whether this cluster can ever need replacement
+// recovery: a single broker has no quorum to protect, and the seed-node
+// behavior that strands a wiped server-0 arrived in RabbitMQ 4.1.
 func rejoinEnabled(instance *rabbitmqv1beta1.RabbitMq) bool {
 	if instance.Spec.Replicas == nil || *instance.Spec.Replicas <= 1 {
 		return false
 	}
-	version := instance.Status.CurrentVersion
-	if instance.Spec.TargetVersion != nil && *instance.Spec.TargetVersion != "" {
-		version = *instance.Spec.TargetVersion
-	}
-	if version == "" {
-		version = DefaultRabbitMQVersion
-	}
-	return rabbitmq.IsVersion4_1OrLater(version)
+	return rabbitmq.IsVersion4_1OrLater(rmqConfigVersion(instance))
+}
+
+// remediationActive reports whether this cluster takes part in PodRemediator
+// PVC remediation. Only then are the pieces that make RabbitMQ depend on a
+// running operator deployed: the startup-gate init container, the pods'
+// serving label, and the serving requirement in the client Services. Without
+// the PodRemediator CRD no PVC can ever be remediated, so those clusters keep
+// operator-independent broker startup and client admission.
+func (r *Reconciler) remediationActive(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) bool {
+	return rejoinEnabled(instance) && r.podRemediatorInstalled(ctx)
 }
 
 // podReady reports whether a pod is Running with its PodReady condition true.
@@ -127,57 +152,107 @@ func podReady(pod *corev1.Pod) bool {
 	return false
 }
 
-// ensurePodsServingLabeled admits ordinary new pods and backfills pre-existing
-// unlabeled pods before the client Service selector is applied. A recorded
-// replacement keeps its initial serving=false until rejoin and queue recovery.
-func (r *Reconciler) ensurePodsServingLabeled(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) error {
-	pods := &corev1.PodList{}
-	if err := r.List(ctx, pods,
-		client.InNamespace(instance.Namespace),
-		client.MatchingLabels(rabbitmq.SelectorLabels(instance.Name)),
-	); err != nil {
-		return fmt.Errorf("listing RabbitMq pods to backfill serving label: %w", err)
+// heldReplacement describes a pod that is held out of client Services because
+// the claim it runs on was consented for deletion.
+type heldReplacement struct {
+	// PVCName is the data claim being remediated.
+	PVCName string
+	// ReplacementUID is the UID of the new claim, once it exists and is not
+	// terminating. It stays empty while the consented claim is still going
+	// away, because until then there is no replacement data to rejoin with.
+	ReplacementUID string
+}
+
+// heldReplacementPods maps pod name to the replacement it is waiting on, for
+// every consented remediation whose original claim is gone. Those pods must
+// stay out of client Services until rejoin and queue recovery are verified.
+// Recovery records are persisted before deletion consent is published, so a
+// replacement is recognizable on its very first reconcile.
+//
+// The claim reads are uncached: a lagging PVC watch could still show the
+// original UID while the replacement pod is already up, which would admit an
+// unverified replacement to client traffic.
+func (r *Reconciler) heldReplacementPods(
+	ctx context.Context,
+	instance *rabbitmqv1beta1.RabbitMq,
+) (map[string]heldReplacement, error) {
+	held := make(map[string]heldReplacement)
+	if !rejoinEnabled(instance) {
+		return held, nil
 	}
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		// Recovery records are persisted before publishing deletion consent, so
-		// a replacement is recognizable on its first reconcile. Never backfill
-		// or admit it before ReconcileNodeRejoin verifies membership and queues.
-		held := false
-		if rejoinEnabled(instance) {
-			for name, recovery := range instance.Status.PVCRemediation {
-				ordinal, ok := rmqPVCOrdinal(name)
-				if !ok || recovery.ConsentState != rabbitmqv1beta1.PVCRemediationConsentGranted ||
-					pod.Name != fmt.Sprintf("%s-server-%d", instance.Name, ordinal) {
-					continue
-				}
-				claim := &corev1.PersistentVolumeClaim{}
-				if err := r.safetyReader().Get(ctx, types.NamespacedName{Namespace: instance.Namespace, Name: name}, claim); err != nil {
-					if !apierrors.IsNotFound(err) {
-						return err
-					}
-					held = true
-				} else {
-					held = claim.DeletionTimestamp != nil || string(claim.UID) != recovery.PVCUID
-				}
-				break
+	for pvcName, remediation := range instance.Status.PVCRemediation {
+		ordinal, ok := rmqPVCOrdinal(pvcName)
+		if !ok || !remediation.Consented() {
+			continue
+		}
+		claim := &corev1.PersistentVolumeClaim{}
+		err := r.safetyReader().Get(ctx,
+			types.NamespacedName{Namespace: instance.Namespace, Name: pvcName}, claim)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("reading replacement PVC %s: %w", pvcName, err)
+		}
+		live := err == nil && claim.DeletionTimestamp == nil
+		if live && string(claim.UID) == remediation.PVCUID {
+			// The consented claim is still in place: nothing was replaced yet.
+			continue
+		}
+		entry := heldReplacement{PVCName: pvcName}
+		if live {
+			entry.ReplacementUID = string(claim.UID)
+		}
+		held[rmqPodName(instance, ordinal)] = entry
+	}
+	return held, nil
+}
+
+// admitPods brings every pod's serving label in line with whether the
+// controller has admitted it to client traffic: a held replacement is always
+// excluded, and any other pod is admitted once its startup is approved.
+//
+// It reports whether anything changed. A patch conflict counts as a change: the
+// pod moved under us, and because the Pod watch predicate filters out routine
+// kubelet updates the caller must requeue rather than wait for an event.
+func (r *Reconciler) admitPods(
+	ctx context.Context,
+	instance *rabbitmqv1beta1.RabbitMq,
+	pods []corev1.Pod,
+	held map[string]heldReplacement,
+) (bool, error) {
+	changed := false
+	for i := range pods {
+		pod := &pods[i]
+		serving := false
+		if _, isHeld := held[pod.Name]; !isHeld {
+			allowed, startupChanged, err := r.ensurePodStartup(ctx, instance, pod)
+			if err != nil {
+				return changed, err
 			}
+			serving = allowed
+			changed = changed || startupChanged
 		}
-		if held {
-			continue
-		}
-		allowed, _, err := r.ensurePodStartup(ctx, instance, pod)
+		updated, err := r.setPodServing(ctx, pod, serving)
 		if err != nil {
-			return err
+			return changed, err
 		}
-		if !allowed {
-			continue
-		}
-		if _, err := r.setPodServing(ctx, pod, true); err != nil {
-			return err
-		}
+		changed = changed || updated
 	}
-	return nil
+	return changed, nil
+}
+
+// ensurePodsServingLabeled admits ordinary pods and backfills the serving label
+// on pre-existing pods before the client Service selector is applied, so that
+// an operator upgrade never drops a running broker out of the Service.
+func (r *Reconciler) ensurePodsServingLabeled(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) error {
+	pods, err := r.rmqListPods(ctx, instance, r.Client)
+	if err != nil {
+		return err
+	}
+	held, err := r.heldReplacementPods(ctx, instance)
+	if err != nil {
+		return err
+	}
+	_, err = r.admitPods(ctx, instance, pods, held)
+	return err
 }
 
 // podServing reports whether the controller has admitted a pod to client Services.
@@ -270,7 +345,7 @@ func (r *Reconciler) clusterMembership(
 	if err != nil {
 		return clusterMembership{}, fmt.Errorf("parsing cluster_status from %s: %w", pod.Name, err)
 	}
-	podNode := rejoinNodeName(instance, pod.Name)
+	podNode := rmqNodeName(instance, pod.Name)
 	if !membership.Running[podNode] {
 		return clusterMembership{}, fmt.Errorf("cluster_status from %s does not report its own node %s as running", pod.Name, podNode)
 	}
@@ -289,148 +364,110 @@ func (r *Reconciler) ReconcileNodeRejoin(
 		return false, nil
 	}
 	log := r.GetLogger(ctx)
-	pods := &corev1.PodList{}
-	if err := r.List(ctx, pods,
-		client.InNamespace(instance.Namespace),
-		client.MatchingLabels(rabbitmq.SelectorLabels(instance.Name)),
-	); err != nil {
-		return false, fmt.Errorf("listing RabbitMq pods for rejoin: %w", err)
+	pods, err := r.rmqListPods(ctx, instance, r.Client)
+	if err != nil {
+		return false, err
 	}
-	podsByName := make(map[string]*corev1.Pod, len(pods.Items))
-	for i := range pods.Items {
-		podsByName[pods.Items[i].Name] = &pods.Items[i]
+	podsByName := make(map[string]*corev1.Pod, len(pods))
+	for i := range pods {
+		podsByName[pods[i].Name] = &pods[i]
 	}
 
-	// A granted consent remains associated with the old PVC UID after deletion.
-	// A different UID is the proof that this is the replacement claim.
-	type pendingRejoin struct {
-		pvcName   string
-		requestID string
+	held, err := r.heldReplacementPods(ctx, instance)
+	if err != nil {
+		return true, err
 	}
-	pendingPods := make(map[string]pendingRejoin)
-	keys := make([]string, 0, len(instance.Status.PVCRemediation))
-	for pvcName := range instance.Status.PVCRemediation {
-		keys = append(keys, pvcName)
-	}
-	sort.Strings(keys)
-	for _, pvcName := range keys {
-		remediation := instance.Status.PVCRemediation[pvcName]
-		if remediation.ConsentState != rabbitmqv1beta1.PVCRemediationConsentGranted {
-			continue
-		}
-		ordinal, ok := rmqPVCOrdinal(pvcName)
-		if !ok {
-			continue
-		}
-		podName := fmt.Sprintf("%s-server-%d", instance.Name, ordinal)
-		pvc := &corev1.PersistentVolumeClaim{}
-		// Use an uncached read: a lagging PVC watch could still show the original
-		// UID while the replacement pod is already up, which would skip this
-		// replacement out of pendingPods and admit it before verification.
-		pvcErr := r.safetyReader().Get(ctx, types.NamespacedName{Namespace: instance.Namespace, Name: pvcName}, pvc)
-		if pvcErr != nil && !apierrors.IsNotFound(pvcErr) {
-			return true, fmt.Errorf("reading replacement PVC %s: %w", pvcName, pvcErr)
-		}
-		if pvcErr == nil && string(pvc.UID) == remediation.PVCUID && pvc.DeletionTimestamp == nil {
-			continue
-		}
 
+	// Release replacements that already finished recovery, so the admission
+	// pass below does not pull a verified broker back out of client Services.
+	for _, podName := range sortedKeys(held) {
 		pod := podsByName[podName]
-		if pod != nil && remediation.QueueReplicaState == rabbitmqv1beta1.PVCRemediationQueueReplicasGrown && podServing(pod) {
-			if pod.Annotations[rabbitmqv1beta1.AnnotationRejoinCluster] == remediation.RequestID {
-				if err := r.clearRejoinAnnotation(ctx, pod); err != nil {
-					return true, err
-				}
-				return true, nil
-			}
-			if pod.Annotations[rabbitmqv1beta1.AnnotationRejoinCluster] == "" {
-				// The verified replacement already completed rejoin and queue growth.
-				// Let the PVC handshake release this replacement's remediation slot.
+		remediation := instance.Status.PVCRemediation[held[podName].PVCName]
+		if pod == nil || !remediation.Phase.AtLeast(rabbitmqv1beta1.PVCRemediationRecovered) || !podServing(pod) {
+			continue
+		}
+		switch pod.Annotations[rabbitmqv1beta1.AnnotationRejoinCluster] {
+		case "":
+			// Recovery is complete; let the PVC handshake release the slot.
+			delete(held, podName)
+		case remediation.RequestID:
+			if remediation.RequestID == "" {
 				continue
 			}
-		}
-		pendingPods[podName] = pendingRejoin{pvcName: pvcName, requestID: remediation.RequestID}
-		if pod == nil {
-			continue
-		}
-		if _, err := r.setPodServing(ctx, pod, false); err != nil {
-			return true, err
-		}
-		if remediation.RequestID == "" {
-			return true, fmt.Errorf("PVC %s recovery has no recorded PodRemediator request ID", pvcName)
-		}
-		if pvcErr != nil || pvc.DeletionTimestamp != nil || string(pvc.UID) == remediation.PVCUID {
-			continue
-		}
-		if !podUsesPVC(pod, pvcName) {
-			continue
-		}
-		if pod.Annotations[rabbitmqv1beta1.AnnotationRejoinCluster] != remediation.RequestID {
-			base := pod.DeepCopy()
-			if pod.Annotations == nil {
-				pod.Annotations = map[string]string{}
+			if err := r.clearRejoinAnnotation(ctx, pod); err != nil {
+				return true, err
 			}
-			pod.Annotations[rabbitmqv1beta1.AnnotationRejoinCluster] = remediation.RequestID
-			if err := r.Patch(ctx, pod, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
-				return true, fmt.Errorf("authorizing rejoin on %s: %w", pod.Name, err)
-			}
-			log.Info("Authorized replacement pod rejoin from PVC consent", "pod", pod.Name, "pvc", pvcName)
 			return true, nil
 		}
 	}
 
-	// Admit ordinary pods, including pods starting with serving=false. Pending
+	// Admit ordinary pods, including pods that start with serving=false. Held
 	// replacements stay outside client Services until recovery is verified.
-	changed := false
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		var ready bool
-		if _, pending := pendingPods[pod.Name]; pending {
-			ready = false
-		} else {
-			allowed, startupChanged, err := r.ensurePodStartup(ctx, instance, pod)
-			if err != nil {
-				return true, err
-			}
-			ready = allowed
-			changed = changed || startupChanged
-		}
-		updated, err := r.setPodServing(ctx, pod, ready)
-		if err != nil {
-			return true, err
-		}
-		changed = changed || updated
+	changed, err := r.admitPods(ctx, instance, pods, held)
+	if err != nil {
+		return true, err
 	}
+
+	// Stamp the authorizing request ID on each replacement pod. The in-pod
+	// recovery commands are destructive, so they run only against a pod that
+	// carries the request ID that consented to its claim's deletion.
+	for _, podName := range sortedKeys(held) {
+		replacement := held[podName]
+		pod := podsByName[podName]
+		remediation := instance.Status.PVCRemediation[replacement.PVCName]
+		if remediation.RequestID == "" {
+			return true, fmt.Errorf("PVC %s recovery has no recorded PodRemediator request ID", replacement.PVCName)
+		}
+		// Without a replacement claim there is no new data directory to rejoin.
+		if pod == nil || replacement.ReplacementUID == "" || !podUsesPVC(pod, replacement.PVCName) ||
+			pod.Annotations[rabbitmqv1beta1.AnnotationRejoinCluster] == remediation.RequestID {
+			continue
+		}
+		base := pod.DeepCopy()
+		if pod.Annotations == nil {
+			pod.Annotations = map[string]string{}
+		}
+		pod.Annotations[rabbitmqv1beta1.AnnotationRejoinCluster] = remediation.RequestID
+		if err := r.Patch(ctx, pod, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+			return true, fmt.Errorf("authorizing rejoin on %s: %w", pod.Name, err)
+		}
+		log.Info("Authorized replacement pod rejoin from PVC consent", "pod", pod.Name, "pvc", replacement.PVCName)
+		return true, nil
+	}
+
 	if changed {
 		return true, nil
 	}
-	if len(pendingPods) == 0 {
+	if len(held) == 0 {
 		return false, nil
 	}
 
 	// Process one authorized replacement at a time.
 	var target *corev1.Pod
 	var targetPVCName string
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		pending, exists := pendingPods[pod.Name]
-		if !exists || pending.requestID == "" || pod.Annotations[rabbitmqv1beta1.AnnotationRejoinCluster] != pending.requestID {
+	for i := range pods {
+		pod := &pods[i]
+		replacement, exists := held[pod.Name]
+		if !exists {
+			continue
+		}
+		requestID := instance.Status.PVCRemediation[replacement.PVCName].RequestID
+		if requestID == "" || pod.Annotations[rabbitmqv1beta1.AnnotationRejoinCluster] != requestID {
 			continue
 		}
 		target = pod
-		targetPVCName = pending.pvcName
+		targetPVCName = replacement.PVCName
 		break
 	}
 	if target == nil {
 		return true, nil
 	}
-	replicas := *instance.Spec.Replicas
-	quorum := int(replicas/2 + 1)
-	targetNode := rejoinNodeName(instance, target.Name)
+	quorum := quorumOf(*instance.Spec.Replicas)
+	targetNode := rmqNodeName(instance, target.Name)
 	var anchor *corev1.Pod
 	var anchorMembership clusterMembership
-	for i := range pods.Items {
-		peer := &pods.Items[i]
+	for i := range pods {
+		peer := &pods[i]
 		if peer.Name == target.Name || !podReady(peer) {
 			continue
 		}
@@ -450,15 +487,15 @@ func (r *Reconciler) ReconcileNodeRejoin(
 	}
 
 	targetName := types.NamespacedName{Namespace: target.Namespace, Name: target.Name}
-	anchorNode := rejoinNodeName(instance, anchor.Name)
+	anchorNode := rmqNodeName(instance, anchor.Name)
 	remediation := instance.Status.PVCRemediation[targetPVCName]
 	claim := &corev1.PersistentVolumeClaim{}
 	if err := r.safetyReader().Get(ctx, client.ObjectKey{Namespace: instance.Namespace, Name: targetPVCName}, claim); err != nil {
 		return true, err
 	}
-	if remediation.MemberRemovalState != rabbitmqv1beta1.PVCRemediationMemberRemoved ||
+	if !remediation.Phase.AtLeast(rabbitmqv1beta1.PVCRemediationMemberRemoved) ||
 		remediation.ReplacementPVCUID != string(claim.UID) {
-		return true, r.removeOldMember(ctx, instance, target, anchor, pods.Items, targetPVCName, anchorMembership)
+		return true, r.removeOldMember(ctx, instance, target, anchor, pods, targetPVCName, anchorMembership)
 	}
 	allowed, startupChanged, err := r.ensurePodStartup(ctx, instance, target)
 	if err != nil {
@@ -559,6 +596,26 @@ func (r *Reconciler) verifyQuorumQueueReplicasOnline(
 	return nil
 }
 
+// growQueueReplicas adds nodeName to every quorum queue that does not already
+// have a replica there. Continuous Membership Reconciliation (enabled for the
+// same 4.x multi-replica clusters, see internal/rabbitmq/configmap.go) normally
+// does this on its own within its trigger interval; this is the explicit
+// fallback for when it is disabled by configuration or has not fired yet.
+func (r *Reconciler) growQueueReplicas(ctx context.Context, pod *corev1.Pod, nodeName string) error {
+	output, err := r.rabbitmqCommand(ctx,
+		types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name},
+		"rabbitmq-queues", "grow", nodeName, "all", "--errors-only", "--silent")
+	if err != nil {
+		return fmt.Errorf("growing quorum queue replicas on %s: %w", nodeName, err)
+	}
+	if outputText := strings.TrimSpace(strings.TrimSpace(output.stdout) + "\n" + strings.TrimSpace(output.stderr)); outputText != "" {
+		return fmt.Errorf("growing quorum queue replicas on %s reported per-queue errors: %s", nodeName, outputText)
+	}
+	return nil
+}
+
+// finishNodeRejoin admits a rejoined replacement to client traffic once it
+// holds an online replica of every quorum queue.
 func (r *Reconciler) finishNodeRejoin(
 	ctx context.Context,
 	instance *rabbitmqv1beta1.RabbitMq,
@@ -567,35 +624,16 @@ func (r *Reconciler) finishNodeRejoin(
 	requestID string,
 ) error {
 	remediation, ok := instance.Status.PVCRemediation[pvcName]
-	if !ok || remediation.ConsentState != rabbitmqv1beta1.PVCRemediationConsentGranted || remediation.RequestID != requestID || requestID == "" {
+	if !ok || !remediation.Consented() || remediation.RequestID != requestID || requestID == "" {
 		return fmt.Errorf("PVC %s no longer has the consented request for RabbitMQ rejoin", pvcName)
 	}
-	nodeName := rejoinNodeName(instance, pod.Name)
-	growQueues := func() error {
-		output, err := r.rabbitmqCommand(ctx,
-			types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name},
-			"rabbitmq-queues", "grow", nodeName, "all", "--errors-only", "--silent")
-		if err != nil {
-			return fmt.Errorf("growing quorum queue replicas on %s: %w", nodeName, err)
-		}
-		if outputText := strings.TrimSpace(strings.TrimSpace(output.stdout) + "\n" + strings.TrimSpace(output.stderr)); outputText != "" {
-			return fmt.Errorf("growing quorum queue replicas on %s reported per-queue errors: %s", nodeName, outputText)
-		}
-		return nil
-	}
-	if remediation.QueueReplicaState != rabbitmqv1beta1.PVCRemediationQueueReplicasGrown {
-		if err := growQueues(); err != nil {
-			return err
-		}
-		remediation.QueueReplicaState = rabbitmqv1beta1.PVCRemediationQueueReplicasGrown
-		instance.Status.PVCRemediation[pvcName] = remediation
-	}
+	nodeName := rmqNodeName(instance, pod.Name)
+	// Check before growing: the replica is usually already there. RabbitMQ can
+	// also declare a new quorum queue while the replacement is held out of
+	// client traffic, so one grow-and-recheck round covers that too.
 	err := r.verifyQuorumQueueReplicasOnline(ctx, instance, pod, nodeName)
 	if errors.Is(err, errQuorumQueueReplicaMissing) {
-		// RabbitMQ can declare a new quorum queue while the replacement is held
-		// unready. Grow skips queues that already include this node, so retry only
-		// when the management API confirms that membership is missing.
-		if growErr := growQueues(); growErr != nil {
+		if growErr := r.growQueueReplicas(ctx, pod, nodeName); growErr != nil {
 			return growErr
 		}
 		err = r.verifyQuorumQueueReplicasOnline(ctx, instance, pod, nodeName)
@@ -603,6 +641,8 @@ func (r *Reconciler) finishNodeRejoin(
 	if err != nil {
 		return fmt.Errorf("verifying quorum queue replicas on %s: %w", pod.Name, err)
 	}
+	remediation.Phase = rabbitmqv1beta1.PVCRemediationRecovered
+	instance.Status.PVCRemediation[pvcName] = remediation
 	if _, err := r.setPodServing(ctx, pod, true); err != nil {
 		return err
 	}
@@ -629,17 +669,37 @@ func (r *Reconciler) setPodServing(ctx context.Context, pod *corev1.Pod, serving
 	// Guard with the base resourceVersion: if the StatefulSet recreated this pod
 	// after the rejoin/queue checks ran, the patch must conflict rather than mark
 	// an unchecked pod as serving.
-	if err := r.Patch(ctx, pod, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+	err := r.Patch(ctx, pod, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	if apierrors.IsConflict(err) {
+		// The pod moved under us. Report a change so the caller re-reads it,
+		// rather than failing a reconcile over an ordinary kubelet update.
+		return true, nil
+	}
+	if err != nil {
 		return false, fmt.Errorf("setting serving label on pod %s: %w", pod.Name, err)
 	}
 	return true, nil
 }
 
+// clearRejoinAnnotation removes the rejoin authorization once recovery is done,
+// so the destructive in-pod commands cannot run again for the same request.
 func (r *Reconciler) clearRejoinAnnotation(ctx context.Context, pod *corev1.Pod) error {
 	base := pod.DeepCopy()
 	delete(pod.Annotations, rabbitmqv1beta1.AnnotationRejoinCluster)
-	if err := r.Patch(ctx, pod, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+	err := r.Patch(ctx, pod, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	if err != nil && !apierrors.IsConflict(err) {
 		return fmt.Errorf("clearing rejoin annotation on %s: %w", pod.Name, err)
 	}
 	return nil
+}
+
+// sortedKeys returns a map's keys in a stable order, so that reconciles process
+// the same work in the same sequence.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }

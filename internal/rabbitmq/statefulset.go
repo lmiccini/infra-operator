@@ -33,6 +33,8 @@ type ProxyConfig struct {
 // is prepended to clear persistent data before the main setup container runs.
 // If proxy is enabled, a proxy sidecar container is added and RabbitMQ's readiness
 // probe is adjusted to check the backend port on localhost.
+// If remediation is true, pods also carry the PVC-remediation startup gate and
+// start outside client Services; see RemediationGated.
 func StatefulSet(
 	r *rabbitmqv1.RabbitMq,
 	configHash string,
@@ -41,18 +43,22 @@ func StatefulSet(
 	targetVersion string,
 	needsDataWipe bool,
 	proxy ProxyConfig,
+	remediation bool,
 ) *appsv1.StatefulSet {
 	matchls := SelectorLabels(r.Name)
 	ls := CommonLabels(r.Name)
 
-	// Every new pod starts outside client Services. The controller admits ordinary
-	// pods and releases recorded replacements only after rejoin and queue recovery.
-	// Existing pods retain their serving label across container/operator restarts.
+	// Under remediation every new pod starts outside client Services: the
+	// controller admits ordinary pods and releases recorded replacements only
+	// after rejoin and queue recovery. Existing pods retain their serving label
+	// across container and operator restarts.
 	podLabels := make(map[string]string, len(ls)+1)
 	for k, v := range ls {
 		podLabels[k] = v
 	}
-	podLabels[rabbitmqv1.RabbitMQServingLabel] = rabbitmqv1.RabbitMQServingFalse
+	if remediation {
+		podLabels[rabbitmqv1.RabbitMQServingLabel] = rabbitmqv1.RabbitMQServingFalse
+	}
 
 	// Default replica count
 	replicas := ptr.To(int32(1))
@@ -117,9 +123,11 @@ func StatefulSet(
 	// Build init containers
 	var initContainers []corev1.Container
 
-	// Client-Service exclusion does not isolate Erlang/Raft peer traffic.
-	// Block the broker process itself until this pod UID is approved.
-	if *replicas > 1 && IsVersion4_1OrLater(targetVersion) {
+	// Client-Service exclusion does not isolate Erlang/Raft peer traffic, so a
+	// replacement broker has to be stopped before it starts. This gate makes
+	// broker startup depend on a running operator, which is why it is only
+	// deployed where PVC remediation can actually happen - see RemediationGated.
+	if remediation {
 		initContainers = append(initContainers, corev1.Container{
 			Name:    "startup-gate",
 			Image:   r.Spec.ContainerImage,

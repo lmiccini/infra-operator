@@ -405,17 +405,27 @@ installed.
 
 ## RabbitMQ replacement recovery
 
-New multi-replica RabbitMQ 4.1+ pods wait in a `startup-gate` init container
-before RabbitMQ can open Erlang/Raft connections. The gate requires the
+Replacement recovery, and with it everything that makes a broker depend on a
+running operator, is only deployed where a PVC can actually be remediated: a
+multi-replica RabbitMQ 4.1+ cluster in a deployment that has the PodRemediator
+CRD installed. A single broker has no quorum to protect, and without the CRD no
+consent is ever granted. Clusters outside that set keep operator-independent
+broker startup and client admission, and carry neither the startup gate nor the
+serving label.
+
+Where it does apply, new pods wait in a `startup-gate` init container before
+RabbitMQ can open Erlang/Raft connections. The gate requires the
 `rabbitmq.openstack.org/startup-approved` annotation to match the pod's own UID;
 the StatefulSet template never supplies that approval. Ordinary pods are approved
-after uncached claim and recovery-record checks.
+after uncached claim and recovery-record checks. This does mean that while the
+operator is unavailable a newly created pod cannot start its broker, which is
+the deliberate price of being able to stop a replacement before it joins.
 
 For a consented replacement, the original PVC deletion has already crossed
 PodRemediator's live SNR fencing barrier. While the replacement remains blocked,
 the RabbitMq controller confirms healthy survivor and queue majorities and uses
 a surviving broker to forget the old member. It verifies authoritative metadata
-membership and queue-replica removal, then records `memberRemovalState=Removed`
+membership and queue-replica removal, then records `phase: MemberRemoved`
 with the exact `replacementPVCUID` in status. Startup approval requires a fresh
 API read of that durable record. A controller restart before or after the status
 write therefore cannot release an unchecked pod or require an unsafe second
@@ -438,7 +448,8 @@ the slot. A subsequent PVC still has to pass the configured-capacity, ready and
 running survivor, and per-queue safety gates; a five-broker cluster requires at
 least three healthy survivors after excluding the next candidate and stuck nodes.
 
-All new RabbitMQ pods start with `rabbitmq.openstack.org/serving=false`. The
+Under remediation, new RabbitMQ pods start with
+`rabbitmq.openstack.org/serving=false`. The
 controller reads recovery records and claim identity directly from the API before
 admitting ordinary pods and backfilling existing unlabeled pods. It does this before
 applying the client Service selector. Recorded replacements stay excluded until
@@ -446,3 +457,18 @@ rejoin and queue verification finish. Existing admitted pods retain their label
 across container restarts or operator downtime. A newly created pod needs the
 operator to admit it, so it waits outside client Services while the operator is
 unavailable. The headless clustering Service does not select on this label.
+
+`RabbitMq.status.pvcRemediation[<claim>]` records one remediation per claim as a
+single ordered `phase`: `Pending` (a stuck claim with no consent yet),
+`Consented` (safe-to-delete published for `requestID`/`pvcUID`), `MemberRemoved`
+(the old broker and its queue replicas are gone and `replacementPVCUID` may
+start), and `Recovered` (the replacement rejoined and holds an online replica of
+every quorum queue). A phase only moves forward for one `(pvcUID, requestID)`
+pair, and an unset or unrecognized phase counts as before `Pending`, so every
+gate that reads it fails closed.
+
+The same evidence drives every safety decision. One helper reads the surviving
+brokers and the cluster's own node list from a survivor's management API, and a
+single check decides whether a candidate can be lost. Consent, the pre-commit
+`ValidatePVCDeletion` hook and old-member removal all call it, so they cannot
+drift apart.

@@ -55,13 +55,13 @@ func rawRecovery() *rabbitmqv1.RabbitMq {
 	// This test starts at the original consent, before member removal.
 	entry := r.Status.PVCRemediation[testPVCName]
 	entry.ReplacementPVCUID = ""
-	entry.MemberRemovalState = ""
+	entry.Phase = rabbitmqv1.PVCRemediationConsented
 	r.Status.PVCRemediation[testPVCName] = entry
 	return r
 }
 
 func TestNewRabbitMQPodsWaitForStartupApproval(t *testing.T) {
-	sts := rabbitmqresources.StatefulSet(instanceWith(3), "config", nil, nil, "4.2", false, rabbitmqresources.ProxyConfig{})
+	sts := rabbitmqresources.StatefulSet(instanceWith(3), "config", nil, nil, "4.2", false, rabbitmqresources.ProxyConfig{}, true)
 	if len(sts.Spec.Template.Spec.InitContainers) == 0 || sts.Spec.Template.Spec.InitContainers[0].Name != "startup-gate" {
 		t.Fatal("new pods must block before any RabbitMQ setup or server process")
 	}
@@ -71,7 +71,7 @@ func TestNewRabbitMQPodsWaitForStartupApproval(t *testing.T) {
 }
 
 func TestStartupScriptRequiresItsOwnPodUID(t *testing.T) {
-	sts := rabbitmqresources.StatefulSet(instanceWith(3), "config", nil, nil, "4.2", false, rabbitmqresources.ProxyConfig{})
+	sts := rabbitmqresources.StatefulSet(instanceWith(3), "config", nil, nil, "4.2", false, rabbitmqresources.ProxyConfig{}, true)
 	gate := sts.Spec.Template.Spec.InitContainers[0]
 	if gate.Name != "startup-gate" {
 		t.Fatal("startup gate is missing")
@@ -136,7 +136,7 @@ func TestReplacementForgetsOldMemberBeforeBrokerStartup(t *testing.T) {
 	entry, _ := json.Marshal(instance.Status.PVCRemediation[testPVCName])
 	var progress map[string]interface{}
 	_ = json.Unmarshal(entry, &progress)
-	if progress["memberRemovalState"] != "Removed" || progress["replacementPVCUID"] != newPVCUID {
+	if progress["phase"] != "MemberRemoved" || progress["replacementPVCUID"] != newPVCUID {
 		t.Fatalf("removal must be recorded against this replacement claim: %s", entry)
 	}
 	if _, err := r.ReconcileNodeRejoin(ctx, instance); err != nil {
@@ -214,7 +214,7 @@ func TestStartupResumesAfterRemovalBeforeStatusWasPersisted(t *testing.T) {
 	if fx.orderOf("forget_cluster_node") >= 0 {
 		t.Fatal("already completed removal must be verified rather than repeated")
 	}
-	if instance.Status.PVCRemediation[testPVCName].MemberRemovalState != rabbitmqv1.PVCRemediationMemberRemoved {
+	if instance.Status.PVCRemediation[testPVCName].Phase != rabbitmqv1.PVCRemediationMemberRemoved {
 		t.Fatal("verified progress must be restored after a controller restart")
 	}
 }
@@ -400,7 +400,7 @@ func TestStartupApprovalRequiresTheDurableRecoveryRequest(t *testing.T) {
 			case "request changed":
 				entry.RequestID = "another-request"
 			case "consent withdrawn":
-				entry.ConsentState = rabbitmqv1.PVCRemediationConsentPending
+				entry.Phase = rabbitmqv1.PVCRemediationPending
 			case "different replacement":
 				entry.ReplacementPVCUID = "another-claim"
 			}
