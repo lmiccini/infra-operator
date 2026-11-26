@@ -17,19 +17,15 @@ limitations under the License.
 package rabbitmq
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	rabbitmqv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	remediationv1 "github.com/openstack-k8s-operators/infra-operator/apis/remediation/v1beta1"
 	"github.com/openstack-k8s-operators/infra-operator/internal/rabbitmq"
 	"github.com/openstack-k8s-operators/infra-operator/internal/rabbitmq/admin"
-	"github.com/openstack-k8s-operators/lib-common/modules/common/rsh"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -40,63 +36,10 @@ const rabbitmqContainerName = "rabbitmq"
 
 const rabbitmqCommandTimeout = 2 * time.Minute
 
-// clusterStatus is the subset of `rabbitmqctl --formatter json cluster_status`
-// output that we rely on.
-type clusterStatus struct {
-	DiskNodes    []string `json:"disk_nodes"`
-	RAMNodes     []string `json:"ram_nodes"`
-	RunningNodes []string `json:"running_nodes"`
-}
-
-// clusterMembership distinguishes configured members from nodes that are
-// currently online. RabbitMQ keeps an offline node in disk_nodes/ram_nodes
-// until it is explicitly forgotten.
-type clusterMembership struct {
-	Configured map[string]bool
-	Running    map[string]bool
-}
-
-func (s clusterStatus) membership() (clusterMembership, error) {
-	if s.DiskNodes == nil || s.RAMNodes == nil || s.RunningNodes == nil {
-		return clusterMembership{}, fmt.Errorf("cluster_status is missing disk_nodes, ram_nodes, or running_nodes")
-	}
-	membership := clusterMembership{
-		Configured: make(map[string]bool, len(s.DiskNodes)+len(s.RAMNodes)),
-		Running:    make(map[string]bool, len(s.RunningNodes)),
-	}
-	for _, node := range append(append([]string{}, s.DiskNodes...), s.RAMNodes...) {
-		if node == "" {
-			return clusterMembership{}, fmt.Errorf("cluster_status contains an empty configured node name")
-		}
-		membership.Configured[node] = true
-	}
-	if len(membership.Configured) == 0 {
-		return clusterMembership{}, fmt.Errorf("cluster_status contains no configured nodes")
-	}
-	for _, node := range s.RunningNodes {
-		if node == "" {
-			return clusterMembership{}, fmt.Errorf("cluster_status contains an empty running node name")
-		}
-		if !membership.Configured[node] {
-			return clusterMembership{}, fmt.Errorf("running node %q is not listed in disk_nodes or ram_nodes", node)
-		}
-		if membership.Running[node] {
-			return clusterMembership{}, fmt.Errorf("cluster_status lists running node %q more than once", node)
-		}
-		membership.Running[node] = true
-	}
-	if len(membership.Running) == 0 {
-		return clusterMembership{}, fmt.Errorf("cluster_status contains no running nodes")
-	}
-	return membership, nil
-}
-
-// rmqNodeName returns the RabbitMQ Erlang node name for a pod, e.g.
-// rabbit@<name>-server-0.<name>-nodes.<namespace>. This is the same hostname
-// the pod certificate's SAN uses, so it is built from one helper to keep the
-// management API, the CLI and the certificate in agreement.
+// rmqNodeName is admin.NodeName, kept as a local name because the controller
+// calls it from many places.
 func rmqNodeName(instance *rabbitmqv1beta1.RabbitMq, podName string) string {
-	return "rabbit@" + rabbitmq.ManagementPodServerName(podName, instance.Name, instance.Namespace)
+	return admin.NodeName(instance, podName)
 }
 
 // rmqPodName returns the StatefulSet pod name for an ordinal.
@@ -411,7 +354,7 @@ func (r *Reconciler) ensurePodsServingLabeled(ctx context.Context, instance *rab
 // The two cluster_status reads are not atomic. Recounting after targetNode is
 // read narrows the stale-view window, but changes between that final anchor
 // read and the serving-label patch remain possible.
-func rejoinAgreed(anchor, target clusterMembership, anchorNode, targetNode string, safe map[string]bool, quorum int) bool {
+func rejoinAgreed(anchor, target admin.Membership, anchorNode, targetNode string, safe map[string]bool, quorum int) bool {
 	if !anchor.Running[targetNode] || !target.Running[anchorNode] {
 		return false
 	}
@@ -450,69 +393,6 @@ func podUsesPVC(pod *corev1.Pod, pvcName string) bool {
 		}
 	}
 	return false
-}
-
-type rabbitmqCommandOutput struct {
-	stdout string
-	stderr string
-}
-
-// rabbitmqCommand runs a RabbitMQ CLI command in the pod's rabbitmq container
-// under a bounded timeout. Both output streams are captured so that a failure
-// can be reported with whatever the CLI wrote to either of them.
-func (r *Reconciler) rabbitmqCommand(ctx context.Context, podName types.NamespacedName, command string, args ...string) (rabbitmqCommandOutput, error) {
-	cmd := append([]string{command}, args...)
-	commandCtx, cancel := context.WithTimeout(ctx, rabbitmqCommandTimeout)
-	defer cancel()
-
-	executor := r.PodCommandExecutor
-	if executor == nil {
-		executor = rsh.ExecInPod
-	}
-	var output rabbitmqCommandOutput
-	err := executor(commandCtx, r.Kclient, r.config, podName, rabbitmqContainerName, cmd,
-		func(out *bytes.Buffer, errOut *bytes.Buffer) error {
-			output.stdout = out.String()
-			output.stderr = errOut.String()
-			return nil
-		})
-	if err != nil {
-		detail := strings.TrimSpace(output.stdout + "\n" + output.stderr)
-		if detail != "" {
-			return output, fmt.Errorf("%w (output: %.4096s)", err, detail)
-		}
-	}
-	return output, err
-}
-
-func (r *Reconciler) rabbitmqctl(ctx context.Context, podName types.NamespacedName, args ...string) (string, error) {
-	output, err := r.rabbitmqCommand(ctx, podName, "rabbitmqctl", args...)
-	return output.stdout, err
-}
-
-func (r *Reconciler) clusterMembership(
-	ctx context.Context,
-	instance *rabbitmqv1beta1.RabbitMq,
-	pod *corev1.Pod,
-) (clusterMembership, error) {
-	out, err := r.rabbitmqctl(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name},
-		"--formatter", "json", "cluster_status")
-	if err != nil {
-		return clusterMembership{}, err
-	}
-	var status clusterStatus
-	if err := json.Unmarshal([]byte(out), &status); err != nil {
-		return clusterMembership{}, fmt.Errorf("parsing cluster_status from %s: %w", pod.Name, err)
-	}
-	membership, err := status.membership()
-	if err != nil {
-		return clusterMembership{}, fmt.Errorf("parsing cluster_status from %s: %w", pod.Name, err)
-	}
-	podNode := rmqNodeName(instance, pod.Name)
-	if !membership.Running[podNode] {
-		return clusterMembership{}, fmt.Errorf("cluster_status from %s does not report its own node %s as running", pod.Name, podNode)
-	}
-	return membership, nil
 }
 
 // ReconcileNodeRejoin drives a replacement broker back into the cluster.
@@ -657,7 +537,7 @@ func (r *Reconciler) ReconcileNodeRejoin(
 	}
 	remediation := instance.Status.PVCRemediation[targetPVCName]
 	var anchor *corev1.Pod
-	var anchorMembership clusterMembership
+	var anchorMembership admin.Membership
 	for i := range pods {
 		peer := &pods[i]
 		if peer.Name == target.Name || !podReady(peer) {
@@ -672,7 +552,7 @@ func (r *Reconciler) ReconcileNodeRejoin(
 			break
 		}
 		peerCtx, peerCancel := context.WithTimeout(probeCtx, peerTimeout)
-		membership, err := r.clusterMembership(peerCtx, instance, peer)
+		membership, err := cluster.Membership(peerCtx, peer)
 		if err != nil {
 			peerCancel()
 			log.Info("Could not read cluster status from candidate peer", "pod", peer.Name, "error", err.Error())
@@ -690,7 +570,7 @@ func (r *Reconciler) ReconcileNodeRejoin(
 		sufficient := len(safePeers) >= quorum
 		if !sufficient && remediation.Phase.AtLeast(rabbitmqv1beta1.PVCRemediationMemberRemoved) &&
 			remediation.ReplacementPVCUID != "" && podRabbitMQContainerReady(target) {
-			targetMembership, targetErr := r.clusterMembership(peerCtx, instance, target)
+			targetMembership, targetErr := cluster.Membership(peerCtx, target)
 			if targetErr == nil {
 				sufficient = rejoinAgreed(membership, targetMembership,
 					rmqNodeName(instance, peer.Name), targetNode, safePeers, quorum)
@@ -748,11 +628,11 @@ func (r *Reconciler) ReconcileNodeRejoin(
 		log.Info("Authorized rejoin is waiting for replacement startup", "pod", target.Name)
 		return true, nil
 	}
-	targetMembership, err := r.clusterMembership(ctx, instance, target)
+	targetMembership, err := cluster.Membership(ctx, target)
 	if err != nil {
 		return true, fmt.Errorf("reading target cluster status: %w", err)
 	}
-	anchorMembership, err = r.clusterMembership(ctx, instance, anchor)
+	anchorMembership, err = cluster.Membership(ctx, anchor)
 	if err != nil {
 		return true, fmt.Errorf("re-reading anchor cluster status: %w", err)
 	}
@@ -765,7 +645,7 @@ func (r *Reconciler) ReconcileNodeRejoin(
 		return true, err
 	}
 	if rejoinAgreed(anchorMembership, targetMembership, anchorNode, targetNode, safeAnchor, quorum) {
-		return true, r.finishNodeRejoin(ctx, instance, target, anchor, targetPVCName,
+		return true, r.finishNodeRejoin(ctx, instance, cluster, target, anchor, targetPVCName,
 			remediation.RequestID, anchorNode, quorum)
 	}
 	if len(safeAnchor) < quorum {
@@ -786,15 +666,15 @@ func (r *Reconciler) ReconcileNodeRejoin(
 
 	// The old member was removed and that progress persisted before startup.
 	// join_cluster performs the fresh-member reset/add lifecycle on the target.
-	if _, err := r.rabbitmqctl(ctx, targetName, "join_cluster", anchorNode); err != nil {
+	if _, err := cluster.Ctl(ctx, targetName, "join_cluster", anchorNode); err != nil {
 		return true, fmt.Errorf("joining RabbitMQ node %s to %s: %w", target.Name, anchorNode, err)
 	}
 
-	targetMembership, err = r.clusterMembership(ctx, instance, target)
+	targetMembership, err = cluster.Membership(ctx, target)
 	if err != nil {
 		return true, fmt.Errorf("verifying target cluster status after rejoin: %w", err)
 	}
-	anchorMembership, err = r.clusterMembership(ctx, instance, anchor)
+	anchorMembership, err = cluster.Membership(ctx, anchor)
 	if err != nil {
 		return true, fmt.Errorf("verifying rejoin via anchor: %w", err)
 	}
@@ -811,7 +691,7 @@ func (r *Reconciler) ReconcileNodeRejoin(
 		return true, nil
 	}
 	log.Info("RabbitMQ replacement rejoined its cluster", "node", targetNode, "requestID", target.Annotations[rabbitmqv1beta1.AnnotationRejoinCluster])
-	return true, r.finishNodeRejoin(ctx, instance, target, anchor, targetPVCName,
+	return true, r.finishNodeRejoin(ctx, instance, cluster, target, anchor, targetPVCName,
 		remediation.RequestID, anchorNode, quorum)
 }
 
@@ -869,6 +749,7 @@ func (r *Reconciler) verifyQuorumQueueReplicasOnline(
 func (r *Reconciler) finishNodeRejoin(
 	ctx context.Context,
 	instance *rabbitmqv1beta1.RabbitMq,
+	cluster *admin.Client,
 	pod *corev1.Pod,
 	anchor *corev1.Pod,
 	pvcName string,
@@ -887,14 +768,14 @@ func (r *Reconciler) finishNodeRejoin(
 	// observes the result: until CMR has added this node to every quorum queue
 	// and those replicas are online, the replacement stays out of client
 	// Services and the caller requeues.
-	targetMembership, err := r.clusterMembership(ctx, instance, pod)
+	targetMembership, err := cluster.Membership(ctx, pod)
 	if err != nil {
 		return fmt.Errorf("rechecking target membership before admission: %w", err)
 	}
 	if anchor == nil {
 		return fmt.Errorf("RabbitMq anchor disappeared before serving admission")
 	}
-	anchorMembership, err := r.clusterMembership(ctx, instance, anchor)
+	anchorMembership, err := cluster.Membership(ctx, anchor)
 	if err != nil {
 		return fmt.Errorf("rechecking anchor membership before admission: %w", err)
 	}

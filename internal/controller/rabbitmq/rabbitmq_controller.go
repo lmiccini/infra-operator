@@ -18,7 +18,6 @@ limitations under the License.
 package rabbitmq
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -103,16 +102,10 @@ var rmqAllWatchFields = []string{
 	topologyField,
 }
 
-// PodCommandExecutor executes a command in a RabbitMQ pod and captures both output streams.
-type PodCommandExecutor func(
-	ctx context.Context,
-	client kubernetes.Interface,
-	config *rest.Config,
-	podName types.NamespacedName,
-	container string,
-	command []string,
-	callback func(*bytes.Buffer, *bytes.Buffer) error,
-) error
+// PodCommandExecutor runs a command in a RabbitMQ pod and captures both of
+// its output streams. It is admin.ExecFunc under the name the controller and
+// its tests already use.
+type PodCommandExecutor = admin.ExecFunc
 
 // Reconciler reconciles a RabbitMq object.
 type Reconciler struct {
@@ -2083,7 +2076,7 @@ func (r *Reconciler) rmqAdmin(ctx context.Context, instance *rabbitmqv1beta1.Rab
 	if r.ManagementHTTPClient != nil {
 		cluster = cluster.WithHTTPClient(r.ManagementHTTPClient)
 	}
-	return cluster, nil
+	return cluster.WithExec(r.Kclient, r.config, r.PodCommandExecutor), nil
 }
 
 // rmqQueuesSafeAfterDeletion checks each quorum queue's own replica majority.
@@ -2163,7 +2156,7 @@ func (r *Reconciler) rmqQueuesSafeAfterDeletion(ctx context.Context, instance *r
 			return err
 		}
 	}
-	return r.verifyQueueQuorumReads(ctx, pod, quorumQueues, safeNodes)
+	return cluster.ProveQueueQuorum(ctx, pod, quorumQueues, safeNodes)
 }
 
 // rmqRunningSurvivorCount verifies each ready survivor pod maps unambiguously to a
