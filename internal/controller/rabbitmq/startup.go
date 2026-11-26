@@ -28,6 +28,7 @@ import (
 
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	remediationv1 "github.com/openstack-k8s-operators/infra-operator/apis/remediation/v1beta1"
+	"github.com/openstack-k8s-operators/infra-operator/internal/rabbitmq/admin"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -78,7 +79,7 @@ type queueQuorumReadResult struct {
 // membership survives losing the candidate. Otherwise this returns an error
 // and the caller refuses the deletion.
 func (r *Reconciler) verifyQueueQuorumReads(ctx context.Context, peer *corev1.Pod,
-	queues []rmqQueueStatus, safeNodes map[string]bool) error {
+	queues []admin.Queue, safeNodes map[string]bool) error {
 	binaryArg := func(value string) string {
 		return `base64:decode(<<"` + base64.StdEncoding.EncodeToString([]byte(value)) + `">>)`
 	}
@@ -445,21 +446,24 @@ func (r *Reconciler) consistentMembers(ctx context.Context, instance *rabbitmqv1
 	return nil, fmt.Errorf("missing authoritative RabbitMQ membership response")
 }
 
-func (r *Reconciler) verifyOldQueueReplicasRemoved(ctx context.Context, instance *rabbitmqv1.RabbitMq, peer *corev1.Pod, creds *rmqMgmtCreds, oldNode string) error {
-	return r.scanQueues(ctx, instance, peer, creds, "name,vhost,type,members,online",
-		func(q rmqQueueStatus) error {
-			if q.Type != "quorum" {
-				return nil // Other queue kinds are checked by rmqQueuesSafeAfterDeletion.
-			}
-			members, _, err := quorumQueueMembers(q)
-			if err != nil {
-				return err
-			}
-			if members[oldNode] {
-				return fmt.Errorf("%w: %s/%s", errOldQueueReplicaPresent, q.Vhost, q.Name)
-			}
-			return nil
-		})
+func (r *Reconciler) verifyOldQueueReplicasRemoved(ctx context.Context, peer *corev1.Pod, cluster *admin.Client, oldNode string) error {
+	queues, err := cluster.Queues(ctx, peer, admin.ColumnsMembership)
+	if err != nil {
+		return err
+	}
+	for _, q := range queues {
+		if q.Type != admin.QueueTypeQuorum {
+			continue // Other queue kinds are checked by rmqQueuesSafeAfterDeletion.
+		}
+		members, _, err := admin.QuorumQueueMembers(q)
+		if err != nil {
+			return err
+		}
+		if members[oldNode] {
+			return fmt.Errorf("%w: %s/%s", errOldQueueReplicaPresent, q.Vhost, q.Name)
+		}
+	}
+	return nil
 }
 
 func (r *Reconciler) safeSurvivorNodes(
@@ -554,18 +558,18 @@ func (r *Reconciler) removeOldMember(ctx context.Context, instance *rabbitmqv1.R
 	if len(safe) < quorum {
 		return fmt.Errorf("not enough healthy survivors for member removal")
 	}
-	creds, err := r.rmqLoadMgmtCreds(ctx, instance)
+	cluster, err := r.rmqAdmin(ctx, instance)
 	if err != nil {
 		return err
 	}
-	if err := r.rmqQueuesSafeAfterDeletion(ctx, instance, anchor, creds, oldNode, safe); err != nil {
+	if err := r.rmqQueuesSafeAfterDeletion(ctx, instance, anchor, cluster, oldNode, safe); err != nil {
 		return err
 	}
 	members, err := r.consistentMembers(ctx, instance, anchor)
 	if err != nil {
 		return err
 	}
-	queueErr := r.verifyOldQueueReplicasRemoved(ctx, instance, anchor, creds, oldNode)
+	queueErr := r.verifyOldQueueReplicasRemoved(ctx, anchor, cluster, oldNode)
 	if queueErr != nil && !errors.Is(queueErr, errOldQueueReplicaPresent) {
 		return queueErr
 	}
@@ -584,7 +588,7 @@ func (r *Reconciler) removeOldMember(ctx context.Context, instance *rabbitmqv1.R
 	if beforeMembership.Running[oldNode] || len(safeBefore) < quorum {
 		return fmt.Errorf("survivor membership changed before old-member removal")
 	}
-	if err := r.rmqQueuesSafeAfterDeletion(ctx, instance, anchor, creds, oldNode, safeBefore); err != nil {
+	if err := r.rmqQueuesSafeAfterDeletion(ctx, instance, anchor, cluster, oldNode, safeBefore); err != nil {
 		return err
 	}
 	if members[oldNode] || errors.Is(queueErr, errOldQueueReplicaPresent) {
@@ -623,10 +627,10 @@ func (r *Reconciler) removeOldMember(ctx context.Context, instance *rabbitmqv1.R
 	if after.Running[oldNode] || voters < quorum {
 		return fmt.Errorf("survivor membership changed after removal")
 	}
-	if err := r.rmqQueuesSafeAfterDeletion(ctx, instance, anchor, creds, oldNode, safeAfter); err != nil {
+	if err := r.rmqQueuesSafeAfterDeletion(ctx, instance, anchor, cluster, oldNode, safeAfter); err != nil {
 		return err
 	}
-	if err := r.verifyOldQueueReplicasRemoved(ctx, instance, anchor, creds, oldNode); err != nil {
+	if err := r.verifyOldQueueReplicasRemoved(ctx, anchor, cluster, oldNode); err != nil {
 		return err
 	}
 	recovery.ReplacementPVCUID = string(claim.UID)

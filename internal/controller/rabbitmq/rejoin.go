@@ -28,6 +28,7 @@ import (
 	rabbitmqv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	remediationv1 "github.com/openstack-k8s-operators/infra-operator/apis/remediation/v1beta1"
 	"github.com/openstack-k8s-operators/infra-operator/internal/rabbitmq"
+	"github.com/openstack-k8s-operators/infra-operator/internal/rabbitmq/admin"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/rsh"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -641,7 +642,7 @@ func (r *Reconciler) ReconcileNodeRejoin(
 	}
 	quorum := quorumOf(*instance.Spec.Replicas)
 	targetNode := rmqNodeName(instance, target.Name)
-	creds, err := r.rmqLoadMgmtCreds(ctx, instance)
+	cluster, err := r.rmqAdmin(ctx, instance)
 	if err != nil {
 		return true, err
 	}
@@ -699,7 +700,7 @@ func (r *Reconciler) ReconcileNodeRejoin(
 			peerCancel()
 			continue
 		}
-		if _, err := r.rmqClusterNodes(peerCtx, instance, peer, creds); err != nil {
+		if _, err := cluster.Nodes(peerCtx, peer); err != nil {
 			peerCancel()
 			log.Info("Could not reach candidate peer management API", "pod", peer.Name, "error", err.Error())
 			continue
@@ -825,7 +826,7 @@ func (r *Reconciler) verifyQuorumQueueReplicasOnline(
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	creds, err := r.rmqLoadMgmtCreds(ctx, instance)
+	cluster, err := r.rmqAdmin(ctx, instance)
 	if err != nil {
 		return fmt.Errorf("reading management credentials: %w", err)
 	}
@@ -834,26 +835,25 @@ func (r *Reconciler) verifyQuorumQueueReplicasOnline(
 	// reported reason is not whichever queue happened to be scanned first.
 	missingReplicaQueue := ""
 	offlineReplicaQueue := ""
-	if err := r.scanQueues(ctx, instance, pod, creds,
-		"name,vhost,type,members,online",
-		func(queue rmqQueueStatus) error {
-			if queue.Type != "quorum" {
-				return nil
-			}
-			members, online, err := quorumQueueMembers(queue)
-			if err != nil {
-				return err
-			}
-			if !members[targetNode] {
-				missingReplicaQueue = queue.Vhost + "/" + queue.Name
-				return nil
-			}
-			if !online[targetNode] {
-				offlineReplicaQueue = queue.Vhost + "/" + queue.Name
-			}
-			return nil
-		}); err != nil {
+	queues, err := cluster.Queues(ctx, pod, admin.ColumnsMembership)
+	if err != nil {
 		return err
+	}
+	for _, queue := range queues {
+		if queue.Type != admin.QueueTypeQuorum {
+			continue
+		}
+		members, online, err := admin.QuorumQueueMembers(queue)
+		if err != nil {
+			return err
+		}
+		if !members[targetNode] {
+			missingReplicaQueue = queue.Ref()
+			continue
+		}
+		if !online[targetNode] {
+			offlineReplicaQueue = queue.Ref()
+		}
 	}
 	if missingReplicaQueue != "" {
 		return fmt.Errorf("RabbitMq quorum queue %s does not include %s yet; waiting for Continuous Membership Reconciliation", missingReplicaQueue, targetNode)
