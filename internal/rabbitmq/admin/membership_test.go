@@ -43,8 +43,11 @@ type fakeExec struct {
 	// replies is matched against the command joined by spaces: the first key
 	// that appears in it wins.
 	replies map[string]string
-	err     error
-	calls   []recordedCommand
+	// replyFunc, when set, answers instead of replies and can give a
+	// different answer to each call.
+	replyFunc func(command []string) string
+	err       error
+	calls     []recordedCommand
 }
 
 func (f *fakeExec) run(
@@ -61,6 +64,9 @@ func (f *fakeExec) run(
 		pod: pod, container: container, command: command, deadline: deadline})
 	if f.err != nil {
 		return f.err
+	}
+	if f.replyFunc != nil {
+		return callback(bytes.NewBufferString(f.replyFunc(command)), &bytes.Buffer{})
 	}
 	joined := strings.Join(command, " ")
 	for key, reply := range f.replies {
