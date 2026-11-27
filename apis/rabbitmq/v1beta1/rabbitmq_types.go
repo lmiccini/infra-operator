@@ -420,7 +420,9 @@ type RabbitMqClusterHealth struct {
 	// +kubebuilder:validation:Optional
 	DegradedQueues []string `json:"degradedQueues,omitempty"`
 
-	// Error says why the last read failed, and is empty when it worked. The
+	// Error says why the last read failed, and is empty when it worked. A
+	// read also counts as failed when a quorum queue's replication cannot be
+	// determined, because its counts would understate what is wrong. The
 	// counts above and ObservedAt are left as they were, so a failed read
 	// does not replace the last good numbers with zeroes or make them look
 	// newer than they are.

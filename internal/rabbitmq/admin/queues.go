@@ -150,7 +150,8 @@ type QueueSummary struct {
 	// between reads.
 	Degraded []string
 	// Err is the first queue whose replication could not be read. The counts
-	// above still cover every queue that could be read.
+	// above cover only the queues that could be read, so a summary with Err
+	// is not a complete picture of the cluster.
 	Err error
 }
 

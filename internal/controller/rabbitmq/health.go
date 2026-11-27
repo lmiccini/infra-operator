@@ -111,6 +111,13 @@ func (r *Reconciler) reportClusterHealth(ctx context.Context, instance *rabbitmq
 		return
 	}
 	summary := admin.SummarizeQueues(queues)
+	if summary.Err != nil {
+		// The listing was read, but not every quorum queue in it could be
+		// accounted for. The counts would understate what is wrong, so treat
+		// this like any other failed read and keep the last complete report.
+		failed(summary.Err)
+		return
+	}
 
 	health := &rabbitmqv1beta1.RabbitMqClusterHealth{
 		ObservedAt:                  metav1.Now(),
@@ -120,9 +127,6 @@ func (r *Reconciler) reportClusterHealth(ctx context.Context, instance *rabbitmq
 		UnderReplicatedQuorumQueues: summary.UnderReplicated,
 		QuorumQueuesBelowQuorum:     summary.BelowQuorum,
 		DegradedQueues:              summary.Degraded,
-	}
-	if summary.Err != nil {
-		health.Error = summary.Err.Error()
 	}
 	report(health)
 }

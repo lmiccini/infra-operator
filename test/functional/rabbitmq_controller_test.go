@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2" //revive:disable:dot-imports
 	. "github.com/onsi/gomega"    //revive:disable:dot-imports
@@ -2556,6 +2557,60 @@ var _ = Describe("RabbitMq cluster health reporting", func() {
 			g.Expect(instance.Status.ClusterHealth.LastAttemptAt.IsZero()).To(BeFalse())
 			g.Expect(instance.Status.Conditions.IsTrue(condition.DeploymentReadyCondition)).To(BeTrue())
 			g.Expect(instance.Status.Conditions.IsFalse(condition.ReadyCondition)).To(BeFalse())
+		}, timeout, interval).Should(Succeed())
+	})
+
+	// A response the client can read but whose quorum queues cannot all be
+	// accounted for is not a complete observation. Reporting its partial
+	// counts would understate what is wrong, so the last complete report is
+	// kept instead.
+	It("keeps the last complete report when a queue cannot be read", func() {
+		rabbitMQMgmt.Respond(
+			`[{"name":"rabbit@a","running":true}]`,
+			`[{"name":"full","vhost":"/","type":"quorum","members":["a","b","c"],"online":["a","b","c"]}]`)
+		DeferCleanup(func() { rabbitMQMgmt.Respond("[]", "[]") })
+
+		rabbitmq := CreateRabbitMQ(rabbitmqName, GetDefaultRabbitMQSpec())
+		DeferCleanup(th.DeleteInstance, rabbitmq)
+		createReadyBrokerPod(rabbitmqName.Name + "-server-0")
+		simulateSTSReady()
+
+		var first rabbitmqv1.RabbitMqClusterHealth
+		Eventually(func(g Gomega) {
+			health := GetRabbitMQ(rabbitmqName).Status.ClusterHealth
+			g.Expect(health).NotTo(BeNil())
+			g.Expect(health.Error).To(BeEmpty())
+			health.DeepCopyInto(&first)
+		}, timeout, interval).Should(Succeed())
+		Expect(first.ObservedAt.IsZero()).To(BeFalse())
+		Expect(first.QuorumQueues).To(Equal(1))
+
+		// The next read sees a quorum queue whose membership is unknown. The
+		// broker list also changes, to prove neither is published.
+		rabbitMQMgmt.Respond(
+			`[{"name":"rabbit@a","running":false}]`,
+			`[{"name":"unknown","vhost":"/","type":"quorum"}]`)
+
+		// Let the one-minute read interval expire, and rewrite it on every
+		// retry in case a reconcile that started before the change puts the
+		// recent attempt time back. Writing status also wakes the controller.
+		Eventually(func(g Gomega) {
+			instance := GetRabbitMQ(rabbitmqName)
+			g.Expect(instance.Status.ClusterHealth).NotTo(BeNil())
+			if instance.Status.ClusterHealth.Error == "" {
+				instance.Status.ClusterHealth.LastAttemptAt =
+					metav1.NewTime(time.Now().Add(-2 * time.Minute))
+				_ = th.K8sClient.Status().Update(th.Ctx, instance)
+			}
+			health := instance.Status.ClusterHealth
+			g.Expect(health.Error).To(ContainSubstring("unknown membership"))
+			// Everything still describes the last read that could account
+			// for every queue.
+			g.Expect(health.Members).To(Equal(first.Members))
+			g.Expect(health.RunningMembers).To(Equal(first.RunningMembers))
+			g.Expect(health.QuorumQueues).To(Equal(first.QuorumQueues))
+			g.Expect(health.ObservedAt.Time.Equal(first.ObservedAt.Time)).To(BeTrue())
+			g.Expect(health.LastAttemptAt.After(first.ObservedAt.Time)).To(BeTrue())
 		}, timeout, interval).Should(Succeed())
 	})
 })
