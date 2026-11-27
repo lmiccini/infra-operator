@@ -2591,6 +2591,14 @@ var _ = Describe("RabbitMq cluster health reporting", func() {
 			`[{"name":"rabbit@a","running":false}]`,
 			`[{"name":"unknown","vhost":"/","type":"quorum"}]`)
 
+		// Status timestamps have one-second precision. Wait for a new second
+		// so that the next attempt's LastAttemptAt is strictly later than
+		// ObservedAt; otherwise both can land in the same second and the
+		// comparison below cannot tell that the attempt time advanced.
+		for time.Now().Unix() <= first.ObservedAt.Unix() {
+			time.Sleep(10 * time.Millisecond)
+		}
+
 		// Let the one-minute read interval expire, and rewrite it on every
 		// retry in case a reconcile that started before the change puts the
 		// recent attempt time back. Writing status also wakes the controller.
