@@ -47,7 +47,7 @@ type queueQuorumReadResult struct {
 	Error           string                   `json:"error,omitempty"`
 }
 
-// verifyQueueQuorumReads determines, for every quorum queue, whether the queue
+// ProveQueueQuorum determines, for every quorum queue, whether the queue
 // would still have a working majority without the deletion candidate.
 //
 // Two cheaper checks are insufficient. The management API's online, leader and

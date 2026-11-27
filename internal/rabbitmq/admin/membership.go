@@ -91,6 +91,12 @@ func (s status) membership() (Membership, error) {
 	return membership, nil
 }
 
+// Membership returns which brokers the cluster counts as members, and which of
+// those it reports as running, as read from pod with `rabbitmqctl
+// cluster_status`.
+//
+// The answer is rejected if it does not report pod's own node as running: a
+// broker that cannot see itself is not a source worth reporting from.
 func (c *Client) Membership(ctx context.Context, pod *corev1.Pod) (Membership, error) {
 	out, err := c.Ctl(ctx, podKey(pod),
 		"--formatter", "json", "cluster_status")
@@ -112,7 +118,7 @@ func (c *Client) Membership(ctx context.Context, pod *corev1.Pod) (Membership, e
 	return membership, nil
 }
 
-// consistentMembers asks the cluster for its agreed member list instead of
+// ConsistentMembers asks the cluster for its agreed member list instead of
 // reading the per-broker cache that `rabbitmqctl cluster_status` reports from.
 //
 // The two differ when confirming a removal. A node absent from one broker's
