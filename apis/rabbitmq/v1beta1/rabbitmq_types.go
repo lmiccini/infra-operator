@@ -418,6 +418,7 @@ type RabbitMqClusterHealth struct {
 	// vhost/name. It is kept short and sorted so that it stays readable on a
 	// cluster with thousands of queues.
 	// +kubebuilder:validation:Optional
+	// +listType=atomic
 	DegradedQueues []string `json:"degradedQueues,omitempty"`
 
 	// Error says why the last read failed, and is empty when it worked. A
