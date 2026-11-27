@@ -2522,6 +2522,7 @@ var _ = Describe("RabbitMq cluster health reporting", func() {
 			g.Expect(health).NotTo(BeNil())
 			g.Expect(health.Error).To(BeEmpty())
 			g.Expect(health.ObservedAt.IsZero()).To(BeFalse())
+			g.Expect(health.LastAttemptAt.IsZero()).To(BeFalse())
 			// A broker that is down still belongs to the cluster.
 			g.Expect(health.Members).To(Equal(3))
 			g.Expect(health.RunningMembers).To(Equal(2))
@@ -2549,6 +2550,10 @@ var _ = Describe("RabbitMq cluster health reporting", func() {
 			instance := GetRabbitMQ(rabbitmqName)
 			g.Expect(instance.Status.ClusterHealth).NotTo(BeNil())
 			g.Expect(instance.Status.ClusterHealth.Error).To(ContainSubstring("503"))
+			// No read has succeeded, so there is no observation time; the
+			// attempt time records that the operator did try.
+			g.Expect(instance.Status.ClusterHealth.ObservedAt.IsZero()).To(BeTrue())
+			g.Expect(instance.Status.ClusterHealth.LastAttemptAt.IsZero()).To(BeFalse())
 			g.Expect(instance.Status.Conditions.IsTrue(condition.DeploymentReadyCondition)).To(BeTrue())
 			g.Expect(instance.Status.Conditions.IsFalse(condition.ReadyCondition)).To(BeFalse())
 		}, timeout, interval).Should(Succeed())

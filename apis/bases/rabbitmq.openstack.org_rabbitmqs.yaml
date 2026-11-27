@@ -1964,8 +1964,15 @@ spec:
                   error:
                     description: |-
                       Error says why the last read failed, and is empty when it worked. The
-                      counts above are left as they were, so a failed read does not replace
-                      the last good numbers with zeroes.
+                      counts above and ObservedAt are left as they were, so a failed read
+                      does not replace the last good numbers with zeroes or make them look
+                      newer than they are.
+                    type: string
+                  lastAttemptAt:
+                    description: |-
+                      LastAttemptAt is when the operator last asked the cluster for these
+                      values, whether or not that attempt succeeded.
+                    format: date-time
                     type: string
                   members:
                     description: |-
@@ -1974,8 +1981,9 @@ spec:
                       and still counts when working out whether a majority is present.
                     type: integer
                   observedAt:
-                    description: ObservedAt is when these values were read from the
-                      cluster.
+                    description: |-
+                      ObservedAt is when these values were read from the cluster. It stays
+                      empty until a read succeeds; Error then says why none has.
                     format: date-time
                     type: string
                   quorumQueues:

@@ -34,6 +34,14 @@ import (
 // again for every one of them would repeat that work for the same answer.
 const clusterHealthInterval = time.Minute
 
+// clusterHealthReadTimeout bounds the broker and queue reads together. The
+// per-request limits allow 15 seconds for the broker list and 60 for the
+// queue list, so without a shared bound an unresponsive broker could hold the
+// reconcile worker for their sum. This is comfortably above what the largest
+// cluster the client will read needs: maxResponseBytes allows about 36,000
+// queues, which the client measures at around half a millisecond each.
+const clusterHealthReadTimeout = 30 * time.Second
+
 // reportClusterHealth asks RabbitMQ how it is doing and writes the answer to
 // status.clusterHealth.
 //
@@ -45,17 +53,20 @@ const clusterHealthInterval = time.Minute
 //
 // When a read fails, the error is written onto the previous report instead of
 // replacing it. That way the last known-good numbers are still there next to
-// the reason the latest read did not work.
+// the reason the latest read did not work. ObservedAt stays at the time of the
+// last successful read, so old counts are never given a fresh timestamp;
+// LastAttemptAt records the failed attempt and keeps the interval below
+// working.
 func (r *Reconciler) reportClusterHealth(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) {
 	Log := r.GetLogger(ctx)
 	previous := instance.Status.ClusterHealth
-	if previous != nil && !previous.ObservedAt.IsZero() &&
-		time.Since(previous.ObservedAt.Time) < clusterHealthInterval {
+	if previous != nil && !previous.LastAttemptAt.IsZero() &&
+		time.Since(previous.LastAttemptAt.Time) < clusterHealthInterval {
 		return
 	}
 
 	report := func(health *rabbitmqv1beta1.RabbitMqClusterHealth) {
-		health.ObservedAt = metav1.Now()
+		health.LastAttemptAt = metav1.Now()
 		instance.Status.ClusterHealth = health
 	}
 	failed := func(err error) {
@@ -86,12 +97,15 @@ func (r *Reconciler) reportClusterHealth(ctx context.Context, instance *rabbitmq
 		cluster = cluster.WithHTTPClient(r.ManagementHTTPClient)
 	}
 
-	nodes, err := cluster.Nodes(ctx, pod)
+	readCtx, cancel := context.WithTimeout(ctx, clusterHealthReadTimeout)
+	defer cancel()
+
+	nodes, err := cluster.Nodes(readCtx, pod)
 	if err != nil {
 		failed(err)
 		return
 	}
-	queues, err := cluster.Queues(ctx, pod, admin.ColumnsReplication)
+	queues, err := cluster.Queues(readCtx, pod, admin.ColumnsReplication)
 	if err != nil {
 		failed(err)
 		return
@@ -99,6 +113,7 @@ func (r *Reconciler) reportClusterHealth(ctx context.Context, instance *rabbitmq
 	summary := admin.SummarizeQueues(queues)
 
 	health := &rabbitmqv1beta1.RabbitMqClusterHealth{
+		ObservedAt:                  metav1.Now(),
 		Members:                     len(nodes),
 		RunningMembers:              len(admin.RunningNodes(nodes)),
 		QuorumQueues:                summary.Quorum,

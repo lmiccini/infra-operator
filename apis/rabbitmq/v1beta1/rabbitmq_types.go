@@ -374,11 +374,18 @@ type RabbitMqStatus struct {
 // readiness only tells you the container started. It tells you nothing about
 // what is happening inside RabbitMQ, and this field fills that gap.
 //
-// These values can be out of date; ObservedAt says when they were read. Do not
-// use them to decide whether something is safe to do. Read the cluster again
-// at the point you need to make that decision.
+// These values can be out of date; ObservedAt says when they were read, and
+// LastAttemptAt when the operator last tried. Do not use them to decide
+// whether something is safe to do. Read the cluster again at the point you
+// need to make that decision.
 type RabbitMqClusterHealth struct {
-	// ObservedAt is when these values were read from the cluster.
+	// LastAttemptAt is when the operator last asked the cluster for these
+	// values, whether or not that attempt succeeded.
+	// +kubebuilder:validation:Optional
+	LastAttemptAt metav1.Time `json:"lastAttemptAt,omitempty"`
+
+	// ObservedAt is when these values were read from the cluster. It stays
+	// empty until a read succeeds; Error then says why none has.
 	// +kubebuilder:validation:Optional
 	ObservedAt metav1.Time `json:"observedAt,omitempty"`
 
@@ -414,8 +421,9 @@ type RabbitMqClusterHealth struct {
 	DegradedQueues []string `json:"degradedQueues,omitempty"`
 
 	// Error says why the last read failed, and is empty when it worked. The
-	// counts above are left as they were, so a failed read does not replace
-	// the last good numbers with zeroes.
+	// counts above and ObservedAt are left as they were, so a failed read
+	// does not replace the last good numbers with zeroes or make them look
+	// newer than they are.
 	// +kubebuilder:validation:Optional
 	Error string `json:"error,omitempty"`
 }
