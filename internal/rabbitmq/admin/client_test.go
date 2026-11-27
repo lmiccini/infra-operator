@@ -275,7 +275,7 @@ func TestLoadCredsRejectsEmptyCA(t *testing.T) {
 // read. The error has to say that, because "unexpected end of JSON input"
 // would send whoever reads it looking for a bug in RabbitMQ.
 func TestGetRejectsAResponseTooLargeToRead(t *testing.T) {
-	// Just over the limit: roughly 300 bytes per queue.
+	// Just over the limit: roughly 460 bytes per queue.
 	client, stop := stubCluster(t, http.StatusOK, syntheticQueueBody(40000))
 	defer stop()
 
