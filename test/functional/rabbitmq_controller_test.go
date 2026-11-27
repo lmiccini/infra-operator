@@ -2595,9 +2595,9 @@ var _ = Describe("RabbitMq cluster health reporting", func() {
 		// so that the next attempt's LastAttemptAt is strictly later than
 		// ObservedAt; otherwise both can land in the same second and the
 		// comparison below cannot tell that the attempt time advanced.
-		for time.Now().Unix() <= first.ObservedAt.Unix() {
-			time.Sleep(10 * time.Millisecond)
-		}
+		Eventually(func(g Gomega) {
+			g.Expect(time.Now().Unix()).To(BeNumerically(">", first.ObservedAt.Unix()))
+		}, timeout, interval).Should(Succeed())
 
 		// Let the one-minute read interval expire, and rewrite it on every
 		// retry in case a reconcile that started before the change puts the
